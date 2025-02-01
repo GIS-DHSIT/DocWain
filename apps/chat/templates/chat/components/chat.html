@@ -1,0 +1,19 @@
+{% load static %}
+<div class="chat-container h-full flex flex-col">
+    <div id="messages" class="flex-grow overflow-y-auto mb-4">
+        <!-- Messages will be inserted here -->
+    </div>
+
+    <div class="chat-input-container">
+        <form id="chat-form" class="flex">
+            <input type="text"
+                   id="message-input"
+                   class="flex-grow border rounded-l px-4 py-2"
+                   placeholder="Type your message...">
+            <button type="submit"
+                    class="bg-blue-500 text-white px-6 py-2 rounded-r">
+                Send
+            </button>
+        </form>
+    </div>
+</div>

@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+
+{% block title %}Chat{% endblock %}
+
+{% block content %}
+<div class="flex h-screen">
+    <!-- Sidebar -->
+    <div class="w-1/4 bg-white p-4 shadow-lg">
+        {% include 'chat/components/upload.html' %}
+    </div>
+
+    <!-- Main chat area -->
+    <div class="w-3/4 bg-white ml-4 p-4 shadow-lg">
+        {% include 'chat/components/chat.html' %}
+    </div>
+</div>
+{% endblock %}
