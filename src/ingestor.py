@@ -10,6 +10,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 path = os.getcwd()
 sys.path.append(path)
 from .config import Config
+from dotenv import load_dotenv
 
 
 class Ingestor:
@@ -37,6 +38,9 @@ class Ingestor:
         return Qdrant.from_documents(
             documents=documents,
             embedding=self.embeddings,
-            path=Config.Path.DATABASE_DIR,
+            url = Config.Path.QDRANT_SVR,
+            api_key = os.getenv('qdrant_key'),
+            # path=Config.Path.DATABASE_DIR,
             collection_name=Config.Database.DOCUMENTS_COLLECTION,
+            prefer_grpc=False,
         )

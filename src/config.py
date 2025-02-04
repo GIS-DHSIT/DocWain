@@ -8,7 +8,7 @@ class Config:
         DATABASE_DIR = APP_HOME / "docs-db"
         DOCUMENTS_DIR = APP_HOME / "tmp"
         IMAGES_DIR = APP_HOME / "files/images"
-
+        QDRANT_SVR = "https://0a25c9cf-4685-49c7-9382-4c3510754343.europe-west3-0.gcp.cloud.qdrant.io:6333"
     class Database:
         DOCUMENTS_COLLECTION = "documents"
 

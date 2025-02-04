@@ -1,0 +1,16 @@
+body {
+    background-color: #f4f4f4;
+}
+.stChatMessage {
+    padding: 10px;
+    border-radius: 12px;
+    background-color: #f1f1f1;
+    margin-bottom: 8px;
+}
+.user {
+    background-color: #dff6ff;
+    text-align: right;
+}
+.bot {
+    background-color: #f0e5ff;
+}
