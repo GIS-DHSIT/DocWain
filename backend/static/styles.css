@@ -1,0 +1,11 @@
+body {
+    font-family: 'Arial', sans-serif;
+}
+
+button {
+    transition: all 0.2s ease-in-out;
+}
+
+button:hover {
+    transform: scale(1.05);
+}

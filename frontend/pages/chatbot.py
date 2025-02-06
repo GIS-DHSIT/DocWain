@@ -1,49 +1,38 @@
 import streamlit as st
 import requests
-from streamlit_extras.chat_elements import message
-from streamlit_extras.toggle_switch import st_toggle_switch
+import time
 
-API_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:8000/api/chat"
 
+def show():
+    st.markdown("<h1 style='text-align: center;'>🤖 Chat with DocWain</h1>", unsafe_allow_html=True)
 
-def chatbot_ui():
-    st.title("🤖 AI Chatbot")
+    if "auth_token" not in st.session_state:
+        st.warning("🚨 Please login first!")
+        return
 
-    # 🎨 Dark Mode Toggle
-    dark_mode = st_toggle_switch("🌙 Dark Mode", default_value=False)
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    # Chat History Storage
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    query = st.text_input("💬 Ask a question about your documents")
+    response_type = st.radio("📖 Response Type", ["Short", "Detailed"], horizontal=True)
 
-    # 🗨️ Chat Container
-    chat_container = st.container()
+    if st.button("🔍 Ask DocWain"):
+        with st.spinner("🧠 Thinking..."):
+            headers = {"Authorization": f"Bearer {st.session_state['auth_token']}"}
+            params = {"query": query, "response_type": response_type.lower()}
+            response = requests.get(BASE_URL, params=params, headers=headers)
 
-    # 📜 Display Chat History
-    for chat in st.session_state.chat_history:
-        message(chat["text"], is_user=chat["is_user"], key=chat["id"])
+            if response.status_code == 200:
+                data = response.json()
+                st.session_state.messages.append({"query": query, "response": data["response"], "sources": data["source_documents"]})
+            else:
+                st.error("⚠️ Error retrieving response.")
 
-    # ⌨️ Chat Input
-    user_query = st.chat_input("Type your question...")
-
-    if user_query:
-        st.session_state.chat_history.append(
-            {"text": user_query, "is_user": True, "id": f"user-{len(st.session_state.chat_history)}"})
-        message(user_query, is_user=True, key=f"user-{len(st.session_state.chat_history)}")
-
-        # API Call
-        with st.spinner("Thinking... 💭"):
-            response = requests.get(f"{API_URL}/query/", params={"question": user_query})
-            answer = response.json().get("answer", "Sorry, I couldn't find an answer.")
-
-        st.session_state.chat_history.append(
-            {"text": answer, "is_user": False, "id": f"bot-{len(st.session_state.chat_history)}"})
-        message(answer, is_user=False, key=f"bot-{len(st.session_state.chat_history)}")
-
-    # 📜 Collapsible Chat History
-    with st.expander("📜 Chat Logs"):
-        history_response = requests.get(f"{API_URL}/history/").json()["history"]
-        for chat in history_response:
-            st.write(f"**Q:** {chat[1]}")
-            st.write(f"**A:** {chat[2]}")
-            st.markdown("---")
+    # Display Chat History with Typing Effect
+    for msg in reversed(st.session_state.messages):
+        st.markdown(f"**🧑‍💻 You:** {msg['query']}")
+        with st.expander("🤖 DocWain's Answer"):
+            st.write(msg["response"])
+            st.info(f"📄 Sources: {', '.join(msg['sources'])}")
+        time.sleep(0.3)  # Simulated Typing Effect

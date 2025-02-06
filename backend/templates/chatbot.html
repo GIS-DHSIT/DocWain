@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chatbot - DocWain AI</title>
+    <script src="https://unpkg.com/htmx.org@1.8.0"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen">
+    <div class="bg-white p-6 rounded-lg shadow-md w-2/3">
+        <h2 class="text-2xl font-bold text-center">🤖 Chat with DocWain</h2>
+        <input type="text" id="query" placeholder="Ask a question..." class="w-full p-2 border rounded mt-4">
+        <button hx-post="/api/chatbot/query" hx-target="#chat-response"
+            class="w-full bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded mt-2">
+            Ask
+        </button>
+        <div id="chat-response" class="mt-4 text-center"></div>
+    </div>
+</body>
+</html>

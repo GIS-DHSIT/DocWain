@@ -1,51 +1,37 @@
 import streamlit as st
 import requests
 
-API_URL = "http://localhost:8000"
+BASE_URL = "http://localhost:8000/api/admin"
 
-def admin_ui():
-    st.title("🛠️ Admin Panel - Document Management & Configuration")
+def show():
+    st.markdown("<h1 style='text-align: center;'>🛠️ Admin Dashboard</h1>", unsafe_allow_html=True)
 
-    # 🎯 Tabs for better organization
-    tab1, tab2 = st.tabs(["📂 Upload & Manage Documents", "⚙️ System Configuration"])
+    if "auth_token" not in st.session_state:
+        st.warning("🚨 Please login first!")
+        return
 
-    # 📂 File Upload Section
-    with tab1:
-        uploaded_file = st.file_uploader("Upload Document", type=["pdf", "docx", "xlsx", "csv", "ppt"])
-        if st.button("Upload"):
-            if uploaded_file:
-                res = requests.post(f"{API_URL}/upload/", files={"file": uploaded_file.getvalue()})
-                st.success(res.json().get("status"))
+    headers = {"Authorization": f"Bearer {st.session_state['auth_token']}"}
 
-        st.subheader("📄 Uploaded Documents")
-        docs = requests.get(f"{API_URL}/history/").json()["history"]
-        for doc in docs:
-            st.write(f"📂 {doc[1]} - `{doc[2]}`")
+    # Fetch Pending Users
+    st.subheader("👤 Pending User Approvals")
+    users = requests.get(f"{BASE_URL}/users", headers=headers).json()
+    for user in users:
+        col1, col2, col3 = st.columns([3, 1, 1])
+        col1.write(f"🧑‍💼 {user['username']} ({user['email']})")
+        if col2.button(f"✅ Approve", key=f"approve_{user['id']}"):
+            requests.post(f"{BASE_URL}/approve/{user['id']}", headers=headers)
+            st.success(f"✅ User {user['username']} approved!")
+        if col3.button(f"❌ Remove", key=f"remove_{user['id']}"):
+            requests.post(f"{BASE_URL}/remove/{user['id']}", headers=headers)
+            st.error(f"❌ User {user['username']} removed!")
 
-    # ⚙️ Configuration Section
-    with tab2:
-        st.subheader("🔧 Configure System Settings")
-
-        aws_key = st.text_input("AWS Access Key", value="your-access-key")
-        aws_secret = st.text_input("AWS Secret Key", value="your-secret-key")
-        s3_bucket = st.text_input("S3 Bucket Name", value="your-bucket-name")
-
-        ftp_server = st.text_input("FTP Server", value="ftp.example.com")
-        ftp_user = st.text_input("FTP Username", value="your-ftp-user")
-        ftp_pass = st.text_input("FTP Password", value="your-ftp-password")
-
-        openai_key = st.text_input("OpenAI API Key", value="your-openai-key")
-
-        if st.button("Save Changes"):
-            updated_config = {
-                "AWS_ACCESS_KEY": aws_key,
-                "AWS_SECRET_KEY": aws_secret,
-                "S3_BUCKET_NAME": s3_bucket,
-                "FTP_SERVER": ftp_server,
-                "FTP_USERNAME": ftp_user,
-                "FTP_PASSWORD": ftp_pass,
-                "OPENAI_API_KEY": openai_key
-            }
-            for key, value in updated_config.items():
-                requests.post(f"{API_URL}/config/update/", json={"key": key, "value": value})
-            st.success("✅ Configuration Updated!")
+    st.markdown("---")
+    st.subheader("📁 Document Sources Management")
+    source_type = st.selectbox("Select Source Type", ["AWS S3", "Azure Blob", "FTP", "Local"])
+    source_path = st.text_input("Enter Path or Connection String")
+    if st.button("➕ Add Document Source"):
+        response = requests.post(f"{BASE_URL}/add_source", json={"type": source_type, "path": source_path}, headers=headers)
+        if response.status_code == 200:
+            st.success("✅ Document source added successfully!")
+        else:
+            st.error("⚠️ Error adding document source.")

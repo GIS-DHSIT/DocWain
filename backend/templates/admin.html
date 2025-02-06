@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard - DocWain AI</title>
+    <script src="https://unpkg.com/htmx.org@1.8.0"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body class="bg-gray-100 flex flex-col items-center justify-center min-h-screen">
+
+    <div class="bg-white p-6 rounded-lg shadow-md w-2/3">
+        <h2 class="text-2xl font-bold text-center">🛠️ Admin Dashboard</h2>
+
+        <h3 class="text-xl font-semibold mt-6">👤 Pending User Approvals</h3>
+        <div id="user-list" class="mt-4">
+            <button hx-get="/api/admin/users" hx-target="#user-list"
+                    class="bg-blue-500 text-white px-4 py-2 rounded">
+                Refresh Users
+            </button>
+        </div>
+
+        <h3 class="text-xl font-semibold mt-6">📁 Manage Document Sources</h3>
+        <form hx-post="/api/admin/add_source" hx-target="#doc-source-msg">
+            <input type="text" name="source" placeholder="Enter Source Path"
+                   class="w-full p-2 border rounded mb-2">
+            <button class="bg-green-500 text-white px-4 py-2 rounded w-full">➕ Add Source</button>
+        </form>
+        <div id="doc-source-msg" class="text-center mt-2"></div>
+    </div>
+
+</body>
+</html>
