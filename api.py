@@ -110,6 +110,5 @@ async def health_check():
     return {"status": "healthy"}
 
 
-# Save this file as api.py in the DocWain directory
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+def run():
+    return uvicorn.run(app, host="0.0.0.0", port=80)
