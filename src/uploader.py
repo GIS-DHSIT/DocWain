@@ -16,7 +16,9 @@ def upload_files(
     file_paths = []
     for file in files:
         file_path = Config.Path.DOCUMENTS_DIR / file.name
+        print(file.name)
         with file_path.open("wb") as f:
             f.write(file.getvalue())
         file_paths.append(file_path)
     return file_paths
+

@@ -7,10 +7,15 @@ class Config:
         APP_HOME = Path(os.getenv("APP_HOME", Path(__file__).parent.parent))
         DATABASE_DIR = APP_HOME / "docs-db"
         DOCUMENTS_DIR = APP_HOME / "tmp"
-        IMAGES_DIR = APP_HOME / "files/images"
+        IMAGES_DIR = APP_HOME /"images"
+        DUCKDB_DIR = DATABASE_DIR / "duck-db"
 
     class Database:
         DOCUMENTS_COLLECTION = "documents"
+
+    class Qdrant:
+        URL = "https://0a25c9cf-4685-49c7-9382-4c3510754343.europe-west3-0.gcp.cloud.qdrant.io:6333"
+        API = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ki8Uux4HtKDYj6ebqH9nzu3qg7QVmXTvxT6UkLNwTc4"
 
     class Model:
         EMBEDDINGS = "BAAI/bge-base-en-v1.5"

@@ -40,3 +40,18 @@ class Ingestor:
             path=Config.Path.DATABASE_DIR,
             collection_name=Config.Database.DOCUMENTS_COLLECTION,
         )
+
+    def s3_ingest(self, loaded_documents) -> VectorStore:
+        documents = []
+        document_text = "\n".join([doc.page_content for doc in loaded_documents])
+        documents.extend(
+            self.recursive_splitter.split_documents(
+                self.semantic_splitter.create_documents([document_text])
+            )
+        )
+        return Qdrant.from_documents(
+            documents=documents,
+            embedding=self.embeddings,
+            path=Config.Path.DATABASE_DIR,
+            collection_name=Config.Database.DOCUMENTS_COLLECTION,
+        )
