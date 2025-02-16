@@ -19,7 +19,7 @@ app = FastAPI(title="DocWain API")
 
 class QuestionRequest(BaseModel):
     query: str
-    mongo_client: str = 'test'
+    mongo_db_name: str = 'test'
     mongo_collection:str = 'documents'
     profile_id: str = "default"
     model_name: str = "llama3.2"
@@ -44,9 +44,9 @@ def load_embeddings_from_mongo(db,tags):
 
 
 
-def answer_question(query, mongoClient, collection_name,tag="default",model='llama3.2'):
+def answer_question(query, mongoDbName, collection_name,tag="default",model='llama3.2'):
     """Answers a question based on stored embeddings."""
-    db = mongoClient[mongoClient]
+    db = mongoClient[mongoDbName]
     conColl = db[collection_name]
     embeddings = load_embeddings_from_mongo(conColl,tag)
     if embeddings is None:
@@ -71,7 +71,7 @@ def ask_question_api(request: QuestionRequest):
     """API endpoint for answering questions."""
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
-    answer = answer_question(request.query, request.mongo_client, request.mongo_collection,
+    answer = answer_question(request.query, request.mongo_db_name, request.mongo_collection,
                              request.profile_id, request.model_name)
     return {"answer": answer}
 
