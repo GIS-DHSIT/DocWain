@@ -14,6 +14,7 @@ docColl = db[dbName]
 documents = docColl.find()
 getProfiles = documents.collection.distinct('profile')
 op = pd.DataFrame(docColl.find())
+op[['name','profile','status']]
 profiles = {}
 for docs in documents:
     if docs['type'] == 'S3' and docs['profile'] in getProfiles:
