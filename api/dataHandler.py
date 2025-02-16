@@ -256,18 +256,15 @@ def trainData(collectionName='documents'):
                         break
             for objIds, Data in combined_dict.items():
                 status = train_on_document(Data['text'], documentData['db'], Data['profile'], objIds)
-            respdb = db[collectionName]
-            respTbl = respdb.find()
-            pd.DataFrame(respdb.find())
+                logging.info(status)
+            statusCon = db[collectionName]
+            op = pd.DataFrame(statusCon.find())
+            status_response = op[['name', 'profile', 'status']]
 
-            return "Training Completed."
+            return status_response
         else:
             return "No data to be processed!"
-        # return "Training Completed."
 
     except Exception as e:
         logging.error(f"Error in training data: {e}")
         return "Training failed."
-
-
-trainData()
