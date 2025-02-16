@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-from pymongo import MongoClient
-from sentence_transformers import SentenceTransformer
 
 
 class Config:
