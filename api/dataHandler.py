@@ -236,13 +236,13 @@ def initiate_training(collections):
         logging.error(f"Error in training initiation: {e}")
 
 
-def extractCont(documentData):
+def extractCont(documentData,collectionName,schemaName):
     """Extracts content details from document metadata."""
     try:
         logging.info("Extracting content from document data.")
         reqDict = {}
-        connData = connStr('connectors')
-        connDet = connData['actual documents provided ']
+        connData = connStr(collectionName) #'connectors'
+        connDet = connData[schemaName] #'actual documents provided '
 
         for fileDetails, vals in connDet.items():
             try:
@@ -266,12 +266,12 @@ def extractCont(documentData):
         logging.error(f"Critical failure in extractCont: {e}")
         return []
 
-def trainData(collectionName='documents'):
+def trainData(collectionDir,schemaName, collectionName='documents'):
     """Orchestrates the full training pipeline."""
     try:
         logging.info(f"Starting training for collection: {collectionName}")
         documentData = docStr(collectionName)
-        coll = extractCont(documentData['profiles'])
+        coll = extractCont(documentData['profiles'],collectionDir, schemaName)
         data = initiate_training(coll)
         if data != 'Not Found':
             combined_dict = {}
@@ -288,7 +288,7 @@ def trainData(collectionName='documents'):
             op = pd.DataFrame(statusCon.find())
             status_response = op[['name', 'profile', 'status']]
 
-            return status_response
+            return status_response.to_json(orient='records')
         else:
             return "No data to be processed!"
 
@@ -296,4 +296,4 @@ def trainData(collectionName='documents'):
         logging.error(f"Error in training data: {e}")
         return "Training failed."
 
-print(trainData())
+# trainData("connectors","actual documents provided ","documents")
