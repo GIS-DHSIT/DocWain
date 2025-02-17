@@ -13,7 +13,7 @@ from api.config import Config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 mongoClient = MongoClient(Config.MongoDB.URI)
-
+chunks_collection = mongoClient[Config.MongoDB.DB]["embeddings_chunks"]
 
 app = FastAPI(title="DocWain API")
 
@@ -25,17 +25,28 @@ class QuestionRequest(BaseModel):
     model_name: str = "llama3.2"
 
 
-def load_embeddings_from_mongo(db,tags):
-    """Loads FAISS index and text data from MongoDB."""
+def load_embeddings_from_mongo(db, tags):
+    """Loads FAISS index and text data from MongoDB, reconstructing chunked embeddings."""
     logging.info(f"Loading embeddings from MongoDB for model: {tags}")
     embedding_data = db.find_one({"profile": ObjectId(tags)})
-    if not embedding_data:
+
+    if not embedding_data or "embedding_chunks" not in embedding_data:
         logging.warning("No embeddings found in database.")
         return None
 
-    embeddings = np.array(embedding_data["embeddings"], dtype=np.float32)
+    # Load and merge chunked embeddings
+    chunk_ids = embedding_data["embedding_chunks"]
+    embeddings = []
+
+    for chunk_id in chunk_ids:
+        chunk_doc = chunks_collection.find_one({"_id": chunk_id})
+        if chunk_doc:
+            embeddings.extend(chunk_doc["chunk"])
+
+    embeddings = np.array(embeddings, dtype=np.float32)
     texts = embedding_data["texts"]
 
+    # Create FAISS index
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
 

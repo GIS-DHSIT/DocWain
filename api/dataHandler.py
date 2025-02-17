@@ -7,6 +7,7 @@ from Crypto.Cipher import AES
 import hashlib
 from pymongo import MongoClient
 import pandas as pd
+import numpy as np
 from bson.objectid import ObjectId
 from sentence_transformers import SentenceTransformer
 from api.config import Config
@@ -17,24 +18,49 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 mongoClient = MongoClient(Config.MongoDB.URI)
 db = mongoClient[Config.MongoDB.DB]
+chunks_collection = db["embeddings_chunks"]  # New collection for chunked embeddings
+
+def chunk_embeddings(embeddings, chunk_size=500):
+    """Splits a large embeddings array into smaller chunks."""
+    return [embeddings[i:i + chunk_size] for i in range(0, len(embeddings), chunk_size)]
 
 def save_embeddings_to_mongo(db_collection, embeddings, tags):
-    """Saves FAISS index and text data to MongoDB."""
+    """Saves large embeddings in chunks to avoid exceeding MongoDB's 16MB limit."""
     try:
         logging.info(f"Saving embeddings to MongoDB for profile ID: {tags}")
-        embedding_data = {"$set": {
-            "tag": tags,
-            "embeddings": embeddings["embeddings"].tolist(),
-            "texts": embeddings["texts"],
-            "status": 'TRAINING_COMPLETED'
-        }}
+
+        # Split large embeddings into chunks
+        chunk_ids = []
+        for chunk in chunk_embeddings(embeddings["embeddings"]):
+            chunk_doc = {"profile": tags, "chunk": chunk.tolist()}
+            chunk_id = chunks_collection.insert_one(chunk_doc).inserted_id
+            chunk_ids.append(chunk_id)
+
+        embedding_data = {
+            "$set": {
+                "tag": tags,
+                "embedding_chunks": chunk_ids,  # Store references instead of full embeddings
+                "texts": embeddings["texts"],
+                "status": 'TRAINING_COMPLETED'
+            }
+        }
+
         db_collection.update_one({"_id": ObjectId(tags)}, embedding_data, upsert=True)
-        logging.info("Embeddings successfully saved.")
+        logging.info("Embeddings successfully saved in chunks.")
     except Exception as e:
         logging.error(f"Error saving embeddings to MongoDB: {e}")
 
+def load_embeddings_from_chunks(chunk_ids):
+    """Loads and reconstructs large embeddings from stored chunks."""
+    chunks = []
+    for chunk_id in chunk_ids:
+        chunk_doc = chunks_collection.find_one({"_id": chunk_id})
+        if chunk_doc:
+            chunks.extend(chunk_doc["chunk"])
+    return np.array(chunks, dtype=np.float32)  # Convert back to NumPy array
+
 def train_on_document(text, db_collection, profiletag, docTag):
-    """Trains and stores embeddings from a document."""
+    """Trains and stores embeddings from a document using chunking."""
     try:
         logging.info(f"Training on document with tag: {profiletag}")
         chunks = text.split(". ")
@@ -216,7 +242,7 @@ def extractCont(documentData):
         logging.info("Extracting content from document data.")
         reqDict = {}
         connData = connStr('connectors')
-        connDet = connData['S3 test connection']
+        connDet = connData['actual documents provided ']
 
         for fileDetails, vals in connDet.items():
             try:
@@ -256,6 +282,7 @@ def trainData(collectionName='documents'):
                         break
             for objIds, Data in combined_dict.items():
                 status = train_on_document(Data['text'], documentData['db'], Data['profile'], objIds)
+                logging.info("Training completed.")
                 logging.info(status)
             statusCon = db[collectionName]
             op = pd.DataFrame(statusCon.find())
@@ -268,3 +295,5 @@ def trainData(collectionName='documents'):
     except Exception as e:
         logging.error(f"Error in training data: {e}")
         return "Training failed."
+
+print(trainData())
