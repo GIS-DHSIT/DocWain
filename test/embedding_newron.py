@@ -1,43 +1,44 @@
 import ollama
 import faiss
-import uvicorn
 import logging
 import numpy as np
-from api.config import Config
+from pymongo import MongoClient
+from qdrant_client import QdrantClient
+from sentence_transformers import SentenceTransformer
+from qdrant_client.models import Distance, VectorParams,Filter
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import AzureOpenAI
-from pymongo import MongoClient
+import uvicorn
+from api.config import Config
 from api.dataHandler import trainData
-from qdrant_client import QdrantClient
-from qdrant_client.models import Filter
-from fastapi import FastAPI, HTTPException
-from sentence_transformers import SentenceTransformer
-from qdrant_client.models import Distance, VectorParams
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 AzureOpenAI.api_key = Config.Model.AZURE_OPENAI_API_KEY
 mongoClient = MongoClient(Config.MongoDB.URI)
-qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
+qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API,timeout=60)
 
 app = FastAPI(title="DocWain API")
 
-
 class QuestionRequest(BaseModel):
     query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
+    schemaName:str = 'actual documents provided '
+    profile_id: str = "profile ID"
     model_name: str = "llama3.2"
-
 
 class AzureQuestionRequest(BaseModel):
     query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
+    schemaName:str = 'actual documents provided '
+    profile_id: str = "profile ID"
     model_name: str = "OpenAI"
     api_version: str = "2023-07-01-preview"
 
 
+class TrainRequest(BaseModel):
+    collectionName: str = 'documents'
+    collectionDir: str = 'connectors'
+    schemaName: str = 'actual documents provided '
 
 def ensure_qdrant_collection(collection_name, vector_size=384):
     """Ensures the Qdrant collection exists with the correct settings."""
@@ -57,40 +58,29 @@ def ensure_qdrant_collection(collection_name, vector_size=384):
     except Exception as e:
         logging.error(f"Error ensuring collection in Qdrant: {e}")
 
-
-def load_embeddings_from_qdrant(tags):
-    """Loads embeddings from Qdrant Cloud, ensuring vectors are retrieved."""
+def load_embeddings_from_qdrant(collection_name, tags):
+    """Loads embeddings from Qdrant Cloud."""
     logging.info(f"Loading embeddings from Qdrant for tag: {tags}")
 
     try:
+        ensure_qdrant_collection(collection_name)
 
         search_result = qdrant_client.scroll(
-            collection_name=tags,
+            collection_name=collection_name,
             scroll_filter=Filter(
                 must=[{"key": "tag", "match": {"value": tags}}]
             ),
-            limit=1000,
-            with_vectors=True
+            limit=1000
         )
 
-        if not search_result or not search_result[0]:
+        if not search_result[0]:
             logging.warning("No embeddings found in Qdrant.")
             return None
 
-        embeddings = []
-        texts = []
+        embeddings = [point.vector for point in search_result[0]]
+        texts = [point.payload["text"] for point in search_result[0]]
 
-        for point in search_result[0]:
-            if "text" in point.payload and "tag" in point.payload and point.vector:
-                embeddings.append(point.vector)
-                texts.append(point.payload["text"])
-            else:
-                logging.warning(f"Skipping invalid point: {point.payload}")
-
-        if not embeddings:
-            logging.warning("Embeddings found but vectors are missing!")
-            return None
-
+        # Create FAISS index
         embeddings = np.array(embeddings, dtype=np.float32)
         index = faiss.IndexFlatL2(embeddings.shape[1])
         index.add(embeddings)
@@ -102,10 +92,11 @@ def load_embeddings_from_qdrant(tags):
         return None
 
 
-def answer_question(query, collection_name, tag="default", model='llama3.2'):
+
+def answer_question(query, collection_name,tag="default",model='llama3.2'):
     """Answers a question based on stored embeddings."""
 
-    embeddings = load_embeddings_from_qdrant(tag)
+    embeddings = load_embeddings_from_qdrant(collection_name,tag)
     if embeddings is None:
         return "No trained model found!"
     logging.info(f"Processing query: {query} for model: {tag}")
@@ -114,19 +105,18 @@ def answer_question(query, collection_name, tag="default", model='llama3.2'):
     retrieved_text = "\n".join([embeddings["texts"][i] for i in I[0]])
     logging.info(f"Retrieving response using Ollama model {model}.")
     response = ollama.chat(
-
         model=model,
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": f"Answer strictly based on this context: {retrieved_text}\nQuestion: {query}"}
+            {"role": "user", "content": f"Answer based on this context: {retrieved_text}\nQuestion: {query}"}
         ]
     )
     return response["message"]
 
 
-def azure_answer_question(query, collection_name, tag="default", model="gpt-35-turbo", apiVersion="2023-07-01-preview"):
+def azure_answer_question(query, collection_name,tag="default",model="gpt-35-turbo",apiVersion ="2023-07-01-preview"):
     """Answers a question based on stored embeddings."""
-    embeddings = load_embeddings_from_qdrant(tag)
+    embeddings = load_embeddings_from_qdrant(collection_name,tag)
     if embeddings is None:
         return "No trained model found!"
     logging.info(f"Processing query: {query} for model: {tag}")
@@ -148,13 +138,12 @@ def azure_answer_question(query, collection_name, tag="default", model="gpt-35-t
     )
     return response.choices[0].message.content
 
-
 @app.post("/ask")
 def ask_question_api(request: QuestionRequest):
     """API endpoint for answering questions."""
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
-    answer = answer_question(request.query, request.user_id,
+    answer = answer_question(request.query, request.schemaName,
                              request.profile_id, request.model_name)
     return {"answer": answer}
 
@@ -164,13 +153,13 @@ def ask_question_api(request: AzureQuestionRequest):
     """Azure openAI API endpoint for answering questions."""
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
-    answer = azure_answer_question(request.query, request.user_id,
-                                   request.profile_id, request.model_name, request.api_version)
+    answer = azure_answer_question(request.query, request.schemaName,
+                             request.profile_id, request.model_name,request.api_version)
     return {"answer": answer}
 
 
-@app.get("/train")
-def trigger_training():
+@app.post("/train")
+def trigger_training(request: TrainRequest):
     """
     API endpoint to trigger document training.
 
@@ -183,11 +172,12 @@ def trigger_training():
     """
     try:
         logging.info(
-            f"Received training request")
+            f"Received training request for collection: {request.collectionName}, connector: {request.collectionDir}")
 
-        status_response = trainData()
-        logging.info(status_response)
-        return {"status": "success", "message": status_response, "response": "Executed"}
+        status_response = trainData(request.collectionDir, request.schemaName,request.collectionName)
+
+        logging.info("Training completed successfully.")
+        return {"status": "success", "message": "Training process triggered", "response": "Completed"}
 
     except Exception as e:
         logging.error(f"Training API error: {e}")
@@ -196,7 +186,7 @@ def trigger_training():
 
 @app.get("/models")
 def list_available_models():
-    """API endpoint to list available models."""
+    """API endpoint to list locally available models."""
     try:
         models = ollama.list().model_dump()
         return {"models": models}
