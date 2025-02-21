@@ -1,77 +1,34 @@
-import boto3 as b3
 import json
 import fitz
 import docx
+import uuid
 import logging
-from Crypto.Cipher import AES
 import hashlib
-from pymongo import MongoClient
-import pandas as pd
+import subprocess
+import boto3 as b3
 import numpy as np
-from bson.objectid import ObjectId
-from sentence_transformers import SentenceTransformer
-from api.config import Config
+import pandas as pd
 from io import BytesIO
+from Crypto.Cipher import AES
+from pymongo import MongoClient
+from urllib.parse import urlparse
+from bson.objectid import ObjectId
+from qdrant_client import QdrantClient
+from qdrant_client.models import PointStruct
+from sentence_transformers import SentenceTransformer
+from qdrant_client.models import Distance, VectorParams
+from api.config import Config
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 mongoClient = MongoClient(Config.MongoDB.URI)
 db = mongoClient[Config.MongoDB.DB]
-chunks_collection = db["embeddings_chunks"]  # New collection for chunked embeddings
+qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API,timeout=60)
 
-def chunk_embeddings(embeddings, chunk_size=500):
-    """Splits a large embeddings array into smaller chunks."""
-    return [embeddings[i:i + chunk_size] for i in range(0, len(embeddings), chunk_size)]
 
-def save_embeddings_to_mongo(db_collection, embeddings, tags):
-    """Saves large embeddings in chunks to avoid exceeding MongoDB's 16MB limit."""
-    try:
-        logging.info(f"Saving embeddings to MongoDB for profile ID: {tags}")
-
-        # Split large embeddings into chunks
-        chunk_ids = []
-        for chunk in chunk_embeddings(embeddings["embeddings"]):
-            chunk_doc = {"profile": tags, "chunk": chunk.tolist()}
-            chunk_id = chunks_collection.insert_one(chunk_doc).inserted_id
-            chunk_ids.append(chunk_id)
-
-        embedding_data = {
-            "$set": {
-                "tag": tags,
-                "embedding_chunks": chunk_ids,  # Store references instead of full embeddings
-                "texts": embeddings["texts"],
-                "status": 'TRAINING_COMPLETED'
-            }
-        }
-
-        db_collection.update_one({"_id": ObjectId(tags)}, embedding_data, upsert=True)
-        logging.info("Embeddings successfully saved in chunks.")
-    except Exception as e:
-        logging.error(f"Error saving embeddings to MongoDB: {e}")
-
-def load_embeddings_from_chunks(chunk_ids):
-    """Loads and reconstructs large embeddings from stored chunks."""
-    chunks = []
-    for chunk_id in chunk_ids:
-        chunk_doc = chunks_collection.find_one({"_id": chunk_id})
-        if chunk_doc:
-            chunks.extend(chunk_doc["chunk"])
-    return np.array(chunks, dtype=np.float32)  # Convert back to NumPy array
-
-def train_on_document(text, db_collection, profiletag, docTag):
-    """Trains and stores embeddings from a document using chunking."""
-    try:
-        logging.info(f"Training on document with tag: {profiletag}")
-        chunks = text.split(". ")
-        embeddings = MODEL.encode(chunks, convert_to_numpy=True)
-        save_embeddings_to_mongo(db_collection, {"embeddings": embeddings, "texts": chunks}, docTag)
-        return f"Training complete. Model stored as {profiletag}!"
-    except Exception as e:
-        logging.error(f"Error during training: {e}")
-        return f"Training failed for tag {profiletag}"
-
-def decrypt_data(encrypted_value: str, encryption_key: str) -> str:
+def decrypt_data(encrypted_value: str, encryption_key= Config.Encryption.ENCRYPTION_KEY ) -> str:
     """Decrypts data using AES CBC mode."""
     try:
         key = hashlib.scrypt(encryption_key.encode(), salt=b'salt', n=16384, r=8, p=1, dklen=32)
@@ -89,7 +46,7 @@ def decrypt_data(encrypted_value: str, encryption_key: str) -> str:
 def extract_text_from_pdf(pdf_path):
     """Extracts text from a PDF file."""
     try:
-        logging.info(f"Extracting text from PDF: {pdf_path}")
+        logging.info(f"Extracting text from PDF")
         text = ""
         with fitz.open(stream=pdf_path, filetype="pdf") as doc:
             for page in doc:
@@ -112,19 +69,25 @@ def extract_text_from_docx(docx_path):
         logging.error(f"Failed to extract text from DOCX: {e}")
         return ""
 
-def get_s3_client(AWS_ACCESS_KEY, AWS_SECRET_KEY, Region):
-    """Returns an S3 client."""
+def fileProcessor(content,file):
+    extracted_data = {}
     try:
-        logging.info("Creating S3 client.")
-        return b3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY,
-            region_name=Region,
-        )
+        if content:
+            logging.info(f"Extracting File {file}")
+            if file.endswith(".csv"):
+                extracted_data[file] = pd.read_csv(BytesIO(content))
+            elif file.endswith(".json"):
+                extracted_data[file] = json.loads(content.decode("utf-8"))
+            elif file.endswith(".pdf"):
+                extracted_data[file] = extract_text_from_pdf(content)
+            elif file.endswith(".docx"):
+                extracted_data[file] = extract_text_from_docx(content)
+            else:
+                extracted_data[file] = content.decode("utf-8")
+        return extracted_data
     except Exception as e:
-        logging.error(f"Error creating S3 client: {e}")
-        return None
+        logging.error(f"Error processing file {file}: {e}")
+
 
 def read_s3_file(s3, bucket, file_key):
     """Reads a file from S3."""
@@ -138,162 +101,218 @@ def read_s3_file(s3, bucket, file_key):
         logging.error(f"Error reading S3 file {file_key}: {e}")
         return None
 
-def extractData(s3, bucket):
-    """Extracts data from all files stored in an S3 bucket."""
-    extracted_data = {}  # Dictionary to store file content
-
+def get_s3_client(AWS_ACCESS_KEY, AWS_SECRET_KEY, Region):
+    """Returns an S3 client."""
     try:
-        logging.info(f"Extracting data from S3 bucket: {bucket}")
-        objs = s3.list_objects_v2(Bucket=bucket)
-        file_list = [obj["Key"] for obj in objs.get("Contents", [])]
+        awsProfile = Config.AWS.profile
+        subprocess.run(
+            ["aws", "configure", "set", "aws_access_key_id", AWS_ACCESS_KEY, "--profile", awsProfile]
+        )
+        subprocess.run(
+            ["aws", "configure", "set", "aws_secret_access_key", AWS_SECRET_KEY, "--profile", awsProfile]
+        )
+        subprocess.run(
+            ["aws", "configure", "set", "region", Region, "--profile", awsProfile]
+        )
 
-        if not file_list:
-            logging.warning("No files found in the selected bucket.")
-            return None
-
-        for file in file_list:
-            try:
-                content = read_s3_file(s3, bucket, file)
-                if content:
-                    logging.info(f"Extracting File {file}")
-                    if file.endswith(".csv"):
-                        extracted_data[file] = pd.read_csv(BytesIO(content))
-                    elif file.endswith(".json"):
-                        extracted_data[file] = json.loads(content.decode("utf-8"))
-                    elif file.endswith(".pdf"):
-                        extracted_data[file] = extract_text_from_pdf(content)
-                    elif file.endswith(".docx"):
-                        extracted_data[file] = extract_text_from_docx(content)
-                    else:
-                        extracted_data[file] = content.decode("utf-8")
-            except Exception as e:
-                logging.error(f"Error processing file {file}: {e}")
-
+        return b3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY,
+            region_name=Region,
+        )
     except Exception as e:
-        logging.error(f"Error extracting data from bucket {bucket}: {e}")
+        logging.error(f"Error creating S3 client: {e}")
         return None
 
-    return extracted_data  # Return dictionary of file data
+def get_s3_document_info(s3_uri):
+    parsed_uri = urlparse(s3_uri)
+    bucket_name = parsed_uri.netloc
+    object_key = parsed_uri.path.lstrip('/')
 
-def connStr(dbName='connectors'):
+    s3 = b3.client(
+            "s3",
+            aws_access_key_id=Config.AWS.accessKey,
+            aws_secret_access_key=Config.AWS.secretKey,
+            region_name=Config.AWS.region,
+        )
+
+    try:
+        content = read_s3_file(s3,bucket_name,object_key)
+        return content
+
+    except Exception as e:
+        return {"Error": str(e)}
+
+
+def connectData(documentConnection):
+    dataDict = {}
+    for k, v in documentConnection.items():
+        docData = v['dataDict']
+        connData = v['connDict']
+        profileId = docData['profile'].__str__()
+        if docData['status'] == 'TRAINING_PENDING':
+            if docData['type'] == 'S3':
+                bkName = connData['s3_details']['bucketName']
+                region = connData['s3_details']['region']
+                ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
+                sk = decrypt_data(connData['s3_details']['secretKey']).split('\x08')[0].strip()
+                s3 = get_s3_client(ak, sk, region)
+                objs = s3.list_objects_v2(Bucket=bkName)
+                file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
+                docContent = read_s3_file(s3, bkName, file[0])
+                extractedDoc = fileProcessor(docContent, file[0])
+                docId = docData['_id'].__str__()
+                profileData = {profileId: extractedDoc}
+                dataDict[docId] = profileData
+            elif docData['type'] == 'LOCAL':
+                files = connData['locations']
+                if len(files) ==1:
+                    file = files[0]
+                    docContent = get_s3_document_info(file)
+                    extractedDoc = fileProcessor(docContent, file)
+                    docId = docData['_id'].__str__()
+                    profileData = {profileId: extractedDoc}
+                    dataDict[docId] = profileData
+                else:
+                    for file in files:
+                        docContent = get_s3_document_info(file)
+                        extractedDoc = fileProcessor(docContent, file)
+                        docId = docData['_id'].__str__()
+                        profileData = {profileId: extractedDoc}
+                        dataDict[docId] = profileData
+            elif docData['type'] == 'FTP':
+                pass
+            elif docData['type'] == 'BLOB':
+                pass
+        else:
+            print(v)
+
+    return dataDict
+
+def collectionConnect(name):
+    logging.info(f"Fetching connection details for collection: {name}")
+    collectionConn = db[name]
+    return collectionConn.find()
+
+def extract_document_info():
     """Retrieves connector details from MongoDB."""
     try:
-        logging.info(f"Fetching connection details for database: {dbName}")
-        conColl = db[dbName]
-        connectors = conColl.find()
-        conn = {}
+        docs = collectionConnect(Config.MongoDB.DOCUMENTS)
+        Docs = {}
+        for doc in docs:
+            refConnector = doc['_id'].__str__()
+            Docs[refConnector] = doc
+        connInfo = {}
+        connectors = collectionConnect(Config.MongoDB.CONNECTOR)
+        for conn in connectors:
+            connId = conn['_id'].__str__()
+            connInfo[connId] = conn
+        connList = list(connInfo.keys())
+        docInfo = {}
+        for docId, docData in Docs.items():
+            connRef = docData['connector'].__str__()
+            if connRef in connList:
+                docInfo[docId] = {'dataDict':docData,'connDict':connInfo[connRef]}
+        return docInfo
 
-        for con in connectors:
-            if con['type'] == 'S3':
-                conn[con['name']] = con['s3_details']
-            elif con['type'] == 'LOCAL':
-                for items in con['files']:
-                    conn[con['name']+'_'+items['name']] = items
-        return conn
     except Exception as e:
         logging.error(f"Error fetching connection details: {e}")
         return {}
 
-def docStr(dbName):
-    """Retrieves document metadata from MongoDB."""
+
+def ensure_qdrant_collection(collection_name, vector_size=768):
+    """Ensures the Qdrant collection exists with the correct settings."""
     try:
-        logging.info(f"Fetching document details for collection: {dbName}")
-        docColl = db[dbName]
-        documents = docColl.find()
-        getProfiles = documents.collection.distinct('profile')
-        profiles = {}
-        for docs in documents:
-            if docs['type'] == 'S3' and docs['profile'] in getProfiles:
-                # if docs['status'] == 'TRAINING_PENDING':
-                profName = docs['profile'].__str__()
-                docName = docs['_id'].__str__()
-                profiles[profName + '_' + docName] = docs
-            elif docs['type'] == 'LOCAL':
-                print(docs) #TODO update the code for LOCAL files
-        return {'profiles': profiles, 'db': docColl}
-    except Exception as e:
-        logging.error(f"Error fetching document details: {e}")
-        return {}
+        collections = qdrant_client.get_collections().collections
+        existing_collections = {col.name for col in collections}
 
-def initiate_training(collections):
-    """Initiates training on extracted documents."""
-    try:
-        logging.info("Starting training process.")
-        for uid, details in collections.items():
-            if 'region' in details:
-                tag = details['profile'].__str__()
-                s3b = get_s3_client(details['accessKey'], details['secretKey'], details['region'])
-                bucketName = details['bucketName']
-                fileData = extractData(s3b, bucketName)
-                return {'fileData': fileData, 'tag': tag}
-            elif 'type' == 'LOCAL':
-                print(details)#TODO update the code
-            else:
-                logging.error("No Region details found")
-        logging.warning("No valid collections found for training.")
-        return 'Not Found'
-    except Exception as e:
-        logging.error(f"Error in training initiation: {e}")
-
-
-def extractCont(documentData,collectionName,schemaName):
-    """Extracts content details from document metadata."""
-    try:
-        logging.info("Extracting content from document data.")
-        reqDict = {}
-        connData = connStr(collectionName) #'connectors'
-        connDet = connData[schemaName] #'actual documents provided '
-
-        for fileDetails, vals in connDet.items():
-            try:
-                if fileDetails == 'accessKey':
-                    decryptedAK = decrypt_data(vals, 'J9cuHrESAz')  # TODO Needs to be parameterized
-                    reqDict[fileDetails] = decryptedAK.split('\x0c')[0].strip()
-                elif fileDetails == 'secretKey':
-                    decryptedSK = decrypt_data(vals, 'J9cuHrESAz')  # TODO Needs to be parameterized
-                    reqDict[fileDetails] = decryptedSK.split('\x08')[0].strip()
-                else:
-                    reqDict[fileDetails] = vals
-            except Exception as e:
-                logging.error(f"Error decrypting {fileDetails}: {e}")
-        resDict = {}
-        for id, data in documentData.items():
-            resDict[id]= data | reqDict
-
-        logging.info("Content extraction complete.")
-        return resDict
-    except Exception as e:
-        logging.error(f"Critical failure in extractCont: {e}")
-        return []
-
-def trainData(collectionDir,schemaName, collectionName='documents'):
-    """Orchestrates the full training pipeline."""
-    try:
-        logging.info(f"Starting training for collection: {collectionName}")
-        documentData = docStr(collectionName)
-        coll = extractCont(documentData['profiles'],collectionDir, schemaName)
-        data = initiate_training(coll)
-        if data != 'Not Found':
-            combined_dict = {}
-            for key1, value1 in data['fileData'].items():
-                for key2, nested_dict in coll.items():
-                    if nested_dict.get('location') == key1:  # Matching based on 'name'
-                        combined_dict[nested_dict['_id']] = {'id': key2, 'text': value1, **nested_dict}
-                        break
-            for objIds, Data in combined_dict.items():
-                status = train_on_document(Data['text'], documentData['db'], Data['profile'], objIds)
-                logging.info("Training completed.")
-                logging.info(status)
-            statusCon = db[collectionName]
-            op = pd.DataFrame(statusCon.find())
-            status_response = op[['name', 'profile', 'status']]
-
-            return status_response.to_json(orient='records')
+        if collection_name not in existing_collections:
+            logging.info(f"Creating Qdrant collection: {collection_name}")
+            qdrant_client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+            )
+            logging.info(f"Collection '{collection_name}' created successfully.")
         else:
-            return "No data to be processed!"
+            logging.info(f"Collection '{collection_name}' already exists.")
+    except Exception as e:
+        logging.error(f"Error ensuring collection in Qdrant: {e}")
 
+
+def save_embeddings_to_qdrant(embeddings, tags, doctag, batch_size=100):
+    """Ensures the collection exists and saves embeddings to Qdrant."""
+    try:
+        if "embeddings" not in embeddings or embeddings["embeddings"] is None:
+            logging.error("Error: 'embeddings' key missing or None!")
+            return
+
+        embedding_array = np.asarray(embeddings["embeddings"], dtype=np.float32)
+        if embedding_array.size == 0 or embedding_array.shape[1] == 0:
+            logging.error("Error: Trying to save empty embeddings!")
+            return
+
+        vector_size = embedding_array.shape[1]
+        ensure_qdrant_collection(tags, vector_size)
+
+        logging.info(f"Saving embeddings to Qdrant for tag: {tags}")
+
+        all_points = []
+        for vector, text in zip(embedding_array, embeddings["texts"]):
+            if np.all(vector == 0) or np.size(vector) == 0:
+                logging.warning(f"Skipping empty or invalid vector for text: {text}")
+                continue
+
+            vector = vector.tolist()
+
+            all_points.append(
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=vector,
+                    payload={"tag": str(tags), "text": text}
+                )
+            )
+
+        for i in range(0, len(all_points), batch_size):
+            batch = all_points[i:i + batch_size]
+            qdrant_client.upsert(collection_name=tags, points=batch)
+            logging.info(f"Uploaded batch {i // batch_size + 1}/{len(all_points) // batch_size + 1}")
+
+        logging.info("Embeddings successfully saved to Qdrant.")
+        trainingStatus = {
+            "$set": {
+                "tag": doctag,
+                "status": 'TRAINING_COMPLETED'
+            }
+        }
+        docdb = db[Config.MongoDB.DOCUMENTS]
+        docdb.update_one({"_id": ObjectId(doctag)}, trainingStatus, upsert=True)
+        logging.info("Training status updated in Mongo DB")
+    except Exception as e:
+        logging.error(f"Error saving embeddings to Qdrant: {e}")
+
+def train_on_document(text, profile_tag,doc_tag):
+    """Trains and stores embeddings from a document using chunking."""
+    try:
+        logging.info(f"Training on document with tag: {profile_tag}")
+        chunks = text.split(". ")
+        embeddings = MODEL.encode(chunks, convert_to_numpy=True)
+        save_embeddings_to_qdrant({"embeddings": embeddings, "texts": chunks},profile_tag,doc_tag)
+        return f"Training complete. Model stored as {profile_tag}!"
+    except Exception as e:
+        logging.error(f"Error during training: {e}")
+        return f"Training failed for tag {profile_tag}"
+
+def trainData():
+    try:
+        logging.info(f"Starting training")
+        docColl = extract_document_info()
+        resData = connectData(docColl)
+        for doc_id,profileData in resData.items():
+            for profile_id, docText in profileData.items():
+                for docName, docContent in docText.items():
+                    docTrain = train_on_document(docContent,profile_id,doc_id)
+                    logging.info(docTrain)
     except Exception as e:
         logging.error(f"Error in training data: {e}")
         return "Training failed."
-
-# trainData("connectors","actual documents provided ","documents")
