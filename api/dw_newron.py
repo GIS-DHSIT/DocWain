@@ -6,10 +6,12 @@ from typing import List
 from api.config import Config
 from openai import AzureOpenAI
 from pymongo import MongoClient
+from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter
+from sklearn.preprocessing import MinMaxScaler
 from sentence_transformers import SentenceTransformer
-from qdrant_client.models import Distance, VectorParams
+from api.dw_chat import get_chat_history,save_chat_history
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,25 +21,19 @@ mongoClient = MongoClient(Config.MongoDB.URI)
 qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
 
 
-
-def rewrite_query(user_id: str, query: str, chat_history: List[dict]):
+def rewrite_query(user_id: str, query: str, chat_history: List[dict],modelName='llama3.2'):
     """Rewrites user queries to improve retrieval accuracy using chat history & AI-based expansion."""
 
-    # **Check Query Length & Clarity**
     num_words = len(query.split())
 
-    # If query is already detailed (15+ words), no need for rewriting
     if num_words > 15:
         logging.info("Query is already detailed, skipping rewriting.")
         return query
-
-    # **Retrieve Chat History (Last 3 Messages)**
     recent_history = chat_history[-3:] if chat_history else []
     history_context = " ".join([f"User: {h['query']} AI: {h['response']}" for h in recent_history])
 
-    # **Generate Rewritten Query Using AI**
     refined_query = ollama.chat(
-        model="llama3.2",
+        model=modelName,
         messages=[
             {"role": "system", "content": "You are an AI specialized in rewriting user queries for improved search results."},
             {"role": "user", "content": f"Rewrite the following query to be more detailed and precise:\n\nQuery: {query}\n\nChat History Context: {history_context}"}
@@ -49,115 +45,108 @@ def rewrite_query(user_id: str, query: str, chat_history: List[dict]):
 
     return rewritten_query
 
-
-def ensure_qdrant_collection(collection_name, vector_size=384):
-    """Ensures the Qdrant collection exists with the correct settings."""
+def load_embeddings_from_qdrant(tag,query: str, top_k: int = 5):
     try:
-        collections = qdrant_client.get_collections().collections
-        existing_collections = {col.name for col in collections}
-
-        if collection_name not in existing_collections:
-            logging.info(f"Creating Qdrant collection: {collection_name}")
-            qdrant_client.create_collection(
-                collection_name=collection_name,
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
-            )
-            logging.info(f"Collection '{collection_name}' created successfully.")
-        else:
-            logging.info(f"Collection '{collection_name}' already exists.")
-    except Exception as e:
-        logging.error(f"Error ensuring collection in Qdrant: {e}")
-
-
-def load_embeddings_from_qdrant(tags):
-    """Loads embeddings from Qdrant Cloud, ensuring vectors are retrieved."""
-    logging.info(f"Loading embeddings from Qdrant for tag: {tags}")
-
-    try:
-
         search_result = qdrant_client.scroll(
-            collection_name=tags,
-            scroll_filter=Filter(
-                must=[{"key": "tag", "match": {"value": tags}}]
-            ),
+            collection_name=tag,
+            scroll_filter=Filter(must=[{"key": "tag", "match": {"value": tag}}]),
             limit=1000,
             with_vectors=True
         )
 
         if not search_result or not search_result[0]:
-            logging.warning("No embeddings found in Qdrant.")
+            logging.warning("No relevant data found in Qdrant.")
             return None
 
-        embeddings = []
-        texts = []
+        texts = [point.payload["text"] for point in search_result[0] if "text" in point.payload]
+        embeddings = np.array([point.vector for point in search_result[0] if point.vector], dtype=np.float32)
 
-        for point in search_result[0]:
-            if "text" in point.payload and "tag" in point.payload and point.vector:
-                embeddings.append(point.vector)
-                texts.append(point.payload["text"])
-            else:
-                logging.warning(f"Skipping invalid point: {point.payload}")
-
-        if not embeddings:
+        if embeddings.size == 0:
             logging.warning("Embeddings found but vectors are missing!")
             return None
 
-        embeddings = np.array(embeddings, dtype=np.float32)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
+        tokenized_corpus = [text.split() for text in texts]
+        bm25 = BM25Okapi(tokenized_corpus)
+        bm25_scores = bm25.get_scores(query.split())
+
+        index = faiss.IndexFlatIP(embeddings.shape[1])
+        faiss.normalize_L2(embeddings)
         index.add(embeddings)
 
-        return {"index": index, "texts": texts}
+        query_embedding = MODEL.encode([query], convert_to_numpy=True)
+        faiss.normalize_L2(query_embedding)
+        D, I = index.search(query_embedding, top_k)
+
+        scaler = MinMaxScaler()
+        bm25_scores = scaler.fit_transform(np.array(bm25_scores).reshape(-1, 1)).flatten()
+        faiss_scores = scaler.fit_transform(D.flatten().reshape(-1, 1)).flatten()
+
+        hybrid_scores = {}
+        for i, idx in enumerate(I[0]):
+            hybrid_scores[idx] = faiss_scores[i]
+        for i, score in enumerate(bm25_scores):
+            if i in hybrid_scores:
+                hybrid_scores[i] += score
+            else:
+                hybrid_scores[i] = score
+
+        sorted_indices = sorted(hybrid_scores, key=hybrid_scores.get, reverse=True)[:top_k]
+        retrieved_texts = [texts[i] for i in sorted_indices]
+
+        return "\n".join(retrieved_texts)
 
     except Exception as e:
-        logging.error(f"Error loading embeddings from Qdrant: {e}")
+        logging.error(f"Error in hybrid retrieval: {e}")
         return None
 
 
-def answer_question(query, user_id, tag="default", model='llama3.2'):
+def answer_question(query, user_id, tag, model='llama3.2'):
     """Answers a question based on stored embeddings."""
+    history = get_chat_history(user_id) or []
+    refined_query = rewrite_query(user_id, query, history)
+    retrieved_text  = load_embeddings_from_qdrant(tag,refined_query)
+    if not retrieved_text:
+        return "No relevant knowledge found in database."
 
-    embeddings = load_embeddings_from_qdrant(tag)
-    if embeddings is None:
-        return "No trained model found!"
-    logging.info(f"Processing query: {query} for model: {tag}")
-    query_embedding = MODEL.encode([query], convert_to_numpy=True)
-    D, I = embeddings["index"].search(query_embedding, 3)
-    retrieved_text = "\n".join([embeddings["texts"][i] for i in I[0]])
-    logging.info(f"Retrieving response using Ollama model {model}.")
-    response = ollama.chat(
+    formatted_history = "\n".join([f"User: {h['query']}\nAI: {h['response']}" for h in history[-5:]])
 
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": f"Answer strictly based on this context: {retrieved_text}\nQuestion: {query}"}
-        ]
-    )
-    return response["message"]
+    prompt = f"""
+        You are a strict knowledge-based AI assistant. Answer ONLY based on retrieved information from the vector database.
+        If the answer is not available, reply with "I do not have that information provided."
 
+        **Chat History:** 
+        {formatted_history}
 
-def azure_answer_question(query, user_id, tag="default", model="gpt-35-turbo", apiVersion="2023-07-01-preview"):
-    """Answers a question based on stored embeddings."""
-    embeddings = load_embeddings_from_qdrant(tag)
-    if embeddings is None:
-        return "No trained model found!"
-    logging.info(f"Processing query: {query} for model: {tag}")
-    query_embedding = MODEL.encode([query], convert_to_numpy=True)
-    D, I = embeddings["index"].search(query_embedding, 3)
-    retrieved_text = "\n".join([embeddings["texts"][i] for i in I[0]])
-    logging.info(f"Retrieving response using Azure OpenAI {model}.")
-    client = AzureOpenAI(
-        api_version=apiVersion,
-        api_key=Config.Model.AZURE_OPENAI_API_KEY,
-        azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
-    )
-    response = client.chat.completions.create(
-        model="gpt-35-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": f"Answer based on this context: {retrieved_text}\nQuestion: {query}"}
-        ]
-    )
-    return response.choices[0].message.content
+        **Retrieved Context:**
+        {retrieved_text}
+
+        **User Query:**
+        {query}
+        """
+    if model == 'Azure-OpenAI':
+        logging.info(f"Retrieving response using Azure OpenAI {model}.")
+        client = AzureOpenAI(
+            api_version=Config.Model.AZURE_VERSION,
+            api_key=Config.Model.AZURE_OPENAI_API_KEY,
+            azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
+        )
+        response = client.chat.completions.create(
+            model=Config.Model.AZURE_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant limited to knowledge from the database."},
+                {"role": "user", "content": prompt}]
+        )
+        response_text = response.choices[0].message.content
+    else:
+        response = ollama.chat(
+            model=model,
+            messages=[{"role": "system", "content": "You are a helpful assistant limited to knowledge from the database."},
+                      {"role": "user", "content": prompt}]
+        )
+        response_text = response["message"]
+        history.append({"query": query, "response": response_text})
+        save_chat_history(user_id, history)
+    return response_text
 
 
 

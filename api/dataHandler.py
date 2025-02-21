@@ -1,6 +1,4 @@
 import json
-import fitz
-import docx
 import uuid
 import logging
 import hashlib
@@ -9,6 +7,7 @@ import boto3 as b3
 import numpy as np
 import pandas as pd
 from io import BytesIO
+from api.config import Config
 from Crypto.Cipher import AES
 from pymongo import MongoClient
 from urllib.parse import urlparse
@@ -17,11 +16,11 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 from qdrant_client.models import Distance, VectorParams
-from api.config import Config
+from api.dw_document_extractor import DocumentExtractor
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
+docEx = DocumentExtractor()
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 mongoClient = MongoClient(Config.MongoDB.URI)
 db = mongoClient[Config.MongoDB.DB]
@@ -43,31 +42,6 @@ def decrypt_data(encrypted_value: str, encryption_key= Config.Encryption.ENCRYPT
         logging.error(f"Decryption failed: {e}")
         return ""
 
-def extract_text_from_pdf(pdf_path):
-    """Extracts text from a PDF file."""
-    try:
-        logging.info(f"Extracting text from PDF")
-        text = ""
-        with fitz.open(stream=pdf_path, filetype="pdf") as doc:
-            for page in doc:
-                text += page.get_text("text") + "\n"
-        logging.info("Text extraction from PDF successful.")
-        return text
-    except Exception as e:
-        logging.error(f"Failed to extract text from PDF: {e}")
-        return ""
-
-def extract_text_from_docx(docx_path):
-    """Extracts text from a DOCX file."""
-    try:
-        logging.info(f"Extracting text from DOCX: {docx_path}")
-        doc = docx.Document(docx_path)
-        text = "\n".join([para.text for para in doc.paragraphs])
-        logging.info("Text extraction from DOCX successful.")
-        return text
-    except Exception as e:
-        logging.error(f"Failed to extract text from DOCX: {e}")
-        return ""
 
 def fileProcessor(content,file):
     extracted_data = {}
@@ -79,9 +53,9 @@ def fileProcessor(content,file):
             elif file.endswith(".json"):
                 extracted_data[file] = json.loads(content.decode("utf-8"))
             elif file.endswith(".pdf"):
-                extracted_data[file] = extract_text_from_pdf(content)
+                extracted_data[file] = docEx.extract_text_from_pdf(content)
             elif file.endswith(".docx"):
-                extracted_data[file] = extract_text_from_docx(content)
+                extracted_data[file] = docEx.extract_text_from_docx(content)
             else:
                 extracted_data[file] = content.decode("utf-8")
         return extracted_data
@@ -104,7 +78,7 @@ def read_s3_file(s3, bucket, file_key):
 def get_s3_client(AWS_ACCESS_KEY, AWS_SECRET_KEY, Region):
     """Returns an S3 client."""
     try:
-        awsProfile = Config.AWS.profile
+        awsProfile = Config.AWS.PROFILE
         subprocess.run(
             ["aws", "configure", "set", "aws_access_key_id", AWS_ACCESS_KEY, "--profile", awsProfile]
         )
@@ -132,9 +106,9 @@ def get_s3_document_info(s3_uri):
 
     s3 = b3.client(
             "s3",
-            aws_access_key_id=Config.AWS.accessKey,
-            aws_secret_access_key=Config.AWS.secretKey,
-            region_name=Config.AWS.region,
+            aws_access_key_id=Config.AWS.ACCESS_KEY,
+            aws_secret_access_key=Config.AWS.SECRET_KEY,
+            region_name=Config.AWS.REGION,
         )
 
     try:

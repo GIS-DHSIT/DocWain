@@ -3,8 +3,8 @@ import logging
 import uvicorn
 from pydantic import BaseModel
 from api.dataHandler import trainData
+from dw_newron import answer_question
 from fastapi import FastAPI, HTTPException
-from dw_newron import answer_question,azure_answer_question
 
 app = FastAPI(title="DocWain API")
 
@@ -16,14 +16,6 @@ class QuestionRequest(BaseModel):
     model_name: str = "llama3.2"
 
 
-class AzureQuestionRequest(BaseModel):
-    query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
-    model_name: str = "OpenAI"
-    api_version: str = "2023-07-01-preview"
-
-
 @app.post("/ask")
 def ask_question_api(request: QuestionRequest):
     """API endpoint for answering questions."""
@@ -31,16 +23,6 @@ def ask_question_api(request: QuestionRequest):
         raise HTTPException(status_code=400, detail="Query is required")
     answer = answer_question(request.query, request.user_id,
                              request.profile_id, request.model_name)
-    return {"answer": answer}
-
-
-@app.post("/askAzure")
-def ask_question_api(request: AzureQuestionRequest):
-    """Azure openAI API endpoint for answering questions."""
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    answer = azure_answer_question(request.query, request.user_id,
-                                   request.profile_id, request.model_name, request.api_version)
     return {"answer": answer}
 
 
@@ -74,6 +56,9 @@ def list_available_models():
     """API endpoint to list available models."""
     try:
         models = ollama.list().model_dump()
+        model_list = models['models']
+        azure = {'model':'Azure-OpenAI'}
+        model_list.append(azure)
         return {"models": models}
     except Exception as e:
         logging.error(f"Failed to list models: {e}")
