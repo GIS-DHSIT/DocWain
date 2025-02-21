@@ -1,18 +1,16 @@
 import ollama
 import faiss
-import uvicorn
 import logging
 import numpy as np
+from typing import List
 from api.config import Config
-from pydantic import BaseModel
 from openai import AzureOpenAI
 from pymongo import MongoClient
-from api.dataHandler import trainData
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter
-from fastapi import FastAPI, HTTPException
 from sentence_transformers import SentenceTransformer
 from qdrant_client.models import Distance, VectorParams
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
@@ -20,23 +18,36 @@ AzureOpenAI.api_key = Config.Model.AZURE_OPENAI_API_KEY
 mongoClient = MongoClient(Config.MongoDB.URI)
 qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
 
-app = FastAPI(title="DocWain API")
 
 
-class QuestionRequest(BaseModel):
-    query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
-    model_name: str = "llama3.2"
+def rewrite_query(user_id: str, query: str, chat_history: List[dict]):
+    """Rewrites user queries to improve retrieval accuracy using chat history & AI-based expansion."""
 
+    # **Check Query Length & Clarity**
+    num_words = len(query.split())
 
-class AzureQuestionRequest(BaseModel):
-    query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
-    model_name: str = "OpenAI"
-    api_version: str = "2023-07-01-preview"
+    # If query is already detailed (15+ words), no need for rewriting
+    if num_words > 15:
+        logging.info("Query is already detailed, skipping rewriting.")
+        return query
 
+    # **Retrieve Chat History (Last 3 Messages)**
+    recent_history = chat_history[-3:] if chat_history else []
+    history_context = " ".join([f"User: {h['query']} AI: {h['response']}" for h in recent_history])
+
+    # **Generate Rewritten Query Using AI**
+    refined_query = ollama.chat(
+        model="llama3.2",
+        messages=[
+            {"role": "system", "content": "You are an AI specialized in rewriting user queries for improved search results."},
+            {"role": "user", "content": f"Rewrite the following query to be more detailed and precise:\n\nQuery: {query}\n\nChat History Context: {history_context}"}
+        ]
+    )
+
+    rewritten_query = refined_query["message"]
+    logging.info(f"Original Query: {query} | Rewritten Query: {rewritten_query}")
+
+    return rewritten_query
 
 
 def ensure_qdrant_collection(collection_name, vector_size=384):
@@ -102,7 +113,7 @@ def load_embeddings_from_qdrant(tags):
         return None
 
 
-def answer_question(query, collection_name, tag="default", model='llama3.2'):
+def answer_question(query, user_id, tag="default", model='llama3.2'):
     """Answers a question based on stored embeddings."""
 
     embeddings = load_embeddings_from_qdrant(tag)
@@ -124,7 +135,7 @@ def answer_question(query, collection_name, tag="default", model='llama3.2'):
     return response["message"]
 
 
-def azure_answer_question(query, collection_name, tag="default", model="gpt-35-turbo", apiVersion="2023-07-01-preview"):
+def azure_answer_question(query, user_id, tag="default", model="gpt-35-turbo", apiVersion="2023-07-01-preview"):
     """Answers a question based on stored embeddings."""
     embeddings = load_embeddings_from_qdrant(tag)
     if embeddings is None:
@@ -149,61 +160,4 @@ def azure_answer_question(query, collection_name, tag="default", model="gpt-35-t
     return response.choices[0].message.content
 
 
-@app.post("/ask")
-def ask_question_api(request: QuestionRequest):
-    """API endpoint for answering questions."""
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    answer = answer_question(request.query, request.user_id,
-                             request.profile_id, request.model_name)
-    return {"answer": answer}
 
-
-@app.post("/askAzure")
-def ask_question_api(request: AzureQuestionRequest):
-    """Azure openAI API endpoint for answering questions."""
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    answer = azure_answer_question(request.query, request.user_id,
-                                   request.profile_id, request.model_name, request.api_version)
-    return {"answer": answer}
-
-
-@app.get("/train")
-def trigger_training():
-    """
-    API endpoint to trigger document training.
-
-    Request Body:
-    - collectionName: Name of the MongoDB collection
-    - bucketName: Name of the bucket where documents are stored
-
-    Response:
-    - Training status message
-    """
-    try:
-        logging.info(
-            f"Received training request")
-
-        status_response = trainData()
-        logging.info(status_response)
-        return {"status": "success", "message": status_response, "response": "Executed"}
-
-    except Exception as e:
-        logging.error(f"Training API error: {e}")
-        raise HTTPException(status_code=500, detail="Training process failed")
-
-
-@app.get("/models")
-def list_available_models():
-    """API endpoint to list available models."""
-    try:
-        models = ollama.list().model_dump()
-        return {"models": models}
-    except Exception as e:
-        logging.error(f"Failed to list models: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve available models")
-
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
