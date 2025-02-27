@@ -3,8 +3,11 @@ import fitz
 import docx
 import logging
 import pytesseract
+import numpy as np
+import pandas as pd
 from PIL import Image
 from pptx import Presentation
+from sklearn.preprocessing import MinMaxScaler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -12,30 +15,42 @@ pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
 class DocumentExtractor(object):
 
-    def extract_text_from_pdf(self,pdf_content):
+    def extract_text_from_pdf(self, pdf_content):
         """Extracts text from a PDF file, including OCR for images."""
         try:
             logging.info("Extracting text from PDF (OCR applied only if images exist)...")
             extracted_text = []
 
             with fitz.open(stream=pdf_content, filetype="pdf") as doc:
+                logging.info("Analyzing PDF contents")
                 for page_num, page in enumerate(doc, start=1):
                     text = page.get_text("text").strip()
                     extracted_text.append(f"\n--- Page {page_num} ---\n{text}" if text else "")
+                    logging.info(f"Reading page {page_num}")
 
                     images = page.get_images(full=True)
                     if images:
-                        for img_index, img in enumerate(images):
-                            xref = img[0]
-                            base_image = doc.extract_image(xref)
-                            image_bytes = base_image["image"]
-                            image = Image.open(io.BytesIO(image_bytes))
-                            ocr_text = pytesseract.image_to_string(image).strip()
-                            if ocr_text:
-                                extracted_text.append(f"\n[OCR Extracted from Image {img_index + 1}]\n{ocr_text}")
+                        logging.info(f"Images found on page {page_num}: {len(images)}")
+
+                        for img_index, img in enumerate(images[:5]):
+                            logging.info(f"Extracting image {img_index + 1} from page {page_num}")
+                            try:
+                                xref = img[0]
+                                base_image = doc.extract_image(xref)
+                                image_bytes = base_image["image"]
+                                image = Image.open(io.BytesIO(image_bytes))
+
+                                image = image.convert("L")
+                                image = image.resize((image.width // 2, image.height // 2))
+
+                                ocr_text = pytesseract.image_to_string(image).strip()
+                                if ocr_text:
+                                    extracted_text.append(f"\n[OCR Extracted from Image {img_index + 1}]\n{ocr_text}")
+
+                            except Exception as img_error:
+                                logging.error(f"Error processing image {img_index + 1}: {img_error}")
 
             result_text = "\n".join(filter(None, extracted_text)).strip()
-
             return result_text if result_text else "No text found in the PDF."
 
         except Exception as e:
@@ -116,3 +131,26 @@ class DocumentExtractor(object):
         except Exception as e:
             logging.error(f"Failed to extract text from PPTX: {e}")
             return ""
+
+    def extract_dataframe(self, df,MODEL):
+        try:
+            df = df.select_dtypes(include=[np.number, 'object']).copy()
+            for col in df.select_dtypes(include=['object']).columns:
+                try:
+                    df[col] = pd.to_datetime(df[col])
+                    df[f"Days Since {col}"] = (df[col] - df[col].min()).dt.days
+                    df.drop(columns=[col], inplace=True)
+                except Exception:
+                    logging.warning(f"Column {col} could not be converted to datetime. Keeping it as categorical.")
+                    df[col] = df[col].astype(str)
+
+            df.columns = df.columns.astype(str)
+            categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
+            if categorical_cols:
+                text_data = df[categorical_cols].astype(str).apply(lambda x: ' '.join(x.dropna()), axis=1).tolist()
+                embeddings = MODEL.encode(text_data, convert_to_numpy=True)
+                return {"embeddings": embeddings, "texts": text_data}
+
+        except Exception as e:
+            logging.error(f"Error processing dataframe: {e}")
+            return None

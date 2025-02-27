@@ -1,3 +1,4 @@
+import ollama
 import boto3 as b3
 import json
 import logging
@@ -49,3 +50,74 @@ def save_chat_history(user_id, chat_history):
 
     except Exception as e:
         logging.error(f"Error saving chat history: {e}")
+
+
+def generate_follow_up_questions(retrieved_text, num_questions=3):
+    """Generates follow-up questions based on retrieved content."""
+    try:
+        prompt = f"""
+        Based on the following retrieved context, suggest {num_questions} relevant follow-up questions.
+
+        **Context:** 
+        {retrieved_text}
+
+        **Follow-up Questions:**
+        """
+        response = ollama.chat(
+            model="llama3.2",
+            messages=[{"role": "system", "content": "You are an AI specialized in helping users continue conversations effectively."},
+                      {"role": "user", "content": prompt}]
+        )
+        return response["message"]["content"]
+    except Exception as e:
+        logging.error(f"Error generating follow-up questions: {e}")
+        return []
+
+#
+# def rewrite_query(query, chat_history, retrieved_content):
+#     """Rewrites queries for improved retrieval and suggests follow-ups."""
+#     try:
+#         num_words = len(query.split())
+#
+#         if num_words > 15:
+#             logging.info("Query is already detailed, skipping rewrite.")
+#             follow_ups = generate_follow_up_questions(retrieved_content) if retrieved_content else []
+#             return query, follow_ups
+#
+#         # **Retrieve Chat History for Context**
+#         recent_history = chat_history[-3:] if chat_history else []
+#         history_context = " ".join([f"User: {h['query']} AI: {h['response']}" for h in recent_history])
+#
+#         # **Enhance Query Using an LLM**
+#         rewrite_prompt = f"""
+#         Improve the following query for better retrieval results. If the query is vague, add relevant details based on the retrieved content
+#
+#         **User Query:** "{query}"
+#         **Recent Chat History:** {history_context}
+#         **Relevant data:**{retrieved_content}
+#         **Improved Query:**
+#         """
+#         response = ollama.chat(
+#             model="llama3.2",
+#             messages=[{"role": "system", "content": "You are an AI specialized in improving search queries. only respond with responses"},
+#                       {"role": "user", "content": rewrite_prompt}]
+#         )
+#
+#         refined_query = response['message']['content'].split('**')[-1].replace('"','').strip()
+#
+#         # **Query Expansion with Sentence Transformer**
+#         expanded_query_embeddings = MODEL.encode([query, refined_query])
+#         similarity_score = util.cos_sim(expanded_query_embeddings[0], expanded_query_embeddings[1])
+#
+#         if similarity_score < 0.8:  # If rewritten query differs significantly, return both
+#             refined_query = f"{query} | {refined_query}"
+#
+#         logging.info(f" Original Query: {query} → Rewritten Query: {refined_query}")
+#
+#         follow_up_questions = generate_follow_up_questions(retrieved_content) if retrieved_content else []
+#
+#         return refined_query, follow_up_questions
+#
+#     except Exception as e:
+#         logging.error(f" Error in query rewriting: {e}")
+#         return query, []

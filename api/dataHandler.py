@@ -49,13 +49,20 @@ def fileProcessor(content,file):
         if content:
             logging.info(f"Extracting File {file}")
             if file.endswith(".csv"):
-                extracted_data[file] = pd.read_csv(BytesIO(content))
+                df = pd.read_csv(BytesIO(content))
+                extracted_data[file] = docEx.extract_dataframe(df,MODEL)
+            elif file.endswith(".xlsx") or file.endswith(".xls"):
+                df = pd.read_excel(BytesIO(content))
+                extracted_data[file] = docEx.extract_dataframe(df, MODEL)
             elif file.endswith(".json"):
                 extracted_data[file] = json.loads(content.decode("utf-8"))
             elif file.endswith(".pdf"):
                 extracted_data[file] = docEx.extract_text_from_pdf(content)
             elif file.endswith(".docx"):
                 extracted_data[file] = docEx.extract_text_from_docx(content)
+            elif file.endswith(".pptx") or file.endswith(".ppt"):
+                extracted_data[file] = docEx.extract_text_from_pptx(content)
+
             else:
                 extracted_data[file] = content.decode("utf-8")
         return extracted_data
@@ -148,19 +155,21 @@ def connectData(documentConnection):
                     docId = docData['_id'].__str__()
                     profileData = {profileId: extractedDoc}
                     dataDict[docId] = profileData
-                else:
+                elif len(files)>1:
                     for file in files:
                         docContent = get_s3_document_info(file)
                         extractedDoc = fileProcessor(docContent, file)
                         docId = docData['_id'].__str__()
                         profileData = {profileId: extractedDoc}
                         dataDict[docId] = profileData
+                elif len(files)==0:
+                    logging.info("location Empty")
             elif docData['type'] == 'FTP':
                 pass
             elif docData['type'] == 'BLOB':
                 pass
         else:
-            print(v)
+            logging.info(v)
 
     return dataDict
 
@@ -268,10 +277,16 @@ def save_embeddings_to_qdrant(embeddings, tags, doctag, batch_size=100):
 def train_on_document(text, profile_tag,doc_tag):
     """Trains and stores embeddings from a document using chunking."""
     try:
-        logging.info(f"Training on document with tag: {profile_tag}")
-        chunks = text.split(". ")
-        embeddings = MODEL.encode(chunks, convert_to_numpy=True)
-        save_embeddings_to_qdrant({"embeddings": embeddings, "texts": chunks},profile_tag,doc_tag)
+        if isinstance(text, dict):
+            save_embeddings_to_qdrant(text,profile_tag,doc_tag)
+        elif isinstance(text, str):
+            chunks = text.split(". ")
+            logging.info(f"Training on document with tag: {profile_tag}")
+            embeddings = MODEL.encode(chunks, convert_to_numpy=True)
+            save_embeddings_to_qdrant({"embeddings": embeddings, "texts": chunks},profile_tag,doc_tag)
+        else:
+            logging.error("Unsupported document format for training.")
+            return "Training failed."
         return f"Training complete. Model stored as {profile_tag}!"
     except Exception as e:
         logging.error(f"Error during training: {e}")
@@ -290,3 +305,4 @@ def trainData():
     except Exception as e:
         logging.error(f"Error in training data: {e}")
         return "Training failed."
+# trainData()
