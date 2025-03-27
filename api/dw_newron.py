@@ -74,22 +74,60 @@ def load_embeddings_from_qdrant(tag,query: str, top_k: int = 5):
         logging.error(f"Error in hybrid retrieval: {e}")
         return None
 
+def get_chat_history(user_id):
+    """Retrieve chat history for a specific user."""
+    user_history = collection.find_one({"user_id": user_id})
+    return user_history["history"] if user_history else []
+
+def save_chat_history(user_id, history):
+    """Save or update chat history for a specific user."""
+    collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"history": history}},
+        upsert=True
+    )
+
+def clear_chat_history(user_id, session_id=None):
+    """Clear chat history for a specific user or session."""
+    query = {"user_id": user_id}
+    if session_id:
+        query["session_id"] = session_id
+    collection.delete_one(query)
+
+def rewrite_query(query, history, retrieved_text):
+    """
+    Refines the user query based on chat history and retrieved context.
+    Generates follow-up questions for a more conversational experience.
+    """
+    # Example logic for refining the query
+    refined_query = f"{query} (based on context: {retrieved_text[:100]}...)"
+
+    # Example logic for generating follow-up questions
+    follow_up_questions = [
+        "Can you clarify your question further?",
+        "Would you like more details on a specific part of the context?",
+    ]
+
+    return refined_query, follow_up_questions
 
 
-def answer_question(query, user_id, tag, model='llama3.2'):
+def answer_question(query, user_id, tag):
     """Answers a question based on stored embeddings."""
     history = get_chat_history(user_id) or []
+    formatted_history = "\n".join([f"User: {h['query']}\nAI: {h['response']}" for h in history[-5:]])
     if not isinstance(query, str):
         query = str(query)
-    retrieved_text  = load_embeddings_from_qdrant(tag,query)
-    # refined_query, follow_up_questions = rewrite_query(query, history, retrieved_text)
-    follow_up_questions = generate_follow_up_questions(retrieved_text) if retrieved_text else []
+    retrieved_text = load_embeddings_from_qdrant(tag, query)
+    
     if not retrieved_text:
         return "No relevant knowledge found in database."
 
+    # Use the rewrite_query function to refine the query and generate follow-up questions
+    refined_query, follow_up_questions = rewrite_query(query, history, retrieved_text)
+
     formatted_history = "\n".join([f"User: {h['query']}\nAI: {h['response']}" for h in history[-5:]])
     prompt = f"""
-       You are an AI assistant. with NO access to outside world. Answer strictly limited only to retrieved text.
+       You are an AI assistant with NO access to the outside world. Answer strictly limited only to retrieved text.
 
        **Chat History:** 
        {formatted_history}
@@ -98,31 +136,22 @@ def answer_question(query, user_id, tag, model='llama3.2'):
        {retrieved_text}
 
        **User Query:**
-       {query}
+       {refined_query}
        """
-    if model == 'Azure-OpenAI':
-        logging.info(f"Retrieving response using Azure OpenAI {model}.")
-        client = AzureOpenAI(
-            api_version=Config.Model.AZURE_VERSION,
-            api_key=Config.Model.AZURE_OPENAI_API_KEY,
-            azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
-        )
-        response = client.chat.completions.create(
-            model=Config.Model.AZURE_DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system",
-                 "content": "You are a clever assistant and respond only with the knowledge provided."},
-                {"role": "user", "content": prompt}]
-        )
-        response_text = response.choices[0].message.content
-    else:
-        response = ollama.chat(
-            model=model,
-            messages=[{"role": "system",
-                       "content": "You are a clever assistant and respond only with the knowledge provided."},
-                      {"role": "user", "content": prompt}]
-        )
-        response_text = response["message"]
-        history.append({"query": query, "response": response_text})
-        save_chat_history(user_id, history)
+    logging.info(f"Retrieving response using Azure OpenAI {Config.Model.AZURE_DEPLOYMENT_NAME}.")
+    client = AzureOpenAI(
+        api_version=Config.Model.AZURE_VERSION,
+        api_key=Config.Model.AZURE_OPENAI_API_KEY,
+        azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
+    )
+    response = client.chat.completions.create(
+        model=Config.Model.AZURE_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system",
+                "content": "You are a clever assistant and respond only with the knowledge provided."},
+            {"role": "user", "content": prompt}]
+    )
+    response_text = response.choices[0].message.content
+    history.append({"query": query, "response": response_text})
+    save_chat_history(user_id, history)
     return {"answer": response_text, "follow_ups": follow_up_questions}

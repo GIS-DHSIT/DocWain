@@ -51,18 +51,15 @@ def trigger_training():
         raise HTTPException(status_code=500, detail="Training process failed")
 
 
-@app.get("/models")
-def list_available_models():
-    """API endpoint to list available models."""
+@app.get("/chat_history")
+def get_chat_history(user_id: str):
+    """API endpoint to retrieve chat history for a specific user."""
     try:
-        models = ollama.list().model_dump()
-        model_list = models['models']
-        azure = {'model':'Azure-OpenAI'}
-        model_list.append(azure)
-        return {"models": models}
+        history = get_chat_history(user_id)
+        return {"history": history}
     except Exception as e:
-        logging.error(f"Failed to list models: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve available models")
+        logging.error(f"Failed to retrieve chat history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
 
 
 if __name__ == "__main__":
