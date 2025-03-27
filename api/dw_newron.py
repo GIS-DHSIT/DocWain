@@ -1,4 +1,3 @@
-import ollama
 import faiss
 import logging
 import numpy as np
@@ -10,7 +9,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Filter
 from sklearn.preprocessing import MinMaxScaler
 from sentence_transformers import SentenceTransformer, util
-from api.dw_chat import get_chat_history,save_chat_history,generate_follow_up_questions
+from api.dw_chat import get_chat_history,save_chat_history
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -75,54 +74,97 @@ def load_embeddings_from_qdrant(tag,query: str, top_k: int = 5):
         return None
 
 
-
-def answer_question(query, user_id, tag, model='llama3.2'):
-    """Answers a question based on stored embeddings."""
+def answer_question(query, user_id, tag):
+    """Answers a question based on stored embeddings and generates human-like follow-up responses."""
     history = get_chat_history(user_id) or []
+
     if not isinstance(query, str):
         query = str(query)
-    retrieved_text  = load_embeddings_from_qdrant(tag,query)
-    # refined_query, follow_up_questions = rewrite_query(query, history, retrieved_text)
-    follow_up_questions = generate_follow_up_questions(retrieved_text) if retrieved_text else []
+
+    # Retrieve relevant context from embeddings
+    retrieved_text = load_embeddings_from_qdrant(tag, query)
     if not retrieved_text:
-        return "No relevant knowledge found in database."
+        return {
+            "answer": "I couldn't find anything relevant in my knowledge base. Would you like me to try rephrasing or expanding the search?",
+            "follow_ups": ["Can you clarify what you're looking for?", "Would you like me to explain related concepts?",
+                           "Do you want me to search in another category?"]
+        }
 
-    formatted_history = "\n".join([f"User: {h['query']}\nAI: {h['response']}" for h in history[-5:]])
+    # Format chat history for continuity
+    formatted_history = "\n".join(
+        [f"User: {h['query']}\nAI: {h['response']}" for h in history[-5:]]
+    ) if history else "No previous chat history."
+
+    # Constructing the final prompt
     prompt = f"""
-       You are an AI assistant. with NO access to outside world. Answer strictly limited only to retrieved text.
+    You are a friendly AI assistant with NO access to the outside world. Answer the user's question based strictly on the retrieved text.
 
-       **Chat History:** 
-       {formatted_history}
+    **Chat History:**  
+    {formatted_history}
 
-       **Retrieved Context:**
-       {retrieved_text}
+    **Retrieved Knowledge:**  
+    {retrieved_text}
 
-       **User Query:**
-       {query}
-       """
-    if model == 'Azure-OpenAI':
-        logging.info(f"Retrieving response using Azure OpenAI {model}.")
+    **User Query:**  
+    {query}
+
+    Respond conversationally, keeping responses engaging, helpful, and natural.
+    Also, suggest three follow-up questions to keep the conversation going.
+    """
+
+    try:
+        # Initialize Azure OpenAI client
         client = AzureOpenAI(
             api_version=Config.Model.AZURE_VERSION,
             api_key=Config.Model.AZURE_OPENAI_API_KEY,
             azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
         )
+
         response = client.chat.completions.create(
             model=Config.Model.AZURE_DEPLOYMENT_NAME,
             messages=[
                 {"role": "system",
-                 "content": "You are a clever assistant and respond only with the knowledge provided."},
-                {"role": "user", "content": prompt}]
+                 "content": "You are a conversational assistant. Keep responses natural and engaging."},
+                {"role": "user", "content": prompt}
+            ]
         )
-        response_text = response.choices[0].message.content
-    else:
-        response = ollama.chat(
-            model=model,
-            messages=[{"role": "system",
-                       "content": "You are a clever assistant and respond only with the knowledge provided."},
-                      {"role": "user", "content": prompt}]
+
+        # Extract response text
+        response_text = response.choices[
+            0].message.content if response.choices else "I'm not sure how to respond to that. Can you clarify?"
+
+        # Generate human-like follow-up questions within the same request
+        follow_up_prompt = f"""
+        Based on the user's question and the retrieved context, suggest 3 natural-sounding follow-up questions.
+
+        **User Query:** {query}
+        **Context:** {retrieved_text}
+
+        Format them as a numbered list.
+        """
+
+        follow_up_response = client.chat.completions.create(
+            model=Config.Model.AZURE_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system",
+                 "content": "Generate three engaging follow-up questions related to the given context."},
+                {"role": "user", "content": follow_up_prompt}
+            ]
         )
-        response_text = response["message"]
+
+        follow_up_questions = follow_up_response.choices[0].message.content.split(
+            "\n") if follow_up_response.choices else []
+
+        # Save chat history
         history.append({"query": query, "response": response_text})
         save_chat_history(user_id, history)
-    return {"answer": response_text, "follow_ups": follow_up_questions}
+
+        return {"answer": response_text, "follow_ups": follow_up_questions}
+
+    except Exception as e:
+        return {
+            "answer": f"Oops, something went wrong: {str(e)}",
+            "follow_ups": ["Can you try rephrasing your question?", "Would you like me to summarize instead?",
+                           "Let me know how I can assist you better."]
+        }
+
