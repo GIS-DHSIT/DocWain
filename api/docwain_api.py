@@ -4,6 +4,7 @@ import uvicorn
 from pydantic import BaseModel
 from api.dataHandler import trainData
 from dw_newron import answer_question
+from api.dw_chat import get_chat_history, clear_chat_history
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI(title="DocWain API")
@@ -13,7 +14,6 @@ class QuestionRequest(BaseModel):
     query: str
     user_id: str = 'someone@email.com'
     profile_id: str = "67ac62ddfaa3aee44d38f4a5"
-    model_name: str = "llama3.2"
 
 
 @app.post("/ask")
@@ -22,7 +22,7 @@ def ask_question_api(request: QuestionRequest):
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
     answer = answer_question(request.query, request.user_id,
-                             request.profile_id, request.model_name)
+                             request.profile_id)
     return {"answer": answer}
 
 
@@ -51,7 +51,7 @@ def trigger_training():
         raise HTTPException(status_code=500, detail="Training process failed")
 
 
-@app.get("/chat_history")
+@app.post("/chat_history")
 def get_chat_history(user_id: str):
     """API endpoint to retrieve chat history for a specific user."""
     try:
@@ -60,6 +60,15 @@ def get_chat_history(user_id: str):
     except Exception as e:
         logging.error(f"Failed to retrieve chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
+
+@app.post("/delete_chat_history")
+def delete_chat_history(user_id:str):
+    try:
+        history = clear_chat_history(user_id)
+        return f"Chat history deleted for user {user_id}"
+    except Exception as e:
+        logging.error(f"Failed to clear chat history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear chat history")
 
 
 if __name__ == "__main__":

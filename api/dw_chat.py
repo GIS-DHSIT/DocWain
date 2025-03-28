@@ -52,6 +52,11 @@ def save_chat_history(user_id, chat_history):
         logging.error(f"Error saving chat history: {e}")
 
 
+def clear_chat_history(user_id, session_id=None):
+    """Clear chat history for a specific user or session."""
+    file_key = f"chat_history/{user_id}.json"
+    s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=file_key)
+
 def generate_follow_up_questions(retrieved_text, num_questions=3):
     """Generates follow-up questions based on retrieved content."""
     try:

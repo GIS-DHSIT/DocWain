@@ -74,25 +74,6 @@ def load_embeddings_from_qdrant(tag,query: str, top_k: int = 5):
         logging.error(f"Error in hybrid retrieval: {e}")
         return None
 
-def get_chat_history(user_id):
-    """Retrieve chat history for a specific user."""
-    user_history = collection.find_one({"user_id": user_id})
-    return user_history["history"] if user_history else []
-
-def save_chat_history(user_id, history):
-    """Save or update chat history for a specific user."""
-    collection.update_one(
-        {"user_id": user_id},
-        {"$set": {"history": history}},
-        upsert=True
-    )
-
-def clear_chat_history(user_id, session_id=None):
-    """Clear chat history for a specific user or session."""
-    query = {"user_id": user_id}
-    if session_id:
-        query["session_id"] = session_id
-    collection.delete_one(query)
 
 def rewrite_query(query, history, retrieved_text):
     """

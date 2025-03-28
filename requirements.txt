@@ -15,6 +15,12 @@ ollama~=0.4.7
 faiss-gpu-cu11
 rank-bm25~=0.2.2
 scikit-learn~=1.6.1
-pytesseract~=0.3.13
+pytesseract
 pillow~=10.4.0
-python-pptx~=1.0.2
+python-pptx
+rank_bm25
+azure-ai-inference
+azure-storage-blob
+azure-identity
+azure-keyvault-secrets
+pymupdf
