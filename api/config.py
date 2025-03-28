@@ -20,6 +20,11 @@ class Config:
         AZURE_OPENAI_API_KEY = "1r0Tggwh4wemD9VU7CDP2YQgeri8Z8tYnvVADu07EtQ8W0GAnvVtJQQJ99AKAC77bzfXJ3w3AAABACOGUkAC"
         AZURE_DEPLOYMENT_NAME = "gpt-35-turbo"
         AZURE_VERSION = "2023-07-01-preview"
+    class AzureGpt4o:
+        AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
+        AZUREGPT4O_DEPLOYMENT = "dw-dev1-gpt-4o"
+        AZUREGPT4O_API_KEY = '6JSK5oHMv76xL6IAtFwVfgCRykf24MWdvp6oRpxawBk9sGyqXuQYJQQJ99BCACmepeSXJ3w3AAABACOGjB0M'
+        AZUREGPT4O_Version = "2024-05-01-preview"
 
     class MongoDB:
         URI = 'mongodb+srv://admin:nj4pJfO3e1FcGXDo@cluster0.47nz8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0'
