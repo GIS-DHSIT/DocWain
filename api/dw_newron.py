@@ -88,11 +88,9 @@ def answer_question(query, user_id, tag, model='llama3.2'):
         return "No relevant knowledge found in database."
 
     formatted_history = "\n".join([f"User: {h['query']}\nAI: {h['response']}" for h in history[-5:]])
-    prompt = f"""
-       You are an AI assistant. with NO access to outside world. Answer strictly limited only to retrieved text.
+    prompt = f"""You are an AI assistant. with NO access to outside world. Answer strictly limited only to retrieved text. 
 
-       **Chat History:** 
-       {formatted_history}
+       The answer content should only contain actual responses.
 
        **Retrieved Context:**
        {retrieved_text}
@@ -103,15 +101,15 @@ def answer_question(query, user_id, tag, model='llama3.2'):
     if model == 'Azure-OpenAI':
         logging.info(f"Retrieving response using Azure OpenAI {model}.")
         client = AzureOpenAI(
-            api_version=Config.Model.AZURE_VERSION,
-            api_key=Config.Model.AZURE_OPENAI_API_KEY,
-            azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
+            api_version=Config.AzureGpt4o.AZUREGPT4O_Version,
+            api_key=Config.AzureGpt4o.AZUREGPT4O_API_KEY,
+            azure_endpoint=Config.AzureGpt4o.AZUREGPT4O_ENDPOINT,
         )
         response = client.chat.completions.create(
-            model=Config.Model.AZURE_DEPLOYMENT_NAME,
+            model=Config.AzureGpt4o.AZUREGPT4O_DEPLOYMENT,
             messages=[
                 {"role": "system",
-                 "content": "You are a clever assistant and respond only with the knowledge provided."},
+                 "content": "You are a clever assistant and respond only with the knowledge provided. respond only with actual content"},
                 {"role": "user", "content": prompt}]
         )
         response_text = response.choices[0].message.content
@@ -119,10 +117,10 @@ def answer_question(query, user_id, tag, model='llama3.2'):
         response = ollama.chat(
             model=model,
             messages=[{"role": "system",
-                       "content": "You are a clever assistant and respond only with the knowledge provided."},
+                       "content": "You are a clever assistant and respond only with the knowledge provided.respond only with actual content"},
                       {"role": "user", "content": prompt}]
         )
         response_text = response["message"]
-        history.append({"query": query, "response": response_text})
+        history.append({"query": query, "response": response_text['content']})
         save_chat_history(user_id, history)
     return {"answer": response_text, "follow_ups": follow_up_questions}
