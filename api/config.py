@@ -27,11 +27,12 @@ class Config:
         AZUREGPT4O_Version = "2024-05-01-preview"
 
     class MongoDB:
-        URI = 'mongodb+srv://admin:nj4pJfO3e1FcGXDo@cluster0.47nz8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0'
-        DB = 'docwain'
+        URI = 'mongodb+srv://dhsdbadmin:d%21p%40s5w0rd@dw-dev-mongodb.global.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000'
+        DB = 'test'
         CONNECTOR = 'connectors'
         DOCUMENTS = 'documents'
         PROFILES = 'profiles'
+
 
     class Encryption:
         ENCRYPTION_KEY = 'J9cuHrESAz'
@@ -42,3 +43,22 @@ class Config:
         SECRET_KEY = 'mXHZjLUbbdw4HA/ES1yl+9sdKHus9rL2OyVqN31V'
         REGION = 'eu-west-2'
         BUCKET_NAME = 'docwain-chat-history'
+
+    class AzureBlob:
+        CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=dwchathistory;AccountKey=1qh9meNrD3PJIbSpfOSC8uMhhg23rMrxBQ0PhL0+QRnE+RUNt1GFx7PCZILc6/XVL5GCrfiZvoQl+ASt3jNtPQ==;EndpointSuffix=core.windows.net"
+        CONTAINER_NAME = "chat-history"
+        BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=your_account_name;AccountKey=your_account_key;EndpointSuffix=core.windows.net"
+        blob_key = "1qh9meNrD3PJIbSpfOSC8uMhhg23rMrxBQ0PhL0+QRnE+RUNt1GFx7PCZILc6/XVL5GCrfiZvoQl+ASt3jNtPQ=="
+
+    class DocAzureBlob:
+        AZURE_BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=docwainuploads;AccountKey=+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA==;EndpointSuffix=core.windows.net"
+        AZURE_BLOB_CONTAINER_NAME = "local-uploads"
+        AZURE_BLOB_KEY = "+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA=="
+        AZURE_BLOB_ACCOUNT_NAME = "docwainuploads"
+
+    class VettingAzureBlob:
+        AZURE_BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=docwainvetting;AccountKey=CM3patdUte0Fm82aFbNBffxtBVHS2i0CzC5JWPy/uQ0C/JtJwGrvHqZ2FO1C/7KH3iduWuCyA/pQ+AStRQkRiQ==;EndpointSuffix=core.windows.net"
+        AZURE_BLOB_CONTAINER_NAME = "configuration"
+        AZURE_BLOB_KEY = "CM3patdUte0Fm82aFbNBffxtBVHS2i0CzC5JWPy/uQ0C/JtJwGrvHqZ2FO1C/7KH3iduWuCyA/pQ+AStRQkRiQ=="
+        AZURE_BLOB_ACCOUNT_NAME = "docwainvetting"
+        AZURE_BLOB_FILE_NAME = "default/Vetting conditions_3words.xlsx"
