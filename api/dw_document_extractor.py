@@ -58,7 +58,7 @@ class DocumentExtractor(object):
             return ""
 
 
-    def extract_text_from_docx(self,doc_content):
+    def extract_text_from_docx(self, doc_content):
         """Extracts text from a DOCX file, including OCR for images."""
         try:
             logging.info("Extracting text from DOCX (OCR applied only if images exist)...")
@@ -79,10 +79,13 @@ class DocumentExtractor(object):
             for rel in doc.part.rels:
                 if "image" in doc.part.rels[rel].target_ref:
                     image_data = doc.part.rels[rel].target_part.blob
-                    image = Image.open(io.BytesIO(image_data))
-                    ocr_text = pytesseract.image_to_string(image).strip()
-                    if ocr_text:
-                        extracted_text.append(f"\n[OCR Extracted from Image]\n{ocr_text}")
+                    try:
+                        image = Image.open(io.BytesIO(image_data))
+                        ocr_text = pytesseract.image_to_string(image).strip()
+                        if ocr_text:
+                            extracted_text.append(f"\n[OCR Extracted from Image]\n{ocr_text}")
+                    except Exception as img_error:
+                        logging.error(f"Error processing image: {img_error}")
 
             result_text = "\n".join(filter(None, extracted_text)).strip()
 
@@ -93,7 +96,7 @@ class DocumentExtractor(object):
             return ""
 
 
-    def extract_text_from_pptx(self,ppt_content):
+    def extract_text_from_pptx(self, ppt_content):
         """Extracts structured text from a PowerPoint (PPTX) file, including OCR for images."""
         try:
             logging.info("Extracting text from PPTX (OCR applied only if images exist)...")
@@ -132,7 +135,7 @@ class DocumentExtractor(object):
             logging.error(f"Failed to extract text from PPTX: {e}")
             return ""
 
-    def extract_dataframe(self, df,MODEL):
+    def extract_dataframe(self, df, MODEL):
         try:
             df = df.select_dtypes(include=[np.number, 'object']).copy()
             for col in df.select_dtypes(include=['object']).columns:

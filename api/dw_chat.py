@@ -1,56 +1,81 @@
 import ollama
-import boto3 as b3
 import json
 import logging
-from typing import Dict, List
+from io import BytesIO
 from api.config import Config
+from azure.storage.blob import BlobServiceClient, ContentSettings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-s3_client = b3.client(
-        "s3",
-        aws_access_key_id=Config.AWS.ACCESS_KEY,
-        aws_secret_access_key=Config.AWS.SECRET_KEY,
-        region_name=Config.AWS.REGION
-    )
-S3_BUCKET_NAME = Config.AWS.BUCKET_NAME
+connection_string = Config.AzureBlob.CONNECTION_STRING
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+container_name = Config.AzureBlob.CONTAINER_NAME
+container_client = blob_service_client.get_container_client(container_name)
 
 
 def get_chat_history(user_id):
-    """Retrieve chat history from S3 or return an empty list if not found."""
+    """Retrieve chat history from Azure Blob Storage or return an empty list if not found."""
     try:
-        file_key = f"chat_history/{user_id}.json"
-        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_key)
-        chat_history = json.loads(response["Body"].read().decode("utf-8"))
+        blob_name = f"{user_id}.json"
+        blob_client = container_client.get_blob_client(blob_name)
+
+        if not blob_client.exists():
+            logging.info(f"No existing chat history found for user {user_id}. Initializing new history.")
+            return []
+
+        blob_data = blob_client.download_blob().readall()
+        chat_history = json.loads(blob_data.decode("utf-8"))
         return chat_history
-    except s3_client.exceptions.NoSuchKey:
-        logging.info(f"No existing chat history found for user {user_id}. Initializing new history.")
-        return []
+
     except Exception as e:
         logging.error(f"Error retrieving chat history: {e}")
         return []
 
 
 def save_chat_history(user_id, chat_history):
-    """Save chat history to AWS S3 in a JSON-safe format."""
+    """Save chat history to Azure Blob Storage in a JSON-safe format."""
     try:
-        file_key = f"chat_history/{user_id}.json"
-        formatted_history = []
-        for message in chat_history:
-            formatted_message = {
+        blob_name = f"{user_id}.json"
+        blob_client = container_client.get_blob_client(blob_name)
+
+        # Ensure the content settings are a proper object
+        content_settings = ContentSettings(content_type="application/json")
+
+        # Check if the blob exists, create it if not
+        if not blob_client.exists():
+            blob_client.upload_blob(b"[]", overwrite=True, content_settings=content_settings)
+            logging.info(f"Blob created for user {user_id}.")
+
+        # Format the chat history
+        formatted_history = [
+            {
                 "query": str(message.get("query", "")),
                 "response": str(message.get("response", ""))
             }
-            formatted_history.append(formatted_message)
+            for message in chat_history
+        ]
 
-        chat_data = json.dumps(formatted_history, ensure_ascii=False)
+        # Serialize JSON data to a BytesIO stream
+        chat_data_stream = BytesIO(json.dumps(formatted_history, ensure_ascii=False).encode("utf-8"))
 
-        s3_client.put_object(Bucket=S3_BUCKET_NAME, Key=file_key, Body=chat_data)
+        # Upload the blob with content type
+        blob_client.upload_blob(chat_data_stream, overwrite=True, content_settings=content_settings)
         logging.info(f"Chat history successfully saved for user {user_id}.")
 
     except Exception as e:
         logging.error(f"Error saving chat history: {e}")
 
+def delete_chat_history(user_id):
+    """Delete chat history from Azure Blob Storage."""
+    try:
+        blob_name = f"chat_history/{user_id}.json"
+        blob_client = container_client.get_blob_client(blob_name)
+        blob_client.delete_blob()
+        logging.info(f"Chat history successfully deleted for user {user_id}.")
+        return {"status": "success", "message": f"Chat history deleted for user {user_id}."}
+    except Exception as e:
+        logging.error(f"Error deleting chat history: {e}")
+        return {"status": "error", "message": "Error deleting chat history."}
 
 def generate_follow_up_questions(retrieved_text, num_questions=3):
     """Generates follow-up questions based on retrieved content."""

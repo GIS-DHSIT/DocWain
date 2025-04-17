@@ -76,8 +76,9 @@ def load_embeddings_from_qdrant(tag,query: str, top_k: int = 5):
 
 
 
-def answer_question(query, user_id, tag, model='llama3.2'):
+def answer_question(query, user_id, tag, model='llama3.2',persona="Document Assistant"):
     """Answers a question based on stored embeddings."""
+
     history = get_chat_history(user_id) or []
     if not isinstance(query, str):
         query = str(query)
@@ -97,6 +98,9 @@ def answer_question(query, user_id, tag, model='llama3.2'):
 
        **User Query:**
        {query}
+       
+       **Chat History:**
+       {formatted_history}
        """
     if model == 'Azure-OpenAI':
         logging.info(f"Retrieving response using Azure OpenAI {model}.")
@@ -109,15 +113,18 @@ def answer_question(query, user_id, tag, model='llama3.2'):
             model=Config.AzureGpt4o.AZUREGPT4O_DEPLOYMENT,
             messages=[
                 {"role": "system",
-                 "content": "You are a clever assistant and respond only with the knowledge provided. respond only with actual content"},
+                 "content": "You are a {0} and respond only with the knowledge provided. respond only with actual content".format(persona)},
                 {"role": "user", "content": prompt}]
         )
         response_text = response.choices[0].message.content
+        history.append({"query": query, "response": response_text})
+        save_chat_history(user_id, history)
+
     else:
         response = ollama.chat(
             model=model,
             messages=[{"role": "system",
-                       "content": "You are a clever assistant and respond only with the knowledge provided.respond only with actual content"},
+                       "content": "You are {0} and respond only with the knowledge provided.respond only with actual content".format(persona)},
                       {"role": "user", "content": prompt}]
         )
         response_text = response["message"]
