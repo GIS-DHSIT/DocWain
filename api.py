@@ -1,19 +1,24 @@
+from contextlib import suppress
+from pathlib import Path
+from typing import List
+from uuid import uuid4
+
+import os
+import sys
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List
-import asyncio
 import uvicorn
-import os
-import sys
+
 path = os.getcwd()
 sys.path.append(path)
+
 from src.chain import ask_question, create_chain
 from src.config import Config
 from src.ingestor import Ingestor
 from src.model import create_llm
 from src.retriever import create_retriever
-from src.uploader import upload_files
 
 app = FastAPI(title="DocWain API")
 
@@ -34,10 +39,10 @@ async def upload_documents(files: List[UploadFile] = File(...)):
     """
     try:
         # Save files temporarily
-        file_paths = []
+        file_paths: List[Path] = []
         for file in files:
-            file_location = f"temp_{file.filename}"
-            with open(file_location, "wb") as buffer:
+            file_location = Config.Path.DOCUMENTS_DIR / f"api_{uuid4().hex}_{file.filename}"
+            with file_location.open("wb") as buffer:
                 buffer.write(await file.read())
             file_paths.append(file_location)
 
@@ -55,6 +60,10 @@ async def upload_documents(files: List[UploadFile] = File(...)):
     except Exception as e:
         print(e)
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        for file_path in file_paths:
+            with suppress(FileNotFoundError):
+                file_path.unlink()
 
 
 @app.post("/api/v1/ask")
