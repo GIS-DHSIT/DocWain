@@ -1,22 +1,26 @@
-import os,sys
+import os
+import sys
+from typing import Optional
+
 from langchain_community.chat_models import ChatOllama
 from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
 from langchain_community.embeddings.fastembed import FastEmbedEmbeddings
 from langchain_core.language_models import BaseLanguageModel
 from langchain_groq import ChatGroq
+
 path = os.getcwd()
 sys.path.append(path)
+
 from .config import Config
-from dotenv import load_dotenv
-import os
-
-# Load environment variables from .env file
-load_dotenv()
-
-# Access the variables
-secret_key = os.getenv("GROQ_API_KEY")
 
 
+def _get_groq_api_key() -> str:
+    api_key: Optional[str] = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "GROQ_API_KEY environment variable is required when using the hosted Groq model."
+        )
+    return api_key
 
 
 def create_llm() -> BaseLanguageModel:
@@ -32,12 +36,16 @@ def create_llm() -> BaseLanguageModel:
             temperature=Config.Model.TEMPERATURE,
             model_name=Config.Model.REMOTE_LLM,
             max_tokens=Config.Model.MAX_TOKENS,
-            groq_api_key= secret_key
+            groq_api_key=_get_groq_api_key(),
         )
 
 
 def create_embeddings() -> FastEmbedEmbeddings:
-    return FastEmbedEmbeddings(model_name=Config.Model.EMBEDDINGS)
+    threads = os.getenv("FASTEMBED_THREADS")
+    return FastEmbedEmbeddings(
+        model_name=Config.Model.EMBEDDINGS,
+        threads=int(threads) if threads else None,
+    )
 
 
 def create_reranker() -> FlashrankRerank:
