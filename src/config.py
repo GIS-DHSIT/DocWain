@@ -1,5 +1,8 @@
 import os
 from pathlib import Path
+from typing import Iterable
+
+from dotenv import load_dotenv
 
 
 class Config:
@@ -27,3 +30,40 @@ class Config:
 
     DEBUG = False
     CONVERSATION_MESSAGES_LIMIT = 160
+
+    _GPU_ENV_DEFAULTS = {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "FASTEMBED_DEVICE": "cuda",
+        "FASTEMBED_USE_GPU": "1",
+        "FASTEMBED_BATCH_SIZE": "64",
+    }
+
+    @classmethod
+    def _ensure_directories(cls) -> None:
+        directories: Iterable[Path] = (
+            cls.Path.DATABASE_DIR,
+            cls.Path.DOCUMENTS_DIR,
+            cls.Path.IMAGES_DIR,
+        )
+        for directory in directories:
+            directory.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def _configure_gpu_environment(cls) -> None:
+        load_dotenv()
+
+        for env_var, default_value in cls._GPU_ENV_DEFAULTS.items():
+            os.environ.setdefault(env_var, default_value)
+
+        # Avoid noisy tokenizer warnings when running on multi-core GPU machines.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    @classmethod
+    def bootstrap(cls) -> None:
+        """Ensure required directories exist and GPU env variables are set."""
+        cls._configure_gpu_environment()
+        cls._ensure_directories()
+
+
+# Automatically prepare the runtime environment when the configuration is imported.
+Config.bootstrap()
