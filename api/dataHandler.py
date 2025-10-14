@@ -18,7 +18,9 @@ from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 from nltk.tokenize import sent_tokenize, word_tokenize
 from qdrant_client.models import Distance, VectorParams
+from api.documentVetting import vettingProcessor
 from api.dw_document_extractor import DocumentExtractor
+from azure.storage.blob import BlobServiceClient
 
 nltk.download('punkt')
 
@@ -46,14 +48,15 @@ def decrypt_data(encrypted_value: str, encryption_key= Config.Encryption.ENCRYPT
         return ""
 
 
-def fileProcessor(content,file):
+def fileProcessor(content, file):
     extracted_data = {}
     try:
+        file = file.split('/')[-1]
         if content:
             logging.info(f"Extracting File {file}")
             if file.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
-                extracted_data[file] = docEx.extract_dataframe(df,MODEL)
+                extracted_data[file] = docEx.extract_dataframe(df, MODEL)
             elif file.endswith(".xlsx") or file.endswith(".xls"):
                 df = pd.read_excel(BytesIO(content))
                 extracted_data[file] = docEx.extract_dataframe(df, MODEL)
@@ -65,12 +68,14 @@ def fileProcessor(content,file):
                 extracted_data[file] = docEx.extract_text_from_docx(content)
             elif file.endswith(".pptx") or file.endswith(".ppt"):
                 extracted_data[file] = docEx.extract_text_from_pptx(content)
-
+            elif file.endswith(".txt"):
+                extracted_data[file] = content.decode("utf-8")
             else:
                 extracted_data[file] = content.decode("utf-8")
         return extracted_data
     except Exception as e:
         logging.error(f"Error processing file {file}: {e}")
+        return {}
 
 
 def read_s3_file(s3, bucket, file_key):
@@ -128,6 +133,48 @@ def get_s3_document_info(s3_uri):
     except Exception as e:
         return {"Error": str(e)}
 
+def updateVetting(document_id, new_value):
+    """
+    Updates a specific field in a MongoDB document.
+
+    Args:
+        document_id (str): The ID of the document to update.
+        field_name (str): The field to update.
+        new_value: The new value to set for the field.
+
+    Returns:
+        dict: The result of the update operation.
+    """
+    try:
+        filter_criteria = {"_id": ObjectId(document_id)}
+        update_operation = {"$set": {'vettingPoints': new_value}}
+        collection = db[Config.MongoDB.DOCUMENTS]
+        result = collection.update_one(filter_criteria, update_operation)
+
+        if result.matched_count > 0:
+            logging.info(f"Document with ID {document_id} updated successfully.")
+            return {"status": "success", "matched_count": result.matched_count, "modified_count": result.modified_count}
+        else:
+            logging.warning(f"No document found with ID {document_id}.")
+            return {"status": "not_found", "matched_count": 0, "modified_count": 0}
+    except Exception as e:
+        logging.error(f"Error updating document: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+def get_azure_docs(files):
+    """Fetches documents from Azure Blob Storage."""
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(Config.DocAzureBlob.AZURE_BLOB_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(Config.DocAzureBlob.AZURE_BLOB_CONTAINER_NAME)
+        # fileName = files.split('/')[-1]
+        blob_client = container_client.get_blob_client('local/'+files)
+        blob_data = blob_client.download_blob().readall()
+        return blob_data
+
+    except Exception as e:
+        logging.error(f"Error fetching Azure documents: {e}")
+        return []
 
 def connectData(documentConnection):
     dataDict = {}
@@ -135,42 +182,57 @@ def connectData(documentConnection):
         docData = v['dataDict']
         connData = v['connDict']
         profileId = docData['profile'].__str__()
-        if docData['status'] == 'TRAINING_PENDING':
-            if docData['type'] == 'S3':
-                bkName = connData['s3_details']['bucketName']
-                region = connData['s3_details']['region']
-                ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
-                sk = decrypt_data(connData['s3_details']['secretKey']).split('\x08')[0].strip()
-                s3 = get_s3_client(ak, sk, region)
-                objs = s3.list_objects_v2(Bucket=bkName)
-                file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
-                docContent = read_s3_file(s3, bkName, file[0])
-                extractedDoc = fileProcessor(docContent, file[0])
-                docId = docData['_id'].__str__()
-                profileData = {profileId: extractedDoc}
-                dataDict[docId] = profileData
-            elif docData['type'] == 'LOCAL':
-                files = connData['locations']
-                if len(files) ==1:
-                    file = files[0]
-                    docContent = get_s3_document_info(file)
-                    extractedDoc = fileProcessor(docContent, file)
+        if docData['status'] == 'UNDER_REVIEW':
+            try:
+                if docData['type'] == 'S3':
+                    bkName = connData['s3_details']['bucketName']
+                    region = connData['s3_details']['region']
+                    ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
+                    sk = decrypt_data(connData['s3_details']['secretKey']).split('\x08')[0].strip()
+                    s3 = get_s3_client(ak, sk, region)
+                    objs = s3.list_objects_v2(Bucket=bkName)
+                    file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
+                    docContent = read_s3_file(s3, bkName, file[0])
+                    extractedDoc = fileProcessor(docContent, file[0])
+                    vettingPoints = vettingProcessor(extractedDoc)
                     docId = docData['_id'].__str__()
                     profileData = {profileId: extractedDoc}
                     dataDict[docId] = profileData
-                elif len(files)>1:
-                    for file in files:
-                        docContent = get_s3_document_info(file)
+                    updateVetting(docId, vettingPoints)
+
+                elif docData['type'] == 'LOCAL':
+                    files = connData['locations']
+                    if len(files) == 1:
+                        file = files[0].split('/', 4)[-1]
+                        docContent = get_azure_docs(file)
                         extractedDoc = fileProcessor(docContent, file)
+                        vettingPoints = vettingProcessor(extractedDoc)
                         docId = docData['_id'].__str__()
                         profileData = {profileId: extractedDoc}
                         dataDict[docId] = profileData
-                elif len(files)==0:
-                    logging.info("location Empty")
-            elif docData['type'] == 'FTP':
-                pass
-            elif docData['type'] == 'BLOB':
-                pass
+                        updateVetting(docId,vettingPoints)
+                    elif len(files) > 1:
+                        for file in files:
+                            docContent = get_azure_docs(file)
+                            extractedDoc = fileProcessor(docContent, file)
+                            vettingPoints = vettingProcessor(extractedDoc)
+                            docId = docData['_id'].__str__()
+                            profileData = {profileId: extractedDoc}
+                            dataDict[docId] = profileData
+                            updateVetting(docId, vettingPoints)
+                    elif len(files) == 0:
+                        logging.info("location Empty")
+                elif docData['type'] == 'FTP':
+                    pass
+                elif docData['type'] == 'BLOB':
+                    pass
+            except Exception as e:
+                logging.error(f"Error processing document {docData['name']}: {e}")
+        elif docData['status'] == 'DELETED':
+            docId = docData['_id'].__str__()
+            profileData = docData['profile'].__str__()
+            # dataDict[docId] = {profileData: 'Document Deleted'}
+            delete_embeddings(profileData, docId)
         else:
             logging.info(v)
 
@@ -206,6 +268,26 @@ def extract_document_info():
         logging.error(f"Error fetching connection details: {e}")
         return {}
 
+def delete_embeddings(tag, file_id):
+    """Delete embeddings from Qdrant for a specific file."""
+    try:
+        # Define the filter to find the embeddings related to the file
+        filter_criteria = {
+            "must": [
+                {"key": "tag", "match": {"value": tag}}
+            ]
+        }
+
+        # Perform the deletion
+        qdrant_client.delete(
+            collection_name=tag,
+            points_selector=filter_criteria
+        )
+        logging.info(f"Embeddings successfully deleted for file {file_id} in collection {tag}.")
+        return {"status": "success", "message": f"Embeddings deleted for file {file_id}."}
+    except Exception as e:
+        logging.error(f"Error deleting embeddings: {e}")
+        return {"status": "error", "message": "Error deleting embeddings."}
 
 def ensure_qdrant_collection(collection_name, vector_size=768):
     """Ensures the Qdrant collection exists with the correct settings."""
@@ -319,6 +401,7 @@ def train_on_document(text, profile_tag,doc_tag):
         logging.error(f"Error during training: {e}")
         return f"Training failed for tag {profile_tag}"
 
+
 def trainData():
     try:
         logging.info(f"Starting training")
@@ -332,4 +415,5 @@ def trainData():
     except Exception as e:
         logging.error(f"Error in training data: {e}")
         return "Training failed."
+
 # trainData()
