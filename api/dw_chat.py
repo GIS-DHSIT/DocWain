@@ -1,40 +1,43 @@
 import ollama
-import boto3 as b3
 import json
 import logging
 from typing import Dict, List
 from api.config import Config
+from azure.storage.blob import BlobServiceClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-s3_client = b3.client(
-        "s3",
-        aws_access_key_id=Config.AWS.ACCESS_KEY,
-        aws_secret_access_key=Config.AWS.SECRET_KEY,
-        region_name=Config.AWS.REGION
-    )
-S3_BUCKET_NAME = Config.AWS.BUCKET_NAME
+connection_string = Config.AzureBlob.CONNECTION_STRING
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+container_name = Config.AzureBlob.CONTAINER_NAME
+container_client = blob_service_client.get_container_client(container_name)
 
 
 def get_chat_history(user_id):
-    """Retrieve chat history from S3 or return an empty list if not found."""
+    """Retrieve chat history from Azure Blob Storage or return an empty list if not found."""
     try:
-        file_key = f"chat_history/{user_id}.json"
-        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=file_key)
-        chat_history = json.loads(response["Body"].read().decode("utf-8"))
+        blob_name = f"chat_history/{user_id}.json"
+        blob_client = container_client.get_blob_client(blob_name)
+
+        if not blob_client.exists():
+            logging.info(f"No existing chat history found for user {user_id}. Initializing new history.")
+            return []
+
+        blob_data = blob_client.download_blob().readall()
+        chat_history = json.loads(blob_data.decode("utf-8"))
         return chat_history
-    except s3_client.exceptions.NoSuchKey:
-        logging.info(f"No existing chat history found for user {user_id}. Initializing new history.")
-        return []
+
     except Exception as e:
         logging.error(f"Error retrieving chat history: {e}")
         return []
 
 
 def save_chat_history(user_id, chat_history):
-    """Save chat history to AWS S3 in a JSON-safe format."""
+    """Save chat history to Azure Blob Storage in a JSON-safe format."""
     try:
-        file_key = f"chat_history/{user_id}.json"
+        blob_name = f"chat_history/{user_id}.json"
+        blob_client = container_client.get_blob_client(blob_name)
+
         formatted_history = []
         for message in chat_history:
             formatted_message = {
@@ -44,13 +47,11 @@ def save_chat_history(user_id, chat_history):
             formatted_history.append(formatted_message)
 
         chat_data = json.dumps(formatted_history, ensure_ascii=False)
-
-        s3_client.put_object(Bucket=S3_BUCKET_NAME, Key=file_key, Body=chat_data)
+        blob_client.upload_blob(chat_data, overwrite=True)
         logging.info(f"Chat history successfully saved for user {user_id}.")
 
     except Exception as e:
         logging.error(f"Error saving chat history: {e}")
-
 
 def generate_follow_up_questions(retrieved_text, num_questions=3):
     """Generates follow-up questions based on retrieved content."""
@@ -73,51 +74,26 @@ def generate_follow_up_questions(retrieved_text, num_questions=3):
         logging.error(f"Error generating follow-up questions: {e}")
         return []
 
-#
-# def rewrite_query(query, chat_history, retrieved_content):
-#     """Rewrites queries for improved retrieval and suggests follow-ups."""
-#     try:
-#         num_words = len(query.split())
-#
-#         if num_words > 15:
-#             logging.info("Query is already detailed, skipping rewrite.")
-#             follow_ups = generate_follow_up_questions(retrieved_content) if retrieved_content else []
-#             return query, follow_ups
-#
-#         # **Retrieve Chat History for Context**
-#         recent_history = chat_history[-3:] if chat_history else []
-#         history_context = " ".join([f"User: {h['query']} AI: {h['response']}" for h in recent_history])
-#
-#         # **Enhance Query Using an LLM**
-#         rewrite_prompt = f"""
-#         Improve the following query for better retrieval results. If the query is vague, add relevant details based on the retrieved content
-#
-#         **User Query:** "{query}"
-#         **Recent Chat History:** {history_context}
-#         **Relevant data:**{retrieved_content}
-#         **Improved Query:**
-#         """
-#         response = ollama.chat(
-#             model="llama3.2",
-#             messages=[{"role": "system", "content": "You are an AI specialized in improving search queries. only respond with responses"},
-#                       {"role": "user", "content": rewrite_prompt}]
-#         )
-#
-#         refined_query = response['message']['content'].split('**')[-1].replace('"','').strip()
-#
-#         # **Query Expansion with Sentence Transformer**
-#         expanded_query_embeddings = MODEL.encode([query, refined_query])
-#         similarity_score = util.cos_sim(expanded_query_embeddings[0], expanded_query_embeddings[1])
-#
-#         if similarity_score < 0.8:  # If rewritten query differs significantly, return both
-#             refined_query = f"{query} | {refined_query}"
-#
-#         logging.info(f" Original Query: {query} → Rewritten Query: {refined_query}")
-#
-#         follow_up_questions = generate_follow_up_questions(retrieved_content) if retrieved_content else []
-#
-#         return refined_query, follow_up_questions
-#
-#     except Exception as e:
-#         logging.error(f" Error in query rewriting: {e}")
-#         return query, []
+
+def rerank_results(retrieved_texts, similar_queries, bm25_scores, faiss_scores):
+    """
+    Rerank retrieval results by boosting those that appeared in past interactions.
+    """
+    try:
+        alpha = 0.6
+        beta = 0.4
+        gamma = 0.3
+
+        final_scores = {}
+        for i, text in enumerate(retrieved_texts):
+            final_scores[i] = alpha * faiss_scores[i] + beta * bm25_scores[i]
+
+            if any(q in text for q in similar_queries):
+                final_scores[i] += gamma
+
+        sorted_indices = sorted(final_scores, key=final_scores.get, reverse=True)
+        return [retrieved_texts[i] for i in sorted_indices]
+
+    except Exception as e:
+        logging.error(f"Error in reranking: {e}")
+        return retrieved_texts

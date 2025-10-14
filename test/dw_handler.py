@@ -1,14 +1,13 @@
 import json
+import fitz
+import docx
 import uuid
-import nltk
 import logging
 import hashlib
-import subprocess
 import boto3 as b3
 import numpy as np
 import pandas as pd
 from io import BytesIO
-from api.config import Config
 from Crypto.Cipher import AES
 from pymongo import MongoClient
 from urllib.parse import urlparse
@@ -16,19 +15,16 @@ from bson.objectid import ObjectId
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
-from nltk.tokenize import sent_tokenize, word_tokenize
 from qdrant_client.models import Distance, VectorParams
-from api.dw_document_extractor import DocumentExtractor
+from api.config import Config
 
-nltk.download('punkt')
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-docEx = DocumentExtractor()
+
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 mongoClient = MongoClient(Config.MongoDB.URI)
 db = mongoClient[Config.MongoDB.DB]
 qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API,timeout=60)
-
 
 def decrypt_data(encrypted_value: str, encryption_key= Config.Encryption.ENCRYPTION_KEY ) -> str:
     """Decrypts data using AES CBC mode."""
@@ -45,6 +41,31 @@ def decrypt_data(encrypted_value: str, encryption_key= Config.Encryption.ENCRYPT
         logging.error(f"Decryption failed: {e}")
         return ""
 
+def extract_text_from_pdf(pdf_path):
+    """Extracts text from a PDF file."""
+    try:
+        logging.info(f"Extracting text from PDF")
+        text = ""
+        with fitz.open(stream=pdf_path, filetype="pdf") as doc:
+            for page in doc:
+                text += page.get_text("text") + "\n"
+        logging.info("Text extraction from PDF successful.")
+        return text
+    except Exception as e:
+        logging.error(f"Failed to extract text from PDF: {e}")
+        return ""
+
+def extract_text_from_docx(docx_path):
+    """Extracts text from a DOCX file."""
+    try:
+        logging.info(f"Extracting text from DOCX: {docx_path}")
+        doc = docx.Document(docx_path)
+        text = "\n".join([para.text for para in doc.paragraphs])
+        logging.info("Text extraction from DOCX successful.")
+        return text
+    except Exception as e:
+        logging.error(f"Failed to extract text from DOCX: {e}")
+        return ""
 
 def fileProcessor(content,file):
     extracted_data = {}
@@ -52,20 +73,13 @@ def fileProcessor(content,file):
         if content:
             logging.info(f"Extracting File {file}")
             if file.endswith(".csv"):
-                df = pd.read_csv(BytesIO(content))
-                extracted_data[file] = docEx.extract_dataframe(df,MODEL)
-            elif file.endswith(".xlsx") or file.endswith(".xls"):
-                df = pd.read_excel(BytesIO(content))
-                extracted_data[file] = docEx.extract_dataframe(df, MODEL)
+                extracted_data[file] = pd.read_csv(BytesIO(content))
             elif file.endswith(".json"):
                 extracted_data[file] = json.loads(content.decode("utf-8"))
             elif file.endswith(".pdf"):
-                extracted_data[file] = docEx.extract_text_from_pdf(content)
+                extracted_data[file] = extract_text_from_pdf(content)
             elif file.endswith(".docx"):
-                extracted_data[file] = docEx.extract_text_from_docx(content)
-            elif file.endswith(".pptx") or file.endswith(".ppt"):
-                extracted_data[file] = docEx.extract_text_from_pptx(content)
-
+                extracted_data[file] = extract_text_from_docx(content)
             else:
                 extracted_data[file] = content.decode("utf-8")
         return extracted_data
@@ -88,17 +102,7 @@ def read_s3_file(s3, bucket, file_key):
 def get_s3_client(AWS_ACCESS_KEY, AWS_SECRET_KEY, Region):
     """Returns an S3 client."""
     try:
-        awsProfile = Config.AWS.PROFILE
-        subprocess.run(
-            ["aws", "configure", "set", "aws_access_key_id", AWS_ACCESS_KEY, "--profile", awsProfile]
-        )
-        subprocess.run(
-            ["aws", "configure", "set", "aws_secret_access_key", AWS_SECRET_KEY, "--profile", awsProfile]
-        )
-        subprocess.run(
-            ["aws", "configure", "set", "region", Region, "--profile", awsProfile]
-        )
-
+        logging.info("Creating S3 client.")
         return b3.client(
             "s3",
             aws_access_key_id=AWS_ACCESS_KEY,
@@ -113,14 +117,7 @@ def get_s3_document_info(s3_uri):
     parsed_uri = urlparse(s3_uri)
     bucket_name = parsed_uri.netloc
     object_key = parsed_uri.path.lstrip('/')
-
-    s3 = b3.client(
-            "s3",
-            aws_access_key_id=Config.AWS.ACCESS_KEY,
-            aws_secret_access_key=Config.AWS.SECRET_KEY,
-            region_name=Config.AWS.REGION,
-        )
-
+    s3 = b3.client('s3')
     try:
         content = read_s3_file(s3,bucket_name,object_key)
         return content
@@ -158,21 +155,19 @@ def connectData(documentConnection):
                     docId = docData['_id'].__str__()
                     profileData = {profileId: extractedDoc}
                     dataDict[docId] = profileData
-                elif len(files)>1:
+                else:
                     for file in files:
                         docContent = get_s3_document_info(file)
                         extractedDoc = fileProcessor(docContent, file)
                         docId = docData['_id'].__str__()
                         profileData = {profileId: extractedDoc}
                         dataDict[docId] = profileData
-                elif len(files)==0:
-                    logging.info("location Empty")
             elif docData['type'] == 'FTP':
                 pass
             elif docData['type'] == 'BLOB':
                 pass
         else:
-            logging.info(v)
+            print(v)
 
     return dataDict
 
@@ -277,49 +272,19 @@ def save_embeddings_to_qdrant(embeddings, tags, doctag, batch_size=100):
     except Exception as e:
         logging.error(f"Error saving embeddings to Qdrant: {e}")
 
-
-def chunk_text(text, chunk_size=256, overlap=128):
-    """
-    Splits text into overlapping chunks to improve retrieval accuracy.
-
-    Parameters:
-    - text (str): The document text.
-    - chunk_size (int): Target number of words per chunk.
-    - overlap (int): Overlapping words between consecutive chunks.
-
-    Returns:
-    - List of chunked text segments.
-    """
-    sentences = sent_tokenize(text)
-    words = [word_tokenize(sent) for sent in sentences]
-    words_flat = [word for sent in words for word in sent]  # Flatten word list
-    logging.info("Converting to Chunks")
-    chunks = []
-    for i in range(0, len(words_flat), chunk_size - overlap):
-        chunk = words_flat[i:i + chunk_size]
-        chunks.append(" ".join(chunk))
-
-    return chunks
-
 def train_on_document(text, profile_tag,doc_tag):
     """Trains and stores embeddings from a document using chunking."""
     try:
-        if isinstance(text, dict):
-            save_embeddings_to_qdrant(text,profile_tag,doc_tag)
-        elif isinstance(text, str):
-            chunks = chunk_text(text)
-            logging.info(f"Training on document with tag: {profile_tag}")
-            embeddings = MODEL.encode(chunks, convert_to_numpy=True)
-            save_embeddings_to_qdrant({"embeddings": embeddings, "texts": chunks},profile_tag,doc_tag)
-        else:
-            logging.error("Unsupported document format for training.")
-            return "Training failed."
+        logging.info(f"Training on document with tag: {profile_tag}")
+        chunks = text.split(". ")
+        embeddings = MODEL.encode(chunks, convert_to_numpy=True)
+        save_embeddings_to_qdrant({"embeddings": embeddings, "texts": chunks},profile_tag,doc_tag)
         return f"Training complete. Model stored as {profile_tag}!"
     except Exception as e:
         logging.error(f"Error during training: {e}")
         return f"Training failed for tag {profile_tag}"
 
-def trainData():
+def train():
     try:
         logging.info(f"Starting training")
         docColl = extract_document_info()
@@ -332,4 +297,6 @@ def trainData():
     except Exception as e:
         logging.error(f"Error in training data: {e}")
         return "Training failed."
-# trainData()
+
+
+train()
