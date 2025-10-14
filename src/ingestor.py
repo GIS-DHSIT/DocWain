@@ -73,9 +73,16 @@ class Ingestor:
                 "No textual content found in the provided documents. Ensure the files contain readable text."
             )
 
-        return Qdrant.from_documents(
-            documents=documents,
-            embedding=self.embeddings,
-            path=Config.Path.DATABASE_DIR,
-            collection_name=Config.Database.DOCUMENTS_COLLECTION,
-        )
+        qdrant_args = {
+            "documents": documents,
+            "embedding": self.embeddings,
+            "collection_name": Config.Database.DOCUMENTS_COLLECTION,
+        }
+        if Config.Database.QDRANT_ENABLED:
+            qdrant_args["host"] = Config.Database.QDRANT_HOST
+            qdrant_args["port"] = Config.Database.QDRANT_PORT
+            qdrant_args["api_key"] = Config.Database.QDRANT_API_KEY
+        else:
+            qdrant_args["path"] = Config.Path.DATABASE_DIR
+
+        return Qdrant.from_documents(**qdrant_args)

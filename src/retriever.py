@@ -14,11 +14,20 @@ def create_retriever(
     llm: BaseLanguageModel, vector_store: Optional[VectorStore] = None
 ) -> VectorStoreRetriever:
     if not vector_store:
-        vector_store = Qdrant.from_existing_collection(
-            embedding=create_embeddings(),
-            collection_name=Config.Database.DOCUMENTS_COLLECTION,
-            path=Config.Path.DATABASE_DIR,
-        )
+        if Config.Database.QDRANT_ENABLED:
+            vector_store = Qdrant.from_existing_collection(
+                embedding=create_embeddings(),
+                collection_name=Config.Database.DOCUMENTS_COLLECTION,
+                host=Config.Database.QDRANT_HOST,
+                port=Config.Database.QDRANT_PORT,
+                api_key=Config.Database.QDRANT_API_KEY,
+            )
+        else:
+            vector_store = Qdrant.from_existing_collection(
+                embedding=create_embeddings(),
+                collection_name=Config.Database.DOCUMENTS_COLLECTION,
+                path=Config.Path.DATABASE_DIR,
+            )
 
     retriever = vector_store.as_retriever(
         search_type="similarity", search_kwargs={"k": 5}

@@ -14,6 +14,14 @@ class Config:
 
     class Database:
         DOCUMENTS_COLLECTION = "documents"
+        QDRANT_HOST = os.getenv("QDRANT_HOST", "6fe03a10-2d12-4853-bd91-7f355d4fe4e5.uksouth-0.azure.cloud.qdrant.io")
+        QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
+        QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+        QDRANT_ENABLED = os.getenv("QDRANT_ENABLED", "False").lower() in (
+            "true",
+            "1",
+            "t",
+        )
 
     class Model:
         EMBEDDINGS = "BAAI/bge-base-en-v1.5"
