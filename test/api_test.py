@@ -1,26 +1,97 @@
 import requests
-from qdrant_client import QdrantClient
+# from qdrant_client import QdrantClient
+#
+# def qudrantTest():
+#     qdrant_client = QdrantClient(
+#         url="https://0a25c9cf-4685-49c7-9382-4c3510754343.europe-west3-0.gcp.cloud.qdrant.io:6333",
+#         api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ki8Uux4HtKDYj6ebqH9nzu3qg7QVmXTvxT6UkLNwTc4",
+#     )
+#
+#     print(qdrant_client.get_collection('documents'))
+#
+# def endpointTest():
+#     headers = {
+#         'Content-Type': 'application/json',
+#     }
+#
+#     json_data = {"query":"summarize the document","user_id":"muthu.subramanian@dhsit.co.uk",
+#                  "profile_id":"67bd5d6b1981cea3aba6aa30","model_name":"Azure-OpenAI"}
+#
+#     response = requests.post('https://dhs-docwain-api.azure-api.net/ask', headers=headers, json=json_data)
+#     print(response.content)
+# endpointTest()
+# import os
+# import base64
+# from openai import AzureOpenAI
+#
+# # Set up environment variables and API details
+# api_key ='6JSK5oHMv76xL6IAtFwVfgCRykf24MWdvp6oRpxawBk9sGyqXuQYJQQJ99BCACmepeSXJ3w3AAABACOGjB0M'
+# endpoint = os.getenv("ENDPOINT_URL", "https://dw-openai-dev.openai.azure.com/")
+# deployment = os.getenv("DEPLOYMENT_NAME", "dw-dev1-gpt-4o")
+# subscription_key = os.getenv("AZURE_OPENAI_API_KEY", api_key)
+#
+# # Initialize Azure OpenAI Service client with key-based authentication
+# client = AzureOpenAI(
+#     azure_endpoint=endpoint,
+#     api_key=subscription_key,
+#     api_version="2024-05-01-preview",
+# )
+#
+# # Prepare the chat prompt
+# chat_prompt = [
+#     {
+#         "role": "system",
+#         "content": [
+#             {
+#                 "type": "text",
+#                 "text": "You are an AI assistant that helps people find information."
+#             }
+#         ]
+#     },
+#     {
+#         "role": "user",
+#         "content": [
+#             {
+#                 "type": "text",
+#                 "text": "What are the top three tourist attractions in Paris?"
+#             }
+#         ]
+#     }
+# ]
+#
+# try:
+#     # Generate chat completion
+#     completion = client.chat.completions.create(
+#         model=deployment,
+#         messages=chat_prompt,
+#         max_tokens=800,
+#         temperature=0.7,
+#         top_p=0.95,
+#         frequency_penalty=0,
+#         presence_penalty=0,
+#         stop=None,
+#         stream=False
+#     )
+#
+#     # Extract and print the assistant's response
+#     assistant_response = completion.choices[0].message.content
+#     print("\nAssistant:", assistant_response)
+#
+# except Exception as e:
+#     print(f"\n❌ Error: {str(e)}")
 
-def qudrantTest():
-    qdrant_client = QdrantClient(
-        url="https://0a25c9cf-4685-49c7-9382-4c3510754343.europe-west3-0.gcp.cloud.qdrant.io:6333",
-        api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ki8Uux4HtKDYj6ebqH9nzu3qg7QVmXTvxT6UkLNwTc4",
-    )
+from azure.storage.blob import BlobServiceClient
+from api.config import Config
 
-    print(qdrant_client.get_collection('documents'))
+connection_string = Config.AzureBlob.CONNECTION_STRING
+blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+container_name = "chat-history"
 
-def endpointTest():
-    headers = {
-        'Content-Type': 'application/json',
-    }
+# Get the container client
+container_client = blob_service_client.get_container_client(container_name)
 
-    json_data = {
-        'query': 'What is the document about?',
-        'mongo_client': 'test',
-        'mongo_collection': 'documents',
-        'profile_id': '67ac62ddfaa3aee44d38f4a5',
-        'model_name': 'OpenAI'
-    }
-
-    response = requests.post('http://127.0.0.1:8000/ask', headers=headers, json=json_data)
-    print(response.content)
+# Check if the container exists
+if container_client.exists():
+    print(f"Connected to container: {container_name}")
+else:
+    print(f"Container '{container_name}' does not exist.")
