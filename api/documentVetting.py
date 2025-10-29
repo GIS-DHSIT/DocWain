@@ -1,7 +1,9 @@
+
 from io import BytesIO
 import pandas as pd
 from api.config import Config
 from azure.storage.blob import BlobServiceClient
+import logging
 
 def readVettingConf(file=Config.VettingAzureBlob.AZURE_BLOB_FILE_NAME):
     """
@@ -28,36 +30,37 @@ def readVettingConf(file=Config.VettingAzureBlob.AZURE_BLOB_FILE_NAME):
         return None
 
 def vettingProcessor(docContent):
-    """
-    Process the vetting configuration and return the processed data.
-
-    Returns:
-        dict: The processed vetting data.
-    """
+    """Process vetting configuration and return points."""
     try:
         VettingConfig = readVettingConf()
         if not VettingConfig:
-            print("No vetting configuration found.")
-            return None
+            logging.warning("No vetting configuration found.")
+            return 100
+
         initialPoints = 100
+
+        # Flatten docContent if it's a dict
+        if isinstance(docContent, dict):
+            text_content = " ".join(
+                str(v) for file_data in docContent.values() for v in file_data.values()
+            )
+        else:
+            text_content = str(docContent)
+
+        # Flatten vetting words
         words = []
-        for key, value in VettingConfig.items():
-            for cond in value:
-                words.append(list(cond.values()))
-        vettingWords = [item for sublist in words for item in sublist]
-        cleaned_list = [str(s).replace("\xa0", " ") for s in vettingWords]
+        for sheet, rows in VettingConfig.items():
+            for row in rows:
+                words.extend(list(row.values()))
+
+        cleaned_list = [str(s).replace("\xa0", " ").strip() for s in words]
 
         for word in cleaned_list:
-            if word in docContent:
+            if word in text_content:
                 initialPoints -= 5
-                points = max(initialPoints, 0)
-                processed_data = points
-                return processed_data
-            else:
-                return 100
+
+        return max(initialPoints, 0)
 
     except Exception as e:
-        print(f"Error processing vetting configuration: {e}")
-        return None
-
-    print(vettingProcessor("testing the document `vetting` processor"))
+        logging.error(f"Error processing vetting configuration: {e}")
+        return 100
