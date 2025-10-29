@@ -1,3 +1,4 @@
+
 import io
 import fitz
 import docx
@@ -157,3 +158,5 @@ class DocumentExtractor(object):
         except Exception as e:
             logging.error(f"Error processing dataframe: {e}")
             return None
+
+#final code
