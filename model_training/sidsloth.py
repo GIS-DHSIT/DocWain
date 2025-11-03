@@ -1,4 +1,3 @@
-# Fine-tuning script using Hugging Face Transformers + PEFT (LoRA) for instruction-tuned models
 
 import os
 from dataclasses import dataclass, field
@@ -6,16 +5,22 @@ from typing import Optional
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TrainingArguments,
+    Trainer,
+    DataCollatorForLanguageModeling
+)
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import BitsAndBytesConfig
 
-
 @dataclass
-class FineTuneConfig:
+class SlothConfig:
+    """Configuration for fine-tuning"""
     base_model: str = "mistralai/Mistral-7B-v0.1"
-    dataset_path: str = "qdrant_dataset.jsonl"
-    output_dir: str = "adapter_model"
+    dataset_path: str = "sidsloth_dataset.jsonl"
+    output_dir: str = "sidsloth_adapter"
     use_4bit: bool = True
     batch_size: int = 4
     learning_rate: float = 2e-4
@@ -27,28 +32,26 @@ class FineTuneConfig:
     lora_dropout: float = 0.05
     target_modules: list = field(default_factory=lambda: ["q_proj", "v_proj"])
 
-
-def fine_tune_with_lora(config: FineTuneConfig):
-    print("Loading tokenizer and dataset...")
+def train_sidsloth(config: SlothConfig):
+    print(" Loading tokenizer and dataset...")
     tokenizer = AutoTokenizer.from_pretrained(config.base_model, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     dataset = load_dataset("json", data_files=config.dataset_path)
 
-    def tokenize(example):
-        prompt = f"### Instruction:\\n{example['instruction']}\\n### Input:\\n{example['input']}\\n### Response:\\n{example['output']}"
-        return tokenizer(prompt, truncation=True, padding="max_length", max_length=512)
 
+    def tokenize(example):
+        prompt = f"### Instruction:\n{example['instruction']}\n### Input:\n{example['input']}\n### Response:\n{example['output']}"
+        return tokenizer(prompt, truncation=True, padding="max_length", max_length=512)
     tokenized_dataset = dataset["train"].map(tokenize, remove_columns=dataset["train"].column_names)
 
-    print("Loading base model...")
+    print(" Loading base model...")
     quant_config = BitsAndBytesConfig(
         load_in_4bit=config.use_4bit,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_quant_type="nf4",
     )
-
     model = AutoModelForCausalLM.from_pretrained(
         config.base_model,
         quantization_config=quant_config if config.use_4bit else None,
@@ -58,7 +61,7 @@ def fine_tune_with_lora(config: FineTuneConfig):
 
     model = prepare_model_for_kbit_training(model)
 
-    print("Setting up LoRA...")
+    print(" Setting up LoRA...")
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
@@ -86,8 +89,7 @@ def fine_tune_with_lora(config: FineTuneConfig):
     )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
-
-    print("Starting training...")
+    print(" Starting training...")
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -99,16 +101,8 @@ def fine_tune_with_lora(config: FineTuneConfig):
     trainer.train()
     model.save_pretrained(config.output_dir)
     tokenizer.save_pretrained(config.output_dir)
-    print(f"LoRA adapter saved to: {config.output_dir}")
-
+    print(f" LoRA adapter saved to: {config.output_dir}")
 
 if __name__ == "__main__":
-    cfg = FineTuneConfig()
-    fine_tune_with_lora(cfg)
-'''
-
-# Save script to file
-fine_tune_path = "/mnt/data/finetune_lora.py"
-with open(fine_tune_path, "w") as f:
-    f.write(fine_tune_script)
-'''
+    cfg = SlothConfig()
+    train_sidsloth(cfg)

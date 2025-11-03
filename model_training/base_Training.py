@@ -1,6 +1,7 @@
+
 # Step 1: Base setup for RAG-style pipeline
 # We'll structure the RAG module in the following components:
-# - OllamaManager: to list and use locally available models
+# - GeminiManager: to call Gemini API
 # - QdrantRetriever: to retrieve relevant documents
 # - RAGPipeline: combines query, retrieval, and generation
 
@@ -10,22 +11,25 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, SearchRequest
 from api.config import Config
 from sentence_transformers import SentenceTransformer
-import ollama
+
+# ---- Commented out Ollama since we are switching to Gemini ----
+# import ollama
+
+# Gemini API import
+import google.generativeai as genai
 
 
-# OllamaManager: handles local model listing and querying
-class OllamaManager:
-    def list_models(self) -> List[str]:
-        """List available Ollama models"""
-        result = subprocess.run(['ollama', 'list'], capture_output=True, text=True)
-        lines = result.stdout.splitlines()[1:]  # skip header
-        models = [line.split()[0] for line in lines if line.strip()]
-        return models
+# GeminiManager: handles Gemini API calls
+class GeminiManager:
+    def __init__(self, model_name: str = "gemini-2.5-flash"):
+        genai.configure(api_key=Config.GEMINI.API_KEY)
+        self.model_name = model_name
+        self.client = genai.GenerativeModel(self.model_name)
 
-    def run_model(self, model_name: str, prompt: str) -> str:
-        """Run a model with the given prompt"""
-        response = ollama.chat(model=model_name, messages=[{"role": "user", "content": prompt}])
-        return response['message']['content']
+    def run_model(self, prompt: str) -> str:
+        """Run Gemini model with the given prompt"""
+        response = self.client.generate_content(prompt)
+        return response.text
 
 
 # QdrantRetriever: connects to Qdrant and fetches top-k results
@@ -46,21 +50,22 @@ class QdrantRetriever:
         return [hit.payload['text'] for hit in hits if 'text' in hit.payload]
 
 
-# RAGPipeline: integrates everything together
+# RAGPipeline: integrates retriever + Gemini
 class RAGPipeline:
-    def __init__(self, retriever: QdrantRetriever, model_name: str):
+    def __init__(self, retriever: QdrantRetriever, model_name: str = "gemini-2.5-flash"):
         self.retriever = retriever
-        self.ollama = OllamaManager()
-        self.model_name = model_name
+        self.model_runner = GeminiManager(model_name=model_name)
 
     def ask(self, query: str, context_docs: int = 5) -> str:
         # Retrieve relevant documents from vector DB
         docs = self.retriever.retrieve_documents(query, top_k=context_docs)
-        context = "\n\n".join(docs)
+        context = "\n\n".join(docs) if docs else "No relevant documents found."
         prompt = f"Use the following context to answer the question:\n\n{context}\n\nQuestion: {query}"
-        return self.ollama.run_model(self.model_name, prompt)
+        return self.model_runner.run_model(prompt)
 
-# Setup example (won't run real inference here due to lack of actual Qdrant/Ollama access)
-rag = RAGPipeline(retriever=QdrantRetriever("67b4e5402191ec097997c2b4"), model_name="mistral")
-answer = rag.ask("summarize the content")
-print(answer)
+
+# Setup example (won't run real inference here due to lack of actual Qdrant/Gemini access)
+if __name__ == "__main__":
+    rag = RAGPipeline(retriever=QdrantRetriever("67b4e5402191ec097997c2b4"))
+    answer = rag.ask("summarize the content")
+    print(answer)

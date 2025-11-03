@@ -1,20 +1,51 @@
-fastapi==0.109.0
-uvicorn==0.27.0
-python-multipart==0.0.7
-pymongo==4.6.1
-boto3==1.34.0
-cryptography==41.0.7
-numpy==1.26.3
-pandas==2.2.0
-Pillow==10.2.0
-PyMuPDF==1.23.8
-python-docx==1.1.0
-python-pptx==0.6.22
-pytesseract==0.3.10
-sentence-transformers==2.2.2
-qdrant-client==1.7.0
-rank-bm25==0.2.2
-scikit-learn==1.4.0
-openai==1.10.0
-ollama==0.1.6
-redis
+# --- Core Web Framework ---
+fastapi
+uvicorn[standard]
+
+# --- Cloud SDKs ---
+boto3
+azure-storage-blob
+google-generativeai
+requests
+
+# --- Database & Vector Storage ---
+pymongo
+qdrant-client
+faiss-cpu
+rank-bm25
+
+# --- ML & NLP ---
+sentence-transformers
+scikit-learn
+numpy
+pandas
+
+# --- Document Processing ---
+python-docx
+python-pptx
+pdfminer.six
+pypdf2
+pytesseract
+pillow
+openpyxl
+pytz
+
+# --- Security & Encryption ---
+pycryptodome
+
+# --- Text Processing Utilities ---
+langchain
+tiktoken
+pydantic
+regex
+
+# --- Optional / Local Model Support ---
+ollama
+
+# --- Dev & Deployment (optional but recommended) ---
+python-dotenv
+loguru
+gunicorn
+
+
+

@@ -1,3 +1,4 @@
+
 import ollama
 import faiss
 import logging
@@ -5,40 +6,47 @@ import numpy as np
 from pymongo import MongoClient
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
-from qdrant_client.models import Distance, VectorParams,Filter
+from qdrant_client.models import Distance, VectorParams, Filter
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import AzureOpenAI
+# from openai import AzureOpenAI   # ❌ Commented out (we no longer use Azure OpenAI)
 import uvicorn
 from api.config import Config
 from api.dataHandler import trainData
+import google.generativeai as genai   # ✅ New Gemini import
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
-AzureOpenAI.api_key = Config.Model.AZURE_OPENAI_API_KEY
+
+# AzureOpenAI.api_key = Config.Model.AZURE_OPENAI_API_KEY   # ❌ Not needed anymore
 mongoClient = MongoClient(Config.MongoDB.URI)
-qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API,timeout=60)
+qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
+
+# ✅ Configure Gemini
+genai.configure(api_key=Config.Model.GEMINI_API_KEY)
 
 app = FastAPI(title="DocWain API")
 
+
 class QuestionRequest(BaseModel):
     query: str
-    schemaName:str = 'actual documents provided '
+    schemaName: str = 'actual documents provided '
     profile_id: str = "profile ID"
     model_name: str = "llama3.2"
 
-class AzureQuestionRequest(BaseModel):
+
+class GeminiQuestionRequest(BaseModel):  # ✅ renamed from AzureQuestionRequest
     query: str
-    schemaName:str = 'actual documents provided '
+    schemaName: str = 'actual documents provided '
     profile_id: str = "profile ID"
-    model_name: str = "OpenAI"
-    api_version: str = "2023-07-01-preview"
+    model_name: str = "gemini-2.5-flash"
 
 
 class TrainRequest(BaseModel):
     collectionName: str = 'documents'
     collectionDir: str = 'connectors'
     schemaName: str = 'actual documents provided '
+
 
 def ensure_qdrant_collection(collection_name, vector_size=384):
     """Ensures the Qdrant collection exists with the correct settings."""
@@ -57,6 +65,7 @@ def ensure_qdrant_collection(collection_name, vector_size=384):
             logging.info(f"Collection '{collection_name}' already exists.")
     except Exception as e:
         logging.error(f"Error ensuring collection in Qdrant: {e}")
+
 
 def load_embeddings_from_qdrant(collection_name, tags):
     """Loads embeddings from Qdrant Cloud."""
@@ -92,11 +101,9 @@ def load_embeddings_from_qdrant(collection_name, tags):
         return None
 
 
-
-def answer_question(query, collection_name,tag="default",model='llama3.2'):
-    """Answers a question based on stored embeddings."""
-
-    embeddings = load_embeddings_from_qdrant(collection_name,tag)
+def answer_question(query, collection_name, tag="default", model='llama3.2'):
+    """Answers a question based on stored embeddings using Ollama."""
+    embeddings = load_embeddings_from_qdrant(collection_name, tag)
     if embeddings is None:
         return "No trained model found!"
     logging.info(f"Processing query: {query} for model: {tag}")
@@ -114,33 +121,33 @@ def answer_question(query, collection_name,tag="default",model='llama3.2'):
     return response["message"]
 
 
-def azure_answer_question(query, collection_name,tag="default",model="gpt-35-turbo",apiVersion ="2023-07-01-preview"):
-    """Answers a question based on stored embeddings."""
-    embeddings = load_embeddings_from_qdrant(collection_name,tag)
+# ❌ Old Azure function (commented out)
+# def azure_answer_question(...):
+#     ...
+
+# ✅ New Gemini function
+def gemini_answer_question(query, collection_name, tag="default", model="gemini-1.5-flash"):
+    """Answers a question based on stored embeddings using Gemini."""
+    embeddings = load_embeddings_from_qdrant(collection_name, tag)
     if embeddings is None:
         return "No trained model found!"
+
     logging.info(f"Processing query: {query} for model: {tag}")
     query_embedding = MODEL.encode([query], convert_to_numpy=True)
     D, I = embeddings["index"].search(query_embedding, 3)
     retrieved_text = "\n".join([embeddings["texts"][i] for i in I[0]])
-    logging.info(f"Retrieving response using Azure OpenAI {model}.")
-    client = AzureOpenAI(
-        api_version=apiVersion,
-        api_key=Config.Model.AZURE_OPENAI_API_KEY,
-        azure_endpoint=Config.Model.AZURE_OPENAI_ENDPOINT,
-    )
-    response = client.chat.completions.create(
-        model="gpt-35-turbo",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": f"Answer based on this context: {retrieved_text}\nQuestion: {query}"}
-        ]
-    )
-    return response.choices[0].message.content
+
+    logging.info(f"Retrieving response using Gemini {model}.")
+    prompt = f"Answer based on this context:\n{retrieved_text}\n\nQuestion: {query}"
+
+    gemini_model = genai.GenerativeModel(model)
+    response = gemini_model.generate_content(prompt)
+    return response.text
+
 
 @app.post("/ask")
 def ask_question_api(request: QuestionRequest):
-    """API endpoint for answering questions."""
+    """API endpoint for answering questions (Ollama)."""
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
     answer = answer_question(request.query, request.schemaName,
@@ -148,33 +155,28 @@ def ask_question_api(request: QuestionRequest):
     return {"answer": answer}
 
 
-@app.post("/askAzure")
-def ask_question_api(request: AzureQuestionRequest):
-    """Azure openAI API endpoint for answering questions."""
+@app.post("/ask_gemini")   # ✅ renamed endpoint safely
+def ask_gemini_api(request: GeminiQuestionRequest):   # ✅ function name unique
+    """Gemini API endpoint for answering questions."""
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
-    answer = azure_answer_question(request.query, request.schemaName,
-                             request.profile_id, request.model_name,request.api_version)
-    return {"answer": answer}
+    answer = gemini_answer_question(request.query, request.schemaName,
+                                    request.profile_id, request.model_name)
+    return {"answer": answer if isinstance(answer, str) else str(answer)}
+
+
 
 
 @app.post("/train")
 def trigger_training(request: TrainRequest):
     """
     API endpoint to trigger document training.
-
-    Request Body:
-    - collectionName: Name of the MongoDB collection
-    - bucketName: Name of the bucket where documents are stored
-
-    Response:
-    - Training status message
     """
     try:
         logging.info(
             f"Received training request for collection: {request.collectionName}, connector: {request.collectionDir}")
 
-        status_response = trainData(request.collectionDir, request.schemaName,request.collectionName)
+        status_response = trainData(request.collectionDir, request.schemaName, request.collectionName)
 
         logging.info("Training completed successfully.")
         return {"status": "success", "message": "Training process triggered", "response": "Completed"}
