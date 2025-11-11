@@ -1,9 +1,9 @@
-
 import ollama
 import logging
 import uvicorn
 from pydantic import BaseModel
 from api.dataHandler import trainData # trainSingleDocument
+from api.dataHandler import train_single_document
 from api.dw_newron import answer_question
 from fastapi import FastAPI, HTTPException
 from api.dw_chat import (
@@ -16,7 +16,6 @@ from api.dw_chat import (
     get_current_session_context
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Path
 
 app = FastAPI(title="DocWain API")
 
@@ -63,18 +62,18 @@ def ask_question_api(request: QuestionRequest):
         "current_session_id": updated_history["sessions"][-1]["session_id"] if updated_history["sessions"] else None
     }
 
-'''
+
 @app.post("/train/{doc_id}")
-def trigger_single_training(doc_id: str = Path(..., description="The ID of the document to train")):
-    """API endpoint to train a single document."""
+def trigger_single_training(doc_id: str):
+    """API endpoint to train a single document by its document ID."""
     try:
         logging.info(f"Received single document training request for: {doc_id}")
-        result = trainSingleDocument(doc_id)
+        result = train_single_document(doc_id)
         return {"status": "success", "message": result}
     except Exception as e:
         logging.error(f"Single training API error: {e}")
         raise HTTPException(status_code=500, detail="Single document training failed")
-'''
+
 
 @app.get("/train")
 def trigger_training():
@@ -201,21 +200,3 @@ def delete_session_api(user_id: str, session_id: str):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

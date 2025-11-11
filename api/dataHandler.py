@@ -1,4 +1,3 @@
-
 import json
 import uuid
 import logging
@@ -14,13 +13,13 @@ from pymongo import MongoClient
 from urllib.parse import urlparse
 from bson.objectid import ObjectId
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, Distance, VectorParams, PayloadSchemaType
+from qdrant_client.models import PointStruct, Distance, VectorParams
 from sentence_transformers import SentenceTransformer
 from api.documentVetting import vettingProcessor
 from api.dw_document_extractor import DocumentExtractor
 from azure.storage.blob import BlobServiceClient
 import time
-import google.generativeai as genai
+import copy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -628,9 +627,101 @@ def trainData():
 
 
 
+# New function: train_single_document
+def train_single_document(doc_id: str):
+    """Train a single document identified by its string ID.
 
+    This function will process the specific document (perform extraction and vetting)
+    and then train embeddings for its files. If the document exists but is not in
+    UNDER_REVIEW status, it will still be processed for training (useful for manual triggers).
+    """
+    try:
+        logging.info(f"Starting single-document training for ID: {doc_id}")
 
+        # Fetch all document/connector info and locate requested doc
+        docColl = extract_document_info()
+        if not docColl or doc_id not in docColl:
+            logging.warning(f"Document {doc_id} not found in connector information")
+            return {"status": "not_found", "message": f"Document {doc_id} not found"}
 
+        # Prepare a single-document mapping for connectData. Force status to UNDER_REVIEW
+        # so that the existing processing path runs.
+        single_doc_info = copy.deepcopy(docColl[doc_id])
+        # Ensure dataDict exists and set status to UNDER_REVIEW to force processing
+        single_doc_info.setdefault('dataDict', {})
+        single_doc_info['dataDict']['status'] = 'UNDER_REVIEW'
 
+        # connectData expects a mapping of docId -> {dataDict, connDict}
+        resData = connectData({doc_id: single_doc_info})
 
+        if not resData:
+            logging.error(f"Processing failed or no content extracted for document {doc_id}")
+            update_training_status(doc_id, 'TRAINING_FAILED', 'Processing or extraction failed')
+            return {"status": "processing_failed", "message": f"Failed to process document {doc_id}"}
 
+        # Use same training flow as trainData but only for this document
+        training_results = {"successful": [], "failed": [], "total": len(resData)}
+
+        for d_id, doc_data in resData.items():
+            try:
+                profile_id = doc_data['profileId']
+                extracted_doc = doc_data['extractedDoc']
+                doc_name = doc_data.get('docName', 'Unknown')
+
+                logging.info(f"Training document: {doc_name} (ID: {d_id})")
+
+                file_results = []
+                file_errors = []
+
+                for file_name, file_content in extracted_doc.items():
+                    try:
+                        logging.info(f"Training file: {file_name}")
+                        result = train_on_document(
+                            file_content,
+                            profile_id,
+                            d_id,
+                            file_name
+                        )
+                        logging.info(result)
+                        file_results.append({"file_name": file_name, "result": result})
+                    except Exception as file_error:
+                        logging.error(f"Failed to train file {file_name}: {file_error}")
+                        file_errors.append({"file_name": file_name, "error": str(file_error)})
+
+                if file_results and not file_errors:
+                    update_training_status(d_id, 'TRAINING_COMPLETED')
+                    training_results['successful'].append({
+                        'doc_id': d_id,
+                        'doc_name': doc_name,
+                        'files_trained': len(file_results),
+                        'results': file_results
+                    })
+                elif file_results and file_errors:
+                    error_msg = f"Partial training: {len(file_results)} succeeded, {len(file_errors)} failed"
+                    update_training_status(d_id, 'TRAINING_PARTIALLY_COMPLETED', error_msg)
+                    training_results['successful'].append({
+                        'doc_id': d_id,
+                        'doc_name': doc_name,
+                        'files_trained': len(file_results),
+                        'files_failed': len(file_errors),
+                        'results': file_results,
+                        'errors': file_errors,
+                        'status': 'partial'
+                    })
+                else:
+                    error_msg = f"All {len(file_errors)} files failed to train"
+                    update_training_status(d_id, 'TRAINING_FAILED', error_msg)
+                    training_results['failed'].append({'doc_id': d_id, 'doc_name': doc_name, 'errors': file_errors})
+
+            except Exception as doc_error:
+                logging.error(f"Failed to train document {d_id}: {doc_error}")
+                update_training_status(d_id, 'TRAINING_FAILED', str(doc_error))
+                training_results['failed'].append({'doc_id': d_id, 'error': str(doc_error)})
+
+        logging.info(f"Single-document training completed for {doc_id}")
+        return {"status": "completed", "results": training_results}
+
+    except Exception as e:
+        logging.error(f"Critical error during single-document training for {doc_id}: {e}", exc_info=True)
+        update_training_status(doc_id, 'TRAINING_FAILED', str(e))
+        return {"status": "error", "message": str(e)}
