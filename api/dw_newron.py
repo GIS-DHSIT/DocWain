@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+import hashlib
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
