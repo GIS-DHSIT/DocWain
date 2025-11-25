@@ -40,8 +40,8 @@ class Config:
     # AZUREGPT4O_Version = "2024-05-01-preview"
 
     class MongoDB:
-        URI = 'mongodb+srv://dhsdbadmin:d%21p%40s5w0rd@dw-dev-mongodb.global.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000'
-        DB = 'test'
+        URI = 'mongodb+srv://admin:nj4pJfO3e1FcGXDo@cluster0.47nz8.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0'
+        DB = 'docwain'
         CONNECTOR = 'connectors'
         DOCUMENTS = 'documents'
         PROFILES = 'profiles'

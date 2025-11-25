@@ -1,5 +1,6 @@
 import json
 import uuid
+import nltk
 import logging
 import hashlib
 import subprocess
