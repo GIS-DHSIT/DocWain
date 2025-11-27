@@ -1,6 +1,5 @@
 import json
 import uuid
-import nltk
 import logging
 import hashlib
 import subprocess
@@ -10,26 +9,128 @@ import pandas as pd
 from io import BytesIO
 from api.config import Config
 from Crypto.Cipher import AES
-from pymongo import MongoClient
+from pymongo import MongoClient, errors
 from urllib.parse import urlparse
 from bson.objectid import ObjectId
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, Distance, VectorParams
+from qdrant_client.models import PointStruct, Distance, VectorParams, SparseVectorParams, SparseVector
 from sentence_transformers import SentenceTransformer
-from api.documentVetting import vettingProcessor
+from api.documentVetting import vettingProcessor, mask_document_content
 from api.dw_document_extractor import DocumentExtractor
 from azure.storage.blob import BlobServiceClient
 import time
 import copy
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Initialize global objects
-docEx = DocumentExtractor()
-MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
-mongoClient = MongoClient(Config.MongoDB.URI)
+# Lazy-loaded globals to avoid heavy initialization during import
+docEx = None
+_MODEL = None
+_QDRANT_CLIENT = None
+logger = logging.getLogger(__name__)
+
+
+def normalize_embedding_matrix(raw_vectors, expected_dim=None):
+    """
+    Normalize a batch of embeddings into List[List[float]].
+
+    Acceptable inputs:
+    - np.ndarray of shape (n, dim)
+    - list[list[float]] (or list[tuple])
+    - list[np.ndarray]
+
+    Everything else is treated as a bug in the upstream pipeline.
+    """
+    # np.ndarray -> list of lists
+    if isinstance(raw_vectors, np.ndarray):
+        raw_vectors = raw_vectors.tolist()
+
+    if not isinstance(raw_vectors, (list, tuple)) or not raw_vectors:
+        raise TypeError(f"Embedding batch must be non-empty list/tuple, got {type(raw_vectors)}")
+
+    normalized_vectors = []
+    dim = None
+
+    for idx, row in enumerate(raw_vectors):
+        # Single row can be np.array, list, or tuple
+        if isinstance(row, np.ndarray):
+            row = row.tolist()
+
+        if not isinstance(row, (list, tuple)):
+            raise TypeError(f"Embedding row at index {idx} must be list/tuple, got {type(row)}")
+
+        vec = [float(x) for x in row]
+
+        if dim is None:
+            dim = len(vec)
+        elif len(vec) != dim:
+            raise ValueError(f"Inconsistent embedding size at index {idx}: {len(vec)} vs {dim}")
+
+        normalized_vectors.append(vec)
+
+    if expected_dim is not None and dim is not None and dim != expected_dim:
+        raise ValueError(f"Embedding dimension mismatch: expected {expected_dim}, got {dim}")
+
+    return normalized_vectors, (dim or expected_dim)
+
+
+def create_mongo_client():
+    """Create a Mongo client with a graceful fallback when the primary URI is misconfigured."""
+    primary_uri = Config.MongoDB.URI
+    fallback_uri = getattr(Config.MongoDB, "FALLBACK_URI", None)
+    try:
+        client = MongoClient(primary_uri, serverSelectionTimeoutMS=5000)
+        try:
+            # Verify connectivity early so failures are visible
+            client.admin.command('ping')
+            logging.info(f"Connected to MongoDB primary URI: {primary_uri}")
+        except Exception as ping_exc:
+            logging.warning(f"Ping to primary MongoDB URI failed: {ping_exc}")
+            # allow fallback to kick in below
+            raise ping_exc
+        return client
+    except Exception as exc:
+        if fallback_uri and fallback_uri != primary_uri:
+            logging.warning(f"Primary MongoDB URI failed ({exc}); attempting fallback {fallback_uri}")
+            try:
+                client = MongoClient(fallback_uri, serverSelectionTimeoutMS=5000)
+                client.admin.command('ping')
+                logging.info(f"Connected to MongoDB fallback URI: {fallback_uri}")
+                return client
+            except Exception as fb_exc:
+                logging.error(f"Fallback MongoDB URI also failed: {fb_exc}")
+                raise
+        logging.error(f"Unable to create MongoClient: {exc}")
+        raise
+
+
+mongoClient = create_mongo_client()
 db = mongoClient[Config.MongoDB.DB]
-qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
+
+
+def get_doc_extractor():
+    """Lazy init for document extractor."""
+    global docEx
+    if docEx is None:
+        docEx = DocumentExtractor()
+    return docEx
+
+
+def get_model():
+    """Lazy init for sentence transformer model to cut import-time cost."""
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
+    return _MODEL
+
+
+def get_qdrant_client():
+    """Lazy init for Qdrant client."""
+    global _QDRANT_CLIENT
+    if _QDRANT_CLIENT is None:
+        _QDRANT_CLIENT = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+    return _QDRANT_CLIENT
 
 
 def decrypt_data(encrypted_value: str, encryption_key=Config.Encryption.ENCRYPTION_KEY) -> str:
@@ -53,22 +154,23 @@ def fileProcessor(content, file):
     extracted_data = {}
     try:
         file_name = file.split('/')[-1]
+        extractor = get_doc_extractor()
         if content:
             logging.info(f"Extracting File {file_name}")
             if file_name.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
-                extracted_data[file_name] = docEx.extract_dataframe(df, MODEL)
+                extracted_data[file_name] = extractor.extract_dataframe(df, get_model())
             elif file_name.endswith((".xlsx", ".xls")):
                 df = pd.read_excel(BytesIO(content))
-                extracted_data[file_name] = docEx.extract_dataframe(df, MODEL)
+                extracted_data[file_name] = extractor.extract_dataframe(df, get_model())
             elif file_name.endswith(".json"):
                 extracted_data[file_name] = json.loads(content.decode("utf-8"))
             elif file_name.endswith(".pdf"):
-                extracted_data[file_name] = docEx.extract_text_from_pdf(content)
+                extracted_data[file_name] = extractor.extract_text_from_pdf(content)
             elif file_name.endswith(".docx"):
-                extracted_data[file_name] = docEx.extract_text_from_docx(content)
+                extracted_data[file_name] = extractor.extract_text_from_docx(content)
             elif file_name.endswith((".pptx", ".ppt")):
-                extracted_data[file_name] = docEx.extract_text_from_pptx(content)
+                extracted_data[file_name] = extractor.extract_text_from_pptx(content)
             elif file_name.endswith(".txt"):
                 extracted_data[file_name] = content.decode("utf-8")
             else:
@@ -176,6 +278,82 @@ def update_training_status(document_id, status, error_msg=None):
         return {"status": "error", "message": str(e)}
 
 
+def update_pii_stats(document_id, masked_count, high_confidential, pii_items=None):
+    """Persist PII masking stats for a document."""
+    try:
+        filter_criteria = {}
+        if ObjectId.is_valid(str(document_id)):
+            filter_criteria["_id"] = ObjectId(str(document_id))
+        else:
+            filter_criteria["_id"] = str(document_id)
+
+        update_data = {
+            "pii_masked_count": int(masked_count),
+            "pii_high_confidential": bool(high_confidential),
+            "pii_has_pii": bool(masked_count or (pii_items or [])),
+            "pii_items": pii_items or [],
+            "pii_last_updated": time.time()
+        }
+        collection = db[Config.MongoDB.DOCUMENTS]
+        collection.update_one(filter_criteria, {"$set": update_data})
+    except Exception as e:
+        logging.error(f"Error updating PII stats for {document_id}: {e}")
+
+
+def get_pii_stats(document_id):
+    """Retrieve PII masking stats for a document."""
+    try:
+        # Try by ObjectId, then string, then fallback field names
+        candidates = []
+        if ObjectId.is_valid(str(document_id)):
+            candidates.append({"_id": ObjectId(str(document_id))})
+        candidates.append({"_id": str(document_id)})
+        candidates.append({"document_id": str(document_id)})
+
+        doc = None
+        for crit in candidates:
+            doc = db[Config.MongoDB.DOCUMENTS].find_one(crit, {
+                "pii_masked_count": 1,
+                "pii_high_confidential": 1,
+                "pii_has_pii": 1,
+                "pii_items": 1,
+                "status": 1,
+                "name": 1,
+                "subscriptionId": 1,
+                "profile": 1,
+            })
+            if doc:
+                break
+
+        if not doc:
+            return None
+
+        return {
+            "document_id": str(document_id),
+            "name": doc.get("name"),
+            "status": doc.get("status"),
+            "subscription_id": doc.get("subscriptionId"),
+            "profile_id": str(doc.get("profile")) if doc.get("profile") else None,
+            "pii_masked_count": doc.get("pii_masked_count", 0),
+            "pii_high_confidential": doc.get("pii_high_confidential", False),
+            "pii_has_pii": doc.get("pii_has_pii", False),
+            "pii_items": doc.get("pii_items", [])
+        }
+    except Exception as e:
+        logging.error(f"Error fetching PII stats for {document_id}: {e}")
+        return None
+
+
+# -----------------------------
+# Qdrant helpers (subscription scoped)
+# -----------------------------
+
+def build_collection_name(subscription_id: str) -> str:
+    """Build a collection name scoped by subscription only."""
+    safe_sub = str(subscription_id).replace(" ", "_")
+    return f"{safe_sub}"
+
+
 def get_azure_docs(files):
     """Fetches documents from Azure Blob Storage."""
     try:
@@ -198,8 +376,20 @@ def connectData(documentConnection):
         connData = v['connDict']
         profileId = str(docData['profile'])
         docId = str(docData['_id'])
+        # Prefer explicit subscription/subscriptionId fields from document, then connector, then default.
+        subscriptionId = str(
+            docData.get('subscriptionId')
+            or docData.get('subscription_id')
+            or docData.get('subscription')
+            or (connData.get('subscriptionId') if isinstance(connData, dict) else None)
+            or (connData.get('subscription') if isinstance(connData, dict) else None)
+            or "default"
+        )
 
-        if docData['status'] == 'UNDER_REVIEW':
+        # Allow reprocessing documents that previously failed training
+        allowed_statuses = {'UNDER_REVIEW', 'TRAINING_FAILED'}
+
+        if docData.get('status') in allowed_statuses:
             try:
                 logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
 
@@ -284,12 +474,34 @@ def connectData(documentConnection):
 
                 # Store all extracted documents for this document ID
                 if all_extracted_docs:
+                    # Mask PII, track counts, and block training if high confidentiality detected
+                    masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
+                    update_pii_stats(docId, pii_count, high_conf, pii_items)
+
+                    if high_conf:
+                        logging.error(f"High confidentiality content detected in document {docId}; blocking training")
+                        update_training_status(docId, 'TRAINING_BLOCKED_CONFIDENTIAL', 'High confidentiality content detected')
+                        continue
+
+                    # Recompute embeddings for structured data after masking
+                    for fname, content in masked_docs.items():
+                        if isinstance(content, dict) and "texts" in content:
+                            texts = content.get("texts") or []
+                            if texts:
+                                model = get_model()
+                                content["embeddings"] = model.encode(texts, convert_to_numpy=True)
+                            masked_docs[fname] = content
+
+                    vettingPoints = vettingProcessor(masked_docs)
+                    updateVetting(docId, vettingPoints)
+
                     dataDict[docId] = {
+                        'subscriptionId': subscriptionId,
                         'profileId': profileId,
-                        'extractedDoc': all_extracted_docs,
+                        'extractedDoc': masked_docs,
                         'docName': docData.get('name', 'Unknown')
                     }
-                    logging.info(f"Stored {len(all_extracted_docs)} files for document {docId}")
+                    logging.info(f"Stored {len(masked_docs)} files for document {docId} (PII masked: {pii_count})")
                 else:
                     logging.error(f"No documents extracted for {docId}")
                     update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
@@ -300,7 +512,7 @@ def connectData(documentConnection):
 
         elif docData['status'] == 'DELETED':
             profileData = str(docData['profile'])
-            delete_embeddings(profileData, docId)
+            delete_embeddings(subscriptionId, profileData, docId)
 
     return dataDict
 
@@ -308,29 +520,67 @@ def connectData(documentConnection):
 def collectionConnect(name):
     """Fetches documents from a MongoDB collection."""
     logging.info(f"Fetching connection details for collection: {name}")
-    collectionConn = db[name]
-    return collectionConn.find()
+    try:
+        collection = db[name]
+        try:
+            # Count documents to make emptiness explicit in the logs
+            count = collection.count_documents({})
+            logging.info(f"Collection '{name}' document count: {count}")
+        except Exception as count_exc:
+            logging.warning(f"Unable to count documents for collection '{name}': {count_exc}")
+        return collection.find()
+    except Exception as e:
+        logging.error(f"Error connecting to collection {name}: {e}")
+        # return an empty iterator to keep calling code behavior predictable
+        return []
 
 
 def extract_document_info():
     """Retrieves connector details from MongoDB."""
     try:
+        logging.info(f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
+        try:
+            existing = db.list_collection_names()
+            logging.info(f"Existing collections in DB '{Config.MongoDB.DB}': {existing}")
+        except Exception as lc_exc:
+            logging.warning(f"Could not list collections: {lc_exc}")
+
         docs = collectionConnect(Config.MongoDB.DOCUMENTS)
         Docs = {}
+        # If docs is a cursor/iterable, iterate, otherwise it's probably an empty list
         for doc in docs:
-            refConnector = doc['_id'].__str__()
+            try:
+                refConnector = doc.get('_id').__str__()
+            except Exception:
+                # fallback if doc['_id'] is not present
+                refConnector = str(doc.get('_id', 'unknown'))
             Docs[refConnector] = doc
+        logging.info(f"Found {len(Docs)} document definitions in collection '{Config.MongoDB.DOCUMENTS}'")
+
         connInfo = {}
         connectors = collectionConnect(Config.MongoDB.CONNECTOR)
         for conn in connectors:
-            connId = conn['_id'].__str__()
+            try:
+                connId = conn.get('_id').__str__()
+            except Exception:
+                connId = str(conn.get('_id', 'unknown'))
             connInfo[connId] = conn
+        logging.info(f"Found {len(connInfo)} connector definitions in collection '{Config.MongoDB.CONNECTOR}'")
+
         connList = list(connInfo.keys())
         docInfo = {}
         for docId, docData in Docs.items():
-            connRef = docData['connector'].__str__()
+            # docData expected to have a 'connector' field referencing a connector id
+            try:
+                connRef = docData.get('connector').__str__()
+            except Exception:
+                connRef = str(docData.get('connector', ''))
             if connRef in connList:
                 docInfo[docId] = {'dataDict': docData, 'connDict': connInfo[connRef]}
+            else:
+                logging.info(f"Document {docId} references connector {connRef} which is not in connectors list")
+
+        logging.info(f"Extracted {len(docInfo)} documents with valid connectors")
         return docInfo
 
     except Exception as e:
@@ -338,22 +588,22 @@ def extract_document_info():
         return {}
 
 
-def delete_embeddings(tag, file_id):
-    """Delete embeddings from Qdrant for a specific file."""
+def delete_embeddings(subscription_id, profile_id, file_id):
+    """Delete embeddings from Qdrant for a specific file within a subscription/profile."""
     try:
-        # Define the filter to find the embeddings related to the file
+        client = get_qdrant_client()
+        collection_name = build_collection_name(subscription_id)
         filter_criteria = {
             "must": [
-                {"key": "document_id", "match": {"value": file_id}}
+                {"key": "document_id", "match": {"value": file_id}},
+                {"key": "profile_id", "match": {"value": str(profile_id)}}
             ]
         }
-
-        # Perform the deletion
-        qdrant_client.delete(
-            collection_name=tag,
+        client.delete(
+            collection_name=collection_name,
             points_selector=filter_criteria
         )
-        logging.info(f"Embeddings successfully deleted for file {file_id} in collection {tag}.")
+        logging.info(f"Embeddings successfully deleted for file {file_id} in collection {collection_name}.")
         return {"status": "success", "message": f"Embeddings deleted for file {file_id}."}
     except Exception as e:
         logging.error(f"Error deleting embeddings: {e}")
@@ -361,59 +611,138 @@ def delete_embeddings(tag, file_id):
 
 
 def ensure_qdrant_collection(collection_name, vector_size=768):
-    """Ensures the Qdrant collection exists with the correct settings."""
+    """Ensures the Qdrant collection exists with the correct settings and payload indexes."""
     try:
-        collections = qdrant_client.get_collections().collections
+        client = get_qdrant_client()
+        collections = client.get_collections().collections
         existing_collections = {col.name for col in collections}
 
         if collection_name not in existing_collections:
             logging.info(f"Creating Qdrant collection: {collection_name}")
-            qdrant_client.create_collection(
+            client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+                vectors_config={
+                    "content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)
+                },
+                sparse_vectors_config={
+                    "keywords_vector": SparseVectorParams()
+                }
             )
             logging.info(f"Collection '{collection_name}' created successfully.")
         else:
             logging.info(f"Collection '{collection_name}' already exists.")
+
+        # Ensure payload indexes exist for common filters
+        for field in ["subscription_id", "profile_id", "document_id", "tag"]:
+            try:
+                client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field,
+                    field_schema="keyword"
+                )
+                logging.info(f"Created payload index for field '{field}' in collection '{collection_name}'")
+            except Exception as idx_exc:
+                # Likely already exists; log at debug level
+                logging.debug(f"Payload index for '{field}' may already exist: {idx_exc}")
+
     except Exception as e:
         logging.error(f"Error ensuring collection in Qdrant: {e}")
         raise
 
 
-def save_embeddings_to_qdrant(embeddings, tags, doctag, source_filename, batch_size=100):
-    """Ensures the collection exists and saves embeddings to Qdrant."""
+def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, source_filename, batch_size=100):
+    """Ensures the collection exists and saves embeddings to Qdrant (scoped by subscription/profile)."""
     try:
+        client = get_qdrant_client()
         if "embeddings" not in embeddings or embeddings["embeddings"] is None:
             logging.error(f"Error: 'embeddings' key missing or None for document {doctag}!")
             raise ValueError("Embeddings data is invalid")
 
-        embedding_array = np.asarray(embeddings["embeddings"], dtype=np.float32)
-        if embedding_array.size == 0 or embedding_array.shape[1] == 0:
+        raw_vectors = embeddings["embeddings"]
+
+        # Fallback: if embeddings are actually plain text strings, re-embed them
+        if isinstance(raw_vectors, (list, tuple)) and raw_vectors and all(isinstance(v, str) for v in raw_vectors):
+            logging.warning(
+                f"Embeddings payload appears to be text; re-encoding {len(raw_vectors)} chunks for document {doctag}"
+            )
+            model = get_model()
+            raw_vectors = model.encode(raw_vectors, convert_to_numpy=True, normalize_embeddings=True)
+
+        # Normalize matrix -> List[List[float]]
+        normalized_vectors, vector_size = normalize_embedding_matrix(raw_vectors)
+
+        if vector_size == 0:
             logging.error(f"Error: Trying to save empty embeddings for document {doctag}!")
             raise ValueError("Empty embeddings array")
 
-        vector_size = embedding_array.shape[1]
-        ensure_qdrant_collection(tags, vector_size)
+        collection_name = build_collection_name(subscription_id)
+        ensure_qdrant_collection(collection_name, vector_size)
 
-        logging.info(f"Saving embeddings to Qdrant for profile: {tags}, document: {doctag}, file: {source_filename}")
+        logging.info(f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
+
+        texts = embeddings.get("texts") or []
+        chunk_count = len(texts)
+        if chunk_count != len(normalized_vectors):
+            logging.warning(
+                f"Mismatch between number of texts ({len(texts)}) and vectors ({len(normalized_vectors)}) "
+                f"for document {doctag}. Truncating to minimum."
+            )
+        max_len = min(len(texts), len(normalized_vectors))
+
+        pages = embeddings.get("pages") or []
+        sections = embeddings.get("sections") or []
+        sparse_vectors = embeddings.get("sparse_vectors") or []
+        summaries = embeddings.get("summaries") or []
 
         all_points = []
-        for vector, text in zip(embedding_array, embeddings["texts"]):
-            if np.all(vector == 0) or np.size(vector) == 0:
+        for idx in range(max_len):
+            vector = normalized_vectors[idx]
+            text = texts[idx]
+            if not vector:
                 logging.warning(f"Skipping empty or invalid vector for text: {text[:50]}...")
                 continue
 
-            vector = vector.tolist()
+            logger.debug(
+                "Embedding normalized: type=%s, first_dim_type=%s, dims=%s",
+                type(vector),
+                type(vector[0]) if isinstance(vector, list) and vector else None,
+                len(vector) if isinstance(vector, list) else None,
+            )
+
+            page_val = pages[idx] if idx < len(pages) else None
+            section_val = sections[idx] if idx < len(sections) else None
+            summary_val = summaries[idx] if idx < len(summaries) else None
+
+            sparse_vector = None
+            if idx < len(sparse_vectors):
+                sv = sparse_vectors[idx]
+                if sv.get("indices") and sv.get("values"):
+                    # Ensure plain Python types to avoid serialization issues
+                    sparse_vector = SparseVector(
+                        indices=[int(i) for i in sv["indices"]],
+                        values=[float(v) for v in sv["values"]]
+                    )
+
+            vector_payload = {"content_vector": vector}
+            if sparse_vector is not None:
+                vector_payload["keywords_vector"] = sparse_vector
 
             all_points.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
-                    vector=vector,
+                    vector=vector_payload,
                     payload={
-                        "tag": str(tags),
+                        "subscription_id": str(subscription_id),
+                        "profile_id": str(profile_id),
+                        "tag": build_collection_name(subscription_id),
                         "text": text,
                         "document_id": str(doctag),
-                        "source_file": source_filename
+                        "source_file": source_filename,
+                        "chunk_index": idx,
+                        "chunk_count": max_len,
+                        "page": page_val,
+                        "section": section_val,
+                        "summary": summary_val
                     }
                 )
             )
@@ -425,7 +754,7 @@ def save_embeddings_to_qdrant(embeddings, tags, doctag, source_filename, batch_s
         # Upload in batches
         for i in range(0, len(all_points), batch_size):
             batch = all_points[i:i + batch_size]
-            qdrant_client.upsert(collection_name=tags, points=batch)
+            client.upsert(collection_name=collection_name, points=batch)
             logging.info(
                 f"Uploaded batch {i // batch_size + 1}/{(len(all_points) + batch_size - 1) // batch_size} for {source_filename}")
 
@@ -438,14 +767,14 @@ def save_embeddings_to_qdrant(embeddings, tags, doctag, source_filename, batch_s
         raise
 
 
-def train_on_document(text, profile_tag, doc_tag, doc_name):
+def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
     """Trains and stores embeddings from a document using chunking."""
     try:
         logging.info(f"Starting training for file {doc_name} (document {doc_tag}) in profile {profile_tag}")
 
         if isinstance(text, dict):
             # Already has embeddings
-            result = save_embeddings_to_qdrant(text, profile_tag, doc_tag, doc_name)
+            result = save_embeddings_to_qdrant(text, subscription_id, profile_tag, doc_tag, doc_name)
             return f"Training complete for {doc_name}. Stored {result.get('points_saved', 0)} embeddings in {profile_tag}"
 
         elif isinstance(text, str):
@@ -457,15 +786,45 @@ def train_on_document(text, profile_tag, doc_tag, doc_name):
             chunks = text.split(". ")
             chunks = [c.strip() for c in chunks if c.strip()]
 
+            # Add document name to each chunk to improve name-based retrieval
+            chunks = [f"{doc_name}: {c}" for c in chunks]
+
             if not chunks:
                 logging.error(f"No valid chunks created for file {doc_name}")
                 raise ValueError(f"No valid text chunks in {doc_name}")
 
             logging.info(f"Training on {len(chunks)} chunks for file {doc_name}")
-            embeddings = MODEL.encode(chunks, convert_to_numpy=True)
+            model = get_model()
+            embeddings_array = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
 
+            # Build sparse keyword vectors for improved keyword-heavy matching
+            tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
+            tfidf_matrix = tfidf.fit_transform(chunks)
+            sparse_vectors = []
+            for row in tfidf_matrix:
+                coo = row.tocoo()
+                sparse_vectors.append({
+                    "indices": coo.col.tolist(),
+                    "values": coo.data.astype(np.float32).tolist()
+                })
+
+            # Lightweight summaries to aid reranking/display
+            summaries = []
+            for c in chunks:
+                words = c.split()
+                summaries.append(" ".join(words[:40]))
+
+            embeddings = {
+                "embeddings": embeddings_array,
+                "texts": chunks,
+                "sparse_vectors": sparse_vectors,
+                "summaries": summaries
+            }
+
+            # Save embeddings (already normalized by model)
             result = save_embeddings_to_qdrant(
-                {"embeddings": embeddings, "texts": chunks},
+                embeddings,
+                subscription_id,
                 profile_tag,
                 doc_tag,
                 doc_name
@@ -496,17 +855,25 @@ def trainData():
 
         logging.info(f"Found {len(docColl)} documents in total")
 
-        # Filter only UNDER_REVIEW documents
+        # Filter documents eligible for training (exclude completed or deleted)
         under_review_docs = {
+            doc_id: doc_info
+            for doc_id, doc_info in docColl.items()
+            if doc_info['dataDict'].get('status') not in {'DELETED', 'TRAINING_COMPLETED'}
+        }
+
+        # Also compute exact count for explicitly UNDER_REVIEW status for clarity
+        explicitly_under_review = {
             doc_id: doc_info
             for doc_id, doc_info in docColl.items()
             if doc_info['dataDict'].get('status') == 'UNDER_REVIEW'
         }
 
-        logging.info(f"Found {len(under_review_docs)} documents with status UNDER_REVIEW")
+        logging.info(f"Found {len(under_review_docs)} documents eligible for processing (excluding DELETED/TRAINING_COMPLETED)")
+        logging.info(f"Found {len(explicitly_under_review)} documents with status == UNDER_REVIEW")
 
         if not under_review_docs:
-            logging.warning("No documents with UNDER_REVIEW status")
+            logging.warning("No documents eligible for training (excluding DELETED/TRAINING_COMPLETED)")
             return {"status": "no_documents", "message": "No documents pending training"}
 
         # Process documents and extract data
@@ -528,6 +895,7 @@ def trainData():
         for doc_id, doc_data in resData.items():
             try:
                 profile_id = doc_data['profileId']
+                subscription_id = doc_data.get('subscriptionId', 'default')
                 extracted_doc = doc_data['extractedDoc']
                 doc_name = doc_data.get('docName', 'Unknown')
 
@@ -545,6 +913,7 @@ def trainData():
                         logging.info(f"Training file: {file_name}")
                         result = train_on_document(
                             file_content,
+                            subscription_id,
                             profile_id,
                             doc_id,
                             file_name
@@ -666,6 +1035,7 @@ def train_single_document(doc_id: str):
         for d_id, doc_data in resData.items():
             try:
                 profile_id = doc_data['profileId']
+                subscription_id = doc_data.get('subscriptionId', 'default')
                 extracted_doc = doc_data['extractedDoc']
                 doc_name = doc_data.get('docName', 'Unknown')
 
@@ -679,6 +1049,7 @@ def train_single_document(doc_id: str):
                         logging.info(f"Training file: {file_name}")
                         result = train_on_document(
                             file_content,
+                            subscription_id,
                             profile_id,
                             d_id,
                             file_name

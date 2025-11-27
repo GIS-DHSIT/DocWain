@@ -38,7 +38,7 @@ langchain
 tiktoken
 pydantic
 regex
-
+redis
 # --- Optional / Local Model Support ---
 ollama
 
