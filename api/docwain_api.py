@@ -1,9 +1,13 @@
 import ollama
 import logging
 import uvicorn
+from typing import Optional
 from pydantic import BaseModel
+import os, sys
+path = os.getcwd()
+sys.path.append(path)
 from api.dataHandler import trainData # trainSingleDocument
-from api.dataHandler import train_single_document
+from api.dataHandler import train_single_document, get_pii_stats
 from api.dw_newron import answer_question
 from fastapi import FastAPI, HTTPException
 from api.dw_chat import (
@@ -12,8 +16,7 @@ from api.dw_chat import (
     add_message_to_history,
     get_session_list,
     get_session_by_id,
-    delete_session,
-    get_current_session_context
+    delete_session
 )
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,8 +36,10 @@ class QuestionRequest(BaseModel):
     query: str
     user_id: str = 'someone@email.com'
     profile_id: str = "67ac62ddfaa3aee44d38f4a5"
+    subscription_id: str = "default"
     model_name: str = "gemini-2.5-flash"
     persona: str = "Document Assistant"
+    session_id: Optional[str] = None
 
 
 @app.post("/ask")
@@ -43,31 +48,39 @@ def ask_question_api(request: QuestionRequest):
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
 
-    # Get current session context for better responses
-    context = get_current_session_context(request.user_id)
+    # Treat missing session_id as a new chat so each invocation gets its own session
+    force_new_session = request.session_id is None
+
     answer = answer_question(
         request.query,
         request.user_id,
         request.profile_id,
+        request.subscription_id,
         request.model_name,
         request.persona
     )
 
-    # Add message to history (creates new session if needed)
-    updated_history = add_message_to_history(request.user_id, request.query, answer)
+    # Add message to history (creates a new session when none is supplied)
+    _history, active_session_id = add_message_to_history(
+        request.user_id,
+        request.query,
+        answer,
+        session_id=request.session_id,
+        force_new_session=force_new_session
+    )
 
     logging.info(f"[ASK] User: {request.user_id}, Answer: {answer}")
     return {
         "answer": answer,
-        "current_session_id": updated_history["sessions"][-1]["session_id"] if updated_history["sessions"] else None
+        "current_session_id": active_session_id
     }
 
 
 @app.post("/train/{doc_id}")
-def trigger_single_training(doc_id: str):
+def trigger_single_training(doc_id: str, subscription_id: str = "default"):
     """API endpoint to train a single document by its document ID."""
     try:
-        logging.info(f"Received single document training request for: {doc_id}")
+        logging.info(f"Received single document training request for: {doc_id} (subscription: {subscription_id})")
         result = train_single_document(doc_id)
         return {"status": "success", "message": result}
     except Exception as e:
@@ -76,10 +89,10 @@ def trigger_single_training(doc_id: str):
 
 
 @app.get("/train")
-def trigger_training():
+def trigger_training(subscription_id: str = "default"):
     """API endpoint to trigger document training."""
     try:
-        logging.info("Received training request")
+        logging.info(f"Received training request (subscription: {subscription_id})")
         status_response = trainData()
         logging.info(status_response)
         return {"status": "success", "message": status_response, "response": "Executed"}
@@ -118,7 +131,7 @@ def get_chat_history_api(user_id: str):
 '''
 
 @app.get("/chat-history/{user_id}")
-def get_chat_history_api(user_id: str):
+def get_chat_history_api(user_id: str, subscription_id: str = "default"):
     """
     Returns all chat sessions for a user in the structure expected by NestJS.
     """
@@ -149,7 +162,7 @@ def get_chat_history_api(user_id: str):
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
 
 @app.get("/sessions/{user_id}")
-def get_sessions_api(user_id: str):
+def get_sessions_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to get list of all sessions (for sidebar)."""
     try:
         sessions = get_session_list(user_id)
@@ -161,7 +174,7 @@ def get_sessions_api(user_id: str):
 
 
 @app.get("/session/{user_id}/{session_id}")
-def get_session_api(user_id: str, session_id: str):
+def get_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to get a specific session's messages."""
     try:
         session = get_session_by_id(user_id, session_id)
@@ -175,7 +188,7 @@ def get_session_api(user_id: str, session_id: str):
 
 
 @app.delete("/chat-history/{user_id}")
-def delete_chat_history_api(user_id: str):
+def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to delete all chat history for a user."""
     try:
         result = delete_chat_history(user_id)
@@ -186,7 +199,7 @@ def delete_chat_history_api(user_id: str):
 
 
 @app.delete("/session/{user_id}/{session_id}")
-def delete_session_api(user_id: str, session_id: str):
+def delete_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to delete a specific session."""
     try:
         result = delete_session(user_id, session_id)
@@ -196,6 +209,19 @@ def delete_session_api(user_id: str, session_id: str):
         raise HTTPException(status_code=500, detail="Failed to delete session")
 
 
+@app.get("/pii/{doc_id}")
+def get_pii_info(doc_id: str, subscription_id: str = "default"):
+    """API endpoint to retrieve PII masking stats for a document."""
+    try:
+        stats = get_pii_stats(doc_id)
+        if not stats:
+            raise HTTPException(status_code=404, detail=f"Document not found for id {doc_id}")
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to retrieve PII stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve PII stats")
 
 
 if __name__ == "__main__":

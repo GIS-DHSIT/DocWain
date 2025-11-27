@@ -1,5 +1,5 @@
-
 import re
+from qdrant_client.http.exceptions import UnexpectedResponse
 import json
 import time
 import logging
@@ -14,6 +14,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct
 from sklearn.preprocessing import MinMaxScaler
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import ollama
+import os
+import redis
 import google.generativeai as genai
 from api.config import Config
 import nltk
@@ -27,20 +30,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Download required NLTK data
-try:
-    nltk.download('wordnet', quiet=True)
-    nltk.download('omw-1.4', quiet=True)
-    nltk.download('averaged_perceptron_tagger', quiet=True)
-    nltk.download('stopwords', quiet=True)
-except Exception as e:
-    logger.warning(f"Failed to download NLTK data: {e}")
+# Download required NLTK data only when missing to avoid repeated network calls
+def ensure_nltk_data():
+    required = {
+        "wordnet": "corpora/wordnet",
+        "omw-1.4": "corpora/omw-1.4",
+        "averaged_perceptron_tagger": "taggers/averaged_perceptron_tagger",
+        "stopwords": "corpora/stopwords",
+        "punkt": "tokenizers/punkt",
+    }
+    for package, resource in required.items():
+        try:
+            nltk.data.find(resource)
+        except LookupError:
+            try:
+                nltk.download(package, quiet=True)
+            except Exception as e:  # pragma: no cover - defensive logging
+                logger.warning(f"Failed to download NLTK package {package}: {e}")
+
+
+ensure_nltk_data()
 
 # Initialize models and clients (lazy loading to avoid startup errors)
 _MODEL = None
 _CROSS_ENCODER = None
 _SPELL_CHECKER = None
 _QDRANT_CLIENT = None
+_REDIS_CLIENT = None
 
 
 def get_model():
@@ -99,10 +115,33 @@ def get_qdrant_client():
     return _QDRANT_CLIENT
 
 
+def get_redis_client():
+    """Lazy init for Redis client."""
+    global _REDIS_CLIENT
+    if _REDIS_CLIENT is None:
+        try:
+            _REDIS_CLIENT = redis.Redis(
+                host=Config.Redis.HOST,
+                port=Config.Redis.PORT,
+                username=Config.Redis.USERNAME or None,
+                password=Config.Redis.PASSWORD or None,
+                db=Config.Redis.DB,
+                decode_responses=True,
+                socket_timeout=5,
+            )
+            # simple ping
+            _REDIS_CLIENT.ping()
+            logger.info("Initialized Redis client")
+        except Exception as e:
+            logger.warning(f"Failed to initialize Redis client, caching disabled: {e}")
+            _REDIS_CLIENT = None
+    return _REDIS_CLIENT
+
+
 def configure_gemini():
     """Configure Gemini API with proper error handling."""
     try:
-        api_key = Config.Model.GEMINI_API_KEY
+        api_key = getattr(Config.Model, "GEMINI_API_KEY", None) or getattr(Config.Gemini, "GEMINI_API_KEY", None)
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set in configuration")
         genai.configure(api_key=api_key)
@@ -362,23 +401,57 @@ class GreetingHandler:
         return False
 
 
+class OllamaClient:
+    """Handles local Ollama model calls with structured output and retries."""
+
+    def __init__(self, model_name: Optional[str] = None):
+        self.model_name = model_name or os.getenv("OLLAMA_MODEL", "llama3.2")
+        if not self.model_name:
+            raise ValueError("OLLAMA_MODEL environment variable is not set")
+        logger.info(f"Initialized OllamaClient with model: {self.model_name}")
+
+    def generate(
+            self,
+            prompt: str,
+            max_retries: int = 3,
+            backoff: float = 1.0
+    ) -> str:
+        """Generate response with retry logic and robust parsing."""
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = ollama.generate(model=self.model_name, prompt=prompt)
+                text = (response.get("response") or "").strip()
+                if text:
+                    return text
+                logger.warning(f"No text in Ollama response: {response}")
+                return "I apologize, but I couldn't generate a proper response."
+            except Exception as e:
+                logger.warning(f"Ollama attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    time.sleep(backoff * attempt)
+                else:
+                    logger.error(f"All retry attempts failed: {e}")
+                    raise
+
+        return "I apologize, but I encountered an error generating a response."
+
+
 class GeminiClient:
     """Handles Gemini API calls with structured output and retries."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash-exp"):
-        try:
-            configure_gemini()
-            self.model = genai.GenerativeModel(model_name)
-            self.generation_config = genai.GenerationConfig(
-                temperature=0.0,
-                top_p=0.95,
-                top_k=40,
-                max_output_tokens=2048,
-            )
-            logger.info(f"Initialized GeminiClient with model: {model_name}")
-        except Exception as e:
-            logger.error(f"Failed to initialize GeminiClient: {e}")
-            raise
+    def __init__(self, model_name: Optional[str] = None):
+        configure_gemini()
+        self.model_name = model_name or Config.Model.GEMINI_MODEL_NAME
+        if not self.model_name:
+            raise ValueError("Gemini model name is not configured")
+        self.model = genai.GenerativeModel(self.model_name)
+        self.generation_config = genai.GenerationConfig(
+            temperature=0.0,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=2048,
+        )
+        logger.info(f"Initialized GeminiClient with model: {self.model_name}")
 
     def generate(
             self,
@@ -426,7 +499,7 @@ class GeminiClient:
 class QueryReformulator:
     """Reformulates conversational queries into clear, concise search queries."""
 
-    def __init__(self, llm_client: GeminiClient):
+    def __init__(self, llm_client):
         self.llm_client = llm_client
 
     def reformulate(self, query: str, conversation_context: str = "") -> str:
@@ -477,12 +550,42 @@ class QdrantRetriever:
         self.model = model
         self.preprocessor = TextPreprocessor()
 
+    def run_search(
+            self,
+            collection_name: str,
+            query_vector: List[float],
+            query_filter: Optional[dict] = None,
+            limit: int = 50,
+            vector_name: str = "content_vector",
+            score_threshold: Optional[float] = None
+    ):
+        """Execute a vector search against Qdrant using query_points."""
+        try:
+            kwargs = dict(
+                collection_name=collection_name,
+                query=query_vector,
+                using=vector_name,
+                limit=limit,
+                filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if score_threshold is not None:
+                kwargs["score_threshold"] = score_threshold
+
+            results = self.client.query_points(**kwargs)
+            return results
+        except Exception as e:
+            logger.error("Qdrant query_points error: %s", e, exc_info=True)
+            return None
+
     def retrieve(
             self,
             collection_name: str,
             query: str,
+            filter_profile: str = None,
             top_k: int = 50,
-            score_threshold: float = 0.2
+            score_threshold: float = None
     ) -> List[RetrievedChunk]:
         """Retrieve relevant chunks using Qdrant's native search."""
         try:
@@ -490,40 +593,53 @@ class QdrantRetriever:
                 query,
                 convert_to_numpy=True,
                 normalize_embeddings=True
-            ).astype(np.float32)
-
-            logger.info(f"Searching collection '{collection_name}' for query: {query[:100]}")
-
-            search_results = self.client.search(
-                collection_name=collection_name,
-                query_vector=query_vector.tolist(),
-                limit=top_k,
-                with_payload=True,
-                with_vectors=False,
-                score_threshold=score_threshold
-            )
-
-            if not search_results:
-                logger.warning(f"No results found in collection '{collection_name}'")
-                return []
-
-            chunks = []
-            for result in search_results:
-                chunk = RetrievedChunk(
-                    id=str(result.id),
-                    text=result.payload.get('text', ''),
-                    score=float(result.score),
-                    source=result.payload.get('source_file', 'unknown'),
-                    metadata=result.payload
-                )
-                chunks.append(chunk)
-
-            logger.info(f"Retrieved {len(chunks)} chunks from Qdrant")
-            return chunks
-
-        except Exception as e:
-            logger.error(f"Error retrieving from Qdrant: {e}", exc_info=True)
+            ).astype(np.float32).tolist()
+        except Exception as err:
+            logger.error(f"Failed to embed query for retrieval: {err}", exc_info=True)
             return []
+
+        logger.info(f"Searching collection '{collection_name}' for query: {query[:100]}")
+
+        profile_filter_val = str(filter_profile).strip() if filter_profile is not None else None
+        filter_clauses = []
+        if profile_filter_val:
+            filter_clauses.append({"key": "profile_id", "match": {"value": profile_filter_val}})
+
+        query_filter = {"must": filter_clauses} if filter_clauses else None
+
+        results = self.run_search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            query_filter=query_filter,
+            limit=top_k,
+            vector_name="content_vector",
+            score_threshold=score_threshold
+        )
+
+        if not results or not getattr(results, "points", []):
+            logger.warning(f"No results found in collection '{collection_name}'")
+            return []
+
+        points = results.points or []
+        logger.info("Qdrant returned %d hits", len(points))
+        logger.info("Top scores: %s", [p.score for p in points[:3]])
+
+        chunks: List[RetrievedChunk] = []
+        for pt in points:
+            payload = pt.payload or {}
+            text = payload.get("text", "")
+            snippet = text[:120].replace("\n", " ")
+            logger.debug("Hit score=%.4f snippet=%s", pt.score, snippet)
+            chunk = RetrievedChunk(
+                id=str(pt.id),
+                text=text,
+                score=float(pt.score),
+                source=payload.get("source_file", "unknown"),
+                metadata=payload
+            )
+            chunks.append(chunk)
+
+        return chunks
 
 
 class HybridReranker:
@@ -670,7 +786,7 @@ class ContextBuilder:
 class AnswerabilityDetector:
     """Detects if a question can be answered from provided context."""
 
-    def __init__(self, llm_client: GeminiClient):
+    def __init__(self, llm_client):
         self.llm_client = llm_client
 
     def check_answerability(self, query: str, context: str) -> Tuple[bool, str]:
@@ -745,17 +861,18 @@ class EnterpriseRAGSystem:
     conversational context, cross-encoder reranking, and grounding.
     """
 
-    def __init__(self):
+    def __init__(self, model_name: Optional[str] = None):
         """Initialize the RAG system with lazy-loaded components."""
         try:
-            # Initialize Gemini client first
-            self.llm_client = GeminiClient(Config.Model.GEMINI_MODEL_NAME)
+            # Initialize LLM client (Ollama by default, Gemini when requested)
+            self.llm_client = create_llm_client(model_name)
 
             # Initialize other components
             qdrant_client = get_qdrant_client()
             model = get_model()
             cross_encoder = get_cross_encoder()
 
+            self.client = qdrant_client
             self.retriever = QdrantRetriever(qdrant_client, model)
             self.reranker = HybridReranker(alpha=0.7, cross_encoder=cross_encoder)
             self.context_builder = ContextBuilder()
@@ -778,7 +895,7 @@ class EnterpriseRAGSystem:
             user_id: str,
             use_reformulation: bool = True
     ) -> Tuple[str, Dict[str, Any]]:
-        """Preprocess query with spelling correction, reformulation, and expansion."""
+        """Preprocess query with spelling correction, reformulation, and light expansion."""
         metadata = {
             'original_query': query,
             'corrections': [],
@@ -786,21 +903,26 @@ class EnterpriseRAGSystem:
             'expanded': False
         }
 
+        processed_query = query
+
+        # Spelling corrections (preserve names if no corrections)
         corrected_query, corrections = self.spell_corrector.correct_text(query)
         if corrections:
             metadata['corrections'] = corrections
-            logger.info(f"Spelling corrections: {corrections}")
+            processed_query = corrected_query
 
-        processed_query = corrected_query
-        if use_reformulation and len(query.split()) > 5:
+        # Reformulate for vaguer prompts to tighten intent
+        if use_reformulation and len(processed_query.split()) >= 4:
             conv_context = self.conversation_history.get_context(user_id, max_turns=2)
-            reformulated = self.query_reformulator.reformulate(corrected_query, conv_context)
-            if reformulated != corrected_query:
+            reformulated = self.query_reformulator.reformulate(processed_query, conv_context)
+            if reformulated and reformulated != processed_query:
                 processed_query = reformulated
                 metadata['reformulated'] = True
 
+        # Light expansion to add semantically related terms
         expanded_query = self.query_expander.expand_query(processed_query)
-        if expanded_query != processed_query:
+        if expanded_query and expanded_query != processed_query:
+            processed_query = expanded_query
             metadata['expanded'] = True
             metadata['expanded_query'] = expanded_query
 
@@ -810,6 +932,7 @@ class EnterpriseRAGSystem:
             self,
             query: str,
             profile_id: str,
+            subscription_id: str,
             user_id: str,
             persona: str = "professional document analysis assistant",
             top_k_retrieval: int = 50,
@@ -820,12 +943,24 @@ class EnterpriseRAGSystem:
         start_time = time.time()
 
         try:
+            collection_name = f"{subscription_id}".replace(" ", "_")
+
+            # Quick collection diagnostics to avoid silent empty searches
+            try:
+                stats = self.client.count(collection_name=collection_name, exact=False)
+                total_points = getattr(stats, "count", 0)
+                logger.info(f"Collection '{collection_name}' point count: {total_points}")
+                if total_points == 0:
+                    logger.warning(f"Collection '{collection_name}' is empty; retrieval will return no results")
+            except Exception as diag_exc:
+                logger.warning(f"Could not count collection '{collection_name}': {diag_exc}")
+
             if self.greeting_handler.is_positive_feedback(query):
                 return {
                     "response": "You're welcome! I'm glad I could help. Feel free to ask any other questions about your documents.",
                     "sources": [],
                     "user_id": user_id,
-                    "collection": profile_id,
+                    "collection": collection_name,
                     "context_found": True,
                     "query_type": "positive_feedback",
                     "grounded": True
@@ -839,7 +974,7 @@ class EnterpriseRAGSystem:
                     "response": greeting_response,
                     "sources": [],
                     "user_id": user_id,
-                    "collection": profile_id,
+                    "collection": collection_name,
                     "context_found": True,
                     "query_type": "greeting",
                     "grounded": True
@@ -853,19 +988,34 @@ class EnterpriseRAGSystem:
                     "response": farewell_response,
                     "sources": [],
                     "user_id": user_id,
-                    "collection": profile_id,
+                    "collection": collection_name,
                     "context_found": True,
                     "query_type": "farewell",
                     "grounded": True
                 }
 
-            logger.info(f"Processing query for collection '{profile_id}': {query[:100]}")
+            logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
 
             processed_query, preprocessing_metadata = self.preprocess_query(query, user_id)
+
+            # Cache lookup (per subscription/profile/query)
+            cache = get_redis_client()
+            cache_key = None
+            if cache:
+                cache_key = f"rag:{collection_name}:{profile_id}:{hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
+                cached = cache.get(cache_key)
+                if cached:
+                    try:
+                        cached_obj = json.loads(cached)
+                        logger.info("Cache hit for query; returning cached answer")
+                        return cached_obj
+                    except Exception:
+                        logger.warning("Failed to parse cached answer; ignoring")
             logger.info(f"Preprocessed query: {processed_query}")
 
             retrieved_chunks = self.retriever.retrieve(
-                collection_name=profile_id,
+                collection_name=collection_name,
+                filter_profile=profile_id,
                 query=processed_query,
                 top_k=top_k_retrieval,
                 score_threshold=0.15
@@ -879,7 +1029,7 @@ class EnterpriseRAGSystem:
                     "response": no_results_response,
                     "sources": [],
                     "user_id": user_id,
-                    "collection": profile_id,
+                    "collection": collection_name,
                     "context_found": False,
                     "query_type": "no_results",
                     "preprocessing": preprocessing_metadata,
@@ -915,7 +1065,7 @@ class EnterpriseRAGSystem:
                     "response": not_answerable_response,
                     "sources": self.context_builder.extract_sources(final_chunks),
                     "user_id": user_id,
-                    "collection": profile_id,
+                    "collection": collection_name,
                     "context_found": True,
                     "query_type": "not_answerable",
                     "answerability_reason": answerability_reason,
@@ -944,7 +1094,7 @@ class EnterpriseRAGSystem:
                 "response": answer,
                 "sources": sources,
                 "user_id": user_id,
-                "collection": profile_id,
+                "collection": collection_name,
                 "context_found": True,
                 "query_type": "document_qa",
                 "num_sources": len(sources),
@@ -962,6 +1112,32 @@ class EnterpriseRAGSystem:
                     "final_context": len(final_chunks)
                 }
             }
+            if cache and cache_key:
+                try:
+                    cache.setex(cache_key, 3600, json.dumps({
+                        "response": answer,
+                        "sources": sources,
+                        "user_id": user_id,
+                        "collection": collection_name,
+                        "context_found": True,
+                        "query_type": "document_qa",
+                        "num_sources": len(sources),
+                        "preprocessing": preprocessing_metadata,
+                        "answerability": {
+                            "is_answerable": is_answerable,
+                            "reason": answerability_reason
+                        },
+                        "grounded": True,
+                        "has_citations": has_citations,
+                        "processing_time": round(processing_time, 2),
+                        "retrieval_stats": {
+                            "initial_retrieved": len(retrieved_chunks),
+                            "after_rerank": len(reranked_chunks),
+                            "final_context": len(final_chunks)
+                        }
+                    }))
+                except Exception as cache_exc:
+                    logger.warning(f"Failed to cache answer: {cache_exc}")
 
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
@@ -972,7 +1148,7 @@ class EnterpriseRAGSystem:
                 "response": error_response,
                 "sources": [],
                 "user_id": user_id,
-                "collection": profile_id,
+                "collection": collection_name if 'collection_name' in locals() else profile_id,
                 "context_found": False,
                 "query_type": "error",
                 "error": str(e),
@@ -983,14 +1159,25 @@ class EnterpriseRAGSystem:
 
 # Global RAG system instance (lazy initialization)
 _RAG_SYSTEM = None
+_RAG_MODEL = None
 
 
-def get_rag_system() -> EnterpriseRAGSystem:
+def create_llm_client(model_name: Optional[str] = None):
+    """Factory to select LLM backend based on requested model name."""
+    name = (model_name or "").lower()
+    if name.startswith("gemini"):
+        return GeminiClient(model_name)
+    # default to Ollama
+    return OllamaClient(model_name)
+
+
+def get_rag_system(model_name: Optional[str] = None) -> EnterpriseRAGSystem:
     """Get or create the RAG system instance (singleton with lazy loading)."""
-    global _RAG_SYSTEM
-    if _RAG_SYSTEM is None:
+    global _RAG_SYSTEM, _RAG_MODEL
+    if _RAG_SYSTEM is None or (model_name and model_name != _RAG_MODEL):
         try:
-            _RAG_SYSTEM = EnterpriseRAGSystem()
+            _RAG_SYSTEM = EnterpriseRAGSystem(model_name=model_name)
+            _RAG_MODEL = model_name
             logger.info("RAG system initialized")
         except Exception as e:
             logger.error(f"Failed to initialize RAG system: {e}")
@@ -1002,7 +1189,8 @@ def answer_question(
         query: str,
         user_id: str,
         profile_id: str,
-        model_name: str = "gemini-2.0-flash-exp",
+        subscription_id: str = "default",
+        model_name: str = "llama3.2",
         persona: str = "professional document analysis assistant"
 ) -> Dict[str, Any]:
     """
@@ -1018,31 +1206,34 @@ def answer_question(
     Returns:
         Response dictionary with enhanced metadata
     """
-    rag_system = get_rag_system()
+    rag_system = get_rag_system(model_name)
     return rag_system.answer_question(
         query=query,
         profile_id=profile_id,
+        subscription_id=subscription_id,
         user_id=user_id,
         persona=persona
     )
 
 
-def debug_collection(profile_id: str) -> Dict[str, Any]:
+def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[str, Any]:
     """
     Debug utility to check collection status with defensive error handling.
 
     Args:
-        profile_id: Collection name
+        profile_id: Profile/department identifier
+        subscription_id: Tenant/subscription identifier
 
     Returns:
         Collection statistics
     """
     try:
+        collection_name = f"{subscription_id}".replace(" ", "_")
         qdrant_client = get_qdrant_client()
-        collection_info = qdrant_client.get_collection(profile_id)
+        collection_info = qdrant_client.get_collection(collection_name)
 
         scroll_result = qdrant_client.scroll(
-            collection_name=profile_id,
+            collection_name=collection_name,
             limit=3,
             with_payload=True,
             with_vectors=False
@@ -1062,7 +1253,7 @@ def debug_collection(profile_id: str) -> Dict[str, Any]:
                 ]
 
         return {
-            "collection_name": profile_id,
+            "collection_name": collection_name,
             "points_count": collection_info.points_count,
             "vector_size": collection_info.config.params.vectors.size,
             "distance": str(collection_info.config.params.vectors.distance),
@@ -1070,9 +1261,9 @@ def debug_collection(profile_id: str) -> Dict[str, Any]:
             "status": "healthy"
         }
     except Exception as e:
-        logger.error(f"Error debugging collection '{profile_id}': {e}", exc_info=True)
+        logger.error(f"Error debugging collection '{collection_name if 'collection_name' in locals() else profile_id}': {e}", exc_info=True)
         return {
-            "collection_name": profile_id,
+            "collection_name": collection_name if 'collection_name' in locals() else profile_id,
             "error": str(e),
             "status": "error"
         }
@@ -1186,6 +1377,3 @@ __all__ = [
     'RAGEvaluator',
     'get_rag_system'
 ]
-
-
-

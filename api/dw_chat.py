@@ -1,4 +1,3 @@
-
 import ollama
 
 import json
@@ -7,7 +6,7 @@ import logging
 
 from io import BytesIO
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from api.config import Config
 
@@ -24,10 +23,6 @@ blob_service_client = BlobServiceClient.from_connection_string(connection_string
 container_name = Config.AzureBlob.CONTAINER_NAME
 
 container_client = blob_service_client.get_container_client(container_name)
-
-# Session timeout in minutes (adjust as needed)
-
-SESSION_TIMEOUT_MINUTES = 30
 
 
 def get_chat_history(user_id):
@@ -120,32 +115,37 @@ def serialize_response(response):
         return str(response)
 
 
-def create_new_session(query, response):
-    """Create a new session with the first message."""
-
+def create_new_session(query, response, session_id=None, initial_message=None):
+    """
+    Create a new session with the first message.
+    Allows supplying a specific session_id and initial message so callers can
+    control when a brand-new session is created.
+    """
     now = datetime.utcnow()
+
+    message = initial_message or {
+
+        "query": str(query),
+
+        "response": serialize_response(response),
+
+        "timestamp": now.isoformat()
+
+    }
 
     return {
 
-        "session_id": now.strftime("%Y%m%d_%H%M%S"),
+        "session_id": session_id or now.strftime("%Y%m%d_%H%M%S"),
 
         "title": generate_session_title(query),
 
-        "created_at": now.isoformat(),
+        "created_at": message["timestamp"],
 
-        "updated_at": now.isoformat(),
+        "updated_at": message["timestamp"],
 
         "messages": [
 
-            {
-
-                "query": str(query),
-
-                "response": serialize_response(response),
-
-                "timestamp": now.isoformat()
-
-            }
+            message
 
         ]
 
@@ -165,35 +165,18 @@ def generate_session_title(first_query):
     return title
 
 
-def should_create_new_session(last_session):
-    """Check if a new session should be created based on timeout."""
-
-    if not last_session or "updated_at" not in last_session:
-        return True
-
-    try:
-
-        last_updated = datetime.fromisoformat(last_session["updated_at"])
-
-        time_diff = datetime.utcnow() - last_updated
-
-        return time_diff > timedelta(minutes=SESSION_TIMEOUT_MINUTES)
-
-    except Exception as e:
-
-        logging.error(f"Error checking session timeout: {e}")
-
-        return True
-
-
-def add_message_to_history(user_id, query, response):
-    """Add a message to chat history, creating new session if needed."""
+def add_message_to_history(user_id, query, response, session_id=None, force_new_session=False):
+    """
+    Add a message to chat history.
+    - If force_new_session is True, always create a fresh session.
+    - If session_id is provided, append to that session when it exists; otherwise create it.
+    - If no session_id is provided, a new session is created by default.
+    Returns a tuple of (history, active_session_id).
+    """
 
     history = get_chat_history(user_id)
 
     now = datetime.utcnow()
-
-    # Get the last session
 
     sessions = history.get("sessions", [])
 
@@ -207,29 +190,24 @@ def add_message_to_history(user_id, query, response):
 
     }
 
-    # Check if we need a new session
+    target_session = None
 
-    if not sessions or should_create_new_session(sessions[-1]):
+    if session_id:
+        target_session = next((s for s in sessions if s.get("session_id") == session_id), None)
 
-        # Create new session
-
-        new_session = create_new_session(query, response)
-
+    if force_new_session or not target_session:
+        new_session = create_new_session(query, response, session_id=session_id, initial_message=new_message)
         sessions.append(new_session)
-
+        target_session = new_session
         logging.info(f"Created new session: {new_session['session_id']}")
 
     else:
 
-        # Add to existing session
+        target_session["messages"].append(new_message)
 
-        sessions[-1]["messages"].append(new_message)
+        target_session["updated_at"] = now.isoformat()
 
-        sessions[-1]["updated_at"] = now.isoformat()
-
-        logging.info(f"Added message to session: {sessions[-1]['session_id']}")
-
-    # Keep only last 50 sessions (adjust as needed)
+        logging.info(f"Added message to session: {target_session['session_id']}")
 
     if len(sessions) > 50:
         sessions = sessions[-50:]
@@ -238,11 +216,11 @@ def add_message_to_history(user_id, query, response):
 
     save_chat_history(user_id, history)
 
-    return history
+    return history, target_session.get("session_id")
 
 
-def get_current_session_context(user_id, max_messages=10):
-    """Get the current session's messages for context."""
+def get_current_session_context(user_id, session_id=None, max_messages=10):
+    """Get messages for a specific session (or the latest one)."""
 
     history = get_chat_history(user_id)
 
@@ -251,13 +229,15 @@ def get_current_session_context(user_id, max_messages=10):
     if not sessions:
         return []
 
-    # Get messages from the current (last) session
+    current_session = None
 
-    current_session = sessions[-1]
+    if session_id:
+        current_session = next((s for s in sessions if s.get("session_id") == session_id), None)
+
+    if current_session is None:
+        current_session = sessions[-1]
 
     messages = current_session.get("messages", [])
-
-    # Return last N messages for context
 
     return messages[-max_messages:] if len(messages) > max_messages else messages
 
