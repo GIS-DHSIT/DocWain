@@ -30,6 +30,61 @@ _MODEL = None
 _QDRANT_CLIENT = None
 logger = logging.getLogger(__name__)
 
+'-------------------------------modified by maha/maria-----------------------'
+'---------------------------------new function for checking PII status in mongodb--------------------'
+
+
+def get_subscription_pii_setting(subscription_id: str) -> bool:
+    """
+    Fetch PII enabled/disabled setting from subscription in MongoDB.
+
+    Args:
+        subscription_id: The subscription ID to check
+
+    Returns:
+        bool: True if PII masking is enabled, False if disabled
+        Default to True if setting not found (safe default)
+    """
+    try:
+        # Check if subscriptions collection exists in Config
+        subscriptions_collection = getattr(Config.MongoDB, 'SUBSCRIPTIONS', 'subscriptions')
+        collection = db[subscriptions_collection]
+
+        # Try to find subscription by _id or subscriptionId field
+        subscription = None
+
+        # Try ObjectId first if valid
+        if ObjectId.is_valid(subscription_id):
+            subscription = collection.find_one({"_id": ObjectId(subscription_id)})
+
+        # If not found, try string matching
+        if not subscription:
+            subscription = collection.find_one({"subscriptionId": subscription_id})
+
+        # If still not found, try _id as string
+        if not subscription:
+            subscription = collection.find_one({"_id": subscription_id})
+
+        if subscription:
+            # Check for pii_enabled field (can be pii_enabled, piiEnabled, or enable_pii)
+            pii_enabled = subscription.get('pii_enabled') or subscription.get('piiEnabled') or subscription.get(
+                'enable_pii')
+
+            if pii_enabled is not None:
+                logging.info(
+                    f"Subscription {subscription_id}: PII masking is {'ENABLED' if pii_enabled else 'DISABLED'}")
+                return bool(pii_enabled)
+            else:
+                logging.warning(f"Subscription {subscription_id}: PII setting not found, defaulting to ENABLED")
+                return True  # Safe default - enable PII masking if not specified
+        else:
+            logging.warning(f"Subscription {subscription_id} not found in database, defaulting to PII ENABLED")
+            return True  # Safe default
+
+    except Exception as e:
+        logging.error(f"Error fetching PII setting for subscription {subscription_id}: {e}")
+        return True  # Safe default - enable PII masking on error
+
 
 def normalize_embedding_matrix(raw_vectors, expected_dim=None):
     """
@@ -366,7 +421,184 @@ def get_azure_docs(files):
         logging.error(f"Error fetching Azure documents: {e}")
         return None
 
+'-------------------------------modified by maha/maria-----------------------'
+'---------------Added a PII control per subscription in connectData function--------------------'
 
+
+def connectData(documentConnection):
+    """Processes documents and extracts data, updates vetting points."""
+    dataDict = {}
+
+    for k, v in documentConnection.items():
+        docData = v['dataDict']
+        connData = v['connDict']
+        profileId = str(docData['profile'])
+        docId = str(docData['_id'])
+
+        # Prefer explicit subscription/subscriptionId fields from document, then connector, then default.
+        subscriptionId = str(
+            docData.get('subscriptionId')
+            or docData.get('subscription_id')
+            or docData.get('subscription')
+            or (connData.get('subscriptionId') if isinstance(connData, dict) else None)
+            or (connData.get('subscription') if isinstance(connData, dict) else None)
+            or "default"
+        )
+
+        # ============= NEW: Check PII setting for this subscription =============
+        pii_masking_enabled = get_subscription_pii_setting(subscriptionId)
+        logging.info(f"Document {docId} (Subscription {subscriptionId}): PII masking = {pii_masking_enabled}")
+        # =========================================================================
+
+        # Allow reprocessing documents that previously failed training
+        allowed_statuses = {'UNDER_REVIEW', 'TRAINING_FAILED'}
+
+        if docData.get('status') in allowed_statuses:
+            try:
+                logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
+
+                # Initialize extracted documents dictionary for this document
+                all_extracted_docs = {}
+
+                if docData['type'] == 'S3':
+                    bkName = connData['s3_details']['bucketName']
+                    region = connData['s3_details']['region']
+                    ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
+                    sk = decrypt_data(connData['s3_details']['secretKey']).split('\x08')[0].strip()
+                    s3 = get_s3_client(ak, sk, region)
+
+                    if not s3:
+                        logging.error(f"Failed to create S3 client for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to create S3 client')
+                        continue
+
+                    objs = s3.list_objects_v2(Bucket=bkName)
+                    file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
+
+                    if not file:
+                        logging.error(f"File {docData['name']} not found in S3 bucket {bkName}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'File not found in S3')
+                        continue
+
+                    docContent = read_s3_file(s3, bkName, file[0])
+
+                    if docContent is None:
+                        logging.error(f"Failed to read S3 file for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to read S3 file')
+                        continue
+
+                    extractedDoc = fileProcessor(docContent, file[0])
+
+                    if not extractedDoc:
+                        logging.error(f"Failed to extract content from document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
+                        continue
+
+                    all_extracted_docs.update(extractedDoc)
+                    vettingPoints = vettingProcessor(extractedDoc)
+                    updateVetting(docId, vettingPoints)
+
+                elif docData['type'] == 'LOCAL':
+                    files = connData['locations']
+
+                    # Process ALL files for this document
+                    for file_path in files:
+                        try:
+                            file_key = file_path.split('/', 4)[-1]
+                            logging.info(f"Processing file: {file_key} for document {docId}")
+
+                            docContent = get_azure_docs(file_key)
+
+                            if docContent is None:
+                                logging.error(f"Failed to read Azure file {file_key} for document {docId}")
+                                continue
+
+                            extractedDoc = fileProcessor(docContent, file_path)
+
+                            if not extractedDoc:
+                                logging.error(f"Failed to extract content from file {file_key}")
+                                continue
+
+                            # Add this file's extracted content to the collection
+                            all_extracted_docs.update(extractedDoc)
+                            logging.info(f"Successfully extracted content from {file_key}")
+
+                        except Exception as file_error:
+                            logging.error(f"Error processing file {file_path}: {file_error}")
+                            continue
+
+                    # Calculate vetting points for all extracted documents
+                    if all_extracted_docs:
+                        vettingPoints = vettingProcessor(all_extracted_docs)
+                        updateVetting(docId, vettingPoints)
+                    else:
+                        logging.error(f"No content extracted for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'No content extracted from any file')
+                        continue
+
+                # Store all extracted documents for this document ID
+                if all_extracted_docs:
+                    # Check if PII masking is enabled for this subscription
+                    subscription_doc = db[Config.MongoDB.SUBSCRIPTIONS].find_one({
+                        "subscription_id": subscriptionId
+                    })
+                    pii_enabled = subscription_doc.get('pii_enabled', False) if subscription_doc else False
+                    if pii_enabled:
+                        # Mask PII, track counts, and block training if high confidentiality detected
+                        masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
+                        update_pii_stats(docId, pii_count, high_conf, pii_items)
+
+                        if high_conf:
+                            logging.error(
+                                f"High confidentiality content detected in document {docId}; blocking training")
+                            update_training_status(docId, 'TRAINING_BLOCKED_CONFIDENTIAL',
+                                                   'High confidentiality content detected')
+                            continue
+
+                        # Recompute embeddings for structured data after masking
+                        for fname, content in masked_docs.items():
+                            if isinstance(content, dict) and "texts" in content:
+                                texts = content.get("texts") or []
+                                if texts:
+                                    model = get_model()
+                                    content["embeddings"] = model.encode(texts, convert_to_numpy=True)
+                                masked_docs[fname] = content
+                    else:
+                        # PII masking disabled - use original documents
+                        logging.info(f"PII masking disabled for subscription {subscriptionId}")
+                        masked_docs = all_extracted_docs
+                        pii_count = 0
+                        high_conf = False
+                        pii_items = []
+                        update_pii_stats(docId, 0, False, [])
+
+                    vettingPoints = vettingProcessor(masked_docs)
+                    updateVetting(docId, vettingPoints)
+
+                    dataDict[docId] = {
+                        'subscriptionId': subscriptionId,
+                        'profileId': profileId,
+                        'extractedDoc': masked_docs,
+                        'docName': docData.get('name', 'Unknown')
+                    }
+                    logging.info(f"Stored {len(masked_docs)} files for document {docId} (PII masked: {pii_count})")
+                    # ==============================================================================================
+                else:
+                    logging.error(f"No documents extracted for {docId}")
+                    update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
+
+            except Exception as e:
+                logging.error(f"Error processing document {docId} ({docData.get('name', 'Unknown')}): {e}")
+                update_training_status(docId, 'TRAINING_FAILED', str(e))
+
+        elif docData['status'] == 'DELETED':
+            profileData = str(docData['profile'])
+            delete_embeddings(subscriptionId, profileData, docId)
+
+    return dataDict
+
+
+'''
 def connectData(documentConnection):
     """Processes documents and extracts data, updates vetting points."""
     dataDict = {}
@@ -515,6 +747,8 @@ def connectData(documentConnection):
             delete_embeddings(subscriptionId, profileData, docId)
 
     return dataDict
+'''
+
 
 
 def collectionConnect(name):
@@ -674,8 +908,17 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         if vector_size == 0:
             logging.error(f"Error: Trying to save empty embeddings for document {doctag}!")
             raise ValueError("Empty embeddings array")
+        # Fetch profile name for tagging
+        try:
+            profile_doc = db[Config.MongoDB.PROFILES].find_one({"_id": ObjectId(profile_id)})
+            profile_name = profile_doc["name"].replace(" ", "_") if profile_doc and "name" in profile_doc else str(profile_id)
+        except Exception as e:
+            logging.warning(f"Could not fetch profile name for {profile_id}: {e}")
+            profile_name = str(profile_id)
 
         collection_name = build_collection_name(subscription_id)
+        # collection_name = build_collection_name(profile_name)
+
         ensure_qdrant_collection(collection_name, vector_size)
 
         logging.info(f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
@@ -734,7 +977,9 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
                     payload={
                         "subscription_id": str(subscription_id),
                         "profile_id": str(profile_id),
-                        "tag": build_collection_name(subscription_id),
+                        "tag": profile_name,  # <-- CHANGED HERE
+                        # "tag": build_collection_name(subscription_id),\
+                        # "log_tag": f"Tag used: {profile_name}",  # <-- add this line
                         "text": text,
                         "document_id": str(doctag),
                         "source_file": source_filename,
@@ -746,6 +991,7 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
                     }
                 )
             )
+        logging.info(f"Prepared PointStruct payload for chunk {idx}: {json.dumps(all_points[-1].payload)}")
 
         if not all_points:
             logging.error(f"No valid points to upload for document {doctag}, file {source_filename}")

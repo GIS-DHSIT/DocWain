@@ -3,7 +3,7 @@ import logging
 import uvicorn
 from typing import Optional
 from pydantic import BaseModel
-from bson.objectid import ObjectId
+from bson.objectid import ObjectId # added by maha/maria
 import time
 import os, sys
 path = os.getcwd()
@@ -218,7 +218,7 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
         logging.error(f"Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
 
-''' 
+'''
 @app.get("/pii/{doc_id}")
 def get_pii_info(doc_id: str, subscription_id: str = "default"):
     """API endpoint to retrieve PII masking stats for a document."""
@@ -232,9 +232,10 @@ def get_pii_info(doc_id: str, subscription_id: str = "default"):
     except Exception as e:
         logging.error(f"Failed to retrieve PII stats: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve PII stats")
- 
- '''
+'''
 
+'-------------added by maha/maria ------------------'
+'--------------for PII setting management ------------------'
 
 class PIISettingUpdate(BaseModel):
     pii_enabled: bool
@@ -358,7 +359,6 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
     except Exception as e:
         logging.error(f"Failed to reprocess documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to reprocess documents")
-
 
 
 if __name__ == "__main__":
