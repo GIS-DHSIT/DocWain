@@ -1,3 +1,4 @@
+
 import re
 from qdrant_client.http.exceptions import UnexpectedResponse
 import json
@@ -410,6 +411,14 @@ class OllamaClient:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
 
+    def warm_up(self):
+        """Eagerly load the model so first user queries do not pay startup cost."""
+        try:
+            ollama.generate(model=self.model_name, prompt="ping", options={"num_predict": 1})
+            logger.info("Ollama warm-up successful")
+        except Exception as e:
+            logger.warning(f"Ollama warm-up failed (continuing without warm cache): {e}")
+
     def generate(
             self,
             prompt: str,
@@ -420,7 +429,11 @@ class OllamaClient:
         for attempt in range(1, max_retries + 1):
             try:
                 response = ollama.generate(model=self.model_name, prompt=prompt)
-                text = (response.get("response") or "").strip()
+                text = (
+                    response.get("response")
+                    or (response.get("message", {}) or {}).get("content")
+                    or ""
+                ).strip()
                 if text:
                     return text
                 logger.warning(f"No text in Ollama response: {response}")
@@ -566,7 +579,7 @@ class QdrantRetriever:
                 query=query_vector,
                 using=vector_name,
                 limit=limit,
-                filter=query_filter,
+                query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
             )
@@ -883,6 +896,7 @@ class EnterpriseRAGSystem:
             self.query_reformulator = QueryReformulator(self.llm_client)
             self.answerability_detector = AnswerabilityDetector(self.llm_client)
             self.conversation_history = ConversationHistory(max_turns=3)
+            self._warm_up_llm()
 
             logger.info("EnterpriseRAGSystem initialized successfully")
         except Exception as e:
@@ -927,6 +941,105 @@ class EnterpriseRAGSystem:
             metadata['expanded_query'] = expanded_query
 
         return processed_query, metadata
+
+    @staticmethod
+    def _is_retrieval_sufficient(chunks: List[RetrievedChunk], min_hits: int = 3, min_score: float = 0.18) -> bool:
+        """Decide if current retrieval is good enough to stop trying fallbacks."""
+        if not chunks:
+            return False
+        if len(chunks) >= min_hits:
+            return True
+        top_score = float(chunks[0].score)
+        return top_score >= min_score
+
+    def retrieve_with_priorities(
+            self,
+            query: str,
+            user_id: str,
+            profile_id: str,
+            collection_name: str,
+            top_k_retrieval: int = 50
+    ) -> Dict[str, Any]:
+        """
+        Try Qdrant retrieval first, fall back to relaxed thresholds, then chat-history
+        reformulation as a last resort.
+        """
+        attempt_records = []
+        retrieval_runs = []
+
+        def run_attempt(label: str, query_text: str, threshold: Optional[float], use_history: bool,
+                        metadata: Dict[str, Any]):
+            chunks = self.retriever.retrieve(
+                collection_name=collection_name,
+                filter_profile=profile_id,
+                query=query_text,
+                top_k=top_k_retrieval,
+                score_threshold=threshold
+            )
+            top_score = float(chunks[0].score) if chunks else 0.0
+            record = {
+                "label": label,
+                "query": query_text,
+                "score_threshold": threshold,
+                "hits": len(chunks),
+                "top_score": round(top_score, 4),
+                "used_history": use_history
+            }
+            attempt_records.append(record)
+            retrieval_runs.append((chunks, record, metadata, query_text))
+            return chunks
+
+        primary_query, primary_metadata = self.preprocess_query(query, user_id, use_reformulation=False)
+        primary_chunks = run_attempt("direct_qdrant", primary_query, 0.25, False, primary_metadata)
+        if self._is_retrieval_sufficient(primary_chunks):
+            return {
+                "chunks": primary_chunks,
+                "query": primary_query,
+                "metadata": primary_metadata,
+                "attempts": attempt_records,
+                "selected_strategy": "direct_qdrant"
+            }
+
+        relaxed_chunks = run_attempt("relaxed_qdrant", primary_query, None, False, primary_metadata)
+        if self._is_retrieval_sufficient(relaxed_chunks):
+            return {
+                "chunks": relaxed_chunks,
+                "query": primary_query,
+                "metadata": primary_metadata,
+                "attempts": attempt_records,
+                "selected_strategy": "relaxed_qdrant"
+            }
+
+        history_query, history_metadata = self.preprocess_query(query, user_id, use_reformulation=True)
+        if history_query != primary_query or history_metadata.get("reformulated") or history_metadata.get("expanded"):
+            history_chunks = run_attempt("history_guided", history_query, None, True, history_metadata)
+            if self._is_retrieval_sufficient(history_chunks):
+                return {
+                    "chunks": history_chunks,
+                    "query": history_query,
+                    "metadata": history_metadata,
+                    "attempts": attempt_records,
+                    "selected_strategy": "history_guided"
+                }
+
+        best_run = max(retrieval_runs, key=lambda r: r[1]["top_score"], default=None)
+        selected_chunks, selected_record, selected_meta, selected_query = best_run if best_run else ([], {}, primary_metadata, primary_query)
+        return {
+            "chunks": selected_chunks,
+            "query": selected_query,
+            "metadata": selected_meta,
+            "attempts": attempt_records,
+            "selected_strategy": selected_record.get("label", "none")
+        }
+
+    def _warm_up_llm(self):
+        """Warm LLM backend so first user calls do not fail cold."""
+        warm_fn = getattr(self.llm_client, "warm_up", None)
+        if callable(warm_fn):
+            try:
+                warm_fn()
+            except Exception as e:
+                logger.warning(f"LLM warm-up skipped due to error: {e}")
 
     def answer_question(
             self,
@@ -996,13 +1109,23 @@ class EnterpriseRAGSystem:
 
             logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
 
-            processed_query, preprocessing_metadata = self.preprocess_query(query, user_id)
+            retrieval_plan = self.retrieve_with_priorities(
+                query=query,
+                user_id=user_id,
+                profile_id=profile_id,
+                collection_name=collection_name,
+                top_k_retrieval=top_k_retrieval
+            )
+            processed_query = retrieval_plan["query"]
+            preprocessing_metadata = retrieval_plan["metadata"]
+            retrieval_attempts = retrieval_plan["attempts"]
+            selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
 
             # Cache lookup (per subscription/profile/query)
             cache = get_redis_client()
             cache_key = None
             if cache:
-                cache_key = f"rag:{collection_name}:{profile_id}:{hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
+                cache_key = f"rag:{collection_name}:{profile_id}:{selected_strategy}:{hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
                 cached = cache.get(cache_key)
                 if cached:
                     try:
@@ -1011,15 +1134,9 @@ class EnterpriseRAGSystem:
                         return cached_obj
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
-            logger.info(f"Preprocessed query: {processed_query}")
+            logger.info(f"Preprocessed query: {processed_query} (strategy: {selected_strategy})")
 
-            retrieved_chunks = self.retriever.retrieve(
-                collection_name=collection_name,
-                filter_profile=profile_id,
-                query=processed_query,
-                top_k=top_k_retrieval,
-                score_threshold=0.15
-            )
+            retrieved_chunks = retrieval_plan["chunks"]
 
             if not retrieved_chunks:
                 no_results_response = f"I searched through all your department documents but couldn't find relevant information for your question: '{query}'. Please try rephrasing or asking about a different topic covered in your documents."
@@ -1033,6 +1150,8 @@ class EnterpriseRAGSystem:
                     "context_found": False,
                     "query_type": "no_results",
                     "preprocessing": preprocessing_metadata,
+                    "retrieval_attempts": retrieval_attempts,
+                    "selected_strategy": selected_strategy,
                     "grounded": True,
                     "processing_time": time.time() - start_time
                 }
@@ -1070,6 +1189,8 @@ class EnterpriseRAGSystem:
                     "query_type": "not_answerable",
                     "answerability_reason": answerability_reason,
                     "preprocessing": preprocessing_metadata,
+                    "retrieval_attempts": retrieval_attempts,
+                    "selected_strategy": selected_strategy,
                     "grounded": True,
                     "processing_time": time.time() - start_time
                 }
@@ -1090,7 +1211,7 @@ class EnterpriseRAGSystem:
 
             processing_time = time.time() - start_time
 
-            return {
+            response_payload = {
                 "response": answer,
                 "sources": sources,
                 "user_id": user_id,
@@ -1105,6 +1226,8 @@ class EnterpriseRAGSystem:
                 },
                 "grounded": True,
                 "has_citations": has_citations,
+                "retrieval_attempts": retrieval_attempts,
+                "selected_strategy": selected_strategy,
                 "processing_time": round(processing_time, 2),
                 "retrieval_stats": {
                     "initial_retrieved": len(retrieved_chunks),
@@ -1114,30 +1237,10 @@ class EnterpriseRAGSystem:
             }
             if cache and cache_key:
                 try:
-                    cache.setex(cache_key, 3600, json.dumps({
-                        "response": answer,
-                        "sources": sources,
-                        "user_id": user_id,
-                        "collection": collection_name,
-                        "context_found": True,
-                        "query_type": "document_qa",
-                        "num_sources": len(sources),
-                        "preprocessing": preprocessing_metadata,
-                        "answerability": {
-                            "is_answerable": is_answerable,
-                            "reason": answerability_reason
-                        },
-                        "grounded": True,
-                        "has_citations": has_citations,
-                        "processing_time": round(processing_time, 2),
-                        "retrieval_stats": {
-                            "initial_retrieved": len(retrieved_chunks),
-                            "after_rerank": len(reranked_chunks),
-                            "final_context": len(final_chunks)
-                        }
-                    }))
+                    cache.setex(cache_key, 3600, json.dumps(response_payload))
                 except Exception as cache_exc:
                     logger.warning(f"Failed to cache answer: {cache_exc}")
+            return response_payload
 
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
