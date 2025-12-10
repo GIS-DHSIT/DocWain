@@ -42,17 +42,21 @@ class QuestionRequest(BaseModel):
     model_name: str = "llama3.2"
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
+    new_session: Optional[bool] = False  # Frontend sends flag here
 
 
 @app.post("/ask")
 def ask_question_api(request: QuestionRequest):
-    logging.info(f"[ASK] User: {request.user_id}, Query: {request.query}")
+    logging.info(f"[ASK] ========== START ==========")
+    logging.info(f"[ASK] User: {request.user_id}")
+    logging.info(f"[ASK] Query: {request.query}")
+    logging.info(f"[ASK] Session ID from frontend: {request.session_id}")
+    logging.info(f"[ASK] New session flag: {request.new_session}")
+
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
 
-    # Treat missing session_id as a new chat so each invocation gets its own session
-    force_new_session = request.session_id is None
-
+    # Generate answer
     answer = answer_question(
         request.query,
         request.user_id,
@@ -62,16 +66,20 @@ def ask_question_api(request: QuestionRequest):
         request.persona
     )
 
-    # Add message to history (creates a new session when none is supplied)
+    # Add to history - backend uses frontend's session_id
     _history, active_session_id = add_message_to_history(
         request.user_id,
         request.query,
         answer,
-        session_id=request.session_id,
-        force_new_session=force_new_session
+        session_id=request.session_id,  # Use frontend's UUID
+        new_session=request.new_session  # Use frontend's flag
     )
 
-    logging.info(f"[ASK] User: {request.user_id}, Answer: {answer}")
+    logging.info(f"[ASK] Answer generated")
+    logging.info(f"[ASK] < Active Session ID: {active_session_id}")
+    logging.info(f"[ASK] ========== END ==========\n")
+
+    # Return session_id back to frontend
     return {
         "answer": answer,
         "current_session_id": active_session_id
@@ -354,4 +362,5 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+
