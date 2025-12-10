@@ -52,6 +52,9 @@ class Config:
         CONNECTOR = os.getenv("MONGODB_CONNECTORS", 'connectors')
         DOCUMENTS = os.getenv("MONGODB_DOCUMENTS", 'documents')
         PROFILES = os.getenv("MONGODB_PROFILES", 'profiles')
+        # Add this new line for subscriptions collection
+        # modified by maha/maria
+        SUBSCRIPTIONS = os.getenv("MONGODB_SUBSCRIPTIONS_COLLECTION", "subscriptions")
 
     class Encryption:
         ENCRYPTION_KEY = 'J9cuHrESAz'
