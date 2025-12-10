@@ -3,6 +3,8 @@ import logging
 import uvicorn
 from typing import Optional
 from pydantic import BaseModel
+from bson.objectid import ObjectId
+import time
 import os, sys
 path = os.getcwd()
 sys.path.append(path)
@@ -37,20 +39,24 @@ class QuestionRequest(BaseModel):
     user_id: str = 'someone@email.com'
     profile_id: str = "67ac62ddfaa3aee44d38f4a5"
     subscription_id: str = "default"
-    model_name: str = "gemini-2.5-flash"
+    model_name: str = "llama3.2"
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
+    new_session: Optional[bool] = False  # Frontend sends flag here
 
 
 @app.post("/ask")
 def ask_question_api(request: QuestionRequest):
-    logging.info(f"[ASK] User: {request.user_id}, Query: {request.query}")
+    logging.info(f"[ASK] ========== START ==========")
+    logging.info(f"[ASK] User: {request.user_id}")
+    logging.info(f"[ASK] Query: {request.query}")
+    logging.info(f"[ASK] Session ID from frontend: {request.session_id}")
+    logging.info(f"[ASK] New session flag: {request.new_session}")
+
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
 
-    # Treat missing session_id as a new chat so each invocation gets its own session
-    force_new_session = request.session_id is None
-
+    # Generate answer
     answer = answer_question(
         request.query,
         request.user_id,
@@ -60,16 +66,20 @@ def ask_question_api(request: QuestionRequest):
         request.persona
     )
 
-    # Add message to history (creates a new session when none is supplied)
+    # Add to history - backend uses frontend's session_id
     _history, active_session_id = add_message_to_history(
         request.user_id,
         request.query,
         answer,
-        session_id=request.session_id,
-        force_new_session=force_new_session
+        session_id=request.session_id,  # Use frontend's UUID
+        new_session=request.new_session  # Use frontend's flag
     )
 
-    logging.info(f"[ASK] User: {request.user_id}, Answer: {answer}")
+    logging.info(f"[ASK] Answer generated")
+    logging.info(f"[ASK] < Active Session ID: {active_session_id}")
+    logging.info(f"[ASK] ========== END ==========\n")
+
+    # Return session_id back to frontend
     return {
         "answer": answer,
         "current_session_id": active_session_id
@@ -208,7 +218,7 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
         logging.error(f"Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
 
-
+''' 
 @app.get("/pii/{doc_id}")
 def get_pii_info(doc_id: str, subscription_id: str = "default"):
     """API endpoint to retrieve PII masking stats for a document."""
@@ -222,7 +232,135 @@ def get_pii_info(doc_id: str, subscription_id: str = "default"):
     except Exception as e:
         logging.error(f"Failed to retrieve PII stats: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve PII stats")
+ 
+ '''
+
+
+class PIISettingUpdate(BaseModel):
+    pii_enabled: bool
+
+
+@app.get("/subscription/{subscription_id}/pii-setting")
+def get_pii_setting(subscription_id: str):
+    """
+    Get current PII masking setting for a subscription
+    """
+    try:
+        from api.dataHandler import get_subscription_pii_setting
+        pii_enabled = get_subscription_pii_setting(subscription_id)
+        return {
+            "subscription_id": subscription_id,
+            "pii_enabled": pii_enabled,
+            "message": f"PII masking is {'ENABLED' if pii_enabled else 'DISABLED'}"
+        }
+    except Exception as e:
+        logging.error(f"Failed to get PII setting: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve PII setting")
+
+
+@app.put("/subscription/{subscription_id}/pii-setting")
+def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
+    """
+    Update PII masking setting for a subscription
+    Body:
+    {
+        "pii_enabled": true/false
+    }
+    """
+    try:
+        from api.config import Config
+        from api.dataHandler import mongoClient, db
+        subscriptions_collection = getattr(Config.MongoDB, 'SUBSCRIPTIONS', 'subscriptions')
+        collection = db[subscriptions_collection]
+        # Find subscription
+        subscription = None
+        if ObjectId.is_valid(subscription_id):
+            subscription = collection.find_one({"_id": ObjectId(subscription_id)})
+        if not subscription:
+            subscription = collection.find_one({"subscriptionId": subscription_id})
+        if not subscription:
+            subscription = collection.find_one({"_id": subscription_id})
+        if not subscription:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Subscription {subscription_id} not found"
+            )
+        # Update PII setting
+        filter_criteria = {"_id": subscription["_id"]}
+        update_operation = {
+            "$set": {
+                "pii_enabled": setting.pii_enabled,
+                "pii_updated_at": time.time()
+            }
+        }
+        result = collection.update_one(filter_criteria, update_operation)
+        if result.modified_count > 0:
+            logging.info(f"Updated PII setting for subscription {subscription_id}: pii_enabled={setting.pii_enabled}")
+            return {
+                "status": "success",
+                "subscription_id": subscription_id,
+                "pii_enabled": setting.pii_enabled,
+                "message": f"PII masking is now {'ENABLED' if setting.pii_enabled else 'DISABLED'}"
+            }
+        else:
+            return {
+                "status": "no_change",
+                "subscription_id": subscription_id,
+                "pii_enabled": setting.pii_enabled,
+                "message": "PII setting was already at the requested value"
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to update PII setting: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update PII setting")
+
+
+@app.post("/subscription/{subscription_id}/reprocess-documents")
+def reprocess_documents_with_new_pii_setting(subscription_id: str):
+    """
+    Reprocess all documents in a subscription with updated PII setting
+    This will retrain documents with new PII masking rules
+    """
+    try:
+        from api.dataHandler import trainData, db
+        from api.config import Config
+        # Get all documents for this subscription
+        documents_collection = db[Config.MongoDB.DOCUMENTS]
+        # Update all documents in this subscription to UNDER_REVIEW
+        # so they get reprocessed with new PII setting
+        result = documents_collection.update_many(
+            {
+                "$or": [
+                    {"subscriptionId": subscription_id},
+                    {"subscription_id": subscription_id},
+                    {"subscription": subscription_id}
+                ],
+                "status": {"$in": ["TRAINING_COMPLETED", "TRAINING_PARTIALLY_COMPLETED"]}
+            },
+            {
+                "$set": {
+                    "status": "UNDER_REVIEW",
+                    "reprocess_reason": "PII setting changed",
+                    "reprocess_timestamp": time.time()
+                }
+            }
+        )
+        logging.info(f"Marked {result.modified_count} documents for reprocessing")
+        # Trigger training
+        training_result = trainData()
+        return {
+            "status": "success",
+            "subscription_id": subscription_id,
+            "documents_marked_for_reprocessing": result.modified_count,
+            "training_result": training_result
+        }
+    except Exception as e:
+        logging.error(f"Failed to reprocess documents: {e}")
+        raise HTTPException(status_code=500, detail="Failed to reprocess documents")
+
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
+
