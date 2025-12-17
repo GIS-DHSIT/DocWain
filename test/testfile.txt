@@ -1,0 +1,227 @@
+test
+
+{
+    "user_id": "ashok.kona@dhsit.co.uk",
+    "chat_history": [
+        {
+            "query": "test",
+            "response": "test"
+        },
+        {
+            "query": "summary",
+            "response": "This report is a quick reference guide enabling side-by-side comparison of local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends. It was generated on March 18, 2022, and contains indicative information only.\n\nThe report covers key areas such as recovery and resolution planning, capital, liquidity, governance and controls, and more. It includes comparisons of foreign bank intermediate holding company resolution plans, domestic firm resolution plans, and other related topics.\n\nKey priorities included monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts during the pandemic. The report also highlights recent trends and changes in control within the industry.\n\nThe information contained in this report is limited to its generated date of March 18, 2022, and may not reflect current events or updates."
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a quick reference guide for comparing local insights on key issues in the banking industry. It focuses on:\n\n1. Supervision and Enforcement\n2. Resolution\n3. Capital Requirements\n4. Ownership Restrictions and Implications\n5. Changes in Control\n6. Recent Trends\n\nThe report includes information on:\n\n- Recovery and Resolution Planning\n- Capital Management, including practices for stressed loss/revenue forecasting and credit risk management\n- Liquidity Management, including internal stress test assumptions and governance over liquidity data\n- Governance and Controls, including IT and cybersecurity risks, compliance with regulatory requirements, and LBOR preparedness\n\nThe report also covers recent trends and changes in the industry."
+        },
+        {
+            "query": "summary",
+            "response": "This Quick Reference Guide provides side-by-side comparison of local insights for large financial institutions. It covers various topics including:\n\n- Legal and regulatory framework\n- Supervision and enforcement\n- Resolution and capital requirements\n- Ownership restrictions and implications\n- Changes in control\n- Recent trends\n\nThe guide also includes information on recovery and resolution planning, capital management, liquidity, governance and controls, and more.\n\nKey highlights include:\n\n* Accommodations allowed the industry to focus on critical pandemic-specific issues during the crisis.\n* The Large Financial Institution (LFI) Rating System applies to U.S. institutions.\n\nPlease note that the information contained in this report is indicative only, generated as of March 18, 2022."
+        },
+        {
+            "query": "summary",
+            "response": "Key Highlights:\n\n* Recovery planning and LISCC foreign bank intermediate holding company resolution plans\n* Capital practices supporting stressed loss/revenue forecasting, credit risk management, underwriting standards\n* Liquidity practices including internal stress test assumptions, liquidity position, IT and cybersecurity governance\n* Governance and controls including information technology, internal audit, compliance risk management, operational resilience of critical systems\n\nRecovery and Resolution Planning:\n\n* Recovery planning and LISCC domestic RM resolution plans follow-up (as needed)\n* Preparation for LISCC firm targeted resolution plans\n\nCapital:\n\n* Loss estimation methodologies and capital planning and management including estimations and scenarios\n* Wholesale credit underwriting and controls with independent review functions\n* CECL implementation\n\nLiquidity:\n\n* Liquidity buffer = Internal liquidity stress testing assumptions and business-as-usual estimates\n* Contingency funding plans and projections\n* Governance over liquidity data, daily and short-term liquidity risk management monitoring programs"
+        },
+        {
+            "query": "test",
+            "response": "test"
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a quick reference guide for comparing local insights on various aspects of the financial industry, particularly during the COVID-19 pandemic. The information includes:\n\n* Supervision and enforcement\n* Resolution planning\n* Capital requirements\n* Ownership restrictions and implications\n* Changes in control\n* Recent trends\n\nThe report highlights key federal reserve priorities, including monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts. It also covers recovery and resolution planning, including peer comparison, governance and controls, liquidity management, and internal audit.\n\nKey topics include:\n\n* Capital planning and risk management\n* Loss estimation methodologies\n* Wholesale credit underwriting and controls\n* CECL implementation\n* Liquidity testing assumptions and contingency funding plans\n\nThe report provides a summary of the Large Financial Institution (LFI) Rating System, which applies to U.S. institutions.\n\n**Supplementary Information:**\n\n* The industry was able to focus on critical pandemic-specific issues with the help of accommodations.\n* Recovery planning includes peer comparison, governance and controls, liquidity management, and internal audit.\n* Capital practices support stressed loss/revenue forecasting, credit risk management, and underwriting standards.\n* Liquidity is managed through internal stress testing assumptions, business-as-usual cash flow projections, and contingency funding plans.\n\n**Pages:**\n\n* Page 47\n\nNote: The report's information may be limited to the context in which it was generated."
+        },
+        {
+            "query": "summary of the document",
+            "response": "This document provides information about the Federal Reserve's Large Financial Institution (LFI) Rating System, its application to US banks, and the process for IDI resolution planning. It also outlines the factors considered by regulatory agencies when reviewing mergers and acquisitions involving banks.\n\nKey points include:\n\n* The LFI Rating System applies to US banks with significant financial holdings.\n* Regulatory agencies consider various factors when reviewing mergers and acquisitions, including:\n  + Effect on competition\n  + Financial and managerial resources of the two entities\n  + Competence, experience, and integrity of officers, directors, and principal shareholders\n  + Convenience and needs of communities to be served\n  + Impact on the banking or financial system\n\nThe document also explains the process for IDI resolution planning, including:\n\n* The need for banks to develop resolution plans in response to changes in control.\n* The requirements for these plans, including content and exemptions.\n* The factors considered by regulatory agencies when reviewing these plans.\n\nOverall, this document provides guidance on the regulatory framework governing mergers and acquisitions involving US banks."
+        },
+        {
+            "query": "what is index",
+            "response": "There is no information available about \"index\" in the retrieved context."
+        },
+        {
+            "query": "summary \nof the documents",
+            "response": "Here is a summary of the retrieved context:\n\nThe user has training experience in SAP business users, including experience with ABAP, new asset accounting (FA), document configurations, processes, solutions for effective knowledge sharing, platform summary reports, and full life cycle implementation. Additionally, they have investigated and resolved billing issues for clients to improve financial records and transactions."
+        },
+        {
+            "query": "summary",
+            "response": "This report is a quick reference guide for side-by-side comparison of local insights in the financial industry. It covers various aspects including legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends.\n\nThe report highlights key Federal Reserve priorities, such as monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts. It also discusses recovery and resolution planning, including the Large Financial Institution (LFI) Rating System, which applies to US institutions.\n\nKey areas covered include:\n\n- Capital: Loss estimation methodologies, capital planning, and risk management.\n- Liquidity: Internal liquidity stress testing assumptions, business-as-usual forecasts, and contingency funding plans.\n- Governance and Controls: Risk management, internal audit, compliance, and operational resilience of critical systems.\n- Recovery and Resolution Planning: Resolution plans, including HC resolution plans.\n\nThe report provides supplementary information on key federal reserve priorities, including the impact of COVID-19."
+        },
+        {
+            "query": "how many docuemnts are uploaded under eductaion",
+            "response": "I don't have information about documents uploaded under Education."
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a side-by-side comparison of local insights on key issues related to the financial industry, specifically in the context of the COVID-19 pandemic. The report covers topics such as:\n\n* Capital requirements and ownership restrictions\n* Supervision and enforcement\n* Resolution planning and recovery readiness\n* Liquidity management and governance\n* Operational resilience and cybersecurity\n\nThe report includes information on the Federal Reserve's Large Financial Institution (LFI) Rating System, which applies to U.S. banks with $50 billion or more in assets.\n\nKey points from the report include:\n\n* Accommodations made by regulatory bodies allowed the industry to focus on critical pandemic-specific issues\n* The LFI Rating System was applied to U.S. banks during the pandemic\n* Capital requirements and ownership restrictions were affected by the pandemic\n* Resolution planning and recovery readiness are crucial for financial institutions\n\nThe report provides a summary of local insights on key issues in the financial industry, enabling side-by-side comparison and analysis of regulatory frameworks and industry practices."
+        },
+        {
+            "query": "summary",
+            "response": "A recovery plan is a document that outlines an organization's strategy for resolving financial difficulties. It typically includes:\n\n*   Loss estimation methodologies \n*   Capital planning and risk management\n*   Liquidity butter = \"Internal liquidity stress testing assumptions and business-as-usual pace\n*   Governance over liquidity data\n*   Daily and short-term liquidity risk monitoring programs"
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a quick reference guide for comparing local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends. It includes information on recovery and resolution planning, governance and controls, and liquidity management.\n\nKey points include:\n\n* Recovery and resolution planning involves domestic and foreign bank intermediate holding company resolution plans\n* Capital practices include stressed loss/revenue forecasting, credit risk management, and underwriting standards\n* Liquidity management includes internal stress test assumptions, liquidity position, and risk management\n* Governance and controls cover information technology and cybersecurity risks, internal audit, compliance risk management, operational resilience, and LUBOR preparedness\n\nThe report also touches on the Large Financial Institution (LFI) Rating System, which applies to U.S. institutions."
+        },
+        {
+            "query": "summary",
+            "response": "Key Highlights:\n\n* The report provides a quick reference guide for comparing local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends.\n* The information is indicative only and not exhaustive.\n* Accommodations allowed the industry to focus on critical pandemic-specific issues, including monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts.\n* Recovery and Resolution Planning includes:\n  * Recovery planning\n  * LISCC foreign bank intermediate holding company resolution plans\n  * Domestic RM resolution plans follow-up (as needed) and ISOC foreign bank HC resolution plans\n  * Preparation for LISCC firm targeted resolution plans\n* Capital requirements include:\n  * Loss estimation methodologies\n  * Capital planning and risk management\n  * CECL implementation\n  * Wholesale credit underwriting and controls with independent oversight functions\n* Liquidity requirements include:\n  * Internal liquidity stress testing assumptions\n  * Business-as-usual scenario testing\n  * Contingency funding plans projections\n  * Governance over liquidity data\n  * Daily and short-term liquidity risk management monitoring programs\n* Governance and Controls include:\n  * Risk-related risks (e.g. cyber)\n  * Internal audit\n  * Compliance with audit regulations\n  * Operational resilience of critical systems"
+        },
+        {
+            "query": "summary",
+            "response": "Key points from the report:\n\n- The report provides a quick reference guide for comparing local insights in the banking sector.\n- It discusses pandemic-specific issues and their impact on the industry, including monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts.\n- Key areas of focus include:\n  - Recovery and Resolution Planning\n  - Capital management and practices supporting stressed loss/revenue forecasting\n  - Liquidity management and governance\n  - Governance and controls\n  - Operational resilience of critical systems\n- The report also touches upon the implementation of the Current Expected Credit Loss (CECL) standard and its impact on banks.\n\nRecommendation:\nThe report offers a comprehensive overview of key areas affecting the banking sector, highlighting the importance of recovery and resolution planning, capital management, liquidity governance, and operational resilience."
+        },
+        {
+            "query": "summary",
+            "response": "This report is a quick reference guide enabling side-by-side comparison of local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends.\n\nThe report provides information on key priorities for Federal Reserve LFBO portfolio supervisory priorities and the impact of COVID-19. It also covers recovery and resolution planning, capital practices, liquidity, governance and controls, operational resilience, and liquidity management.\n\nKey points include:\n\n* Recovery planning, including LISCC foreign bank intermediate holding company resolution plans\n* Capital practices supporting stressed loss/revenue forecasting\n* Credit risk management and current expected credit loss (CECI) implementation\n* Liquidity management and governance over liquidity data\n* Governance and controls, including information technology and cybersecurity risks\n* Operational resilience and LBOR preparedness\n\nThe report includes information on recent trends, the Large Financial Institution (LFI) Rating System, and the impact of COVID-19 on the financial industry."
+        },
+        {
+            "query": "how many documents are present under this profile",
+            "response": "There is 1 document."
+        },
+        {
+            "query": "\nwhat is the docuemnt name",
+            "response": "The retrieved text does not provide information on a specific document name."
+        },
+        {
+            "query": "how many docs are there in this profile",
+            "response": "There is 1 doc in this profile."
+        },
+        {
+            "query": "how many documents are there in this profile",
+            "response": "There are 2 documents in this profile."
+        },
+        {
+            "query": "\nsummary",
+            "response": "This report provides a side-by-side comparison of local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends for Debevoise & Plimpton LLP.\n\nThe report includes information on key federal reserve priorities and the impact of COVID-19. It also covers recovery and resolution planning, including LISCC foreign bank intermediate holding company resolution plans and peer reviews.\n\nKey areas of focus include:\n\n* Capital: practices supporting stressed loss/revenue forecasting, credit risk management, underwriting standards, and CECL implementation\n* Liquidity: internal liquidity stress testing assumptions, liquidity position, and governance over liquidity data\n* Governance and Controls: information technology and cyber-related risks, internal audit, compliance risk management, operational resilience of critical systems\n\nThe report also includes summaries of planned 2020 federal reserve LFBO projects, capital planning and implementation, and recent trends in the industry.\n\nPlease note that the information contained in this report is indicative only."
+        },
+        {
+            "query": "how many docuemnts are there in the profile",
+            "response": "I don't have information about the number of documents in a profile."
+        },
+        {
+            "query": "summary",
+            "response": "Key Federal Reserve LFBO Portfolio Supervisory Priorities & the Impact of COVID-19:\n\n*   Accommodations allowed industry focus on critical pandemic-specific issues, including:\n    *   Monitoring capital\n    *   Liquidity\n    *   Asset quality\n    *   Operational preparedness\n    *   Consumer impacts\n\nRecovery and Resolution Planning:\n\n*   Recovery planning\n*   LISCC foreign bank intermediate holding company resolution plans\n*   LISCC domestic bank resolution plans follow-up (as needed)\n*   ISOC foreign bank HC resolution plans\n*   Preparation for LISCC firm targeted resolution plans\n\nCapital:\n\n*   Practices supporting stressed loss/revenue forecasting\n*   Credit risk management\n*   Current expected credit losses (CECL) implementation\n*   Underwriting standards\n*   Capital planning and risk management including estimations and scenarios design governance\n\nLiquidity:\n\n*   Internal liquidity stress testing assumptions\n*   Liquidity position\n*   Risk management for liquidity data and new products\n*   Compliance with audit regulations\n\nGovernance and Controls:\n\n*   Information technology and cyber-related risks\n*   Internal audit\n*   Compliance risk management\n*   Operational resilience of critical systems"
+        },
+        {
+            "query": "how many docs are there in this profile",
+            "response": "There is only 1 document mentioned in the retrieved text."
+        },
+        {
+            "query": "summary\n",
+            "response": "This report provides a quick reference guide for side-by-side comparison of local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends. The report includes information on key Federal Reserve LFBO portfolio supervisory priorities and the impact of COVID-19.\n\nThe report covers various topics including recovery and resolution planning, capital management, liquidity, governance and controls, and operational resilience. It also discusses loss estimation methodologies, CECL implementation, liquidity risk management, and governance and control measures.\n\nKey highlights include:\n\n* Accommodations allowed during the pandemic to focus on critical issues\n* Federal Reserve LFBO portfolio supervisory priorities and their impact on the industry\n* Recovery and resolution planning, including LISCC foreign bank intermediate holding company resolution plans and domestic LM resolution plans\n* Capital management practices supporting stressed loss/revenue forecasting\n* Liquidity risk management and governance measures\n\nThe report provides a comprehensive overview of local insights and recent trends in the financial services industry."
+        },
+        {
+            "query": "how many docuemnts are there in the profile",
+            "response": "There is only 1 document."
+        },
+        {
+            "query": "\nsummary",
+            "response": "Here is a summary of the retrieved text:\n\nThis report provides a quick reference guide for comparing local insights on various regulatory and legal frameworks, including:\n\n* Capital requirements\n* Supervision and enforcement\n* Resolution\n* Ownership restrictions and implications\n* Changes in control\n* Recent trends\n\nThe report focuses on the recovery and resolution planning process, highlighting key priorities such as:\n\n* Recovery planning\n* Loss-stress testing methodologies\n* Liquidity management\n* Governance and controls\n* Operational resilience of critical systems\n\nIt also covers specific topics, including:\n\n* Credit risk management\n* Current expected credit losses (CECL)\n* Underwriting standards\n* Compliance with audit regulations\n* Information technology and cybersecurity risks\n* Internal audits\n* Compliance risk management"
+        },
+        {
+            "query": "summary again\n",
+            "response": "Here's a summary of the provided text:\n\nThe Dodd-Frank Act was created to address the 2008 financial crisis, focusing on capital, liquidity, and oversight expectations for banking organizations based on their size and complexity.\n\nBasel norms are international banking regulations issued by the Basel Committee on Banking Supervision to coordinate banking regulations globally and strengthen the international banking system.\n\nThe Basel Committee on Banking Supervision aims to establish global standards for prudential regulation of banks, providing a forum for cooperation among central banks.\n\nKey areas addressed in the Basel norms include:\n\n* Capital: practices supporting stressed loss/revenue forecasting, credit risk management, underwriting standards\n* Liquidity: internal liquidity stress testing assumptions, contingency funding plans, governance over liquidity data\n* Governance and Controls: obder-related risks, internal audit, compliance with regulatory requirements\n\nRecovery and Resolution Planning is also a critical aspect of the Basel norms, involving:\n\n* Recovery planning\n* LISCC foreign bank intermediate holding company resolution plans\n* Domestic RM resolution plans follow-up (as needed) and ISOC foreign bank |HC resolution plans"
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a summary of key information on the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends affecting foreign banks operating in the US. The report focuses on the Large Financial Institution (LFI) Rating System, which applies to US banks.\n\nThe report highlights the following key points:\n\n* Recovery planning: The report provides information on recovery planning, including domestic and foreign bank resolution plans.\n* Capital requirements: The report discusses capital practices supporting stressed loss/revenue forecasting, credit risk management, and underwriting standards.\n* Liquidity: The report explains liquidity positioning, internal stress test assumptions, and governance over liquidity data.\n* Governance and Controls: The report covers information technology and cyber-related risks, internal audit, compliance risk management, and operational resilience of critical systems.\n* Recovery and Resolution Planning: The report provides an overview of resolution plans, including HC resolution plans.\n\nThe report also highlights recent trends and accommodations made by the industry to focus on pandemic-specific issues."
+        },
+        {
+            "query": "summary",
+            "response": "This quick reference guide is a supplementary report containing information on the legal and regulatory framework, supervision and enforcement, recovery and resolution planning, capital requirements, ownership restrictions and implications, changes in control, and recent trends in the banking industry. The report provides an overview of key priorities, including credit risk management, liquidity, governance and controls, operational resilience, and recovery and resolution planning. It also covers topics such as capital planning and implementation, loss estimation methodologies, contingency funding plans, and compliance with regulatory requirements."
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a quick reference guide for comparing local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends. \n\nIt includes information on recovery and resolution planning, including domestic and foreign bank intermediate holding company resolution plans, as well as liquidity management and governance practices. The report also covers capital planning and risk management, internal audit, operational resilience of critical systems, and daily and short-term liquidity risk monitoring programs.\n\nKey priorities include:\n\n- Monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts\n- Managing credit risk\n- Implementing Current Expected Credit Loss (CECL) methodologies\n- Designing governance and scenario-based policies\n- Conducting internal stress testing assumptions\n- Overseeing liquidity position and risk management\n\nThe report also highlights key areas for recovery and resolution planning, including domestic and foreign bank intermediate holding company resolution plans, as well as loss estimation methodologies and capital planning. \n\nKey Federal Reserve LFBO portfolio supervisory priorities include:\n\n- Credit risk management\n- Current expected credit losses (CECL) implementation\n- Underwriting standards\n\nThe report provides a summary of key information for local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends."
+        },
+        {
+            "query": "summary",
+            "response": "**Summary**\n\nThis report provides a quick reference guide for side-by-side comparison of local insights into the legal and regulatory framework, supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends. The report was generated on March 18, 2022, and contains supplementary information, including accommodations allowed during the pandemic, Federal Reserve LFBO portfolio supervisory priorities, and recovery and resolution planning. Key topics include capital management, liquidity management, governance and controls, operational resilience, and compliance with regulatory requirements."
+        },
+        {
+            "query": "\nperfect give me more details",
+            "response": "I can't fulfill your request as it is outside my knowledge domain."
+        },
+        {
+            "query": "\nokay lets check one more",
+            "response": "$8,370,878 $10,300,041, Yes"
+        },
+        {
+            "query": "try again\n",
+            "response": "Fintech companies have struggled with significant compliance burdens as they try to situate themselves in the regulatory spectrum."
+        },
+        {
+            "query": "summary\n",
+            "response": "The results and conclusions drawn upon by using Market Research (MR) are not very accurate. The results are very vague as MR is carried out on consumers, suppliers, intermediaries, etc. This will provide a comprehensive picture of the situation and possible solution."
+        },
+        {
+            "query": "summary",
+            "response": "Key Federal Reserve LFBO Portfolio Supervisory Priorities & the Impact of COVID-19:\n\n* Accommodations allowed industry focus on critical pandemic-specific issues, including:\n\t+ Monitoring capital\n\t+ Liquidity\n\t+ Asset quality\n\t+ Operational preparedness\n\t+ Consumer impacts\n\nRecovery and Resolution Planning:\n\n* Recovery planning\n* LISCC foreign bank intermediate holding company resolution plans\n* Domestic resolution plans (LISCC) follow-up (as needed)\n* Foreign bank HC resolution plans\n* Preparation for LISCC firm targeted resolution plans\n\nCapital:\n\n* Practices supporting stressed loss/revenue forecasting\n\t+ Credit risk management\n\t+ Current expected credit losses (CECI) implementation\n\t+ Underwriting standards\n* Capital planning and risk management including:\n\t+ Loss estimation methodologies\n\t+ Capital planning and management including editions estimations\n\t+ CECL implementation\n\nLiquidity:\n\n* Liquidity buffer\n\t+ Internal liquidity stress testing assumptions\n\t+ Business-as-usual (BAU) forecast\n* Contingency funding plans projections\n* Governance over liquidity data\n\nGovernance and Controls:\n\n* Operational-related risks\n\t+ Information technology risks\n\t+ Internal audit\n* Compliance and business conduct\n\t+ LBOR preparedness\n\t+ BSWANL and OFAC compliance program control"
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a quick reference guide for comparing local insights on various aspects of the financial industry, including legal and regulatory frameworks, supervision and enforcement, resolution, capital requirements, ownership restrictions, changes in control, and recent trends. The information is based on data available as of March 18, 2022, and is intended to be indicative only.\n\nKey areas covered in the report include:\n\n* Recovery and Resolution Planning\n\t+ Recovery planning\n\t+ LISCC foreign bank intermediate holding company resolution plans\n\t+ LISCC domestic firm resolution plans\n\t+ FCRA (Federal Deposit Insurance Corporation) resolution plans\n* Capital\n\t+ Practices supporting stressed loss/revenue forecasting\n\t+ Credit risk management\n\t+ Underwriting standards\n\t+ Capital planning and risk management\n* Liquidity\n\t+ Internal liquidity stress testing assumptions\n\t+ Business-as-usual cash flow projections\n\t+ Contingency funding plans and projections\n\t+ Governance over liquidity data\n* Governance and Controls\n\t+ Operational resilience of critical systems\n\t+ BSAWM (Bank Secrecy Act/USA PATRIOT Act) compliance program control\n\t+ LBOR preparedness\n\t+ Compliance risk management\n\t+ Internal audit\n\nThe report also mentions the Large Financial Institution (LFI) Rating System, which applies to U.S. banks with more than $50 billion in total consolidated assets.\n\nThe document includes supplementary information, including a key federal reserve LFBO portfolio supervisory priorities and the impact of COVID-19, as well as OCR (optical character recognition) extracted from images 1, 3, and 4."
+        },
+        {
+            "query": "test",
+            "response": "test"
+        },
+        {
+            "query": "summary\n",
+            "response": "Here is a summary of the retrieved text:\n\nThis report provides a quick reference guide for comparing local insights on various aspects of the banking industry, including legal and regulatory frameworks, supervision and enforcement, resolution, capital requirements, ownership restrictions, changes in control, and recent trends.\n\nKey topics include:\n\n* Recovery and Resolution Planning\n\t+ Recovery planning\n\t+ LISCC foreign bank intermediate holding company resolution plans\n\t+ Domestic LM resolution plans\n* Capital\n\t+ Practices supporting stressed loss/revenue forecasting\n\t+ Credit risk management\n\t+ Underwriting standards\n* Liquidity\n\t+ Internal liquidity stress testing assumptions\n\t+ Contingency funding plans and projections\n\t+ Governance over liquidity data\n* Governance and Controls\n\t+ Obder-related risks\n\t+ Information technology and cyber-related risks\n\t+ Compliance and business conduct\n\nThe report also mentions the Large Financial Institution (LFI) Rating System, which applies to U.S. banks.\n\nNote: The information contained in this report is indicative only and was generated on March 18, 2022."
+        },
+        {
+            "query": "summary",
+            "response": "Key points include:\n\n- Accommodations allowed industry focus on pandemic-specific issues.\n- Federal Reserve LFBO Portfolio Supervisory Priorities & the Impact of COVID-19.\n- Recovery and Resolution Planning, including LISCC foreign bank intermediate holding company resolution plans and recovery planning.\n- Capital practices supporting stressed loss/revenue forecasting.\n- Credit risk management and current expected credit losses (CECI) implementation.\n- Liquidity position with internal stress test assumptions and liquidity management.\n- Governance and Controls, including information technology and cybersecurity risks.\n- Operational resilience of critical systems."
+        },
+        {
+            "query": "Summary",
+            "response": "Quick reference guide enabling side-by-side comparison of local insights. \n\nThe 2008 financial crisis resulted in the Dodd–Frank Wall Street Reform and Consumer Protection Act (the Dodd–Frank Act), which sought to create meaningful differences in the capital, liquidity and oversight expectations of banking organisations depending on their size and complexity"
+        },
+        {
+            "query": "\nproivde more details",
+            "response": "Countercyclical capital buffer (CCCB)\nThe countercyclical capital buffer is a component of the Basel-III framework that aims to regulate banks' risk-taking behavior during economic downturns. The CCCB is implemented as a percentage of a bank's total equity, ranging from 1% to 2.5%. Its primary goal is to maintain the stability of the financial system by requiring banks to hold more capital when the economy is growing and less capital when the economy is slowing down.\n\nThe idea behind the CCCB is that banks tend to take on more risk during periods of economic growth, leading to an increase in their capital requirements. Conversely, during economic downturns, banks may be more cautious and reduce their risk-taking behavior, which could lead to a decrease in their capital requirements. By adjusting the capital requirements accordingly, the CCCB aims to mitigate the risks associated with excessive lending or other risky activities.\n\nCentral banks specify certain capital adequacy norms for banks in a country following Basel-III norms. These norms require banks to maintain minimum levels of capital and liquidity to ensure their stability and ability to meet their obligations.\n\nCAMELS ratings have become more qualitative and subjective over time, particularly after the 1996 update to the CAMELS standards. The management component is now given special consideration when assigning a composite rating, reflecting the increasingly complex nature of banking risks."
+        },
+        {
+            "query": "Summary",
+            "response": "This Quick reference guide enables side-by-side comparison of local insights into the legal and regulatory framework for China's financial sector. It covers key areas including:\n\n- Legal and Regulatory Framework\n- Supervision and Enforcement\n- Resolution\n- Capital Requirements\n- Ownership Restrictions and Implications\n- Changes in Control\n- Recent Trends\n\nNote: The information contained in this report is indicative only and not necessarily up-to-date or definitive."
+        },
+        {
+            "query": "\nsummarise again",
+            "response": "The Dodd-Frank Act was created to strengthen the banking system after the 2008 financial crisis. It includes regulations such as Basel norms, which coordinate global banking standards to reduce risk. The Basel Committee on Banking Supervision sets international banking standards.\n\nKey components of Basel norms include:\n\n* Strengthening capital, liquidity, and oversight expectations\n* Creating differences in expectations depending on size and complexity\n* Regulating banks and providing a forum for cooperation among central banks\n\nBasel norms aim to coordinate banking regulations across the globe to strengthen the international banking system."
+        },
+        {
+            "query": "more summary\n",
+            "response": "Debevoise & Plimpton LLP provides a quick reference guide for comparing local insights into the legal and regulatory framework. \n\nThe information contained in this report is indicative only.\n\nAs people withdraw their funds, the probability of default increases, prompting more withdrawals.\n\nCountercyclical capital buffer (CCCB) is 4/5.\n\nCapital adequacy norms for banks are specified by central banks following Basel-III norms.\n\nCAMELS ratings have become more qualitative and subjective over time, with management being a primary consideration."
+        },
+        {
+            "query": "\nsummary",
+            "response": "This quick reference guide enables side-by-side comparison of local insights into the legal and regulatory framework; supervision and enforcement; resolution; capital requirements; ownership restrictions and implications; changes in control; and recent trends. It was generated on March 18, 2022, and contains supplementary information on key Federal Reserve priorities, recovery and resolution planning, capital practices, liquidity management, governance and controls, operational resilience, and more. The report provides a summary of the industry's focus on critical pandemic-specific issues and includes tables and images with OCR-extracted data."
+        },
+        {
+            "query": "Summary ",
+            "response": "This report provides a quick reference guide for side-by-side comparison of local insights into the legal and regulatory framework. It covers topics such as supervision and enforcement, resolution, capital requirements, ownership restrictions and implications, changes in control, and recent trends related to banking organizations. The information is based on the Dodd-Frank Act, enacted in response to the 2008 financial crisis, which aims to differentiate capital, liquidity, and oversight expectations among banks based on their size and complexity."
+        },
+        {
+            "query": "\nsummary again",
+            "response": "Here is a summary of the text based on the retrieved content:\n\nThe Basel norms are international banking regulations issued by the Basel Committee on Banking Supervision to coordinate banking regulations across the globe. The committee focuses on risks to banks and the financial system, aiming to strengthen the international banking system.\n\nKey Federal Reserve priorities during the pandemic included monitoring capital, liquidity, asset quality, operational preparedness, and consumer impacts. Accommodations allowed the industry to focus on these critical issues.\n\nThe Dodd-Frank Act aimed to create meaningful differences in capital, liquidity, and oversight expectations for banking organizations based on their size and complexity."
+        },
+        {
+            "query": "summary",
+            "response": "This report provides a summary guide for comparing local insights on key issues in the financial industry, specifically:\n\n1. Legal and regulatory framework\n2. Supervision and enforcement\n3. Resolution and capital requirements\n4. Ownership restrictions and implications\n5. Changes in control\n6. Recent trends.\n\nThe report includes information on:\n\n- Accommodations allowing industry focus on pandemic-specific issues\n- Key Federal Reserve LFBO portfolio supervisory priorities\n- Capital practices supporting stressed loss/revenue forecasting\n- Liquidity management and governance\n- Governance and controls, including information technology and cybersecurity risks\n\nAdditionally, the report covers recovery and resolution planning, capital requirements, liquidity, operational resilience, and recent trends.\n\nThe Large Financial Institution (LFI) Rating System applies to U.S. institutions."
+        },
+        {
+            "query": "Summary",
+            "response": "The summary is as follows:\n\nWith an emphasis on the product life cycle we can study how products are created and managed,\nNot only do damaged goods erode profits, but frequent claims increase insurance premiums and\ninconvenience customers, endangering future business."
+        },
+        {
+            "query": "summary",
+            "response": "A product is one of the main components of marketing, revolving around it. A good product communicates its benefits, differences, and value to users. A bad product affects the firm's reputation, price, channel members, and promotional measures. Supplies and services facilitate product development or management."
+        },
+        {
+            "query": "Summary",
+            "response": "A quick reference guide enabling side-by-side comparison of local insights into the legal and regulatory framework for banking organizations in various jurisdictions."
+        }
+    ]
+}
