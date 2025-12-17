@@ -2,6 +2,7 @@ import json
 import uuid
 import logging
 import hashlib
+import re
 import subprocess
 import boto3 as b3
 import numpy as np
@@ -176,7 +177,10 @@ def get_model():
     """Lazy init for sentence transformer model to cut import-time cost."""
     global _MODEL
     if _MODEL is None:
-        _MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
+        name = getattr(Config.Model, "SENTENCE_TRANSFORMERS", "sentence-transformers/all-mpnet-base-v2")
+        logging.info(f"Loading sentence transformer model: {name}")
+        _MODEL = SentenceTransformer(name)
+        logging.info(f"Loaded sentence transformer model: {name}")
     return _MODEL
 
 
@@ -865,6 +869,39 @@ def ensure_qdrant_collection(collection_name, vector_size=768):
             logging.info(f"Collection '{collection_name}' created successfully.")
         else:
             logging.info(f"Collection '{collection_name}' already exists.")
+            try:
+                info = client.get_collection(collection_name)
+
+                def _extract_dim(collection_info):
+                    cfg = getattr(collection_info, "config", None) or {}
+                    params = getattr(cfg, "params", None) or {}
+                    vectors = getattr(params, "vectors", None) or getattr(params, "vector_size", None) or {}
+                    # qdrant_client may return vectors as dict or as a dataclass with .size
+                    if hasattr(vectors, "size"):
+                        return vectors.size
+                    if isinstance(vectors, dict):
+                        if "size" in vectors:
+                            return vectors.get("size")
+                        if "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
+                            return vectors["content_vector"].get("size")
+                    return None
+
+                existing_dim = _extract_dim(info)
+                if existing_dim is None:
+                    logging.warning(
+                        f"Existing collection '{collection_name}' has unknown dim; "
+                        f"assuming {vector_size} and continuing without recreation to avoid data loss"
+                    )
+                else:
+                    logging.info(f"Collection '{collection_name}' expects dim={existing_dim}")
+                    if existing_dim != vector_size:
+                        raise ValueError(
+                            f"Collection '{collection_name}' vector dim mismatch: existing {existing_dim}, new {vector_size}. "
+                            f"Use a model with dim {existing_dim} or recreate the collection."
+                        )
+            except Exception as dim_exc:
+                logging.error(f"Failed dimension check for collection '{collection_name}': {dim_exc}")
+                raise
 
         # Ensure payload indexes exist for common filters
         for field in ["subscription_id", "profile_id", "document_id", "tag"]:
@@ -1013,13 +1050,191 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         raise
 
 
+_BULLET_LINE_RE = re.compile(r'^\s*(?:[-*]|\d+[.)])\s+')
+
+
+def _normalize_text_for_chunking(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\f", "\n\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+def _is_heading_block(block: str) -> bool:
+    stripped = block.strip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    if stripped.endswith(":") and len(stripped.split()) <= 12:
+        return True
+    letters = re.sub(r"[^A-Za-z]+", "", stripped)
+    if letters and letters.isupper() and len(letters) >= 6:
+        return True
+    if len(stripped.split()) <= 6 and not re.search(r"[.!?]", stripped) and len(stripped) <= 80:
+        return True
+    return False
+
+
+def _clean_heading(block: str) -> str:
+    heading = block.strip().lstrip("#").strip()
+    heading = heading.rstrip(":").strip()
+    heading = re.sub(r"\s+", " ", heading)
+    return heading
+
+
+def _split_block_into_units(block: str) -> list:
+    lines = [line.strip() for line in block.splitlines() if line.strip()]
+    if not lines:
+        return []
+    bullet_lines = [line for line in lines if _BULLET_LINE_RE.match(line)]
+    if bullet_lines and len(bullet_lines) >= max(2, len(lines) // 2):
+        units = []
+        for line in lines:
+            if _BULLET_LINE_RE.match(line):
+                cleaned = _BULLET_LINE_RE.sub("", line).strip()
+                if cleaned:
+                    units.append(cleaned)
+            else:
+                units.append(line)
+        return units
+
+    paragraph = " ".join(lines)
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", paragraph)
+    units = [s.strip() for s in sentences if s.strip()]
+    return units or [paragraph]
+
+
+def _split_long_unit(unit: str, max_words: int) -> list:
+    words = unit.split()
+    if len(words) <= max_words:
+        return [unit]
+    parts = []
+    for i in range(0, len(words), max_words):
+        parts.append(" ".join(words[i:i + max_words]))
+    return parts
+
+
+def build_document_chunks(
+        raw_text: str,
+        doc_name: str,
+        max_words: int = 180,
+        min_words: int = 60,
+        overlap_sentences: int = 1
+) -> tuple:
+    """Chunk text into coherent sections with sentence-aware overlap."""
+    text = _normalize_text_for_chunking(raw_text)
+    if not text:
+        return [], []
+
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+    chunks = []
+    sections = []
+    active_heading = None
+    chunk_units = []
+    chunk_words = 0
+    prefix = f"{doc_name}: " if doc_name else ""
+
+    def flush(use_overlap: bool = True):
+        nonlocal chunk_units, chunk_words
+        if not chunk_units:
+            return []
+        chunk_text = " ".join(chunk_units).strip()
+        if active_heading:
+            chunk_text = f"{active_heading} - {chunk_text}"
+            section_label = active_heading[:80]
+        else:
+            section_label = f"chunk-{len(sections) + 1}"
+
+        chunks.append(f"{prefix}{chunk_text}")
+        sections.append(section_label)
+
+        overlap_units = []
+        if use_overlap and overlap_sentences > 0:
+            overlap_units = chunk_units[-overlap_sentences:]
+        chunk_units = []
+        chunk_words = 0
+        return overlap_units
+
+    for block in blocks:
+        if _is_heading_block(block):
+            if chunk_units:
+                flush(use_overlap=False)
+            active_heading = _clean_heading(block)
+            continue
+
+        units = _split_block_into_units(block)
+        if not units:
+            continue
+
+        for unit in units:
+            for part in _split_long_unit(unit, max_words):
+                unit_words = len(part.split())
+                if chunk_units and (chunk_words + unit_words > max_words):
+                    overlap_units = flush(use_overlap=True)
+                    if overlap_units:
+                        chunk_units = list(overlap_units)
+                        chunk_words = sum(len(u.split()) for u in overlap_units)
+                chunk_units.append(part)
+                chunk_words += unit_words
+
+    if chunk_units:
+        flush(use_overlap=False)
+
+    if len(chunks) >= 2:
+        merged_chunks = []
+        merged_sections = []
+        for idx, chunk in enumerate(chunks):
+            word_count = len(chunk.split())
+            if word_count < min_words and merged_chunks:
+                merged_chunks[-1] = f"{merged_chunks[-1]} {chunk}"
+            else:
+                merged_chunks.append(chunk)
+                merged_sections.append(sections[idx])
+        chunks = merged_chunks
+        sections = merged_sections
+
+    return chunks, sections
+
+
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
     """Trains and stores embeddings from a document using chunking."""
     try:
         logging.info(f"Starting training for file {doc_name} (document {doc_tag}) in profile {profile_tag}")
 
         if isinstance(text, dict):
-            # Already has embeddings
+            # If embeddings are missing/malformed, recompute from texts when possible
+            embeddings_obj = text.get("embeddings")
+            texts_obj = text.get("texts") or text.get("text") or text.get("content")
+
+            # Flatten dict-shaped embeddings (e.g., keyed by column)
+            if isinstance(embeddings_obj, dict):
+                try:
+                    embeddings_obj = list(embeddings_obj.values())
+                except Exception:
+                    embeddings_obj = None
+
+            if embeddings_obj is None and texts_obj:
+                if isinstance(texts_obj, dict):
+                    texts_obj = list(texts_obj.values())
+                if isinstance(texts_obj, str):
+                    texts_obj = [texts_obj]
+                model = get_model()
+                logging.info(f"Recomputing embeddings for {doc_name} from provided texts ({len(texts_obj)} chunks)")
+                text["embeddings"] = model.encode(texts_obj, convert_to_numpy=True, normalize_embeddings=True)
+                text["texts"] = texts_obj
+            elif embeddings_obj is not None and not isinstance(embeddings_obj, (list, tuple, np.ndarray)):
+                try:
+                    text["embeddings"] = np.asarray(embeddings_obj)
+                except Exception:
+                    logging.warning(f"Could not coerce embeddings for {doc_name}; recomputing from text if available")
+                    if texts_obj:
+                        model = get_model()
+                        text["embeddings"] = model.encode(texts_obj, convert_to_numpy=True, normalize_embeddings=True)
+                        text["texts"] = texts_obj
+                    else:
+                        raise ValueError(f"Embeddings for {doc_name} are invalid and no texts provided to recompute")
+
             result = save_embeddings_to_qdrant(text, subscription_id, profile_tag, doc_tag, doc_name)
             return f"Training complete for {doc_name}. Stored {result.get('points_saved', 0)} embeddings in {profile_tag}"
 
@@ -1028,12 +1243,14 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                 logging.error(f"Empty text content for file {doc_name}")
                 raise ValueError(f"Empty content in {doc_name}")
 
-            # Split into chunks
-            chunks = text.split(". ")
-            chunks = [c.strip() for c in chunks if c.strip()]
-
-            # Add document name to each chunk to improve name-based retrieval
-            chunks = [f"{doc_name}: {c}" for c in chunks]
+            # Split into context-preserving chunks with heading awareness
+            chunks, section_labels = build_document_chunks(
+                text,
+                doc_name,
+                max_words=180,
+                min_words=60,
+                overlap_sentences=1
+            )
 
             if not chunks:
                 logging.error(f"No valid chunks created for file {doc_name}")
@@ -1064,7 +1281,8 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                 "embeddings": embeddings_array,
                 "texts": chunks,
                 "sparse_vectors": sparse_vectors,
-                "summaries": summaries
+                "summaries": summaries,
+                "sections": section_labels
             }
 
             # Save embeddings (already normalized by model)
