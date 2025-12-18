@@ -2,6 +2,7 @@ import json
 import uuid
 import logging
 import hashlib
+import re
 import subprocess
 import boto3 as b3
 import numpy as np
@@ -21,6 +22,8 @@ from azure.storage.blob import BlobServiceClient
 import time
 import copy
 from sklearn.feature_extraction.text import TfidfVectorizer
+from typing import List, Tuple, Dict, Any
+from dataclasses import dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -29,6 +32,62 @@ docEx = None
 _MODEL = None
 _QDRANT_CLIENT = None
 logger = logging.getLogger(__name__)
+
+
+'-------------------------------modified by maha/maria-----------------------'
+'---------------------------------new function for checking PII status in mongodb--------------------'
+
+
+def get_subscription_pii_setting(subscription_id: str) -> bool:
+    """
+    Fetch PII enabled/disabled setting from subscription in MongoDB.
+
+    Args:
+        subscription_id: The subscription ID to check
+
+    Returns:
+        bool: True if PII masking is enabled, False if disabled
+        Default to True if setting not found (safe default)
+    """
+    try:
+        # Check if subscriptions collection exists in Config
+        subscriptions_collection = getattr(Config.MongoDB, 'SUBSCRIPTIONS', 'subscriptions')
+        collection = db[subscriptions_collection]
+
+        # Try to find subscription by _id or subscriptionId field
+        subscription = None
+
+        # Try ObjectId first if valid
+        if ObjectId.is_valid(subscription_id):
+            subscription = collection.find_one({"_id": ObjectId(subscription_id)})
+
+        # If not found, try string matching
+        if not subscription:
+            subscription = collection.find_one({"subscriptionId": subscription_id})
+
+        # If still not found, try _id as string
+        if not subscription:
+            subscription = collection.find_one({"_id": subscription_id})
+
+        if subscription:
+            # Check for pii_enabled field (can be pii_enabled, piiEnabled, or enable_pii)
+            pii_enabled = subscription.get('pii_enabled') or subscription.get('piiEnabled') or subscription.get(
+                'enable_pii')
+
+            if pii_enabled is not None:
+                logging.info(
+                    f"Subscription {subscription_id}: PII masking is {'ENABLED' if pii_enabled else 'DISABLED'}")
+                return bool(pii_enabled)
+            else:
+                logging.warning(f"Subscription {subscription_id}: PII setting not found, defaulting to ENABLED")
+                return True  # Safe default - enable PII masking if not specified
+        else:
+            logging.warning(f"Subscription {subscription_id} not found in database, defaulting to PII ENABLED")
+            return True  # Safe default
+
+    except Exception as e:
+        logging.error(f"Error fetching PII setting for subscription {subscription_id}: {e}")
+        return True  # Safe default - enable PII masking on error
 
 
 def normalize_embedding_matrix(raw_vectors, expected_dim=None):
@@ -121,7 +180,10 @@ def get_model():
     """Lazy init for sentence transformer model to cut import-time cost."""
     global _MODEL
     if _MODEL is None:
-        _MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
+        name = getattr(Config.Model, "SENTENCE_TRANSFORMERS", "sentence-transformers/all-mpnet-base-v2")
+        logging.info(f"Loading sentence transformer model: {name}")
+        _MODEL = SentenceTransformer(name)
+        logging.info(f"Loaded sentence transformer model: {name}")
     return _MODEL
 
 
@@ -367,6 +429,184 @@ def get_azure_docs(files):
         return None
 
 
+'-------------------------------modified by maha/maria-----------------------'
+'---------------Added a PII control per subscription in connectData function--------------------'
+
+
+def connectData(documentConnection):
+    """Processes documents and extracts data, updates vetting points."""
+    dataDict = {}
+
+    for k, v in documentConnection.items():
+        docData = v['dataDict']
+        connData = v['connDict']
+        profileId = str(docData['profile'])
+        docId = str(docData['_id'])
+
+        # Prefer explicit subscription/subscriptionId fields from document, then connector, then default.
+        subscriptionId = str(
+            docData.get('subscriptionId')
+            or docData.get('subscription_id')
+            or docData.get('subscription')
+            or (connData.get('subscriptionId') if isinstance(connData, dict) else None)
+            or (connData.get('subscription') if isinstance(connData, dict) else None)
+            or "default"
+        )
+
+        # ============= NEW: Check PII setting for this subscription =============
+        pii_masking_enabled = get_subscription_pii_setting(subscriptionId)
+        logging.info(f"Document {docId} (Subscription {subscriptionId}): PII masking = {pii_masking_enabled}")
+        # =========================================================================
+
+        # Allow reprocessing documents that previously failed training
+        allowed_statuses = {'UNDER_REVIEW', 'TRAINING_FAILED'}
+
+        if docData.get('status') in allowed_statuses:
+            try:
+                logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
+
+                # Initialize extracted documents dictionary for this document
+                all_extracted_docs = {}
+
+                if docData['type'] == 'S3':
+                    bkName = connData['s3_details']['bucketName']
+                    region = connData['s3_details']['region']
+                    ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
+                    sk = decrypt_data(connData['s3_details']['secretKey']).split('\x08')[0].strip()
+                    s3 = get_s3_client(ak, sk, region)
+
+                    if not s3:
+                        logging.error(f"Failed to create S3 client for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to create S3 client')
+                        continue
+
+                    objs = s3.list_objects_v2(Bucket=bkName)
+                    file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
+
+                    if not file:
+                        logging.error(f"File {docData['name']} not found in S3 bucket {bkName}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'File not found in S3')
+                        continue
+
+                    docContent = read_s3_file(s3, bkName, file[0])
+
+                    if docContent is None:
+                        logging.error(f"Failed to read S3 file for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to read S3 file')
+                        continue
+
+                    extractedDoc = fileProcessor(docContent, file[0])
+
+                    if not extractedDoc:
+                        logging.error(f"Failed to extract content from document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
+                        continue
+
+                    all_extracted_docs.update(extractedDoc)
+                    vettingPoints = vettingProcessor(extractedDoc)
+                    updateVetting(docId, vettingPoints)
+
+                elif docData['type'] == 'LOCAL':
+                    files = connData['locations']
+
+                    # Process ALL files for this document
+                    for file_path in files:
+                        try:
+                            file_key = file_path.split('/', 4)[-1]
+                            logging.info(f"Processing file: {file_key} for document {docId}")
+
+                            docContent = get_azure_docs(file_key)
+
+                            if docContent is None:
+                                logging.error(f"Failed to read Azure file {file_key} for document {docId}")
+                                continue
+
+                            extractedDoc = fileProcessor(docContent, file_path)
+
+                            if not extractedDoc:
+                                logging.error(f"Failed to extract content from file {file_key}")
+                                continue
+
+                            # Add this file's extracted content to the collection
+                            all_extracted_docs.update(extractedDoc)
+                            logging.info(f"Successfully extracted content from {file_key}")
+
+                        except Exception as file_error:
+                            logging.error(f"Error processing file {file_path}: {file_error}")
+                            continue
+
+                    # Calculate vetting points for all extracted documents
+                    if all_extracted_docs:
+                        vettingPoints = vettingProcessor(all_extracted_docs)
+                        updateVetting(docId, vettingPoints)
+                    else:
+                        logging.error(f"No content extracted for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'No content extracted from any file')
+                        continue
+
+                # Store all extracted documents for this document ID
+                if all_extracted_docs:
+                    # Check if PII masking is enabled for this subscription
+                    subscription_doc = db[Config.MongoDB.SUBSCRIPTIONS].find_one({
+                        "subscription_id": subscriptionId
+                    })
+                    pii_enabled = subscription_doc.get('pii_enabled', False) if subscription_doc else False
+                    if pii_enabled:
+                        # Mask PII, track counts, and block training if high confidentiality detected
+                        masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
+                        update_pii_stats(docId, pii_count, high_conf, pii_items)
+
+                        if high_conf:
+                            logging.error(
+                                f"High confidentiality content detected in document {docId}; blocking training")
+                            update_training_status(docId, 'TRAINING_BLOCKED_CONFIDENTIAL',
+                                                   'High confidentiality content detected')
+                            continue
+
+                        # Recompute embeddings for structured data after masking
+                        for fname, content in masked_docs.items():
+                            if isinstance(content, dict) and "texts" in content:
+                                texts = content.get("texts") or []
+                                if texts:
+                                    model = get_model()
+                                    content["embeddings"] = model.encode(texts, convert_to_numpy=True)
+                                masked_docs[fname] = content
+                    else:
+                        # PII masking disabled - use original documents
+                        logging.info(f"PII masking disabled for subscription {subscriptionId}")
+                        masked_docs = all_extracted_docs
+                        pii_count = 0
+                        high_conf = False
+                        pii_items = []
+                        update_pii_stats(docId, 0, False, [])
+
+                    vettingPoints = vettingProcessor(masked_docs)
+                    updateVetting(docId, vettingPoints)
+
+                    dataDict[docId] = {
+                        'subscriptionId': subscriptionId,
+                        'profileId': profileId,
+                        'extractedDoc': masked_docs,
+                        'docName': docData.get('name', 'Unknown')
+                    }
+                    logging.info(f"Stored {len(masked_docs)} files for document {docId} (PII masked: {pii_count})")
+                    # ==============================================================================================
+                else:
+                    logging.error(f"No documents extracted for {docId}")
+                    update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
+
+            except Exception as e:
+                logging.error(f"Error processing document {docId} ({docData.get('name', 'Unknown')}): {e}")
+                update_training_status(docId, 'TRAINING_FAILED', str(e))
+
+        elif docData['status'] == 'DELETED':
+            profileData = str(docData['profile'])
+            delete_embeddings(subscriptionId, profileData, docId)
+
+    return dataDict
+
+
+'''
 def connectData(documentConnection):
     """Processes documents and extracts data, updates vetting points."""
     dataDict = {}
@@ -515,6 +755,7 @@ def connectData(documentConnection):
             delete_embeddings(subscriptionId, profileData, docId)
 
     return dataDict
+'''
 
 
 def collectionConnect(name):
@@ -538,7 +779,8 @@ def collectionConnect(name):
 def extract_document_info():
     """Retrieves connector details from MongoDB."""
     try:
-        logging.info(f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
+        logging.info(
+            f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
         try:
             existing = db.list_collection_names()
             logging.info(f"Existing collections in DB '{Config.MongoDB.DB}': {existing}")
@@ -631,6 +873,39 @@ def ensure_qdrant_collection(collection_name, vector_size=768):
             logging.info(f"Collection '{collection_name}' created successfully.")
         else:
             logging.info(f"Collection '{collection_name}' already exists.")
+            try:
+                info = client.get_collection(collection_name)
+
+                def _extract_dim(collection_info):
+                    cfg = getattr(collection_info, "config", None) or {}
+                    params = getattr(cfg, "params", None) or {}
+                    vectors = getattr(params, "vectors", None) or getattr(params, "vector_size", None) or {}
+                    # qdrant_client may return vectors as dict or as a dataclass with .size
+                    if hasattr(vectors, "size"):
+                        return vectors.size
+                    if isinstance(vectors, dict):
+                        if "size" in vectors:
+                            return vectors.get("size")
+                        if "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
+                            return vectors["content_vector"].get("size")
+                    return None
+
+                existing_dim = _extract_dim(info)
+                if existing_dim is None:
+                    logging.warning(
+                        f"Existing collection '{collection_name}' has unknown dim; "
+                        f"assuming {vector_size} and continuing without recreation to avoid data loss"
+                    )
+                else:
+                    logging.info(f"Collection '{collection_name}' expects dim={existing_dim}")
+                    if existing_dim != vector_size:
+                        raise ValueError(
+                            f"Collection '{collection_name}' vector dim mismatch: existing {existing_dim}, new {vector_size}. "
+                            f"Use a model with dim {existing_dim} or recreate the collection."
+                        )
+            except Exception as dim_exc:
+                logging.error(f"Failed dimension check for collection '{collection_name}': {dim_exc}")
+                raise
 
         # Ensure payload indexes exist for common filters
         for field in ["subscription_id", "profile_id", "document_id", "tag"]:
@@ -674,11 +949,22 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         if vector_size == 0:
             logging.error(f"Error: Trying to save empty embeddings for document {doctag}!")
             raise ValueError("Empty embeddings array")
+        # Fetch profile name for tagging
+        try:
+            profile_doc = db[Config.MongoDB.PROFILES].find_one({"_id": ObjectId(profile_id)})
+            profile_name = profile_doc["name"].replace(" ", "_") if profile_doc and "name" in profile_doc else str(
+                profile_id)
+        except Exception as e:
+            logging.warning(f"Could not fetch profile name for {profile_id}: {e}")
+            profile_name = str(profile_id)
 
         collection_name = build_collection_name(subscription_id)
+        # collection_name = build_collection_name(profile_name)
+
         ensure_qdrant_collection(collection_name, vector_size)
 
-        logging.info(f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
+        logging.info(
+            f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
 
         texts = embeddings.get("texts") or []
         chunk_count = len(texts)
@@ -693,6 +979,7 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         sections = embeddings.get("sections") or []
         sparse_vectors = embeddings.get("sparse_vectors") or []
         summaries = embeddings.get("summaries") or []
+        chunk_metadata = embeddings.get("chunk_metadata", [])
 
         all_points = []
         for idx in range(max_len):
@@ -727,14 +1014,16 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             if sparse_vector is not None:
                 vector_payload["keywords_vector"] = sparse_vector
 
+            chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
             all_points.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
                     vector=vector_payload,
-                    payload={
+
+                    payload = {
                         "subscription_id": str(subscription_id),
                         "profile_id": str(profile_id),
-                        "tag": build_collection_name(subscription_id),
+                        "tag": profile_name,
                         "text": text,
                         "document_id": str(doctag),
                         "source_file": source_filename,
@@ -742,10 +1031,19 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
                         "chunk_count": max_len,
                         "page": page_val,
                         "section": section_val,
-                        "summary": summary_val
+                        "summary": summary_val,
+                        "chunk_id": chunk_meta.get('chunk_id', f"{doctag}_chunk_{idx}"),
+                        "section_title": chunk_meta.get('section_title', ''),
+                        "prev_chunk_id": chunk_meta.get('prev_chunk_id'),
+                        "next_chunk_id": chunk_meta.get('next_chunk_id'),
+                        "chunk_type": chunk_meta.get('chunk_type', 'text')
                     }
                 )
             )
+
+
+
+        logging.info(f"Prepared PointStruct payload for chunk {idx}: {json.dumps(all_points[-1].payload)}")
 
         if not all_points:
             logging.error(f"No valid points to upload for document {doctag}, file {source_filename}")
@@ -767,39 +1065,49 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         raise
 
 
+
+from enhanced_retrieval import chunk_text_for_embedding
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
-    """Trains and stores embeddings from a document using chunking."""
+    """Trains and stores embeddings with enhanced chunking."""
     try:
-        logging.info(f"Starting training for file {doc_name} (document {doc_tag}) in profile {profile_tag}")
+        logging.info(f"Starting training for {doc_name}")
 
         if isinstance(text, dict):
-            # Already has embeddings
-            result = save_embeddings_to_qdrant(text, subscription_id, profile_tag, doc_tag, doc_name)
-            return f"Training complete for {doc_name}. Stored {result.get('points_saved', 0)} embeddings in {profile_tag}"
+            # Handle pre-embedded structured data (CSV/Excel)
+            result = save_embeddings_to_qdrant(
+                text, subscription_id, profile_tag, doc_tag, doc_name
+            )
+            return f"Stored {result.get('points_saved', 0)} embeddings"
 
         elif isinstance(text, str):
             if not text.strip():
-                logging.error(f"Empty text content for file {doc_name}")
                 raise ValueError(f"Empty content in {doc_name}")
 
-            # Split into chunks
-            chunks = text.split(". ")
-            chunks = [c.strip() for c in chunks if c.strip()]
+            # NEW: Use enhanced semantic chunking
+            chunks_with_meta = chunk_text_for_embedding(text, doc_name)
 
-            # Add document name to each chunk to improve name-based retrieval
-            chunks = [f"{doc_name}: {c}" for c in chunks]
+            if not chunks_with_meta:
+                raise ValueError(f"No valid chunks in {doc_name}")
 
-            if not chunks:
-                logging.error(f"No valid chunks created for file {doc_name}")
-                raise ValueError(f"No valid text chunks in {doc_name}")
+            # Extract chunks and metadata
+            chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
+            chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
 
-            logging.info(f"Training on {len(chunks)} chunks for file {doc_name}")
+            logging.info(f"Created {len(chunks)} enhanced chunks for {doc_name}")
+
+            # Generate embeddings
             model = get_model()
-            embeddings_array = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
+            embeddings_array = model.encode(
+                chunks,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            )
 
-            # Build sparse keyword vectors for improved keyword-heavy matching
+            # Build sparse vectors for keyword matching
+            from sklearn.feature_extraction.text import TfidfVectorizer
             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
             tfidf_matrix = tfidf.fit_transform(chunks)
+
             sparse_vectors = []
             for row in tfidf_matrix:
                 coo = row.tocoo()
@@ -808,20 +1116,22 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                     "values": coo.data.astype(np.float32).tolist()
                 })
 
-            # Lightweight summaries to aid reranking/display
-            summaries = []
-            for c in chunks:
-                words = c.split()
-                summaries.append(" ".join(words[:40]))
+            # Create summaries
+            summaries = [
+                chunk[:200] + "..." if len(chunk) > 200 else chunk
+                for chunk in chunks
+            ]
 
+            # Prepare embeddings dict with metadata
             embeddings = {
                 "embeddings": embeddings_array,
                 "texts": chunks,
                 "sparse_vectors": sparse_vectors,
-                "summaries": summaries
+                "summaries": summaries,
+                "chunk_metadata": chunk_metadata  # NEW: Include metadata
             }
 
-            # Save embeddings (already normalized by model)
+            # Save to Qdrant
             result = save_embeddings_to_qdrant(
                 embeddings,
                 subscription_id,
@@ -829,13 +1139,14 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                 doc_tag,
                 doc_name
             )
-            return f"Training complete for {doc_name}. Stored {result.get('points_saved', 0)} embeddings in {profile_tag}"
+
+            return f"Stored {result.get('points_saved', 0)} embeddings"
+
         else:
-            logging.error(f"Unsupported document format for {doc_name}: {type(text)}")
-            raise ValueError(f"Unsupported format for {doc_name}: {type(text)}")
+            raise ValueError(f"Unsupported format: {type(text)}")
 
     except Exception as e:
-        logging.error(f"Error during training for file {doc_name} (document {doc_tag}): {e}")
+        logging.error(f"Training error for {doc_name}: {e}")
         raise
 
 
@@ -869,7 +1180,8 @@ def trainData():
             if doc_info['dataDict'].get('status') == 'UNDER_REVIEW'
         }
 
-        logging.info(f"Found {len(under_review_docs)} documents eligible for processing (excluding DELETED/TRAINING_COMPLETED)")
+        logging.info(
+            f"Found {len(under_review_docs)} documents eligible for processing (excluding DELETED/TRAINING_COMPLETED)")
         logging.info(f"Found {len(explicitly_under_review)} documents with status == UNDER_REVIEW")
 
         if not under_review_docs:
@@ -994,7 +1306,6 @@ def trainData():
             "message": str(e),
             "results": None
         }
-
 
 
 # New function: train_single_document
