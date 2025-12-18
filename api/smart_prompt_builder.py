@@ -455,10 +455,5 @@ def build_enhanced_answer_with_verification(
 #
 # {source_map}
 #
-# CRITICAL GROUNDING RULES - VIOLATION = FAILURE
-#
-# 1. **READ THE QUESTION CAREFULLY**
-#     -Identify exactly what entity/
-
 
 
