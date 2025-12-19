@@ -1066,87 +1066,241 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
 
 
 
+# from enhanced_retrieval import chunk_text_for_embedding
+# def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
+#     """Trains and stores embeddings with enhanced chunking."""
+#     try:
+#         logging.info(f"Starting training for {doc_name}")
+#
+#         if isinstance(text, dict):
+#             # Handle pre-embedded structured data (CSV/Excel)
+#             result = save_embeddings_to_qdrant(
+#                 text, subscription_id, profile_tag, doc_tag, doc_name
+#             )
+#             return f"Stored {result.get('points_saved', 0)} embeddings"
+#
+#         elif isinstance(text, str):
+#             if not text.strip():
+#                 raise ValueError(f"Empty content in {doc_name}")
+#
+#             # NEW: Use enhanced semantic chunking
+#             chunks_with_meta = chunk_text_for_embedding(text, doc_name)
+#
+#             if not chunks_with_meta:
+#                 raise ValueError(f"No valid chunks in {doc_name}")
+#
+#             # Extract chunks and metadata
+#             chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
+#             chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
+#
+#             logging.info(f"Created {len(chunks)} enhanced chunks for {doc_name}")
+#
+#             # Generate embeddings
+#             model = get_model()
+#             embeddings_array = model.encode(
+#                 chunks,
+#                 convert_to_numpy=True,
+#                 normalize_embeddings=True
+#             )
+#
+#             # Build sparse vectors for keyword matching
+#             from sklearn.feature_extraction.text import TfidfVectorizer
+#             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
+#             tfidf_matrix = tfidf.fit_transform(chunks)
+#
+#             sparse_vectors = []
+#             for row in tfidf_matrix:
+#                 coo = row.tocoo()
+#                 sparse_vectors.append({
+#                     "indices": coo.col.tolist(),
+#                     "values": coo.data.astype(np.float32).tolist()
+#                 })
+#
+#             # Create summaries
+#             summaries = [
+#                 chunk[:200] + "..." if len(chunk) > 200 else chunk
+#                 for chunk in chunks
+#             ]
+#
+#             # Prepare embeddings dict with metadata
+#             embeddings = {
+#                 "embeddings": embeddings_array,
+#                 "texts": chunks,
+#                 "sparse_vectors": sparse_vectors,
+#                 "summaries": summaries,
+#                 "chunk_metadata": chunk_metadata  # NEW: Include metadata
+#             }
+#
+#             # Save to Qdrant
+#             result = save_embeddings_to_qdrant(
+#                 embeddings,
+#                 subscription_id,
+#                 profile_tag,
+#                 doc_tag,
+#                 doc_name
+#             )
+#
+#             return f"Stored {result.get('points_saved', 0)} embeddings"
+#
+#         else:
+#             raise ValueError(f"Unsupported format: {type(text)}")
+#
+#     except Exception as e:
+#         logging.error(f"Training error for {doc_name}: {e}")
+#         raise
+
+
+# CRITICAL FIX for train_on_document() in dataHandler.py
+
+# Replace your existing train_on_document function with this:
+
 from enhanced_retrieval import chunk_text_for_embedding
+
+
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
-    """Trains and stores embeddings with enhanced chunking."""
+    """
+
+    FIXED: Trains and stores embeddings with proper document_id tracking
+
+    """
+
     try:
-        logging.info(f"Starting training for {doc_name}")
+
+        logging.info(f"Starting training for {doc_name}, doc_id={doc_tag}")
 
         if isinstance(text, dict):
+
             # Handle pre-embedded structured data (CSV/Excel)
+
             result = save_embeddings_to_qdrant(
+
                 text, subscription_id, profile_tag, doc_tag, doc_name
+
             )
+
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         elif isinstance(text, str):
+
             if not text.strip():
                 raise ValueError(f"Empty content in {doc_name}")
 
-            # NEW: Use enhanced semantic chunking
-            chunks_with_meta = chunk_text_for_embedding(text, doc_name)
+            # FIXED: Pass document_id to chunking
+
+            chunks_with_meta = chunk_text_for_embedding(
+
+                text,
+
+                doc_name,
+
+                document_id=doc_tag  # CRITICAL: Pass doc_tag as document_id
+
+            )
 
             if not chunks_with_meta:
                 raise ValueError(f"No valid chunks in {doc_name}")
 
             # Extract chunks and metadata
+
             chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
+
             chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
 
-            logging.info(f"Created {len(chunks)} enhanced chunks for {doc_name}")
+            # VERIFY: Log document IDs
+
+            unique_doc_ids = list(set([m.get('document_id') for m in chunk_metadata]))
+
+            logging.info(f"Created {len(chunks)} chunks for document_ids: {unique_doc_ids}")
 
             # Generate embeddings
+
             model = get_model()
+
             embeddings_array = model.encode(
+
                 chunks,
+
                 convert_to_numpy=True,
+
                 normalize_embeddings=True
+
             )
 
-            # Build sparse vectors for keyword matching
+            # Build sparse vectors
+
             from sklearn.feature_extraction.text import TfidfVectorizer
+
             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
+
             tfidf_matrix = tfidf.fit_transform(chunks)
 
             sparse_vectors = []
+
             for row in tfidf_matrix:
                 coo = row.tocoo()
+
                 sparse_vectors.append({
+
                     "indices": coo.col.tolist(),
+
                     "values": coo.data.astype(np.float32).tolist()
+
                 })
 
             # Create summaries
+
             summaries = [
+
                 chunk[:200] + "..." if len(chunk) > 200 else chunk
+
                 for chunk in chunks
+
             ]
 
             # Prepare embeddings dict with metadata
+
             embeddings = {
+
                 "embeddings": embeddings_array,
+
                 "texts": chunks,
+
                 "sparse_vectors": sparse_vectors,
+
                 "summaries": summaries,
-                "chunk_metadata": chunk_metadata  # NEW: Include metadata
+
+                "chunk_metadata": chunk_metadata  # Includes document_id
+
             }
 
             # Save to Qdrant
+
             result = save_embeddings_to_qdrant(
+
                 embeddings,
+
                 subscription_id,
+
                 profile_tag,
+
                 doc_tag,
+
                 doc_name
+
             )
+
+            logging.info(f"✅ Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
 
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         else:
+
             raise ValueError(f"Unsupported format: {type(text)}")
 
     except Exception as e:
+
         logging.error(f"Training error for {doc_name}: {e}")
+
         raise
 
 
