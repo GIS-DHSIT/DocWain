@@ -149,3 +149,12 @@ class Config:
         PASSWORD = os.getenv("REDIS_PASSWORD", _redis_defaults.get("password"))
         DB = int(os.getenv("REDIS_DB", "0"))
         SSL = str(os.getenv("REDIS_SSL", str(_redis_defaults.get("ssl", True)))).lower() in {"true", "1", "yes", "on"}
+
+    class Retrieval:
+        CHUNK_SIZE = 800
+        CHUNK_OVERLAP = 200
+        MIN_CHUNK_SIZE = 150
+        MAX_CONTEXT_CHUNKS = 7
+        SIMILARITY_THRESHOLD = 0.7
+        USE_SPARSE_VECTORS = True  # Enable hybrid search
+        USE_ADJACENT_EXPANSION = True  # Fetch neighboring chunks

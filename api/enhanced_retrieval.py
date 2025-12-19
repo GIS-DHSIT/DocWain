@@ -1,0 +1,545 @@
+"""
+Enhanced Retrieval System - FIXED FOR MULTI-DOCUMENT ACCURACY
+Key Fixes:
+1. Proper OR logic for document filtering
+2. Document-aware adjacent chunk expansion
+3. Strict source boundary preservation
+"""
+
+import logging
+import numpy as np
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from qdrant_client import QdrantClient
+from qdrant_client.models import SparseVector, Filter, FieldCondition, MatchValue, MatchAny
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ChunkMetadata:
+    """Metadata for each chunk to preserve context"""
+    chunk_id: str
+    doc_name: str
+    chunk_index: int
+    total_chunks: int
+    section_title: str
+    document_id: str  # ADDED: Track document ID
+    prev_chunk_id: str = None
+    next_chunk_id: str = None
+    chunk_type: str = "text"
+    page_number: int = None
+
+
+class EnhancedSemanticChunker:
+    """Advanced chunking that preserves document structure"""
+
+    def __init__(self, chunk_size: int = 800, overlap: int = 200, min_chunk_size: int = 150):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.min_chunk_size = min_chunk_size
+        self.heading_pattern = re.compile(r'^(?:#+\s+|[A-Z][A-Z\s]{2,}:|\d+\.\s+[A-Z])', re.MULTILINE)
+        self.list_pattern = re.compile(r'^[\s]*[-"*]\s+|\d+\.\s+', re.MULTILINE)
+        self.table_pattern = re.compile(r'\|.*\|.*\||(?:\s{2,}[^\s]+){3,}', re.MULTILINE)
+
+    def _detect_structure(self, text: str) -> List[Dict[str, Any]]:
+        structures = []
+        for match in self.heading_pattern.finditer(text):
+            structures.append({
+                'type': 'heading',
+                'start': match.start(),
+                'end': match.end(),
+                'text': match.group().strip()
+            })
+        for match in self.table_pattern.finditer(text):
+            structures.append({
+                'type': 'table',
+                'start': match.start(),
+                'end': match.end(),
+                'text': match.group().strip()
+            })
+        return sorted(structures, key=lambda x: x['start'])
+
+    def _split_into_semantic_units(self, text: str) -> List[Tuple[str, str]]:
+        structures = self._detect_structure(text)
+        units = []
+        current_section = "Introduction"
+        last_pos = 0
+
+        for struct in structures:
+            if struct['start'] > last_pos:
+                chunk_text = text[last_pos:struct['start']].strip()
+                if chunk_text:
+                    units.append((chunk_text, current_section))
+            if struct['type'] == 'heading':
+                current_section = struct['text']
+            units.append((struct['text'], current_section))
+            last_pos = struct['end']
+
+        if last_pos < len(text):
+            remaining = text[last_pos:].strip()
+            if remaining:
+                units.append((remaining, current_section))
+
+        return units
+
+    def _estimate_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def _create_chunk_with_context(self, current_text: str, prev_text: str, next_text: str, section_title: str,
+                                   doc_name: str) -> str:
+        """FIXED: Add document name to context"""
+        parts = []
+
+        # CRITICAL: Always include document identifier
+        parts.append(f"[DOCUMENT: {doc_name}]")
+
+        if section_title and section_title != "Introduction":
+            parts.append(f"[SECTION: {section_title}]")
+        if prev_text:
+            prev_snippet = prev_text[-100:].strip()
+            if prev_snippet:
+                parts.append(f"[CONTEXT: ...{prev_snippet}]")
+        parts.append(current_text)
+        if next_text:
+            next_snippet = next_text[:100].strip()
+            if next_snippet:
+                parts.append(f"[CONTINUES: {next_snippet}...]")
+        return " ".join(parts)
+
+    def chunk_document(self, text: str, doc_name: str, document_id: str, page_number: int = None) -> List[
+        Tuple[str, ChunkMetadata]]:
+        """FIXED: Added document_id parameter"""
+        if not text or not text.strip():
+            logger.warning(f"Empty text for document: {doc_name}")
+            return []
+
+        units = self._split_into_semantic_units(text)
+        if not units:
+            logger.warning(f"No semantic units extracted from: {doc_name}")
+            return []
+
+        chunks = []
+        current_chunk_units = []
+        current_tokens = 0
+        current_section = units[0][1] if units else "Introduction"
+
+        for i, (unit_text, section_title) in enumerate(units):
+            unit_tokens = self._estimate_tokens(unit_text)
+
+            if current_tokens + unit_tokens > self.chunk_size and current_chunk_units:
+                chunk_text = " ".join([u[0] for u in current_chunk_units])
+                prev_text = chunks[-1][0] if chunks else ""
+                next_text = unit_text if i < len(units) else ""
+                contextualized_text = self._create_chunk_with_context(
+                    chunk_text, prev_text, next_text, current_section, doc_name
+                )
+
+                metadata = ChunkMetadata(
+                    chunk_id=f"{doc_name}_chunk_{len(chunks)}",
+                    doc_name=doc_name,
+                    document_id=document_id,  # ADDED
+                    chunk_index=len(chunks),
+                    total_chunks=-1,
+                    section_title=current_section,
+                    prev_chunk_id=chunks[-1][1].chunk_id if chunks else None,
+                    next_chunk_id=None,
+                    page_number=page_number
+                )
+
+                chunks.append((contextualized_text, metadata))
+                if len(chunks) > 1:
+                    chunks[-2][1].next_chunk_id = metadata.chunk_id
+
+                overlap_units = []
+                overlap_tokens = 0
+                for u in reversed(current_chunk_units):
+                    u_tokens = self._estimate_tokens(u[0])
+                    if overlap_tokens + u_tokens <= self.overlap:
+                        overlap_units.insert(0, u)
+                        overlap_tokens += u_tokens
+                    else:
+                        break
+
+                current_chunk_units = overlap_units
+                current_tokens = overlap_tokens
+
+            current_chunk_units.append((unit_text, section_title))
+            current_tokens += unit_tokens
+            current_section = section_title
+
+        if current_chunk_units:
+            chunk_text = " ".join([u[0] for u in current_chunk_units])
+            prev_text = chunks[-1][0] if chunks else ""
+            contextualized_text = self._create_chunk_with_context(
+                chunk_text, prev_text, "", current_section, doc_name
+            )
+
+            metadata = ChunkMetadata(
+                chunk_id=f"{doc_name}_chunk_{len(chunks)}",
+                doc_name=doc_name,
+                document_id=document_id,  # ADDED
+                chunk_index=len(chunks),
+                total_chunks=-1,
+                section_title=current_section,
+                prev_chunk_id=chunks[-1][1].chunk_id if chunks else None,
+                page_number=page_number
+            )
+
+            chunks.append((contextualized_text, metadata))
+            if len(chunks) > 1:
+                chunks[-2][1].next_chunk_id = metadata.chunk_id
+
+        total = len(chunks)
+        for _, meta in chunks:
+            meta.total_chunks = total
+
+        logger.info(f"Created {len(chunks)} chunks from {len(units)} units for {doc_name}")
+        return chunks
+
+
+def chunk_text_for_embedding(text: str, doc_name: str, document_id: str = None) -> List[Tuple[str, dict]]:
+    """FIXED: Added document_id parameter"""
+    if document_id is None:
+        document_id = doc_name  # Fallback
+
+    chunker = EnhancedSemanticChunker(chunk_size=800, overlap=200, min_chunk_size=150)
+    chunks = chunker.chunk_document(text, doc_name, document_id)
+
+    result = []
+    for chunk_text, metadata in chunks:
+        meta_dict = {
+            'chunk_id': metadata.chunk_id,
+            'doc_name': metadata.doc_name,
+            'document_id': metadata.document_id,  # ADDED
+            'chunk_index': metadata.chunk_index,
+            'total_chunks': metadata.total_chunks,
+            'section_title': metadata.section_title,
+            'prev_chunk_id': metadata.prev_chunk_id,
+            'next_chunk_id': metadata.next_chunk_id,
+            'page_number': metadata.page_number
+        }
+        result.append((chunk_text, meta_dict))
+
+    return result
+
+
+class AdaptiveRetriever:
+    """
+    Multi-strategy retrieval - FIXED FOR MULTI-DOCUMENT
+    """
+
+    def __init__(self, qdrant_client: QdrantClient, model: SentenceTransformer):
+        self.client = qdrant_client
+        self.model = model
+        self.tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2), stop_words='english')
+        self._fit_tfidf()
+
+    def _fit_tfidf(self):
+        """Pre-fit TF-IDF on sample corpus"""
+        sample_corpus = [
+            "machine learning artificial intelligence",
+            "data science analysis python",
+            "software engineer developer",
+            "professional summary experience skills",
+            "location address city country"
+        ]
+        try:
+            self.tfidf.fit(sample_corpus)
+        except Exception as e:
+            logger.warning(f"TF-IDF pre-fitting failed: {e}")
+
+    def _build_filter(
+            self,
+            profile_id: str,
+            document_ids: Optional[List[str]] = None,
+            source_files: Optional[List[str]] = None
+    ) -> Optional[Filter]:
+        """
+        FIXED: Use MatchAny for OR logic with multiple documents
+        """
+        conditions = []
+
+        # Profile filter (always required)
+        if profile_id:
+            conditions.append(
+                FieldCondition(
+                    key="profile_id",
+                    match=MatchValue(value=str(profile_id))
+                )
+            )
+
+        # FIXED: Use MatchAny for document filtering (OR logic)
+        if document_ids and len(document_ids) > 0:
+            conditions.append(
+                FieldCondition(
+                    key="document_id",
+                    match=MatchAny(any=document_ids)  # FIXED: OR logic
+                )
+            )
+
+        # FIXED: Use MatchAny for source file filtering (OR logic)
+        if source_files and len(source_files) > 0:
+            conditions.append(
+                FieldCondition(
+                    key="source_file",
+                    match=MatchAny(any=source_files)  # FIXED: OR logic
+                )
+            )
+
+        if not conditions:
+            return None
+
+        return Filter(must=conditions)
+
+    def _dense_search(
+            self,
+            collection_name: str,
+            query: str,
+            profile_id: str,
+            top_k: int,
+            document_ids: Optional[List[str]] = None,
+            source_files: Optional[List[str]] = None,
+            score_threshold: Optional[float] = None
+    ) -> List[Dict]:
+        """Dense vector search with proper document filtering"""
+        try:
+            # Encode query
+            query_vector = self.model.encode(
+                query,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype(np.float32).tolist()
+
+            # Build filter with OR logic
+            query_filter = self._build_filter(profile_id, document_ids, source_files)
+
+            # Log filter for debugging
+            if query_filter:
+                logger.info(f"Filter: profile={profile_id}, docs={document_ids}, sources={source_files}")
+
+            # Search using query_points
+            kwargs = {
+                "collection_name": collection_name,
+                "query": query_vector,
+                "using": "content_vector",
+                "limit": top_k,
+                "with_payload": True,
+                "with_vectors": False
+            }
+
+            if query_filter:
+                kwargs["query_filter"] = query_filter
+
+            if score_threshold is not None:
+                kwargs["score_threshold"] = score_threshold
+
+            results = self.client.query_points(**kwargs)
+
+            chunks = []
+            for pt in (results.points or []):
+                payload = pt.payload or {}
+                chunks.append({
+                    'id': str(pt.id),
+                    'text': payload.get('text', ''),
+                    'score': float(pt.score),
+                    'metadata': payload,
+                    'method': 'dense'
+                })
+
+            logger.info(f"Dense search returned {len(chunks)} results")
+            if chunks:
+                # ADDED: Log which documents were returned
+                returned_docs = list(set([c['metadata'].get('source_file', 'unknown') for c in chunks[:10]]))
+                logger.info(f"Returned documents: {returned_docs}")
+                logger.info(f"Top 3 scores: {[round(c['score'], 4) for c in chunks[:3]]}")
+
+            return chunks
+
+        except Exception as e:
+            logger.error(f"Dense search failed: {e}", exc_info=True)
+            return []
+
+    def _keyword_boost_rerank(self, chunks: List[Dict], query: str, boost_factor: float = 0.15) -> List[Dict]:
+        """Boost scores for exact keyword matches"""
+        query_terms = set(query.lower().split())
+
+        for chunk in chunks:
+            text_lower = chunk['text'].lower()
+            matched_terms = sum(1 for term in query_terms if term in text_lower)
+
+            if matched_terms > 0:
+                match_ratio = matched_terms / len(query_terms)
+                chunk['score'] = chunk['score'] + (boost_factor * match_ratio)
+                chunk['keyword_boost'] = match_ratio
+
+        chunks.sort(key=lambda x: x['score'], reverse=True)
+        return chunks
+
+    def _expand_with_adjacent_chunks(
+            self,
+            collection_name: str,
+            chunks: List[Dict],
+            max_adjacent: int = 1
+    ) -> List[Dict]:
+        """
+        FIXED: Only expand within SAME document
+        """
+        try:
+            expanded = []
+            chunk_ids_seen = set()
+
+            for chunk in chunks:
+                chunk_id = chunk['metadata'].get('chunk_id')
+                current_doc_id = chunk['metadata'].get('document_id')  # ADDED
+
+                if not chunk_id or chunk_id in chunk_ids_seen:
+                    expanded.append(chunk)
+                    continue
+
+                chunk_ids_seen.add(chunk_id)
+                expanded.append(chunk)
+
+                # Get adjacent IDs
+                prev_id = chunk['metadata'].get('prev_chunk_id')
+                next_id = chunk['metadata'].get('next_chunk_id')
+
+                adjacent_ids = []
+                if prev_id and prev_id not in chunk_ids_seen:
+                    adjacent_ids.append(prev_id)
+                if next_id and next_id not in chunk_ids_seen:
+                    adjacent_ids.append(next_id)
+
+                # Fetch adjacent chunks
+                for adj_id in adjacent_ids[:max_adjacent]:
+                    try:
+                        # FIXED: Filter by both chunk_id AND document_id
+                        scroll_filter = Filter(
+                            must=[
+                                FieldCondition(
+                                    key="chunk_id",
+                                    match=MatchValue(value=adj_id)
+                                ),
+                                FieldCondition(
+                                    key="document_id",
+                                    match=MatchValue(value=current_doc_id)  # ADDED
+                                )
+                            ]
+                        )
+
+                        results = self.client.scroll(
+                            collection_name=collection_name,
+                            scroll_filter=scroll_filter,
+                            limit=1,
+                            with_payload=True,
+                            with_vectors=False
+                        )
+
+                        if hasattr(results, 'points'):
+                            points = results.points or []
+                        elif isinstance(results, tuple):
+                            points = results[0] if len(results) > 0 else []
+                        else:
+                            points = []
+
+                        for pt in points:
+                            if adj_id not in chunk_ids_seen:
+                                payload = pt.payload or {}
+                                # VERIFY: Adjacent chunk is from same document
+                                adj_doc_id = payload.get('document_id')
+                                if adj_doc_id == current_doc_id:  # ADDED CHECK
+                                    expanded.append({
+                                        'id': str(pt.id),
+                                        'text': payload.get('text', ''),
+                                        'score': chunk['score'] * 0.95,
+                                        'metadata': payload,
+                                        'method': f"{chunk['method']}_adjacent"
+                                    })
+                                    chunk_ids_seen.add(adj_id)
+                                else:
+                                    logger.warning(
+                                        f"Skipped adjacent chunk from different document: {adj_doc_id} vs {current_doc_id}")
+
+                    except Exception as adj_err:
+                        logger.debug(f"Failed to fetch adjacent chunk {adj_id}: {adj_err}")
+
+            logger.info(f"Expanded from {len(chunks)} to {len(expanded)} chunks (same-document only)")
+            return expanded
+
+        except Exception as e:
+            logger.error(f"Adjacent expansion failed: {e}", exc_info=True)
+            return chunks
+
+    def retrieve_adaptive(
+            self,
+            collection_name: str,
+            query: str,
+            profile_id: str,
+            top_k: int = 30,
+            document_ids: Optional[List[str]] = None,
+            source_files: Optional[List[str]] = None,
+            use_expansion: bool = True,
+            use_keyword_boost: bool = True
+    ) -> List[Dict]:
+        """
+        Main adaptive retrieval - FIXED FOR MULTI-DOCUMENT
+        """
+        logger.info(f"Adaptive retrieval for query: {query[:100]}")
+        if document_ids:
+            logger.info(f"Filtering by document_ids: {document_ids}")
+        if source_files:
+            logger.info(f"Filtering by source_files: {source_files}")
+
+        # Strategy 1: Dense search with moderate threshold
+        chunks = self._dense_search(
+            collection_name, query, profile_id, top_k,
+            document_ids=document_ids,
+            source_files=source_files,
+            score_threshold=0.15
+        )
+
+        # Strategy 2: Fallback without threshold
+        if not chunks:
+            logger.warning("No results with threshold, retrying without")
+            chunks = self._dense_search(
+                collection_name, query, profile_id, top_k,
+                document_ids=document_ids,
+                source_files=source_files,
+                score_threshold=None
+            )
+
+        # Strategy 3: Remove document filter if still empty
+        if not chunks and (document_ids or source_files):
+            logger.warning("No results with document filter, retrying without filter")
+            chunks = self._dense_search(
+                collection_name, query, profile_id, top_k * 2,
+                score_threshold=None
+            )
+
+        if not chunks:
+            logger.error("All retrieval strategies failed")
+            return []
+
+        # Keyword boosting
+        if use_keyword_boost:
+            chunks = self._keyword_boost_rerank(chunks, query)
+
+        # Adjacent chunk expansion (FIXED: same-document only)
+        if use_expansion and len(chunks) > 0:
+            chunks = self._expand_with_adjacent_chunks(collection_name, chunks, max_adjacent=1)
+
+        # Add methods metadata
+        for chunk in chunks:
+            if 'methods' not in chunk:
+                chunk['methods'] = [chunk.get('method', 'unknown')]
+
+        logger.info(f"Final retrieval: {len(chunks)} chunks")
+        if chunks:
+            unique_docs = list(set([c['metadata'].get('source_file', 'unknown') for c in chunks]))
+            logger.info(f"Unique documents in results: {unique_docs}")
+            logger.info(f"Top 5 scores: {[round(c['score'], 4) for c in chunks[:5]]}")
+
+        return chunks
