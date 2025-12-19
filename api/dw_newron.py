@@ -566,10 +566,14 @@ class QdrantRetriever:
                 query=query_vector,
                 using=vector_name,
                 limit=limit,
-                filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
             )
+
+            # Add query_filter only if provided (not as 'filter')
+            if query_filter is not None:
+                kwargs["query_filter"] = query_filter
+
             if score_threshold is not None:
                 kwargs["score_threshold"] = score_threshold
 
