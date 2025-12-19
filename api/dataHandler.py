@@ -22,6 +22,8 @@ from azure.storage.blob import BlobServiceClient
 import time
 import copy
 from sklearn.feature_extraction.text import TfidfVectorizer
+from typing import List, Tuple, Dict, Any
+from dataclasses import dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -30,6 +32,7 @@ docEx = None
 _MODEL = None
 _QDRANT_CLIENT = None
 logger = logging.getLogger(__name__)
+
 
 '-------------------------------modified by maha/maria-----------------------'
 '---------------------------------new function for checking PII status in mongodb--------------------'
@@ -425,6 +428,7 @@ def get_azure_docs(files):
         logging.error(f"Error fetching Azure documents: {e}")
         return None
 
+
 '-------------------------------modified by maha/maria-----------------------'
 '---------------Added a PII control per subscription in connectData function--------------------'
 
@@ -754,7 +758,6 @@ def connectData(documentConnection):
 '''
 
 
-
 def collectionConnect(name):
     """Fetches documents from a MongoDB collection."""
     logging.info(f"Fetching connection details for collection: {name}")
@@ -776,7 +779,8 @@ def collectionConnect(name):
 def extract_document_info():
     """Retrieves connector details from MongoDB."""
     try:
-        logging.info(f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
+        logging.info(
+            f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
         try:
             existing = db.list_collection_names()
             logging.info(f"Existing collections in DB '{Config.MongoDB.DB}': {existing}")
@@ -948,7 +952,8 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         # Fetch profile name for tagging
         try:
             profile_doc = db[Config.MongoDB.PROFILES].find_one({"_id": ObjectId(profile_id)})
-            profile_name = profile_doc["name"].replace(" ", "_") if profile_doc and "name" in profile_doc else str(profile_id)
+            profile_name = profile_doc["name"].replace(" ", "_") if profile_doc and "name" in profile_doc else str(
+                profile_id)
         except Exception as e:
             logging.warning(f"Could not fetch profile name for {profile_id}: {e}")
             profile_name = str(profile_id)
@@ -958,7 +963,8 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
 
         ensure_qdrant_collection(collection_name, vector_size)
 
-        logging.info(f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
+        logging.info(
+            f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
 
         texts = embeddings.get("texts") or []
         chunk_count = len(texts)
@@ -973,6 +979,7 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         sections = embeddings.get("sections") or []
         sparse_vectors = embeddings.get("sparse_vectors") or []
         summaries = embeddings.get("summaries") or []
+        chunk_metadata = embeddings.get("chunk_metadata", [])
 
         all_points = []
         for idx in range(max_len):
@@ -1007,16 +1014,16 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             if sparse_vector is not None:
                 vector_payload["keywords_vector"] = sparse_vector
 
+            chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
             all_points.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
                     vector=vector_payload,
-                    payload={
+
+                    payload = {
                         "subscription_id": str(subscription_id),
                         "profile_id": str(profile_id),
-                        "tag": profile_name,  # <-- CHANGED HERE
-                        # "tag": build_collection_name(subscription_id),\
-                        # "log_tag": f"Tag used: {profile_name}",  # <-- add this line
+                        "tag": profile_name,
                         "text": text,
                         "document_id": str(doctag),
                         "source_file": source_filename,
@@ -1024,10 +1031,18 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
                         "chunk_count": max_len,
                         "page": page_val,
                         "section": section_val,
-                        "summary": summary_val
+                        "summary": summary_val,
+                        "chunk_id": chunk_meta.get('chunk_id', f"{doctag}_chunk_{idx}"),
+                        "section_title": chunk_meta.get('section_title', ''),
+                        "prev_chunk_id": chunk_meta.get('prev_chunk_id'),
+                        "next_chunk_id": chunk_meta.get('next_chunk_id'),
+                        "chunk_type": chunk_meta.get('chunk_type', 'text')
                     }
                 )
             )
+
+
+
         logging.info(f"Prepared PointStruct payload for chunk {idx}: {json.dumps(all_points[-1].payload)}")
 
         if not all_points:
@@ -1050,256 +1065,242 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         raise
 
 
-_BULLET_LINE_RE = re.compile(r'^\s*(?:[-*]|\d+[.)])\s+')
+
+# from enhanced_retrieval import chunk_text_for_embedding
+# def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
+#     """Trains and stores embeddings with enhanced chunking."""
+#     try:
+#         logging.info(f"Starting training for {doc_name}")
+#
+#         if isinstance(text, dict):
+#             # Handle pre-embedded structured data (CSV/Excel)
+#             result = save_embeddings_to_qdrant(
+#                 text, subscription_id, profile_tag, doc_tag, doc_name
+#             )
+#             return f"Stored {result.get('points_saved', 0)} embeddings"
+#
+#         elif isinstance(text, str):
+#             if not text.strip():
+#                 raise ValueError(f"Empty content in {doc_name}")
+#
+#             # NEW: Use enhanced semantic chunking
+#             chunks_with_meta = chunk_text_for_embedding(text, doc_name)
+#
+#             if not chunks_with_meta:
+#                 raise ValueError(f"No valid chunks in {doc_name}")
+#
+#             # Extract chunks and metadata
+#             chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
+#             chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
+#
+#             logging.info(f"Created {len(chunks)} enhanced chunks for {doc_name}")
+#
+#             # Generate embeddings
+#             model = get_model()
+#             embeddings_array = model.encode(
+#                 chunks,
+#                 convert_to_numpy=True,
+#                 normalize_embeddings=True
+#             )
+#
+#             # Build sparse vectors for keyword matching
+#             from sklearn.feature_extraction.text import TfidfVectorizer
+#             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
+#             tfidf_matrix = tfidf.fit_transform(chunks)
+#
+#             sparse_vectors = []
+#             for row in tfidf_matrix:
+#                 coo = row.tocoo()
+#                 sparse_vectors.append({
+#                     "indices": coo.col.tolist(),
+#                     "values": coo.data.astype(np.float32).tolist()
+#                 })
+#
+#             # Create summaries
+#             summaries = [
+#                 chunk[:200] + "..." if len(chunk) > 200 else chunk
+#                 for chunk in chunks
+#             ]
+#
+#             # Prepare embeddings dict with metadata
+#             embeddings = {
+#                 "embeddings": embeddings_array,
+#                 "texts": chunks,
+#                 "sparse_vectors": sparse_vectors,
+#                 "summaries": summaries,
+#                 "chunk_metadata": chunk_metadata  # NEW: Include metadata
+#             }
+#
+#             # Save to Qdrant
+#             result = save_embeddings_to_qdrant(
+#                 embeddings,
+#                 subscription_id,
+#                 profile_tag,
+#                 doc_tag,
+#                 doc_name
+#             )
+#
+#             return f"Stored {result.get('points_saved', 0)} embeddings"
+#
+#         else:
+#             raise ValueError(f"Unsupported format: {type(text)}")
+#
+#     except Exception as e:
+#         logging.error(f"Training error for {doc_name}: {e}")
+#         raise
 
 
-def _normalize_text_for_chunking(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\f", "\n\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+# CRITICAL FIX for train_on_document() in dataHandler.py
 
+# Replace your existing train_on_document function with this:
 
-def _is_heading_block(block: str) -> bool:
-    stripped = block.strip()
-    if not stripped:
-        return False
-    if stripped.startswith("#"):
-        return True
-    if stripped.endswith(":") and len(stripped.split()) <= 12:
-        return True
-    letters = re.sub(r"[^A-Za-z]+", "", stripped)
-    if letters and letters.isupper() and len(letters) >= 6:
-        return True
-    if len(stripped.split()) <= 6 and not re.search(r"[.!?]", stripped) and len(stripped) <= 80:
-        return True
-    return False
-
-
-def _clean_heading(block: str) -> str:
-    heading = block.strip().lstrip("#").strip()
-    heading = heading.rstrip(":").strip()
-    heading = re.sub(r"\s+", " ", heading)
-    return heading
-
-
-def _split_block_into_units(block: str) -> list:
-    lines = [line.strip() for line in block.splitlines() if line.strip()]
-    if not lines:
-        return []
-    bullet_lines = [line for line in lines if _BULLET_LINE_RE.match(line)]
-    if bullet_lines and len(bullet_lines) >= max(2, len(lines) // 2):
-        units = []
-        for line in lines:
-            if _BULLET_LINE_RE.match(line):
-                cleaned = _BULLET_LINE_RE.sub("", line).strip()
-                if cleaned:
-                    units.append(cleaned)
-            else:
-                units.append(line)
-        return units
-
-    paragraph = " ".join(lines)
-    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", paragraph)
-    units = [s.strip() for s in sentences if s.strip()]
-    return units or [paragraph]
-
-
-def _split_long_unit(unit: str, max_words: int) -> list:
-    words = unit.split()
-    if len(words) <= max_words:
-        return [unit]
-    parts = []
-    for i in range(0, len(words), max_words):
-        parts.append(" ".join(words[i:i + max_words]))
-    return parts
-
-
-def build_document_chunks(
-        raw_text: str,
-        doc_name: str,
-        max_words: int = 180,
-        min_words: int = 60,
-        overlap_sentences: int = 1
-) -> tuple:
-    """Chunk text into coherent sections with sentence-aware overlap."""
-    text = _normalize_text_for_chunking(raw_text)
-    if not text:
-        return [], []
-
-    blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
-    chunks = []
-    sections = []
-    active_heading = None
-    chunk_units = []
-    chunk_words = 0
-    prefix = f"{doc_name}: " if doc_name else ""
-
-    def flush(use_overlap: bool = True):
-        nonlocal chunk_units, chunk_words
-        if not chunk_units:
-            return []
-        chunk_text = " ".join(chunk_units).strip()
-        if active_heading:
-            chunk_text = f"{active_heading} - {chunk_text}"
-            section_label = active_heading[:80]
-        else:
-            section_label = f"chunk-{len(sections) + 1}"
-
-        chunks.append(f"{prefix}{chunk_text}")
-        sections.append(section_label)
-
-        overlap_units = []
-        if use_overlap and overlap_sentences > 0:
-            overlap_units = chunk_units[-overlap_sentences:]
-        chunk_units = []
-        chunk_words = 0
-        return overlap_units
-
-    for block in blocks:
-        if _is_heading_block(block):
-            if chunk_units:
-                flush(use_overlap=False)
-            active_heading = _clean_heading(block)
-            continue
-
-        units = _split_block_into_units(block)
-        if not units:
-            continue
-
-        for unit in units:
-            for part in _split_long_unit(unit, max_words):
-                unit_words = len(part.split())
-                if chunk_units and (chunk_words + unit_words > max_words):
-                    overlap_units = flush(use_overlap=True)
-                    if overlap_units:
-                        chunk_units = list(overlap_units)
-                        chunk_words = sum(len(u.split()) for u in overlap_units)
-                chunk_units.append(part)
-                chunk_words += unit_words
-
-    if chunk_units:
-        flush(use_overlap=False)
-
-    if len(chunks) >= 2:
-        merged_chunks = []
-        merged_sections = []
-        for idx, chunk in enumerate(chunks):
-            word_count = len(chunk.split())
-            if word_count < min_words and merged_chunks:
-                merged_chunks[-1] = f"{merged_chunks[-1]} {chunk}"
-            else:
-                merged_chunks.append(chunk)
-                merged_sections.append(sections[idx])
-        chunks = merged_chunks
-        sections = merged_sections
-
-    return chunks, sections
+from enhanced_retrieval import chunk_text_for_embedding
 
 
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
-    """Trains and stores embeddings from a document using chunking."""
+    """
+
+    FIXED: Trains and stores embeddings with proper document_id tracking
+
+    """
+
     try:
-        logging.info(f"Starting training for file {doc_name} (document {doc_tag}) in profile {profile_tag}")
+
+        logging.info(f"Starting training for {doc_name}, doc_id={doc_tag}")
 
         if isinstance(text, dict):
-            # If embeddings are missing/malformed, recompute from texts when possible
-            embeddings_obj = text.get("embeddings")
-            texts_obj = text.get("texts") or text.get("text") or text.get("content")
 
-            # Flatten dict-shaped embeddings (e.g., keyed by column)
-            if isinstance(embeddings_obj, dict):
-                try:
-                    embeddings_obj = list(embeddings_obj.values())
-                except Exception:
-                    embeddings_obj = None
+            # Handle pre-embedded structured data (CSV/Excel)
 
-            if embeddings_obj is None and texts_obj:
-                if isinstance(texts_obj, dict):
-                    texts_obj = list(texts_obj.values())
-                if isinstance(texts_obj, str):
-                    texts_obj = [texts_obj]
-                model = get_model()
-                logging.info(f"Recomputing embeddings for {doc_name} from provided texts ({len(texts_obj)} chunks)")
-                text["embeddings"] = model.encode(texts_obj, convert_to_numpy=True, normalize_embeddings=True)
-                text["texts"] = texts_obj
-            elif embeddings_obj is not None and not isinstance(embeddings_obj, (list, tuple, np.ndarray)):
-                try:
-                    text["embeddings"] = np.asarray(embeddings_obj)
-                except Exception:
-                    logging.warning(f"Could not coerce embeddings for {doc_name}; recomputing from text if available")
-                    if texts_obj:
-                        model = get_model()
-                        text["embeddings"] = model.encode(texts_obj, convert_to_numpy=True, normalize_embeddings=True)
-                        text["texts"] = texts_obj
-                    else:
-                        raise ValueError(f"Embeddings for {doc_name} are invalid and no texts provided to recompute")
+            result = save_embeddings_to_qdrant(
 
-            result = save_embeddings_to_qdrant(text, subscription_id, profile_tag, doc_tag, doc_name)
-            return f"Training complete for {doc_name}. Stored {result.get('points_saved', 0)} embeddings in {profile_tag}"
+                text, subscription_id, profile_tag, doc_tag, doc_name
+
+            )
+
+            return f"Stored {result.get('points_saved', 0)} embeddings"
 
         elif isinstance(text, str):
+
             if not text.strip():
-                logging.error(f"Empty text content for file {doc_name}")
                 raise ValueError(f"Empty content in {doc_name}")
 
-            # Split into context-preserving chunks with heading awareness
-            chunks, section_labels = build_document_chunks(
+            # FIXED: Pass document_id to chunking
+
+            chunks_with_meta = chunk_text_for_embedding(
+
                 text,
+
                 doc_name,
-                max_words=180,
-                min_words=60,
-                overlap_sentences=1
+
+                document_id=doc_tag  # CRITICAL: Pass doc_tag as document_id
+
             )
 
-            if not chunks:
-                logging.error(f"No valid chunks created for file {doc_name}")
-                raise ValueError(f"No valid text chunks in {doc_name}")
+            if not chunks_with_meta:
+                raise ValueError(f"No valid chunks in {doc_name}")
 
-            logging.info(f"Training on {len(chunks)} chunks for file {doc_name}")
+            # Extract chunks and metadata
+
+            chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
+
+            chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
+
+            # VERIFY: Log document IDs
+
+            unique_doc_ids = list(set([m.get('document_id') for m in chunk_metadata]))
+
+            logging.info(f"Created {len(chunks)} chunks for document_ids: {unique_doc_ids}")
+
+            # Generate embeddings
+
             model = get_model()
-            embeddings_array = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
 
-            # Build sparse keyword vectors for improved keyword-heavy matching
+            embeddings_array = model.encode(
+
+                chunks,
+
+                convert_to_numpy=True,
+
+                normalize_embeddings=True
+
+            )
+
+            # Build sparse vectors
+
+            from sklearn.feature_extraction.text import TfidfVectorizer
+
             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
+
             tfidf_matrix = tfidf.fit_transform(chunks)
+
             sparse_vectors = []
+
             for row in tfidf_matrix:
                 coo = row.tocoo()
+
                 sparse_vectors.append({
+
                     "indices": coo.col.tolist(),
+
                     "values": coo.data.astype(np.float32).tolist()
+
                 })
 
-            # Lightweight summaries to aid reranking/display
-            summaries = []
-            for c in chunks:
-                words = c.split()
-                summaries.append(" ".join(words[:40]))
+            # Create summaries
+
+            summaries = [
+
+                chunk[:200] + "..." if len(chunk) > 200 else chunk
+
+                for chunk in chunks
+
+            ]
+
+            # Prepare embeddings dict with metadata
 
             embeddings = {
+
                 "embeddings": embeddings_array,
+
                 "texts": chunks,
+
                 "sparse_vectors": sparse_vectors,
+
                 "summaries": summaries,
-                "sections": section_labels
+
+                "chunk_metadata": chunk_metadata  # Includes document_id
+
             }
 
-            # Save embeddings (already normalized by model)
+            # Save to Qdrant
+
             result = save_embeddings_to_qdrant(
+
                 embeddings,
+
                 subscription_id,
+
                 profile_tag,
+
                 doc_tag,
+
                 doc_name
+
             )
-            return f"Training complete for {doc_name}. Stored {result.get('points_saved', 0)} embeddings in {profile_tag}"
+
+            logging.info(f"✅ Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
+
+            return f"Stored {result.get('points_saved', 0)} embeddings"
+
         else:
-            logging.error(f"Unsupported document format for {doc_name}: {type(text)}")
-            raise ValueError(f"Unsupported format for {doc_name}: {type(text)}")
+
+            raise ValueError(f"Unsupported format: {type(text)}")
 
     except Exception as e:
-        logging.error(f"Error during training for file {doc_name} (document {doc_tag}): {e}")
+
+        logging.error(f"Training error for {doc_name}: {e}")
+
         raise
 
 
@@ -1333,7 +1334,8 @@ def trainData():
             if doc_info['dataDict'].get('status') == 'UNDER_REVIEW'
         }
 
-        logging.info(f"Found {len(under_review_docs)} documents eligible for processing (excluding DELETED/TRAINING_COMPLETED)")
+        logging.info(
+            f"Found {len(under_review_docs)} documents eligible for processing (excluding DELETED/TRAINING_COMPLETED)")
         logging.info(f"Found {len(explicitly_under_review)} documents with status == UNDER_REVIEW")
 
         if not under_review_docs:
@@ -1458,7 +1460,6 @@ def trainData():
             "message": str(e),
             "results": None
         }
-
 
 
 # New function: train_single_document

@@ -1,4 +1,3 @@
-
 import re
 import json
 import time
@@ -498,14 +497,6 @@ class OllamaClient:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
 
-    def warm_up(self):
-        """Eagerly load the model so first user queries do not pay startup cost."""
-        try:
-            ollama.generate(model=self.model_name, prompt="ping", options={"num_predict": 1})
-            logger.info("Ollama warm-up successful")
-        except Exception as e:
-            logger.warning(f"Ollama warm-up failed (continuing without warm cache): {e}")
-
     def generate(
             self,
             prompt: str,
@@ -516,11 +507,7 @@ class OllamaClient:
         for attempt in range(1, max_retries + 1):
             try:
                 response = ollama.generate(model=self.model_name, prompt=prompt)
-                text = (
-                    response.get("response")
-                    or (response.get("message", {}) or {}).get("content")
-                    or ""
-                ).strip()
+                text = (response.get("response") or "").strip()
                 if text:
                     return text
                 logger.warning(f"No text in Ollama response: {response}")
@@ -735,10 +722,14 @@ class QdrantRetriever:
                 query=query_vector,
                 using=vector_name,
                 limit=limit,
-                query_filter=query_filter,
                 with_payload=True,
                 with_vectors=False,
             )
+
+            # Add query_filter only if provided (not as 'filter')
+            if query_filter is not None:
+                kwargs["query_filter"] = query_filter
+
             if score_threshold is not None:
                 kwargs["score_threshold"] = score_threshold
 
@@ -1262,6 +1253,7 @@ class EnterpriseRAGSystem:
             self.greeting_handler = GreetingHandler()
             self.query_reformulator = QueryReformulator(self.llm_client)
             self.answerability_detector = AnswerabilityDetector(self.llm_client)
+            self.conversation_history = ConversationHistory(max_turns=3)
             redis_client = get_redis_client()
             self.conversation_history = ConversationHistory(max_turns=3, redis_client=redis_client)
             self.conversation_summarizer = ConversationSummarizer(self.llm_client)
@@ -1544,8 +1536,8 @@ class EnterpriseRAGSystem:
                 collection_name=collection_name,
                 top_k_retrieval=top_k_retrieval
             )
-            processed_query = retrieval_plan["query"]
-            preprocessing_metadata = retrieval_plan["metadata"]
+            processed_query, preprocessing_metadata = self.preprocess_query(query, user_id)
+
             retrieval_attempts = retrieval_plan["attempts"]
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
             profile_context_data = retrieval_plan.get("profile_context", {})
@@ -1577,9 +1569,15 @@ class EnterpriseRAGSystem:
                         return cached_obj
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
-            logger.info(f"Preprocessed query: {processed_query} (strategy: {selected_strategy})")
+            logger.info(f"Preprocessed query: {processed_query}")
 
-            retrieved_chunks = retrieval_plan["chunks"]
+            retrieved_chunks = self.retriever.retrieve(
+                collection_name=collection_name,
+                filter_profile=profile_id,
+                query=processed_query,
+                top_k=top_k_retrieval,
+                score_threshold=0.15
+            )
 
             if not retrieved_chunks:
                 no_results_response = (
@@ -1689,7 +1687,7 @@ class EnterpriseRAGSystem:
 
             processing_time = time.time() - start_time
 
-            response_payload = {
+            return {
                 "response": answer,
                 "sources": sources,
                 "user_id": user_id,
@@ -1717,10 +1715,30 @@ class EnterpriseRAGSystem:
             }
             if cache and cache_key:
                 try:
-                    cache.setex(cache_key, 3600, json.dumps(response_payload))
+                    cache.setex(cache_key, 3600, json.dumps({
+                        "response": answer,
+                        "sources": sources,
+                        "user_id": user_id,
+                        "collection": collection_name,
+                        "context_found": True,
+                        "query_type": "document_qa",
+                        "num_sources": len(sources),
+                        "preprocessing": preprocessing_metadata,
+                        "answerability": {
+                            "is_answerable": is_answerable,
+                            "reason": answerability_reason
+                        },
+                        "grounded": True,
+                        "has_citations": has_citations,
+                        "processing_time": round(processing_time, 2),
+                        "retrieval_stats": {
+                            "initial_retrieved": len(retrieved_chunks),
+                            "after_rerank": len(reranked_chunks),
+                            "final_context": len(final_chunks)
+                        }
+                    }))
                 except Exception as cache_exc:
                     logger.warning(f"Failed to cache answer: {cache_exc}")
-            return response_payload
 
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
