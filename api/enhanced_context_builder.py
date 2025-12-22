@@ -446,4 +446,3 @@ def generate_accurate_answer(
     )
 
     return result
-

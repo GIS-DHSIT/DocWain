@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="0b0981b8-762b-41db-81a9-99115988a623" name="Changes" comment="added the chunking and retrival in separate files">
+      <change beforePath="$PROJECT_DIR$/api/config.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/config.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/dataHandler.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/dataHandler.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/docwain_api.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/docwain_api.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/dw_newron.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/dw_newron.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/enhanced_context_builder.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/enhanced_context_builder.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/enhanced_retrieval.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/enhanced_retrieval.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/api/smart_prompt_builder.py" beforeDir="false" afterPath="$PROJECT_DIR$/api/smart_prompt_builder.py" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_BRANCH_BY_REPOSITORY">
+      <map>
+        <entry key="$PROJECT_DIR$" value="Docwain_Dev_Dec2025" />
+      </map>
+    </option>
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;Mariaselciya16&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/GIS-DHSIT/DocWain.git&quot;,
+    &quot;accountId&quot;: &quot;318522e8-5438-4f00-aa5e-c86f11c05ec1&quot;
+  }
+}</component>
+  <component name="HighlightingSettingsPerFile">
+    <setting file="file://$PROJECT_DIR$/api/docwain_api.py" root0="FORCE_HIGHLIGHTING" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 7
+}</component>
+  <component name="ProjectId" id="36Yhz2DBm9c7Gv8jFP5jxdMprQ9" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.dataHandler.executor&quot;: &quot;Run&quot;,
+    &quot;Python.docwain_api.executor&quot;: &quot;Run&quot;,
+    &quot;Python.dw_newron.executor&quot;: &quot;Run&quot;,
+    &quot;Python.enhanced_context_builder.executor&quot;: &quot;Run&quot;,
+    &quot;Python.enhanced_retrieval.executor&quot;: &quot;Run&quot;,
+    &quot;Python.smart_prompt_builder.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;Docwain__Dev__Dec2025&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/home/maria/PycharmProjects/DocWain&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;
+  }
+}</component>
+  <component name="RunManager">
+    <configuration name="docwain_api" type="PythonConfigurationType" factoryName="Python" nameIsGenerated="true">
+      <module name="DocWain" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="SDK_NAME" value="Python 3.12 (DocWain)" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/api" />
+      <option name="IS_MODULE_SDK" value="false" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="RUN_TOOL" value="" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/api/docwain_api.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-f2b7a9f6281b-6e1f45a539f7-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-253.29346.142" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="SvnConfiguration">
+    <configuration>$USER_HOME$/.subversion</configuration>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="0b0981b8-762b-41db-81a9-99115988a623" name="Changes" comment="" />
+      <created>1765189671371</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1765189671371</updated>
+    </task>
+    <task id="LOCAL-00001" summary="chat history wrapped based on the session id from the frontend">
+      <option name="closed" value="true" />
+      <created>1765371141183</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1765371141183</updated>
+    </task>
+    <task id="LOCAL-00002" summary="added the chunking and retrival in separate files">
+      <option name="closed" value="true" />
+      <created>1766071899803</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1766071899803</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
+    <servers />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="chat history wrapped based on the session id from the frontend" />
+    <MESSAGE value="added the chunking and retrival in separate files" />
+    <option name="LAST_COMMIT_MESSAGE" value="added the chunking and retrival in separate files" />
+  </component>
+  <component name="XDebuggerManager">
+    <breakpoint-manager>
+      <breakpoints>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/api/dw_chat.py</url>
+          <option name="timeStamp" value="2" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/api/dw_chat.py</url>
+          <line>177</line>
+          <option name="timeStamp" value="3" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/api/dw_chat.py</url>
+          <line>437</line>
+          <option name="timeStamp" value="4" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/api/dw_chat.py</url>
+          <line>127</line>
+          <option name="timeStamp" value="7" />
+        </line-breakpoint>
+      </breakpoints>
+    </breakpoint-manager>
+  </component>
+</project>

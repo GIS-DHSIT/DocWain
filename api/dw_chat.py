@@ -434,4 +434,3 @@ def generate_follow_up_questions(retrieved_text, num_questions=3):
         logging.error(f"Error generating follow-up questions: {e}")
 
         return []
-

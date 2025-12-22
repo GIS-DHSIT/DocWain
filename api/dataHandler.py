@@ -1289,7 +1289,7 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
 
             )
 
-            logging.info(f"✅ Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
+            logging.info(f" Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
 
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
