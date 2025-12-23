@@ -1253,8 +1253,11 @@ class EnterpriseRAGSystem:
             self.greeting_handler = GreetingHandler()
             self.query_reformulator = QueryReformulator(self.llm_client)
             self.answerability_detector = AnswerabilityDetector(self.llm_client)
-            self.conversation_history = ConversationHistory(max_turns=3)
+            # Initialize Redis client for storing conversation history and feedback.
             redis_client = get_redis_client()
+
+            # Initialize conversation history backed by Redis. Avoid instantiating
+            # a non-redis version first since it would immediately be overwritten.
             self.conversation_history = ConversationHistory(max_turns=3, redis_client=redis_client)
             self.conversation_summarizer = ConversationSummarizer(self.llm_client)
             self.feedback_memory = ChatFeedbackMemory(max_items=12, redis_client=redis_client)
@@ -1536,9 +1539,14 @@ class EnterpriseRAGSystem:
                 collection_name=collection_name,
                 top_k_retrieval=top_k_retrieval
             )
-            processed_query, preprocessing_metadata = self.preprocess_query(query, user_id)
 
-            retrieval_attempts = retrieval_plan["attempts"]
+            # Use the retrieval plan output directly to avoid diverging queries and
+            # ensure reranking operates on the best available candidates.
+            processed_query = retrieval_plan.get("query", query)
+            preprocessing_metadata = retrieval_plan.get("metadata", {})
+            retrieved_chunks = retrieval_plan.get("chunks") or []
+
+            retrieval_attempts = retrieval_plan.get("attempts", [])
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
             profile_context_data = retrieval_plan.get("profile_context", {})
 
@@ -1570,14 +1578,6 @@ class EnterpriseRAGSystem:
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
             logger.info(f"Preprocessed query: {processed_query}")
-
-            retrieved_chunks = self.retriever.retrieve(
-                collection_name=collection_name,
-                filter_profile=profile_id,
-                query=processed_query,
-                top_k=top_k_retrieval,
-                score_threshold=0.15
-            )
 
             if not retrieved_chunks:
                 no_results_response = (
@@ -1687,7 +1687,8 @@ class EnterpriseRAGSystem:
 
             processing_time = time.time() - start_time
 
-            return {
+            # Construct the full response object up front so it can be cached
+            response_obj = {
                 "response": answer,
                 "sources": sources,
                 "user_id": user_id,
@@ -1713,32 +1714,17 @@ class EnterpriseRAGSystem:
                     "final_context": len(final_chunks)
                 }
             }
+
+            # Persist the response in Redis before returning. Only cache successful
+            # answers (document_qa) to improve subsequent response accuracy.
             if cache and cache_key:
                 try:
-                    cache.setex(cache_key, 3600, json.dumps({
-                        "response": answer,
-                        "sources": sources,
-                        "user_id": user_id,
-                        "collection": collection_name,
-                        "context_found": True,
-                        "query_type": "document_qa",
-                        "num_sources": len(sources),
-                        "preprocessing": preprocessing_metadata,
-                        "answerability": {
-                            "is_answerable": is_answerable,
-                            "reason": answerability_reason
-                        },
-                        "grounded": True,
-                        "has_citations": has_citations,
-                        "processing_time": round(processing_time, 2),
-                        "retrieval_stats": {
-                            "initial_retrieved": len(retrieved_chunks),
-                            "after_rerank": len(reranked_chunks),
-                            "final_context": len(final_chunks)
-                        }
-                    }))
+                    cache.setex(cache_key, 3600, json.dumps(response_obj))
                 except Exception as cache_exc:
                     logger.warning(f"Failed to cache answer: {cache_exc}")
+
+            # Return the constructed response
+            return response_obj
 
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
