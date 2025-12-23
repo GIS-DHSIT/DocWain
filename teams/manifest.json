@@ -1,0 +1,54 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.14/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.14",
+  "version": "1.0.0",
+  "id": "00000000-0000-0000-0000-000000000000",
+  "packageName": "com.docwain.bot",
+  "name": {
+    "short": "DocWain",
+    "full": "DocWain Assistant"
+  },
+  "description": {
+    "short": "Ask DocWain questions from Microsoft Teams.",
+    "full": "DocWain lets you ask questions against your documents directly from Teams. Configure the messaging endpoint to point at /teams/messages."
+  },
+  "accentColor": "#004578",
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "bots": [
+    {
+      "botId": "00000000-0000-0000-0000-000000000000",
+      "scopes": [
+        "personal"
+      ],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": [
+            "personal"
+          ],
+          "commands": [
+            {
+              "title": "Ask",
+              "description": "Ask DocWain a question"
+            },
+            {
+              "title": "Help",
+              "description": "Get usage tips"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "webApplicationInfo": {
+    "id": "00000000-0000-0000-0000-000000000000",
+    "resource": "api://YOUR_HOSTNAME/botid-00000000-0000-0000-0000-000000000000"
+  },
+  "validDomains": [
+    "YOUR_HOSTNAME"
+  ]
+}
