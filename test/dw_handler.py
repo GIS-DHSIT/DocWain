@@ -16,7 +16,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 from sentence_transformers import SentenceTransformer
 from qdrant_client.models import Distance, VectorParams
-from api.config import Config
+from src.api.config import Config
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")

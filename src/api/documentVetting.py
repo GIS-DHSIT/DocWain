@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import pandas as pd
-from api.config import Config
+from src.api.config import Config
 from azure.storage.blob import BlobServiceClient
 import google.generativeai as genai
 

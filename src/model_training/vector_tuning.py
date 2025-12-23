@@ -1,7 +1,7 @@
 
 import logging
 import numpy as np
-from api.config import Config
+from src.api.config import Config
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter
 from sentence_transformers import SentenceTransformer, losses, models

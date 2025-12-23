@@ -2,8 +2,8 @@ import logging
 import re
 from typing import Any, Dict, List
 
-from api.config import Config
-from api.dw_newron import answer_question
+from src.api.config import Config
+from src.api.dw_newron import answer_question
 
 logger = logging.getLogger(__name__)
 

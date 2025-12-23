@@ -5,7 +5,7 @@ Run this to verify your setup is working correctly
 
 import logging
 import sys
-from api.config import Config
+from src.api.config import Config
 from qdrant_client import QdrantClient
 from sentence_transformers import SentenceTransformer
 
@@ -191,7 +191,7 @@ def test_retrieval(client, model, collection_name, profile_id):
         # Test 3: Try enhanced retrieval
         logger.info("\n--- Test 3: Enhanced Adaptive Retrieval ---")
         try:
-            from enhanced_retrieval import AdaptiveRetriever
+            from src.api.enhanced_retrieval import AdaptiveRetriever
 
             retriever = AdaptiveRetriever(client, model, use_sparse=True)
             chunks = retriever.retrieve_adaptive(
@@ -288,7 +288,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

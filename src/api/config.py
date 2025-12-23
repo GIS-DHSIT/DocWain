@@ -83,10 +83,10 @@ class Config:
         SENTENCE_TRANSFORMERS = os.getenv("SENTENCE_TRANSFORMERS", 'sentence-transformers/all-mpnet-base-v2')
         SENTENCE_TRANSFORMERS_FALLBACK = SENTENCE_TRANSFORMERS
         SENTENCE_TRANSFORMERS_CANDIDATES = [SENTENCE_TRANSFORMERS]
-        # AZURE_OPENAI_ENDPOINT = "https://nhspoc.openai.azure.com/"
-        # AZURE_OPENAI_API_KEY = "1r0Tggwh4wemD9VU7CDP2YQgeri8Z8tYnvVADu07EtQ8W0GAnvVtJQQJ99AKAC77bzfXJ3w3AAABACOGUkAC"
-        # AZURE_DEPLOYMENT_NAME = "gpt-35-turbo"
-        # AZURE_VERSION = "2023-07-01-preview"
+        AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+        AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "")
+        AZURE_VERSION = os.getenv("AZURE_OPENAI_VERSION", "")
         # ✅ Gemini 2.5 Flash configs
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
@@ -149,6 +149,13 @@ class Config:
         PASSWORD = os.getenv("REDIS_PASSWORD", _redis_defaults.get("password"))
         DB = int(os.getenv("REDIS_DB", "0"))
         SSL = str(os.getenv("REDIS_SSL", str(_redis_defaults.get("ssl", True)))).lower() in {"true", "1", "yes", "on"}
+
+    class Teams:
+        SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
+        DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
+        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "default")
+        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
+        DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
 
     class Retrieval:
         CHUNK_SIZE = 800

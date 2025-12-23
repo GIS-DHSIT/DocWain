@@ -3,7 +3,7 @@ from pymongo import MongoClient
 import pandas as pd
 from bson.objectid import ObjectId
 
-from api.config import Config
+from src.api.config import Config
 
 # Connect to MongoDB
 mongoClient = MongoClient(Config.MongoDB.URI)
