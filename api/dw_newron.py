@@ -18,6 +18,7 @@ import google.generativeai as genai
 from urllib import request
 from urllib.error import HTTPError, URLError
 from api.config import Config
+from api.enhanced_context_builder import IntelligentContextBuilder
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +34,16 @@ _QDRANT_CLIENT = None
 _REDIS_CLIENT = None
 _MODEL_CACHE: Dict[int, SentenceTransformer] = {}
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
+ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
+ANSWER_CACHE_VERSION = "v2"
+
+
+def _slug(value: str) -> str:
+    """Safe, lowercase slug for cache keys."""
+    if not value:
+        return "default"
+    cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return cleaned or "default"
 
 
 def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransformer:
@@ -1164,12 +1175,14 @@ class PromptBuilder:
             persona: str,
             conversation_summary: str = "",
             domain_guidance: str = "",
-            feedback_memory: str = ""
+            feedback_memory: str = "",
+            retrieval_brief: str = ""
     ) -> str:
         """Build a structured QA prompt with grounding and citation requirements."""
         convo_block = f"\nPRIOR CONVERSATION SUMMARY:\n{conversation_summary}\n" if conversation_summary else ""
         domain_block = f"\nDOMAIN ADAPTER:\n{domain_guidance}\n" if domain_guidance else ""
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
+        retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
         prompt = f"""You are a {persona} specialized in providing accurate, document-based answers with STRICT GROUNDING.
 
 CRITICAL RULES FOR GROUNDING:
@@ -1185,13 +1198,15 @@ DOCUMENT CONTEXT:
 {context}
 {convo_block}
 {domain_block}
+{retrieval_block}
 {feedback_block}
 
 USER QUESTION: {query}
 
 RESPONSE REQUIREMENTS:
-- Write in a natural, human tone; contractions are fine. Use 2-6 concise sentences.
-- Keep it conversational and approachable, like explaining to a teammate.
+- Write in a natural, human tone; contractions are fine. Use 2-6 concise, vivid sentences.
+- Keep it conversational and approachable, like explaining to a teammate, but stay precise.
+- Lead with the clearest direct answer; keep sentences short and active-voice.
 - Do NOT repeat or paraphrase the user question; go straight to the answer.
 - Lead with the direct answer; include brief reasoning or supporting evidence.
 - Cite sources using [SOURCE] notation after each factual claim or quoted phrase.
@@ -1239,6 +1254,7 @@ class EnterpriseRAGSystem:
         try:
             # Initialize LLM client (Ollama by default, Gemini when requested)
             self.llm_client = create_llm_client(model_name)
+            self.model_name = getattr(self.llm_client, "model_name", model_name or "default")
 
             # Initialize other components
             qdrant_client = get_qdrant_client()
@@ -1249,6 +1265,9 @@ class EnterpriseRAGSystem:
             self.retriever = QdrantRetriever(qdrant_client, model)
             self.reranker = HybridReranker(alpha=0.7, cross_encoder=cross_encoder)
             self.context_builder = ContextBuilder()
+            self.intelligent_context_builder = IntelligentContextBuilder(
+                max_context_chunks=getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)
+            )
             self.prompt_builder = PromptBuilder()
             self.greeting_handler = GreetingHandler()
             self.query_reformulator = QueryReformulator(self.llm_client)
@@ -1557,15 +1576,27 @@ class EnterpriseRAGSystem:
             memory_fingerprint = "noctx"
             if conversation_context_for_cache:
                 memory_fingerprint = hashlib.md5(conversation_context_for_cache.encode("utf-8")).hexdigest()
+            profile_context_fingerprint = "noprof"
+            try:
+                profile_context_fingerprint = hashlib.md5(
+                    json.dumps(profile_context_data or {}, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+            except Exception as fp_exc:
+                logger.debug("Failed to fingerprint profile context: %s", fp_exc)
             if cache:
                 cache_key = (
-                    f"rag:{collection_name}:{profile_id}:{selected_strategy}:{memory_fingerprint}:"
+                    f"rag:{ANSWER_CACHE_VERSION}:"
+                    f"{_slug(collection_name)}:{_slug(profile_id)}:"
+                    f"{_slug(self.model_name)}:{_slug(persona)}:"
+                    f"{selected_strategy}:{memory_fingerprint}:{profile_context_fingerprint}:"
                     f"{hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
                 )
                 cached = cache.get(cache_key)
                 if cached:
                     try:
                         cached_obj = json.loads(cached)
+                        if cached_obj.get("cache_version") and cached_obj["cache_version"] != ANSWER_CACHE_VERSION:
+                            raise ValueError("Cache version mismatch")
                         logger.info("Cache hit for query; returning cached answer")
                         cached_response = cached_obj.get("response", "")
                         self.conversation_history.add_turn(user_id, query, cached_response)
@@ -1616,12 +1647,35 @@ class EnterpriseRAGSystem:
                 use_cross_encoder=True
             )
 
-            final_chunks = reranked_chunks[:final_k]
+            config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", final_k or 3)
+            context_chunk_limit = max(final_k or 0, config_context_limit)
+            context_chunk_limit = min(context_chunk_limit, len(reranked_chunks))
+            final_chunks = reranked_chunks[:context_chunk_limit]
 
-            context = self.context_builder.build_context(
-                chunks=final_chunks,
-                max_chunks=final_k
-            )
+            context_sources: List[Dict[str, Any]] = []
+            context = ""
+            if final_chunks:
+                try:
+                    chunk_dicts = [
+                        {
+                            "text": chunk.text,
+                            "score": float(chunk.score),
+                            "metadata": chunk.metadata or {}
+                        }
+                        for chunk in final_chunks
+                    ]
+                    context, context_sources = self.intelligent_context_builder.build_context(
+                        chunks=chunk_dicts,
+                        query=processed_query,
+                        include_metadata=True
+                    )
+                except Exception as ctx_exc:
+                    logger.warning(f"Enhanced context builder failed; falling back: {ctx_exc}")
+                    context = self.context_builder.build_context(
+                        chunks=final_chunks,
+                        max_chunks=context_chunk_limit
+                    )
+                    context_sources = self.context_builder.extract_sources(final_chunks)
 
             logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
 
@@ -1643,7 +1697,7 @@ class EnterpriseRAGSystem:
 
                 return {
                     "response": not_answerable_response,
-                    "sources": self.context_builder.extract_sources(final_chunks),
+                    "sources": context_sources,
                     "user_id": user_id,
                     "collection": collection_name,
                     "context_found": True,
@@ -1657,13 +1711,22 @@ class EnterpriseRAGSystem:
                     "processing_time": time.time() - start_time
                 }
 
+            retrieval_brief = (
+                f"strategy={selected_strategy}; processed_query=\"{processed_query}\"; "
+                f"context_chunks={len(final_chunks)}; attempts={len(retrieval_attempts)}"
+            )
+            if context_sources:
+                top_sources = ", ".join(str(src.get('source_name')) for src in context_sources[:3])
+                retrieval_brief += f"; top_sources={top_sources}"
+
             prompt = self.prompt_builder.build_qa_prompt(
                 query=query,
                 context=context,
                 persona=persona,
                 conversation_summary=conversation_summary,
                 domain_guidance=adapter_text,
-                feedback_memory=feedback_text
+                feedback_memory=feedback_text,
+                retrieval_brief=retrieval_brief
             )
 
             answer = self.llm_client.generate(prompt)
@@ -1672,7 +1735,7 @@ class EnterpriseRAGSystem:
                 if trimmed:
                     answer = trimmed
 
-            sources = self.context_builder.extract_sources(final_chunks)
+            sources = context_sources or self.context_builder.extract_sources(final_chunks)
 
             self.conversation_history.add_turn(user_id, query, answer)
             final_doc_ids = [
@@ -1698,6 +1761,7 @@ class EnterpriseRAGSystem:
                 "num_sources": len(sources),
                 "source_doc_ids": final_doc_ids,
                 "preprocessing": preprocessing_metadata,
+                "processed_query": processed_query,
                 "answerability": {
                     "is_answerable": is_answerable,
                     "reason": answerability_reason
@@ -1708,6 +1772,12 @@ class EnterpriseRAGSystem:
                 "selected_strategy": selected_strategy,
                 "profile_context": profile_context_data,
                 "processing_time": round(processing_time, 2),
+                "retrieval_notes": retrieval_brief,
+                "model_name": self.model_name,
+                "persona": persona,
+                "cache_version": ANSWER_CACHE_VERSION,
+                "context_fingerprint": memory_fingerprint,
+                "profile_context_fingerprint": profile_context_fingerprint,
                 "retrieval_stats": {
                     "initial_retrieved": len(retrieved_chunks),
                     "after_rerank": len(reranked_chunks),
@@ -1719,7 +1789,7 @@ class EnterpriseRAGSystem:
             # answers (document_qa) to improve subsequent response accuracy.
             if cache and cache_key:
                 try:
-                    cache.setex(cache_key, 3600, json.dumps(response_obj))
+                    cache.setex(cache_key, ANSWER_CACHE_TTL, json.dumps(response_obj))
                 except Exception as cache_exc:
                     logger.warning(f"Failed to cache answer: {cache_exc}")
 
