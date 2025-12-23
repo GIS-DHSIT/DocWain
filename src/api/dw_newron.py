@@ -17,8 +17,8 @@ import redis
 import google.generativeai as genai
 from urllib import request
 from urllib.error import HTTPError, URLError
-from api.config import Config
-from api.enhanced_context_builder import IntelligentContextBuilder
+from src.api.config import Config
+from src.api.enhanced_context_builder import IntelligentContextBuilder
 
 # Configure logging
 logging.basicConfig(

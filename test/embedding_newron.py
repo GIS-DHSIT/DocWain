@@ -11,8 +11,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 # from openai import AzureOpenAI   # ❌ Commented out (we no longer use Azure OpenAI)
 import uvicorn
-from api.config import Config
-from api.dataHandler import trainData
+from src.api.config import Config
+from src.api.dataHandler import trainData
 import google.generativeai as genai   # ✅ New Gemini import
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

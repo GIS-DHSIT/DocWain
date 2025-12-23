@@ -1,24 +1,69 @@
 from contextlib import suppress
 from pathlib import Path
-from typing import List
+from typing import AsyncGenerator, List
 from uuid import uuid4
-
-import os
-import sys
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse
+from langchain.chains import create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.retrievers import ContextualCompressionRetriever
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel
 import uvicorn
 
-path = os.getcwd()
-sys.path.append(path)
+from src.app.config import Config
+from src.app.ingestor import Ingestor
+from src.app.model import create_llm, create_reranker
 
-from src.chain import ask_question, create_chain
-from src.config import Config
-from src.ingestor import Ingestor
-from src.model import create_llm
-from src.retriever import create_retriever
+
+def create_retriever(llm, vector_store):
+    """Build a retriever with optional reranking."""
+    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+    if Config.Retriever.USE_RERANKER:
+        reranker = create_reranker()
+        return ContextualCompressionRetriever(
+            base_retriever=retriever,
+            base_compressor=reranker,
+        )
+    return retriever
+
+
+def _build_prompt() -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a helpful assistant. Use the provided context to answer the question. "
+                "If the answer is not contained in the context, respond with \"I don't know.\" "
+                "\n\nContext:\n{context}",
+            ),
+            ("human", "{input}"),
+        ]
+    )
+
+
+def create_chain(llm, retriever):
+    prompt = _build_prompt()
+    document_chain = create_stuff_documents_chain(llm, prompt)
+    return create_retrieval_chain(retriever, document_chain)
+
+
+async def ask_question(chain, question: str, session_id: str) -> AsyncGenerator[str | List[Document], None]:
+    """Run a retrieval chain and yield the answer followed by sources."""
+    result = await chain.ainvoke({"input": question})
+    answer = (
+        result.get("answer")
+        or result.get("output_text")
+        or result.get("result")
+        or str(result)
+    )
+    yield answer
+
+    sources = result.get("context") or []
+    if sources:
+        yield sources
 
 app = FastAPI(title="DocWain API")
 

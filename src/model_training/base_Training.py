@@ -5,11 +5,10 @@
 # - QdrantRetriever: to retrieve relevant documents
 # - RAGPipeline: combines query, retrieval, and generation
 
-import subprocess
 from typing import List
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter, SearchRequest
-from api.config import Config
+from src.api.config import Config
 from sentence_transformers import SentenceTransformer
 
 # ---- Commented out Ollama since we are switching to Gemini ----
@@ -22,7 +21,7 @@ import google.generativeai as genai
 # GeminiManager: handles Gemini API calls
 class GeminiManager:
     def __init__(self, model_name: str = "gemini-2.5-flash"):
-        genai.configure(api_key=Config.GEMINI.API_KEY)
+        genai.configure(api_key=Config.Model.GEMINI_API_KEY)
         self.model_name = model_name
         self.client = genai.GenerativeModel(self.model_name)
 

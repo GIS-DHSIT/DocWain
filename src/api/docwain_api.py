@@ -1,27 +1,31 @@
+import logging
+import time
+from typing import Optional
 
 import ollama
-import logging
 import uvicorn
-from typing import Optional
-from pydantic import BaseModel
-from bson.objectid import ObjectId # added by maha/maria
-import time
-import os, sys
-path = os.getcwd()
-sys.path.append(path)
-from api.dataHandler import trainData # trainSingleDocument
-from api.dataHandler import train_single_document, get_pii_stats
-from api.dw_newron import answer_question
+from bson.objectid import ObjectId  # added by maha/maria
 from fastapi import FastAPI, HTTPException
-from api.dw_chat import (
-    get_chat_history,
-    delete_chat_history,
-    add_message_to_history,
-    get_session_list,
-    get_session_by_id,
-    delete_session
-)
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from src.api.config import Config
+from src.api.dataHandler import (
+    db,
+    get_subscription_pii_setting,
+    mongoClient,
+    trainData,  # trainSingleDocument
+    train_single_document,
+)
+from src.api.dw_chat import (
+    add_message_to_history,
+    delete_chat_history,
+    delete_session,
+    get_chat_history,
+    get_session_by_id,
+    get_session_list,
+)
+from src.api.dw_newron import answer_question
 
 app = FastAPI(title="DocWain API")
 
@@ -248,7 +252,6 @@ def get_pii_setting(subscription_id: str):
     Get current PII masking setting for a subscription
     """
     try:
-        from api.dataHandler import get_subscription_pii_setting
         pii_enabled = get_subscription_pii_setting(subscription_id)
         return {
             "subscription_id": subscription_id,
@@ -270,8 +273,6 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
     }
     """
     try:
-        from api.config import Config
-        from api.dataHandler import mongoClient, db
         subscriptions_collection = getattr(Config.MongoDB, 'SUBSCRIPTIONS', 'subscriptions')
         collection = db[subscriptions_collection]
         # Find subscription
@@ -325,8 +326,6 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
     This will retrain documents with new PII masking rules
     """
     try:
-        from api.dataHandler import trainData, db
-        from api.config import Config
         # Get all documents for this subscription
         documents_collection = db[Config.MongoDB.DOCUMENTS]
         # Update all documents in this subscription to UNDER_REVIEW
@@ -364,4 +363,3 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-

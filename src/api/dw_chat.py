@@ -8,7 +8,7 @@ from io import BytesIO
 
 from datetime import datetime
 
-from api.config import Config
+from src.api.config import Config
 
 from azure.storage.blob import BlobServiceClient, ContentSettings
 

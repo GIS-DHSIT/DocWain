@@ -2,13 +2,12 @@ import json
 import uuid
 import logging
 import hashlib
-import re
 import subprocess
 import boto3 as b3
 import numpy as np
 import pandas as pd
 from io import BytesIO
-from api.config import Config
+from src.api.config import Config
 from Crypto.Cipher import AES
 from pymongo import MongoClient, errors
 from urllib.parse import urlparse
@@ -16,14 +15,12 @@ from bson.objectid import ObjectId
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Distance, VectorParams, SparseVectorParams, SparseVector
 from sentence_transformers import SentenceTransformer
-from api.documentVetting import vettingProcessor, mask_document_content
-from api.dw_document_extractor import DocumentExtractor
+from src.api.documentVetting import vettingProcessor, mask_document_content
+from src.api.dw_document_extractor import DocumentExtractor
 from azure.storage.blob import BlobServiceClient
 import time
 import copy
 from sklearn.feature_extraction.text import TfidfVectorizer
-from typing import List, Tuple, Dict, Any
-from dataclasses import dataclass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -1154,7 +1151,7 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
 
 # Replace your existing train_on_document function with this:
 
-from enhanced_retrieval import chunk_text_for_embedding
+from src.api.enhanced_retrieval import chunk_text_for_embedding
 
 
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):

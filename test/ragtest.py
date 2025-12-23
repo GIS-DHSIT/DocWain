@@ -11,7 +11,7 @@ from sentence_transformers import SentenceTransformer
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from openai import AzureOpenAI
-from api.config import Config
+from src.api.config import Config
 import uvicorn
 from typing import Dict, List
 
@@ -172,7 +172,6 @@ def chat_with_rag(request: ChatRequest):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
 
 
 
