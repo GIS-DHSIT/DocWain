@@ -116,3 +116,7 @@ def handle_teams_activity(activity: Dict[str, Any], headers: Dict[str, str]) -> 
     logger.info("Teams message handled | user=%s session=%s", user_id, session_id)
 
     return build_teams_message(answer)
+
+
+
+
