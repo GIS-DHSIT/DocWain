@@ -431,7 +431,10 @@ def get_azure_docs(files):
 
 
 def connectData(documentConnection):
-    """Processes documents and extracts data, updates vetting points."""
+    """
+    FIXED: Processes documents and extracts data, updates vetting points.
+    Now only processes files that belong to each specific document.
+    """
     dataDict = {}
 
     for k, v in documentConnection.items():
@@ -440,7 +443,6 @@ def connectData(documentConnection):
         profileId = str(docData['profile'])
         docId = str(docData['_id'])
 
-        # Prefer explicit subscription/subscriptionId fields from document, then connector, then default.
         subscriptionId = str(
             docData.get('subscriptionId')
             or docData.get('subscription_id')
@@ -450,22 +452,19 @@ def connectData(documentConnection):
             or "default"
         )
 
-        # ============= NEW: Check PII setting for this subscription =============
+        # Check PII setting for this subscription
         pii_masking_enabled = get_subscription_pii_setting(subscriptionId)
         logging.info(f"Document {docId} (Subscription {subscriptionId}): PII masking = {pii_masking_enabled}")
-        # =========================================================================
 
-        # Allow reprocessing documents that previously failed training
         allowed_statuses = {'UNDER_REVIEW', 'TRAINING_FAILED'}
 
         if docData.get('status') in allowed_statuses:
             try:
                 logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
-
-                # Initialize extracted documents dictionary for this document
                 all_extracted_docs = {}
 
                 if docData['type'] == 'S3':
+                    # S3 processing (unchanged)
                     bkName = connData['s3_details']['bucketName']
                     region = connData['s3_details']['region']
                     ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
@@ -486,70 +485,91 @@ def connectData(documentConnection):
                         continue
 
                     docContent = read_s3_file(s3, bkName, file[0])
-
                     if docContent is None:
                         logging.error(f"Failed to read S3 file for document {docId}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Failed to read S3 file')
                         continue
 
                     extractedDoc = fileProcessor(docContent, file[0])
-
                     if not extractedDoc:
                         logging.error(f"Failed to extract content from document {docId}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
                         continue
 
                     all_extracted_docs.update(extractedDoc)
-                    vettingPoints = vettingProcessor(extractedDoc)
-                    updateVetting(docId, vettingPoints)
 
                 elif docData['type'] == 'LOCAL':
-                    files = connData['locations']
+                    # ============================================
+                    # CRITICAL FIX: Filter connector files to match THIS document only
+                    # ============================================
 
-                    # Process ALL files for this document
-                    for file_path in files:
-                        try:
-                            file_key = file_path.split('/', 4)[-1]
-                            logging.info(f"Processing file: {file_key} for document {docId}")
+                    # Get this document's filename
+                    doc_name = docData.get('name', '')
 
-                            docContent = get_azure_docs(file_key)
+                    if not doc_name:
+                        logging.error(f"No filename found for document {docId}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'No filename specified')
+                        continue
 
-                            if docContent is None:
-                                logging.error(f"Failed to read Azure file {file_key} for document {docId}")
-                                continue
+                    # Get all files from connector
+                    all_connector_files = connData.get('locations', [])
 
-                            extractedDoc = fileProcessor(docContent, file_path)
+                    # Filter to find ONLY the file that matches this document's name
+                    matching_files = [
+                        file_path for file_path in all_connector_files
+                        if file_path.endswith(doc_name) or doc_name in file_path
+                    ]
 
-                            if not extractedDoc:
-                                logging.error(f"Failed to extract content from file {file_key}")
-                                continue
+                    if not matching_files:
+                        logging.error(f"No matching file found in connector for document {docId} (name: {doc_name})")
+                        logging.error(f"Available files in connector: {all_connector_files}")
+                        update_training_status(docId, 'TRAINING_FAILED', f'File {doc_name} not found in connector')
+                        continue
 
-                            # Add this file's extracted content to the collection
-                            all_extracted_docs.update(extractedDoc)
-                            logging.info(f"Successfully extracted content from {file_key}")
+                    if len(matching_files) > 1:
+                        logging.warning(f"Multiple files match {doc_name}: {matching_files}. Using first match.")
 
-                        except Exception as file_error:
-                            logging.error(f"Error processing file {file_path}: {file_error}")
+                    file_path = matching_files[0]
+                    logging.info(f"Document {docId} will process ONLY file: {file_path}")
+
+                    # Process ONLY this document's specific file
+                    try:
+                        # Extract the path after 'az://' prefix
+                        file_key = file_path.split('/', 4)[-1] if file_path.startswith('az://') else file_path
+                        logging.info(f"Processing file: {file_key} for document {docId}")
+
+                        docContent = get_azure_docs(file_key)
+                        if docContent is None:
+                            logging.error(f"Failed to read Azure file {file_key} for document {docId}")
+                            update_training_status(docId, 'TRAINING_FAILED', f'Failed to read file {file_key}')
                             continue
 
-                    # Calculate vetting points for all extracted documents
+                        extractedDoc = fileProcessor(docContent, file_path)
+                        if not extractedDoc:
+                            logging.error(f"Failed to extract content from file {file_key}")
+                            update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
+                            continue
+
+                        all_extracted_docs.update(extractedDoc)
+                        logging.info(f"Successfully extracted content from {file_key}")
+
+                    except Exception as file_error:
+                        logging.error(f"Error processing file {file_path}: {file_error}")
+                        update_training_status(docId, 'TRAINING_FAILED', str(file_error))
+                        continue
+
+                    # Calculate vetting points
                     if all_extracted_docs:
                         vettingPoints = vettingProcessor(all_extracted_docs)
                         updateVetting(docId, vettingPoints)
                     else:
                         logging.error(f"No content extracted for document {docId}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'No content extracted from any file')
+                        update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
                         continue
 
-                # Store all extracted documents for this document ID
+                # Apply PII masking if enabled
                 if all_extracted_docs:
-                    # Check if PII masking is enabled for this subscription
-                    subscription_doc = db[Config.MongoDB.SUBSCRIPTIONS].find_one({
-                        "subscription_id": subscriptionId
-                    })
-                    pii_enabled = subscription_doc.get('pii_enabled', False) if subscription_doc else False
-                    if pii_enabled:
-                        # Mask PII, track counts, and block training if high confidentiality detected
+                    if pii_masking_enabled:
                         masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
                         update_pii_stats(docId, pii_count, high_conf, pii_items)
 
@@ -569,7 +589,6 @@ def connectData(documentConnection):
                                     content["embeddings"] = model.encode(texts, convert_to_numpy=True)
                                 masked_docs[fname] = content
                     else:
-                        # PII masking disabled - use original documents
                         logging.info(f"PII masking disabled for subscription {subscriptionId}")
                         masked_docs = all_extracted_docs
                         pii_count = 0
@@ -586,8 +605,7 @@ def connectData(documentConnection):
                         'extractedDoc': masked_docs,
                         'docName': docData.get('name', 'Unknown')
                     }
-                    logging.info(f"Stored {len(masked_docs)} files for document {docId} (PII masked: {pii_count})")
-                    # ==============================================================================================
+                    logging.info(f"Stored document {docId} with {len(masked_docs)} file(s) (PII masked: {pii_count})")
                 else:
                     logging.error(f"No documents extracted for {docId}")
                     update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
@@ -602,157 +620,6 @@ def connectData(documentConnection):
 
     return dataDict
 
-
-'''
-def connectData(documentConnection):
-    """Processes documents and extracts data, updates vetting points."""
-    dataDict = {}
-
-    for k, v in documentConnection.items():
-        docData = v['dataDict']
-        connData = v['connDict']
-        profileId = str(docData['profile'])
-        docId = str(docData['_id'])
-        # Prefer explicit subscription/subscriptionId fields from document, then connector, then default.
-        subscriptionId = str(
-            docData.get('subscriptionId')
-            or docData.get('subscription_id')
-            or docData.get('subscription')
-            or (connData.get('subscriptionId') if isinstance(connData, dict) else None)
-            or (connData.get('subscription') if isinstance(connData, dict) else None)
-            or "default"
-        )
-
-        # Allow reprocessing documents that previously failed training
-        allowed_statuses = {'UNDER_REVIEW', 'TRAINING_FAILED'}
-
-        if docData.get('status') in allowed_statuses:
-            try:
-                logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
-
-                # Initialize extracted documents dictionary for this document
-                all_extracted_docs = {}
-
-                if docData['type'] == 'S3':
-                    bkName = connData['s3_details']['bucketName']
-                    region = connData['s3_details']['region']
-                    ak = decrypt_data(connData['s3_details']['accessKey']).split('\x0c')[0].strip()
-                    sk = decrypt_data(connData['s3_details']['secretKey']).split('\x08')[0].strip()
-                    s3 = get_s3_client(ak, sk, region)
-
-                    if not s3:
-                        logging.error(f"Failed to create S3 client for document {docId}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to create S3 client')
-                        continue
-
-                    objs = s3.list_objects_v2(Bucket=bkName)
-                    file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
-
-                    if not file:
-                        logging.error(f"File {docData['name']} not found in S3 bucket {bkName}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'File not found in S3')
-                        continue
-
-                    docContent = read_s3_file(s3, bkName, file[0])
-
-                    if docContent is None:
-                        logging.error(f"Failed to read S3 file for document {docId}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to read S3 file')
-                        continue
-
-                    extractedDoc = fileProcessor(docContent, file[0])
-
-                    if not extractedDoc:
-                        logging.error(f"Failed to extract content from document {docId}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
-                        continue
-
-                    all_extracted_docs.update(extractedDoc)
-                    vettingPoints = vettingProcessor(extractedDoc)
-                    updateVetting(docId, vettingPoints)
-
-                elif docData['type'] == 'LOCAL':
-                    files = connData['locations']
-
-                    # Process ALL files for this document
-                    for file_path in files:
-                        try:
-                            file_key = file_path.split('/', 4)[-1]
-                            logging.info(f"Processing file: {file_key} for document {docId}")
-
-                            docContent = get_azure_docs(file_key)
-
-                            if docContent is None:
-                                logging.error(f"Failed to read Azure file {file_key} for document {docId}")
-                                continue
-
-                            extractedDoc = fileProcessor(docContent, file_path)
-
-                            if not extractedDoc:
-                                logging.error(f"Failed to extract content from file {file_key}")
-                                continue
-
-                            # Add this file's extracted content to the collection
-                            all_extracted_docs.update(extractedDoc)
-                            logging.info(f"Successfully extracted content from {file_key}")
-
-                        except Exception as file_error:
-                            logging.error(f"Error processing file {file_path}: {file_error}")
-                            continue
-
-                    # Calculate vetting points for all extracted documents
-                    if all_extracted_docs:
-                        vettingPoints = vettingProcessor(all_extracted_docs)
-                        updateVetting(docId, vettingPoints)
-                    else:
-                        logging.error(f"No content extracted for document {docId}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'No content extracted from any file')
-                        continue
-
-                # Store all extracted documents for this document ID
-                if all_extracted_docs:
-                    # Mask PII, track counts, and block training if high confidentiality detected
-                    masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
-                    update_pii_stats(docId, pii_count, high_conf, pii_items)
-
-                    if high_conf:
-                        logging.error(f"High confidentiality content detected in document {docId}; blocking training")
-                        update_training_status(docId, 'TRAINING_BLOCKED_CONFIDENTIAL', 'High confidentiality content detected')
-                        continue
-
-                    # Recompute embeddings for structured data after masking
-                    for fname, content in masked_docs.items():
-                        if isinstance(content, dict) and "texts" in content:
-                            texts = content.get("texts") or []
-                            if texts:
-                                model = get_model()
-                                content["embeddings"] = model.encode(texts, convert_to_numpy=True)
-                            masked_docs[fname] = content
-
-                    vettingPoints = vettingProcessor(masked_docs)
-                    updateVetting(docId, vettingPoints)
-
-                    dataDict[docId] = {
-                        'subscriptionId': subscriptionId,
-                        'profileId': profileId,
-                        'extractedDoc': masked_docs,
-                        'docName': docData.get('name', 'Unknown')
-                    }
-                    logging.info(f"Stored {len(masked_docs)} files for document {docId} (PII masked: {pii_count})")
-                else:
-                    logging.error(f"No documents extracted for {docId}")
-                    update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
-
-            except Exception as e:
-                logging.error(f"Error processing document {docId} ({docData.get('name', 'Unknown')}): {e}")
-                update_training_status(docId, 'TRAINING_FAILED', str(e))
-
-        elif docData['status'] == 'DELETED':
-            profileData = str(docData['profile'])
-            delete_embeddings(subscriptionId, profileData, docId)
-
-    return dataDict
-'''
 
 
 def collectionConnect(name):
