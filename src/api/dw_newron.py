@@ -38,6 +38,50 @@ ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v2"
 
 
+def _parse_redis_connection_string(conn_str: str):
+    """
+    Lightweight parser for Azure Redis Cache connection strings.
+
+    Returns a dict with host, port, password, username, and ssl settings. Falls
+    back to conservative defaults when parsing fails so the app can still start.
+    """
+    settings = {
+        "host": "rediscache.redis.cache.windows.net",
+        "port": 6380,
+        "password": "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=",
+        "username": "default",
+        "ssl": True,
+    }
+
+    if not conn_str:
+        return settings
+
+    try:
+        parts = conn_str.split(",")
+        host_port = parts[0]
+        if ":" in host_port:
+            host, port = host_port.split(":", 1)
+            settings["host"] = host
+            settings["port"] = int(port)
+
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "password":
+                settings["password"] = value
+            elif key in ("user", "username"):
+                settings["username"] = value
+            elif key == "ssl":
+                settings["ssl"] = value.lower() in {"true", "1", "yes", "on"}
+    except Exception:
+        return settings
+
+    return settings
+
+
 def _slug(value: str) -> str:
     """Safe, lowercase slug for cache keys."""
     if not value:
@@ -115,23 +159,32 @@ def get_redis_client():
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
         try:
+            conn_str = os.getenv("REDIS_CONNECTION_STRING", getattr(Config.Redis, "CONNECTION_STRING", ""))
+            parsed = _parse_redis_connection_string(conn_str)
+
+            host = os.getenv("REDIS_HOST") or parsed["host"]
+            port = int(os.getenv("REDIS_PORT") or parsed["port"])
+            username = os.getenv("REDIS_USERNAME") or parsed.get("username")
+            password = os.getenv("REDIS_PASSWORD") or parsed.get("password")
+            ssl_enabled = str(os.getenv("REDIS_SSL") or parsed.get("ssl", True)).lower() in {"true", "1", "yes", "on"}
+
             _REDIS_CLIENT = redis.Redis(
-                host=Config.Redis.HOST,
-                port=Config.Redis.PORT,
-                username=Config.Redis.USERNAME or None,
-                password=Config.Redis.PASSWORD or None,
+                host=host,
+                port=port,
+                username=username or None,
+                password=password or None,
                 db=Config.Redis.DB,
                 decode_responses=True,
                 socket_timeout=5,
-                ssl=getattr(Config.Redis, "SSL", False),
+                ssl=ssl_enabled,
             )
             # simple ping
             _REDIS_CLIENT.ping()
             logger.info(
                 "Initialized Redis client at %s:%s (ssl=%s)",
-                Config.Redis.HOST,
-                Config.Redis.PORT,
-                getattr(Config.Redis, "SSL", False)
+                host,
+                port,
+                ssl_enabled
             )
         except Exception as e:
             logger.warning(f"Failed to initialize Redis client, caching disabled: {e}")
