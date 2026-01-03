@@ -5,11 +5,12 @@ from typing import Optional
 import ollama
 import uvicorn
 from bson.objectid import ObjectId  # added by maha/maria
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.api.config import Config
+from src.api import teams_adapter
 from src.api.dataHandler import (
     db,
     get_subscription_pii_setting,
@@ -48,6 +49,16 @@ class QuestionRequest(BaseModel):
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
     new_session: Optional[bool] = False  # Frontend sends flag here
+
+
+@app.post("/teams/messages")
+async def handle_teams_messages(request: Request):
+    """Endpoint for Microsoft Teams activities (messages, attachments)."""
+    activity = await request.json()
+    try:
+        return await teams_adapter.handle_teams_activity(activity, headers=dict(request.headers))
+    except teams_adapter.TeamsAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
 
 
 @app.post("/ask")

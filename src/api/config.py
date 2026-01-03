@@ -9,57 +9,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_REDIS_CONNECTION_STRING = "rediscache.redis.cache.windows.net:6380,password=IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=,ssl=True,abortConnect=False"
-
-
-def _parse_redis_connection_string(conn_str: str):
-    """
-    Lightweight parser for Azure Redis Cache connection strings.
-
-    Returns a dict with host, port, password, username, and ssl settings. Falls
-    back to the secure defaults above when parsing fails or when fields are
-    missing so the application can still start.
-    """
-    settings = {
-        "host": "rediscache.redis.cache.windows.net",
-        "port": 6380,
-        "password": "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=",
-        "username": "default",
-        "ssl": True,
-    }
-
-    if not conn_str:
-        return settings
-
-    try:
-        parts = conn_str.split(",")
-        host_port = parts[0]
-        if ":" in host_port:
-            host, port = host_port.split(":", 1)
-            settings["host"] = host
-            settings["port"] = int(port)
-
-        for part in parts[1:]:
-            if "=" not in part:
-                continue
-            key, value = part.split("=", 1)
-            key = key.strip().lower()
-            value = value.strip()
-            if key == "password":
-                settings["password"] = value
-            elif key in ("user", "username"):
-                settings["username"] = value
-            elif key == "ssl":
-                settings["ssl"] = value.lower() in {"true", "1", "yes", "on"}
-    except Exception:
-        # Keep defaults when parsing fails
-        return settings
-
-    return settings
-
-
-_redis_defaults = _parse_redis_connection_string(
-    os.getenv("REDIS_CONNECTION_STRING", DEFAULT_REDIS_CONNECTION_STRING)
-)
+_REDIS_DEFAULTS = {
+    "host": "rediscache.redis.cache.windows.net",
+    "port": 6380,
+    "password": "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=",
+    "username": "default",
+    "ssl": True,
+}
 
 
 class Config:
@@ -93,11 +49,11 @@ class Config:
         GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
 
-    # class AzureGpt4o:
-    # AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
-    # AZUREGPT4O_DEPLOYMENT = "dw-dev1-gpt-4o"
-    # AZUREGPT4O_API_KEY = '6JSK5oHMv76xL6IAtFwVfgCRykf24MWdvp6oRpxawBk9sGyqXuQYJQQJ99BCACmepeSXJ3w3AAABACOGjB0M'
-    # AZUREGPT4O_Version = "2024-05-01-preview"
+    class AzureGpt4o:
+        AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
+        AZUREGPT4O_DEPLOYMENT = "dw-dev1-gpt-4o"
+        AZUREGPT4O_API_KEY = '6JSK5oHMv76xL6IAtFwVfgCRykf24MWdvp6oRpxawBk9sGyqXuQYJQQJ99BCACmepeSXJ3w3AAABACOGjB0M'
+        AZUREGPT4O_Version = "2024-05-01-preview"
 
     class MongoDB:
         # Allow overriding the Mongo connection string via env; fall back to a localhost URI
@@ -143,12 +99,12 @@ class Config:
 
     class Redis:
         CONNECTION_STRING = os.getenv("REDIS_CONNECTION_STRING", DEFAULT_REDIS_CONNECTION_STRING)
-        HOST = os.getenv("REDIS_HOST", _redis_defaults["host"])
-        PORT = int(os.getenv("REDIS_PORT", _redis_defaults["port"]))
-        USERNAME = os.getenv("REDIS_USERNAME", _redis_defaults.get("username", "default"))
-        PASSWORD = os.getenv("REDIS_PASSWORD", _redis_defaults.get("password"))
+        HOST = os.getenv("REDIS_HOST", _REDIS_DEFAULTS["host"])
+        PORT = int(os.getenv("REDIS_PORT", _REDIS_DEFAULTS["port"]))
+        USERNAME = os.getenv("REDIS_USERNAME", _REDIS_DEFAULTS.get("username", "default"))
+        PASSWORD = os.getenv("REDIS_PASSWORD", _REDIS_DEFAULTS.get("password"))
         DB = int(os.getenv("REDIS_DB", "0"))
-        SSL = str(os.getenv("REDIS_SSL", str(_redis_defaults.get("ssl", True)))).lower() in {"true", "1", "yes", "on"}
+        SSL = str(os.getenv("REDIS_SSL", str(_REDIS_DEFAULTS.get("ssl", True)))).lower() in {"true", "1", "yes", "on"}
 
     class Teams:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
@@ -156,6 +112,10 @@ class Config:
         DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "default")
         DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
+        UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
+        BLOB_CONNECTION_STRING = os.getenv("TEAMS_BLOB_CONNECTION_STRING", "")
+        BLOB_CONTAINER = os.getenv("TEAMS_BLOB_CONTAINER", "local-uploads")
+        BLOB_PATH_PREFIX = os.getenv("TEAMS_BLOB_PATH_PREFIX", "teams")
 
     class Retrieval:
         CHUNK_SIZE = 800

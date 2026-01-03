@@ -2,6 +2,9 @@
 fastapi
 uvicorn[standard]
 
+# --- Bot Framework / Teams ---
+botbuilder-core
+
 # --- Cloud SDKs ---
 boto3
 azure-storage-blob
@@ -46,7 +49,6 @@ ollama
 python-dotenv
 loguru
 gunicorn
-
 
 
 
