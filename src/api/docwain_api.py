@@ -26,7 +26,7 @@ from src.api.dw_chat import (
     get_session_by_id,
     get_session_list,
 )
-from src.api.dw_newron import answer_question
+from src.api.dw_newron import answer_question, metrics_summary
 
 app = FastAPI(title="DocWain API")
 
@@ -139,6 +139,21 @@ def list_available_models():
     except Exception as e:
         logging.error(f"Failed to list models: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve available models")
+
+
+@app.get("/metrics")
+def get_metrics(days: int = 7):
+    """API endpoint to retrieve model/retrieval performance statistics."""
+    try:
+        summary = metrics_summary(days=days)
+        return {
+            "status": "success",
+            "window_days": days,
+            "metrics": summary
+        }
+    except Exception as e:
+        logging.error(f"Failed to retrieve metrics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
 
 '''
 @app.get("/chat-history/{user_id}")

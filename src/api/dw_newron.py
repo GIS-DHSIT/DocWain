@@ -7,6 +7,7 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from collections import deque, Counter
+from datetime import datetime, timedelta
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct
@@ -33,6 +34,7 @@ _CROSS_ENCODER = None
 _QDRANT_CLIENT = None
 _REDIS_CLIENT = None
 _MODEL_CACHE: Dict[int, SentenceTransformer] = {}
+_METRICS_TRACKER = None
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
 ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v2"
@@ -1337,6 +1339,144 @@ Your response:"""
             return True, "Check failed"
 
 
+class MetricsTracker:
+    """Lightweight metrics sink for usage and quality signals."""
+
+    def __init__(self, redis_client: Optional[redis.Redis] = None):
+        self.redis = redis_client
+        self.retention_days = 120  # keep ~4 months of daily metrics
+
+    @staticmethod
+    def _day(ts: Optional[float] = None) -> str:
+        return datetime.utcfromtimestamp(ts or time.time()).strftime("%Y-%m-%d")
+
+    def record(
+            self,
+            model_name: str,
+            subscription_id: str,
+            profile_id: str,
+            query_type: str,
+            context_found: bool,
+            grounded: bool,
+            cached: bool,
+            processing_time: float,
+            retrieval_stats: Optional[Dict[str, Any]] = None
+    ):
+        if not self.redis:
+            return
+
+        day = self._day()
+        base_key = f"rag:metrics:daily:{day}"
+        model_key = f"rag:metrics:model:{day}"
+        profile_key = f"rag:metrics:profile:{day}"
+
+        stats = retrieval_stats or {}
+        hits = float(stats.get("initial_retrieved", 0))
+        final_ctx = float(stats.get("final_context", 0))
+
+        pipe = self.redis.pipeline()
+        pipe.hincrby(base_key, "total", 1)
+        pipe.hincrby(base_key, f"type:{query_type}", 1)
+        if context_found:
+            pipe.hincrby(base_key, "context_found", 1)
+        if grounded:
+            pipe.hincrby(base_key, "grounded", 1)
+        if cached:
+            pipe.hincrby(base_key, "cache_hits", 1)
+        pipe.hincrbyfloat(base_key, "sum_latency", float(processing_time or 0.0))
+        pipe.hincrbyfloat(base_key, "sum_hits", hits)
+        pipe.hincrbyfloat(base_key, "sum_final_ctx", final_ctx)
+        pipe.hincrby(model_key, model_name or "unknown", 1)
+        pipe.hincrby(profile_key, _slug(profile_id), 1)
+        pipe.expire(base_key, self.retention_days * 86400)
+        pipe.expire(model_key, self.retention_days * 86400)
+        pipe.expire(profile_key, self.retention_days * 86400)
+        try:
+            pipe.execute()
+        except Exception as exc:
+            logger.debug("Metrics write failed: %s", exc)
+
+    def summary(self, days: int = 7) -> Dict[str, Any]:
+        if not self.redis:
+            return {"available": False, "reason": "redis_unavailable"}
+
+        days = max(1, min(days, 90))
+        total = Counter()
+        model_usage: Counter = Counter()
+        profile_usage: Counter = Counter()
+
+        for offset in range(days):
+            day = self._day(time.time() - offset * 86400)
+            base_key = f"rag:metrics:daily:{day}"
+            model_key = f"rag:metrics:model:{day}"
+            profile_key = f"rag:metrics:profile:{day}"
+
+            data = self.redis.hgetall(base_key) or {}
+            for k, v in data.items():
+                try:
+                    if k.startswith("sum_"):
+                        total[k] += float(v)
+                    else:
+                        total[k] += int(v)
+                except Exception:
+                    continue
+
+            for k, v in (self.redis.hgetall(model_key) or {}).items():
+                try:
+                    model_usage[k] += int(v)
+                except Exception:
+                    continue
+            for k, v in (self.redis.hgetall(profile_key) or {}).items():
+                try:
+                    profile_usage[k] += int(v)
+                except Exception:
+                    continue
+
+        grand_total = int(total.get("total", 0))
+        grounded = int(total.get("grounded", 0))
+        context_found = int(total.get("context_found", 0))
+        cache_hits = int(total.get("cache_hits", 0))
+        not_answerable = int(total.get("type:not_answerable", 0))
+        no_results = int(total.get("type:no_results", 0))
+
+        # Derived rates
+        def _pct(num: float, denom: float) -> float:
+            return round((num / denom) * 100, 2) if denom else 0.0
+
+        avg_latency = round(total.get("sum_latency", 0.0) / grand_total, 3) if grand_total else 0.0
+        avg_hits = round(total.get("sum_hits", 0.0) / grand_total, 3) if grand_total else 0.0
+        avg_ctx = round(total.get("sum_final_ctx", 0.0) / max(grounded, 1), 3)
+
+        return {
+            "available": True,
+            "window_days": days,
+            "totals": {
+                "total_queries": grand_total,
+                "grounded_answers": grounded,
+                "context_found": context_found,
+                "cache_hits": cache_hits,
+                "not_answerable": not_answerable,
+                "no_results": no_results,
+            },
+            "rates": {
+                "accuracy_pct": _pct(grounded, grand_total),
+                "context_found_pct": _pct(context_found, grand_total),
+                "cache_hit_pct": _pct(cache_hits, grand_total),
+                "not_answerable_pct": _pct(not_answerable, grand_total),
+                "no_results_pct": _pct(no_results, grand_total),
+            },
+            "averages": {
+                "latency_seconds": avg_latency,
+                "retrieval_hits": avg_hits,
+                "context_chunks_used": avg_ctx,
+            },
+            "usage": {
+                "models": dict(model_usage.most_common(10)),
+                "profiles": dict(profile_usage.most_common(10)),
+            }
+        }
+
+
 class PromptBuilder:
     """Builds structured prompts with strict grounding and citation requirements."""
 
@@ -1378,6 +1518,7 @@ USER QUESTION: {query}
 RESPONSE REQUIREMENTS:
 - Write in a natural, human tone; contractions are fine. Use 2-6 concise, vivid sentences.
 - Keep it conversational and approachable, like explaining to a teammate, but stay precise.
+- If sharing multiple facts, use short bullet lines with citations after each bullet.
 - Lead with the clearest direct answer; keep sentences short and active-voice.
 - Do NOT repeat or paraphrase the user question; go straight to the answer.
 - Lead with the direct answer; include brief reasoning or supporting evidence.
@@ -1638,19 +1779,6 @@ class EnterpriseRAGSystem:
                         "profile_context": profile_context_data
                     }
 
-        # As a last resort, try removing the profile filter entirely to avoid silent misses
-        if profile_id and best_hits == 0:
-            nofilter_chunks = run_attempt("nofilter_qdrant", primary_query, None, False, primary_metadata, None)
-            if self._is_retrieval_sufficient(nofilter_chunks, min_hits=1, min_score=0.08):
-                return {
-                    "chunks": nofilter_chunks,
-                    "query": primary_query,
-                    "metadata": primary_metadata,
-                    "attempts": attempt_records,
-                    "selected_strategy": "nofilter_qdrant",
-                    "profile_context": profile_context_data
-                }
-
         best_run = max(retrieval_runs, key=lambda r: r[1]["top_score"], default=None)
         selected_chunks, selected_record, selected_meta, selected_query = best_run if best_run else ([], {}, primary_metadata, primary_query)
         return {
@@ -1688,6 +1816,7 @@ class EnterpriseRAGSystem:
         try:
             collection_name = f"{subscription_id}".replace(" ", "_")
             namespace = _build_namespace(subscription_id, profile_id, self.model_name)
+            metrics = get_metrics_tracker()
 
             # Quick collection diagnostics to avoid silent empty searches
             try:
@@ -1795,6 +1924,20 @@ class EnterpriseRAGSystem:
                         doc_ids = cached_obj.get("source_doc_ids") or []
                         if doc_ids:
                             self.conversation_history.add_sources(namespace, user_id, [d for d in doc_ids if d])
+                        try:
+                            metrics.record(
+                                model_name=self.model_name,
+                                subscription_id=subscription_id,
+                                profile_id=profile_id,
+                                query_type=cached_obj.get("query_type", "cached"),
+                                context_found=bool(cached_obj.get("context_found", False)),
+                                grounded=bool(cached_obj.get("grounded", True)),
+                                cached=True,
+                                processing_time=float(cached_obj.get("processing_time", 0.0)),
+                                retrieval_stats=cached_obj.get("retrieval_stats") or {}
+                            )
+                        except Exception as metric_exc:
+                            logger.debug("Metrics record (cache hit) failed: %s", metric_exc)
                         return cached_obj
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
@@ -1806,6 +1949,21 @@ class EnterpriseRAGSystem:
                     "Try rephrasing or tell me which document or section to focus on."
                 )
                 self.conversation_history.add_turn(namespace, user_id, query, no_results_response)
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="no_results",
+                        context_found=False,
+                        grounded=False,
+                        cached=False,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats={"initial_retrieved": 0, "final_context": 0}
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (no_results) failed: %s", metric_exc)
 
                 return {
                     "response": no_results_response,
@@ -1894,6 +2052,24 @@ class EnterpriseRAGSystem:
                     "If you can point me to a specific document or section, I can check again."
                 )
                 self.conversation_history.add_turn(namespace, user_id, query, not_answerable_response)
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="not_answerable",
+                        context_found=True,
+                        grounded=False,
+                        cached=False,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats=retrieval_plan.get("retrieval_stats") or {
+                            "initial_retrieved": len(retrieved_chunks),
+                            "final_context": len(final_chunks),
+                        }
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (not_answerable) failed: %s", metric_exc)
 
                 return {
                     "response": not_answerable_response,
@@ -1987,6 +2163,21 @@ class EnterpriseRAGSystem:
                 }
             }
 
+            try:
+                metrics.record(
+                    model_name=self.model_name,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    query_type=response_obj.get("query_type", "document_qa"),
+                    context_found=True,
+                    grounded=bool(response_obj.get("grounded", True)),
+                    cached=False,
+                    processing_time=processing_time,
+                    retrieval_stats=response_obj.get("retrieval_stats") or {}
+                )
+            except Exception as metric_exc:
+                logger.debug("Metrics record (success) failed: %s", metric_exc)
+
             # Persist the response in Redis before returning. Only cache successful
             # answers (document_qa) to improve subsequent response accuracy.
             if cache and cache_key:
@@ -2002,6 +2193,22 @@ class EnterpriseRAGSystem:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
 
             error_response = "Sorry, something went wrong on my side. Please try again, and let me know if it keeps happening."
+
+            try:
+                metrics = get_metrics_tracker()
+                metrics.record(
+                    model_name=getattr(self, "model_name", "unknown"),
+                    subscription_id=subscription_id if 'subscription_id' in locals() else "unknown",
+                    profile_id=profile_id if 'profile_id' in locals() else "unknown",
+                    query_type="error",
+                    context_found=False,
+                    grounded=False,
+                    cached=False,
+                    processing_time=time.time() - start_time,
+                    retrieval_stats={}
+                )
+            except Exception as metric_exc:
+                logger.debug("Metrics record (error) failed: %s", metric_exc)
 
             return {
                 "response": error_response,
@@ -2033,6 +2240,14 @@ def create_llm_client(model_name: Optional[str] = None):
         return OllamaClient(model_name)
     # default to local Ollama for plug-and-play usage
     return OllamaClient(model_name)
+
+
+def get_metrics_tracker() -> MetricsTracker:
+    """Singleton metrics tracker."""
+    global _METRICS_TRACKER
+    if _METRICS_TRACKER is None:
+        _METRICS_TRACKER = MetricsTracker(get_redis_client())
+    return _METRICS_TRACKER
 
 
 def get_rag_system(model_name: Optional[str] = None) -> EnterpriseRAGSystem:
@@ -2165,6 +2380,14 @@ def clear_conversation_history(user_id: str, subscription_id: str = "default", p
         logger.error(f"Error clearing conversation history: {e}")
 
 
+def metrics_summary(days: int = 7) -> Dict[str, Any]:
+    """
+    Aggregate metrics for the requested window (defaults to 7 days).
+    """
+    tracker = get_metrics_tracker()
+    return tracker.summary(days=days)
+
+
 class RAGEvaluator:
     """Evaluation utilities for monitoring RAG performance."""
 
@@ -2241,5 +2464,6 @@ __all__ = [
     'add_domain_terms',
     'clear_conversation_history',
     'RAGEvaluator',
-    'get_rag_system'
+    'get_rag_system',
+    'metrics_summary'
 ]
