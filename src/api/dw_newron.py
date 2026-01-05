@@ -18,6 +18,7 @@ import redis
 import google.generativeai as genai
 from urllib import request
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from src.api.config import Config
 from src.api.enhanced_context_builder import IntelligentContextBuilder
 
@@ -48,17 +49,30 @@ def _parse_redis_connection_string(conn_str: str):
     back to conservative defaults when parsing fails so the app can still start.
     """
     settings = {
-        "host": "rediscache.redis.cache.windows.net",
-        "port": 6380,
-        "password": "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=",
-        "username": "default",
-        "ssl": True,
+        "host": getattr(Config.Redis, "HOST", "localhost"),
+        "port": getattr(Config.Redis, "PORT", 6379),
+        "password": getattr(Config.Redis, "PASSWORD", None) or None,
+        "username": getattr(Config.Redis, "USERNAME", None) or None,
+        "ssl": getattr(Config.Redis, "SSL", False),
     }
 
     if not conn_str:
         return settings
 
     try:
+        if conn_str.startswith(("redis://", "rediss://")):
+            parsed_url = urlparse(conn_str)
+            if parsed_url.hostname:
+                settings["host"] = parsed_url.hostname
+            if parsed_url.port:
+                settings["port"] = parsed_url.port
+            if parsed_url.username:
+                settings["username"] = parsed_url.username
+            if parsed_url.password:
+                settings["password"] = parsed_url.password
+            settings["ssl"] = parsed_url.scheme == "rediss" or settings["ssl"]
+            return settings
+
         parts = conn_str.split(",")
         host_port = parts[0]
         if ":" in host_port:
@@ -175,25 +189,41 @@ def get_redis_client():
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
         try:
-            conn_str = os.getenv("REDIS_CONNECTION_STRING", getattr(Config.Redis, "CONNECTION_STRING", ""))
+            conn_str = (
+                os.getenv("REDIS_URL")
+                or os.getenv("REDIS_CONNECTION_STRING")
+                or getattr(Config.Redis, "CONNECTION_STRING", "")
+            )
             parsed = _parse_redis_connection_string(conn_str)
 
-            host = os.getenv("REDIS_HOST") or parsed["host"]
-            port = int(os.getenv("REDIS_PORT") or parsed["port"])
-            username = os.getenv("REDIS_USERNAME") or parsed.get("username")
-            password = os.getenv("REDIS_PASSWORD") or parsed.get("password")
-            ssl_enabled = str(os.getenv("REDIS_SSL") or parsed.get("ssl", True)).lower() in {"true", "1", "yes", "on"}
+            host = os.getenv("REDIS_HOST") or parsed["host"] or "localhost"
+            port = int(os.getenv("REDIS_PORT") or parsed["port"] or 6379)
+            username = (os.getenv("REDIS_USERNAME") or parsed.get("username") or "").strip() or None
+            password = (os.getenv("REDIS_PASSWORD") or parsed.get("password") or "").strip() or None
 
-            _REDIS_CLIENT = redis.Redis(
-                host=host,
-                port=port,
-                username=username or None,
-                password=password or None,
-                db=Config.Redis.DB,
-                decode_responses=True,
-                socket_timeout=5,
-                ssl=ssl_enabled,
-            )
+            ssl_enabled = parsed.get("ssl", False)
+            ssl_override = os.getenv("REDIS_SSL")
+            if ssl_override is not None:
+                ssl_enabled = str(ssl_override).lower() in {"true", "1", "yes", "on"}
+
+            if conn_str.startswith(("redis://", "rediss://")) and not os.getenv("REDIS_HOST"):
+                _REDIS_CLIENT = redis.from_url(
+                    conn_str,
+                    db=Config.Redis.DB,
+                    decode_responses=True,
+                    socket_timeout=5,
+                )
+            else:
+                _REDIS_CLIENT = redis.Redis(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    db=Config.Redis.DB,
+                    decode_responses=True,
+                    socket_timeout=5,
+                    ssl=ssl_enabled,
+                )
             # simple ping
             _REDIS_CLIENT.ping()
             logger.info(
