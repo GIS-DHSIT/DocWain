@@ -1,7 +1,18 @@
 # docker-compose.yml
 services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
   docwain:
     build: .
+    depends_on:
+      - redis
     ports:
       - "8000:8000"
     environment:
@@ -16,7 +27,15 @@ services:
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_SSL=false
+      - REDIS_DB=0
+      - REDIS_USERNAME=
+      - REDIS_PASSWORD=
     volumes:
       - ./:/app
     restart: unless-stopped
 
+volumes:
+  redis-data:
