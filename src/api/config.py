@@ -9,13 +9,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_REDIS_CONNECTION_STRING = "rediscache.redis.cache.windows.net:6380,password=IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=,ssl=True,abortConnect=False"
-_REDIS_DEFAULTS = {
-    "host": "rediscache.redis.cache.windows.net",
-    "port": 6380,
-    "password": "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=",
-    "username": "default",
-    "ssl": True,
-}
 
 
 class Config:
@@ -98,13 +91,14 @@ class Config:
         AZURE_BLOB_FILE_NAME = "default/Vetting conditions_3words.xlsx"
 
     class Redis:
-        CONNECTION_STRING = os.getenv("REDIS_CONNECTION_STRING", DEFAULT_REDIS_CONNECTION_STRING)
-        HOST = os.getenv("REDIS_HOST", _REDIS_DEFAULTS["host"])
-        PORT = int(os.getenv("REDIS_PORT", _REDIS_DEFAULTS["port"]))
-        USERNAME = os.getenv("REDIS_USERNAME", _REDIS_DEFAULTS.get("username", "default"))
-        PASSWORD = os.getenv("REDIS_PASSWORD", _REDIS_DEFAULTS.get("password"))
-        DB = int(os.getenv("REDIS_DB", "0"))
-        SSL = str(os.getenv("REDIS_SSL", str(_REDIS_DEFAULTS.get("ssl", True)))).lower() in {"true", "1", "yes", "on"}
+        CONNECTION_STRING = DEFAULT_REDIS_CONNECTION_STRING
+        HOST = "rediscache.redis.cache.windows.net"
+        PORT = 6380
+        USERNAME = "default"
+        PASSWORD = "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo="
+        DB = 0
+        SSL = True
+        ABORT_CONNECT = False
 
     class Teams:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")

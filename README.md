@@ -9,3 +9,8 @@
 - Expose the `/teams/messages` route on your deployment host (e.g., `https://<api-host>/teams/messages`).
 - In the Teams bot manifest, set the messaging endpoint to the URL above and enable file uploads/attachments so Teams sends `file.download.info` payloads.
 - Restart or redeploy the API after updating environment variables, then re-upload the manifest to your Teams tenant so the new endpoint is active.
+
+### Redis cache setup
+- Redis backs chat history, feedback, and answer caching; configure it with `REDIS_URL` (`rediss://default:<key>@<host>:6380/0`) or `REDIS_CONNECTION_STRING` (Azure style `host:port,password=...,ssl=True`), or explicitly set `REDIS_HOST`, `REDIS_PORT`, `REDIS_USERNAME`, `REDIS_PASSWORD`, `REDIS_SSL`, and `REDIS_DB`.
+- Local development: `docker-compose up --build` now starts a Redis 7 container and wires the app to it with no auth and SSL disabled. Verify it is running with `docker compose exec redis redis-cli ping`.
+- If you point at your own Redis instance, update the env vars above and restart the service so the client reinitializes with the new settings.
