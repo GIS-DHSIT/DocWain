@@ -201,10 +201,28 @@ class EnhancedSemanticChunker:
         return chunks
 
 
-def chunk_text_for_embedding(text: str, doc_name: str, document_id: str = None) -> List[Tuple[str, dict]]:
-    """FIXED: Added document_id parameter"""
-    if document_id is None:
-        document_id = doc_name  # Fallback
+def chunk_text_for_embedding(text: str, doc_name: str, document_id: str) -> List[Tuple[str, dict]]:
+    """
+     FIXED: document_id is now REQUIRED (no default value)
+
+    Args:
+        text: Document text to chunk
+        doc_name: Source filename
+        document_id: MongoDB _id (REQUIRED - must be unique per document)
+
+    Returns:
+        List of (chunk_text, metadata) tuples
+    """
+    #  REMOVED fallback - document_id is mandatory
+    if not document_id:
+        raise ValueError(f"document_id is required for {doc_name}")
+
+    #  Validate document_id is not a filename
+    if document_id.endswith(('.pdf', '.docx', '.txt', '.csv', '.xlsx')):
+        raise ValueError(
+            f"Invalid document_id '{document_id}' - looks like a filename. "
+            f"Must be MongoDB _id (e.g., '695a5ce55a3e77b5c85c144a')"
+        )
 
     chunker = EnhancedSemanticChunker(chunk_size=800, overlap=200, min_chunk_size=150)
     chunks = chunker.chunk_document(text, doc_name, document_id)
@@ -214,7 +232,7 @@ def chunk_text_for_embedding(text: str, doc_name: str, document_id: str = None) 
         meta_dict = {
             'chunk_id': metadata.chunk_id,
             'doc_name': metadata.doc_name,
-            'document_id': metadata.document_id,  # ADDED
+            'document_id': metadata.document_id,  #  Now guaranteed to be MongoDB _id
             'chunk_index': metadata.chunk_index,
             'total_chunks': metadata.total_chunks,
             'section_title': metadata.section_title,
@@ -223,6 +241,13 @@ def chunk_text_for_embedding(text: str, doc_name: str, document_id: str = None) 
             'page_number': metadata.page_number
         }
         result.append((chunk_text, meta_dict))
+
+    logger.info(f" Created {len(result)} chunks with document_id={document_id} for {doc_name}")
+
+    #  VERIFICATION: Check all chunks have same document_id
+    doc_ids = set(m['document_id'] for _, m in result)
+    if len(doc_ids) > 1:
+        raise ValueError(f"L CRITICAL: Multiple document_ids in chunks: {doc_ids}")
 
     return result
 
