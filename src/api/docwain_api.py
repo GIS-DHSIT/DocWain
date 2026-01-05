@@ -6,11 +6,12 @@ from typing import Optional
 import ollama
 import uvicorn
 from bson.objectid import ObjectId  # added by maha/maria
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.api.config import Config
+from src.api import teams_adapter
 from src.api.dataHandler import (
     db,
     get_subscription_pii_setting,
@@ -27,7 +28,7 @@ from src.api.dw_chat import (
     get_session_by_id,
     get_session_list,
 )
-from src.api.dw_newron import answer_question
+from src.api.dw_newron import answer_question, metrics_summary
 
 app = FastAPI(title="DocWain API")
 
@@ -50,6 +51,16 @@ class QuestionRequest(BaseModel):
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
     new_session: Optional[bool] = False  # Frontend sends flag here
+
+
+@app.post("/teams/messages")
+async def handle_teams_messages(request: Request):
+    """Endpoint for Microsoft Teams activities (messages, attachments)."""
+    activity = await request.json()
+    try:
+        return await teams_adapter.handle_teams_activity(activity, headers=dict(request.headers))
+    except teams_adapter.TeamsAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
 
 
 @app.post("/ask")
@@ -201,6 +212,21 @@ def list_available_models():
     except Exception as e:
         logging.error(f"Failed to list models: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve available models")
+
+
+@app.get("/metrics")
+def get_metrics(days: int = 7):
+    """API endpoint to retrieve model/retrieval performance statistics."""
+    try:
+        summary = metrics_summary(days=days)
+        return {
+            "status": "success",
+            "window_days": days,
+            "metrics": summary
+        }
+    except Exception as e:
+        logging.error(f"Failed to retrieve metrics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
 
 '''
 @app.get("/chat-history/{user_id}")

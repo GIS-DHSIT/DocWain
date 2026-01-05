@@ -7,6 +7,7 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from collections import deque, Counter
+from datetime import datetime, timedelta
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct
@@ -17,6 +18,7 @@ import redis
 import google.generativeai as genai
 from urllib import request
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from src.api.config import Config
 from src.api.enhanced_context_builder import IntelligentContextBuilder
 
@@ -33,9 +35,67 @@ _CROSS_ENCODER = None
 _QDRANT_CLIENT = None
 _REDIS_CLIENT = None
 _MODEL_CACHE: Dict[int, SentenceTransformer] = {}
+_METRICS_TRACKER = None
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
 ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v2"
+
+
+def _parse_redis_connection_string(conn_str: str):
+    """
+    Lightweight parser for Azure Redis Cache connection strings.
+
+    Returns a dict with host, port, password, username, and ssl settings. Falls
+    back to conservative defaults when parsing fails so the app can still start.
+    """
+    settings = {
+        "host": getattr(Config.Redis, "HOST", "localhost"),
+        "port": getattr(Config.Redis, "PORT", 6379),
+        "password": getattr(Config.Redis, "PASSWORD", None) or None,
+        "username": getattr(Config.Redis, "USERNAME", None) or None,
+        "ssl": getattr(Config.Redis, "SSL", False),
+    }
+
+    if not conn_str:
+        return settings
+
+    try:
+        if conn_str.startswith(("redis://", "rediss://")):
+            parsed_url = urlparse(conn_str)
+            if parsed_url.hostname:
+                settings["host"] = parsed_url.hostname
+            if parsed_url.port:
+                settings["port"] = parsed_url.port
+            if parsed_url.username:
+                settings["username"] = parsed_url.username
+            if parsed_url.password:
+                settings["password"] = parsed_url.password
+            settings["ssl"] = parsed_url.scheme == "rediss" or settings["ssl"]
+            return settings
+
+        parts = conn_str.split(",")
+        host_port = parts[0]
+        if ":" in host_port:
+            host, port = host_port.split(":", 1)
+            settings["host"] = host
+            settings["port"] = int(port)
+
+        for part in parts[1:]:
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            key = key.strip().lower()
+            value = value.strip()
+            if key == "password":
+                settings["password"] = value
+            elif key in ("user", "username"):
+                settings["username"] = value
+            elif key == "ssl":
+                settings["ssl"] = value.lower() in {"true", "1", "yes", "on"}
+    except Exception:
+        return settings
+
+    return settings
 
 
 def _slug(value: str) -> str:
@@ -44,6 +104,20 @@ def _slug(value: str) -> str:
         return "default"
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return cleaned or "default"
+
+
+def _build_namespace(subscription_id: str, profile_id: str, model_name: str = "") -> str:
+    """
+    Compose a stable namespace for Redis keys so history/feedback/cache
+    never bleed across tenants, profiles, or model choices.
+    """
+    return ":".join(
+        [
+            _slug(subscription_id),
+            _slug(profile_id),
+            _slug(model_name or "default"),
+        ]
+    )
 
 
 def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransformer:
@@ -115,27 +189,65 @@ def get_redis_client():
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
         try:
-            _REDIS_CLIENT = redis.Redis(
-                host=Config.Redis.HOST,
-                port=Config.Redis.PORT,
-                username=Config.Redis.USERNAME or None,
-                password=Config.Redis.PASSWORD or None,
-                db=Config.Redis.DB,
-                decode_responses=True,
-                socket_timeout=5,
-                ssl=getattr(Config.Redis, "SSL", False),
+            conn_str = (
+                os.getenv("REDIS_URL")
+                or os.getenv("REDIS_CONNECTION_STRING")
+                or getattr(Config.Redis, "CONNECTION_STRING", "")
             )
+            parsed = _parse_redis_connection_string(conn_str)
+
+            host = os.getenv("REDIS_HOST") or parsed["host"] or "localhost"
+            port = int(os.getenv("REDIS_PORT") or parsed["port"] or 6379)
+            username = (os.getenv("REDIS_USERNAME") or parsed.get("username") or "").strip() or None
+            password = (os.getenv("REDIS_PASSWORD") or parsed.get("password") or "").strip() or None
+
+            ssl_enabled = parsed.get("ssl", False)
+            ssl_override = os.getenv("REDIS_SSL")
+            if ssl_override is not None:
+                ssl_enabled = str(ssl_override).lower() in {"true", "1", "yes", "on"}
+
+            if conn_str.startswith(("redis://", "rediss://")) and not os.getenv("REDIS_HOST"):
+                _REDIS_CLIENT = redis.from_url(
+                    conn_str,
+                    db=Config.Redis.DB,
+                    decode_responses=True,
+                    socket_timeout=5,
+                )
+            else:
+                _REDIS_CLIENT = redis.Redis(
+                    host=host,
+                    port=port,
+                    username=username,
+                    password=password,
+                    db=Config.Redis.DB,
+                    decode_responses=True,
+                    socket_timeout=5,
+                    ssl=ssl_enabled,
+                )
             # simple ping
             _REDIS_CLIENT.ping()
             logger.info(
                 "Initialized Redis client at %s:%s (ssl=%s)",
-                Config.Redis.HOST,
-                Config.Redis.PORT,
-                getattr(Config.Redis, "SSL", False)
+                host,
+                port,
+                ssl_enabled
             )
         except Exception as e:
-            logger.warning(f"Failed to initialize Redis client, caching disabled: {e}")
-            _REDIS_CLIENT = None
+            logger.warning(f"Failed to initialize Redis client, attempting local fallback: {e}")
+            # Optional local fallback for dev/testing
+            try:
+                _REDIS_CLIENT = redis.Redis(
+                    host="localhost",
+                    port=6379,
+                    decode_responses=True,
+                    socket_timeout=3,
+                    ssl=False,
+                )
+                _REDIS_CLIENT.ping()
+                logger.info("Initialized Redis client using local fallback at localhost:6379")
+            except Exception as fallback_exc:
+                logger.warning(f"Local Redis fallback unavailable; caching disabled: {fallback_exc}")
+                _REDIS_CLIENT = None
     return _REDIS_CLIENT
 
 
@@ -189,18 +301,19 @@ class ChatFeedbackMemory:
             ttl_seconds: int = REDIS_MEMORY_TTL
     ):
         self.max_items = max_items
-        self.memories: Dict[str, deque] = {}
+        self.memories: Dict[Tuple[str, str], deque] = {}
         self.redis = redis_client
         self.ttl_seconds = ttl_seconds
 
-    def _cache_key(self, user_id: str) -> str:
-        return f"rag:memory:feedback:{user_id}"
+    def _cache_key(self, namespace: str, user_id: str) -> str:
+        return f"rag:memory:feedback:{namespace}:{user_id}"
 
-    def _load_from_cache(self, user_id: str):
-        if user_id in self.memories or not self.redis:
+    def _load_from_cache(self, namespace: str, user_id: str):
+        key = (namespace, user_id)
+        if key in self.memories or not self.redis:
             return
         try:
-            cached = self.redis.get(self._cache_key(user_id))
+            cached = self.redis.get(self._cache_key(namespace, user_id))
         except Exception as exc:
             logger.warning(f"Failed to read feedback memory from Redis: {exc}")
             return
@@ -209,37 +322,39 @@ class ChatFeedbackMemory:
         try:
             items = json.loads(cached)
             if isinstance(items, list):
-                self.memories[user_id] = deque(items, maxlen=self.max_items)
+                self.memories[key] = deque(items, maxlen=self.max_items)
         except Exception as exc:
             logger.warning(f"Failed to parse feedback memory from Redis: {exc}")
 
-    def _persist(self, user_id: str):
+    def _persist(self, namespace: str, user_id: str):
         if not self.redis:
             return
         try:
-            payload = list(self.memories.get(user_id, []))
-            self.redis.setex(self._cache_key(user_id), self.ttl_seconds, json.dumps(payload))
+            payload = list(self.memories.get((namespace, user_id), []))
+            self.redis.setex(self._cache_key(namespace, user_id), self.ttl_seconds, json.dumps(payload))
         except Exception as exc:
             logger.warning(f"Failed to persist feedback memory to Redis: {exc}")
 
-    def add_feedback(self, user_id: str, query: str, answer: str, sources: List[Dict[str, Any]]):
-        self._load_from_cache(user_id)
-        if user_id not in self.memories:
-            self.memories[user_id] = deque(maxlen=self.max_items)
+    def add_feedback(self, namespace: str, user_id: str, query: str, answer: str, sources: List[Dict[str, Any]]):
+        self._load_from_cache(namespace, user_id)
+        key = (namespace, user_id)
+        if key not in self.memories:
+            self.memories[key] = deque(maxlen=self.max_items)
         src_names = [s.get("source_name") for s in (sources or []) if s.get("source_name")]
-        self.memories[user_id].append({
+        self.memories[key].append({
             "q": query.strip(),
             "a": answer.strip(),
             "sources": src_names,
             "ts": time.time()
         })
-        self._persist(user_id)
+        self._persist(namespace, user_id)
 
-    def build_feedback_context(self, user_id: str, limit: int = 5) -> str:
-        self._load_from_cache(user_id)
-        if user_id not in self.memories or not self.memories[user_id]:
+    def build_feedback_context(self, namespace: str, user_id: str, limit: int = 5) -> str:
+        self._load_from_cache(namespace, user_id)
+        key = (namespace, user_id)
+        if key not in self.memories or not self.memories[key]:
             return ""
-        recent = list(self.memories[user_id])[-limit:]
+        recent = list(self.memories[key])[-limit:]
         lines = []
         for idx, item in enumerate(recent, 1):
             source_hint = f" | sources: {', '.join(item['sources'][:3])}" if item.get("sources") else ""
@@ -257,22 +372,23 @@ class ConversationHistory:
             ttl_seconds: int = REDIS_MEMORY_TTL
     ):
         self.max_turns = max_turns
-        self.histories: Dict[str, deque] = {}
-        self.recent_docs: Dict[str, deque] = {}
+        self.histories: Dict[Tuple[str, str], deque] = {}
+        self.recent_docs: Dict[Tuple[str, str], deque] = {}
         self.redis = redis_client
         self.ttl_seconds = ttl_seconds
 
-    def _history_key(self, user_id: str) -> str:
-        return f"rag:memory:history:{user_id}"
+    def _history_key(self, namespace: str, user_id: str) -> str:
+        return f"rag:memory:history:{namespace}:{user_id}"
 
-    def _docs_key(self, user_id: str) -> str:
-        return f"rag:memory:recent_docs:{user_id}"
+    def _docs_key(self, namespace: str, user_id: str) -> str:
+        return f"rag:memory:recent_docs:{namespace}:{user_id}"
 
-    def _load_history(self, user_id: str):
-        if user_id in self.histories or not self.redis:
+    def _load_history(self, namespace: str, user_id: str):
+        key = (namespace, user_id)
+        if key in self.histories or not self.redis:
             return
         try:
-            cached = self.redis.get(self._history_key(user_id))
+            cached = self.redis.get(self._history_key(namespace, user_id))
         except Exception as exc:
             logger.warning(f"Failed to read conversation history from Redis: {exc}")
             return
@@ -290,15 +406,16 @@ class ConversationHistory:
                         assistant_response=item.get("assistant_response", ""),
                         timestamp=float(item.get("timestamp", 0.0))
                     ))
-                self.histories[user_id] = turns
+                self.histories[key] = turns
         except Exception as exc:
             logger.warning(f"Failed to parse conversation history from Redis: {exc}")
 
-    def _load_recent_docs(self, user_id: str):
-        if user_id in self.recent_docs or not self.redis:
+    def _load_recent_docs(self, namespace: str, user_id: str):
+        key = (namespace, user_id)
+        if key in self.recent_docs or not self.redis:
             return
         try:
-            cached = self.redis.get(self._docs_key(user_id))
+            cached = self.redis.get(self._docs_key(namespace, user_id))
         except Exception as exc:
             logger.warning(f"Failed to read recent docs from Redis: {exc}")
             return
@@ -307,66 +424,69 @@ class ConversationHistory:
         try:
             items = json.loads(cached)
             if isinstance(items, list):
-                self.recent_docs[user_id] = deque(items, maxlen=10)
+                self.recent_docs[key] = deque(items, maxlen=10)
         except Exception as exc:
             logger.warning(f"Failed to parse recent docs from Redis: {exc}")
 
-    def _persist_history(self, user_id: str):
+    def _persist_history(self, namespace: str, user_id: str):
         if not self.redis:
             return
         try:
             payload = []
-            for turn in self.histories.get(user_id, []):
+            for turn in self.histories.get((namespace, user_id), []):
                 payload.append({
                     "user_message": turn.user_message,
                     "assistant_response": turn.assistant_response,
                     "timestamp": turn.timestamp
                 })
-            self.redis.setex(self._history_key(user_id), self.ttl_seconds, json.dumps(payload))
+            self.redis.setex(self._history_key(namespace, user_id), self.ttl_seconds, json.dumps(payload))
         except Exception as exc:
             logger.warning(f"Failed to persist conversation history to Redis: {exc}")
 
-    def _persist_recent_docs(self, user_id: str):
+    def _persist_recent_docs(self, namespace: str, user_id: str):
         if not self.redis:
             return
         try:
-            payload = list(self.recent_docs.get(user_id, []))
-            self.redis.setex(self._docs_key(user_id), self.ttl_seconds, json.dumps(payload))
+            payload = list(self.recent_docs.get((namespace, user_id), []))
+            self.redis.setex(self._docs_key(namespace, user_id), self.ttl_seconds, json.dumps(payload))
         except Exception as exc:
             logger.warning(f"Failed to persist recent docs to Redis: {exc}")
 
-    def add_turn(self, user_id: str, user_message: str, assistant_response: str):
+    def add_turn(self, namespace: str, user_id: str, user_message: str, assistant_response: str):
         """Add a conversation turn to history."""
-        self._load_history(user_id)
-        if user_id not in self.histories:
-            self.histories[user_id] = deque(maxlen=self.max_turns)
+        key = (namespace, user_id)
+        self._load_history(namespace, user_id)
+        if key not in self.histories:
+            self.histories[key] = deque(maxlen=self.max_turns)
 
         turn = ConversationTurn(
             user_message=user_message,
             assistant_response=assistant_response,
             timestamp=time.time()
         )
-        self.histories[user_id].append(turn)
-        self._persist_history(user_id)
+        self.histories[key].append(turn)
+        self._persist_history(namespace, user_id)
 
-    def add_sources(self, user_id: str, doc_ids: List[str]):
+    def add_sources(self, namespace: str, user_id: str, doc_ids: List[str]):
         """Track recently used document IDs for recency-based boosting."""
-        self._load_recent_docs(user_id)
-        if user_id not in self.recent_docs:
-            self.recent_docs[user_id] = deque(maxlen=10)
+        key = (namespace, user_id)
+        self._load_recent_docs(namespace, user_id)
+        if key not in self.recent_docs:
+            self.recent_docs[key] = deque(maxlen=10)
         for doc_id in doc_ids:
             if doc_id:
-                self.recent_docs[user_id].append(doc_id)
-        self._persist_recent_docs(user_id)
+                self.recent_docs[key].append(doc_id)
+        self._persist_recent_docs(namespace, user_id)
 
-    def get_context(self, user_id: str, max_turns: int = 2) -> str:
+    def get_context(self, namespace: str, user_id: str, max_turns: int = 2) -> str:
         """Get recent conversation context as formatted string."""
-        self._load_history(user_id)
-        if user_id not in self.histories or not self.histories[user_id]:
+        key = (namespace, user_id)
+        self._load_history(namespace, user_id)
+        if key not in self.histories or not self.histories[key]:
             return ""
 
         context_parts = []
-        recent_turns = list(self.histories[user_id])[-max_turns:]
+        recent_turns = list(self.histories[key])[-max_turns:]
 
         for turn in recent_turns:
             context_parts.append(f"User: {turn.user_message}")
@@ -374,23 +494,25 @@ class ConversationHistory:
 
         return "\n".join(context_parts)
 
-    def get_recent_doc_ids(self, user_id: str) -> List[str]:
+    def get_recent_doc_ids(self, namespace: str, user_id: str) -> List[str]:
         """Return a list of recently cited document IDs for this user."""
-        self._load_recent_docs(user_id)
-        if user_id not in self.recent_docs:
+        key = (namespace, user_id)
+        self._load_recent_docs(namespace, user_id)
+        if key not in self.recent_docs:
             return []
-        return list(self.recent_docs[user_id])
+        return list(self.recent_docs[key])
 
-    def clear_history(self, user_id: str):
+    def clear_history(self, namespace: str, user_id: str):
         """Clear conversation history for a user."""
-        if user_id in self.histories:
-            self.histories[user_id].clear()
-        if user_id in self.recent_docs:
-            self.recent_docs[user_id].clear()
+        key = (namespace, user_id)
+        if key in self.histories:
+            self.histories[key].clear()
+        if key in self.recent_docs:
+            self.recent_docs[key].clear()
         if self.redis:
             try:
-                self.redis.delete(self._history_key(user_id))
-                self.redis.delete(self._docs_key(user_id))
+                self.redis.delete(self._history_key(namespace, user_id))
+                self.redis.delete(self._docs_key(namespace, user_id))
             except Exception as exc:
                 logger.warning(f"Failed to clear Redis memory for user {user_id}: {exc}")
 
@@ -843,6 +965,88 @@ class QdrantRetriever:
 
         return chunks
 
+    def expand_with_neighbors(
+            self,
+            collection_name: str,
+            seed_chunks: List[RetrievedChunk],
+            profile_id: Optional[str],
+            window: int = 1,
+            max_new: int = 6
+    ) -> List[RetrievedChunk]:
+        """
+        Pull immediate neighbor chunks (same document_id, adjacent chunk_index)
+        to improve local context continuity.
+        """
+        if not seed_chunks or window <= 0:
+            return seed_chunks
+
+        seen = set()
+        expanded = []
+
+        for chunk in seed_chunks:
+            doc_id = (chunk.metadata or {}).get("document_id")
+            idx = (chunk.metadata or {}).get("chunk_index")
+            if doc_id is None or idx is None:
+                expanded.append(chunk)
+                continue
+
+            key = (str(doc_id), int(idx))
+            seen.add(key)
+            expanded.append(chunk)
+
+            if len(expanded) >= len(seed_chunks) + max_new:
+                continue
+
+            filter_clauses = [
+                {"key": "document_id", "match": {"value": str(doc_id)}},
+                {"key": "chunk_index", "range": {"gte": int(idx) - window, "lte": int(idx) + window}},
+            ]
+            if profile_id is not None:
+                filter_clauses.append({"key": "profile_id", "match": {"value": str(profile_id)}})
+
+            try:
+                scroll = self.client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter={"must": filter_clauses},
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=window * 4  # small fetch per seed
+                )
+            except Exception as exc:
+                logger.debug("Neighbor fetch failed for doc %s idx %s: %s", doc_id, idx, exc)
+                continue
+
+            points = []
+            if hasattr(scroll, "points"):
+                points = scroll.points or []
+            elif isinstance(scroll, tuple) and scroll:
+                points = scroll[0] or []
+
+            for pt in points:
+                payload = pt.payload or {}
+                neighbor_idx = payload.get("chunk_index")
+                neighbor_key = (str(payload.get("document_id", doc_id)), int(neighbor_idx)) if neighbor_idx is not None else None
+                if neighbor_key and neighbor_key in seen:
+                    continue
+                text = payload.get("text") or ""
+                if not text:
+                    continue
+                seen.add(neighbor_key)
+                neighbor_score = max(float(chunk.score) - 0.05, 0.0)
+                expanded.append(
+                    RetrievedChunk(
+                        id=str(pt.id),
+                        text=text,
+                        score=neighbor_score,
+                        source=payload.get("source_file", chunk.source),
+                        metadata=payload
+                    )
+                )
+                if len(expanded) >= len(seed_chunks) + max_new:
+                    break
+
+        return expanded
+
     def get_profile_context(
             self,
             collection_name: str,
@@ -1165,6 +1369,144 @@ Your response:"""
             return True, "Check failed"
 
 
+class MetricsTracker:
+    """Lightweight metrics sink for usage and quality signals."""
+
+    def __init__(self, redis_client: Optional[redis.Redis] = None):
+        self.redis = redis_client
+        self.retention_days = 120  # keep ~4 months of daily metrics
+
+    @staticmethod
+    def _day(ts: Optional[float] = None) -> str:
+        return datetime.utcfromtimestamp(ts or time.time()).strftime("%Y-%m-%d")
+
+    def record(
+            self,
+            model_name: str,
+            subscription_id: str,
+            profile_id: str,
+            query_type: str,
+            context_found: bool,
+            grounded: bool,
+            cached: bool,
+            processing_time: float,
+            retrieval_stats: Optional[Dict[str, Any]] = None
+    ):
+        if not self.redis:
+            return
+
+        day = self._day()
+        base_key = f"rag:metrics:daily:{day}"
+        model_key = f"rag:metrics:model:{day}"
+        profile_key = f"rag:metrics:profile:{day}"
+
+        stats = retrieval_stats or {}
+        hits = float(stats.get("initial_retrieved", 0))
+        final_ctx = float(stats.get("final_context", 0))
+
+        pipe = self.redis.pipeline()
+        pipe.hincrby(base_key, "total", 1)
+        pipe.hincrby(base_key, f"type:{query_type}", 1)
+        if context_found:
+            pipe.hincrby(base_key, "context_found", 1)
+        if grounded:
+            pipe.hincrby(base_key, "grounded", 1)
+        if cached:
+            pipe.hincrby(base_key, "cache_hits", 1)
+        pipe.hincrbyfloat(base_key, "sum_latency", float(processing_time or 0.0))
+        pipe.hincrbyfloat(base_key, "sum_hits", hits)
+        pipe.hincrbyfloat(base_key, "sum_final_ctx", final_ctx)
+        pipe.hincrby(model_key, model_name or "unknown", 1)
+        pipe.hincrby(profile_key, _slug(profile_id), 1)
+        pipe.expire(base_key, self.retention_days * 86400)
+        pipe.expire(model_key, self.retention_days * 86400)
+        pipe.expire(profile_key, self.retention_days * 86400)
+        try:
+            pipe.execute()
+        except Exception as exc:
+            logger.debug("Metrics write failed: %s", exc)
+
+    def summary(self, days: int = 7) -> Dict[str, Any]:
+        if not self.redis:
+            return {"available": False, "reason": "redis_unavailable"}
+
+        days = max(1, min(days, 90))
+        total = Counter()
+        model_usage: Counter = Counter()
+        profile_usage: Counter = Counter()
+
+        for offset in range(days):
+            day = self._day(time.time() - offset * 86400)
+            base_key = f"rag:metrics:daily:{day}"
+            model_key = f"rag:metrics:model:{day}"
+            profile_key = f"rag:metrics:profile:{day}"
+
+            data = self.redis.hgetall(base_key) or {}
+            for k, v in data.items():
+                try:
+                    if k.startswith("sum_"):
+                        total[k] += float(v)
+                    else:
+                        total[k] += int(v)
+                except Exception:
+                    continue
+
+            for k, v in (self.redis.hgetall(model_key) or {}).items():
+                try:
+                    model_usage[k] += int(v)
+                except Exception:
+                    continue
+            for k, v in (self.redis.hgetall(profile_key) or {}).items():
+                try:
+                    profile_usage[k] += int(v)
+                except Exception:
+                    continue
+
+        grand_total = int(total.get("total", 0))
+        grounded = int(total.get("grounded", 0))
+        context_found = int(total.get("context_found", 0))
+        cache_hits = int(total.get("cache_hits", 0))
+        not_answerable = int(total.get("type:not_answerable", 0))
+        no_results = int(total.get("type:no_results", 0))
+
+        # Derived rates
+        def _pct(num: float, denom: float) -> float:
+            return round((num / denom) * 100, 2) if denom else 0.0
+
+        avg_latency = round(total.get("sum_latency", 0.0) / grand_total, 3) if grand_total else 0.0
+        avg_hits = round(total.get("sum_hits", 0.0) / grand_total, 3) if grand_total else 0.0
+        avg_ctx = round(total.get("sum_final_ctx", 0.0) / max(grounded, 1), 3)
+
+        return {
+            "available": True,
+            "window_days": days,
+            "totals": {
+                "total_queries": grand_total,
+                "grounded_answers": grounded,
+                "context_found": context_found,
+                "cache_hits": cache_hits,
+                "not_answerable": not_answerable,
+                "no_results": no_results,
+            },
+            "rates": {
+                "accuracy_pct": _pct(grounded, grand_total),
+                "context_found_pct": _pct(context_found, grand_total),
+                "cache_hit_pct": _pct(cache_hits, grand_total),
+                "not_answerable_pct": _pct(not_answerable, grand_total),
+                "no_results_pct": _pct(no_results, grand_total),
+            },
+            "averages": {
+                "latency_seconds": avg_latency,
+                "retrieval_hits": avg_hits,
+                "context_chunks_used": avg_ctx,
+            },
+            "usage": {
+                "models": dict(model_usage.most_common(10)),
+                "profiles": dict(profile_usage.most_common(10)),
+            }
+        }
+
+
 class PromptBuilder:
     """Builds structured prompts with strict grounding and citation requirements."""
 
@@ -1206,6 +1548,7 @@ USER QUESTION: {query}
 RESPONSE REQUIREMENTS:
 - Write in a natural, human tone; contractions are fine. Use 2-6 concise, vivid sentences.
 - Keep it conversational and approachable, like explaining to a teammate, but stay precise.
+- If sharing multiple facts, use short bullet lines with citations after each bullet.
 - Lead with the clearest direct answer; keep sentences short and active-voice.
 - Do NOT repeat or paraphrase the user question; go straight to the answer.
 - Lead with the direct answer; include brief reasoning or supporting evidence.
@@ -1291,6 +1634,7 @@ class EnterpriseRAGSystem:
             self,
             query: str,
             user_id: str,
+            namespace: str,
             use_reformulation: bool = True
     ) -> Tuple[str, Dict[str, Any]]:
         """Preprocess query with normalization and optional reformulation."""
@@ -1306,7 +1650,7 @@ class EnterpriseRAGSystem:
 
         # Reformulate for vaguer prompts to tighten intent
         if use_reformulation and len(processed_query.split()) >= 4:
-            conv_context = self.conversation_history.get_context(user_id, max_turns=2)
+            conv_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
             reformulated = self.query_reformulator.reformulate(processed_query, conv_context)
             if reformulated and reformulated != processed_query:
                 processed_query = reformulated
@@ -1356,6 +1700,7 @@ class EnterpriseRAGSystem:
             user_id: str,
             profile_id: str,
             collection_name: str,
+            namespace: str,
             top_k_retrieval: int = 50
     ) -> Dict[str, Any]:
         """
@@ -1378,10 +1723,10 @@ class EnterpriseRAGSystem:
         retrieval_runs = []
 
         def run_attempt(label: str, query_text: str, threshold: Optional[float], use_history: bool,
-                        metadata: Dict[str, Any]):
+                        metadata: Dict[str, Any], profile_filter: Optional[str]):
             chunks = self.retriever.retrieve(
                 collection_name=collection_name,
-                filter_profile=profile_id,
+                filter_profile=profile_filter,
                 query=query_text,
                 top_k=top_k_retrieval,
                 score_threshold=threshold
@@ -1393,17 +1738,18 @@ class EnterpriseRAGSystem:
                 "score_threshold": threshold,
                 "hits": len(chunks),
                 "top_score": round(top_score, 4),
-                "used_history": use_history
+                "used_history": use_history,
+                "profile_filter": profile_filter
             }
             attempt_records.append(record)
             retrieval_runs.append((chunks, record, metadata, query_text))
             return chunks
 
-        primary_query, primary_metadata = self.preprocess_query(query, user_id, use_reformulation=False)
+        primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=False)
         primary_metadata["vague_query"] = is_vague
         primary_metadata["profile_context"] = profile_context_data
 
-        primary_chunks = run_attempt("direct_qdrant", primary_query, primary_threshold, False, primary_metadata)
+        primary_chunks = run_attempt("direct_qdrant", primary_query, primary_threshold, False, primary_metadata, profile_id)
         if self._is_retrieval_sufficient(primary_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
             return {
                 "chunks": primary_chunks,
@@ -1419,7 +1765,7 @@ class EnterpriseRAGSystem:
             contextual_metadata = {**primary_metadata, **contextual_meta, "contextualized": True}
             contextual_threshold = 0.15 if is_vague else 0.2
             contextual_chunks = run_attempt("contextual_qdrant", contextual_query, contextual_threshold, False,
-                                            contextual_metadata)
+                                            contextual_metadata, profile_id)
             if self._is_retrieval_sufficient(contextual_chunks, min_hits=primary_min_hits,
                                              min_score=primary_min_score):
                 return {
@@ -1431,7 +1777,7 @@ class EnterpriseRAGSystem:
                     "profile_context": profile_context_data
                 }
 
-        relaxed_chunks = run_attempt("relaxed_qdrant", primary_query, None, False, primary_metadata)
+        relaxed_chunks = run_attempt("relaxed_qdrant", primary_query, None, False, primary_metadata, profile_id)
         if self._is_retrieval_sufficient(relaxed_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
             return {
                 "chunks": relaxed_chunks,
@@ -1444,15 +1790,15 @@ class EnterpriseRAGSystem:
 
         best_hits = max((rec.get("hits", 0) for rec in attempt_records), default=0)
         best_score = max((rec.get("top_score", 0.0) for rec in attempt_records), default=0.0)
-        history_context = self.conversation_history.get_context(user_id, max_turns=2)
+        history_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
         should_try_history = bool(history_context.strip()) and best_hits < primary_min_hits and best_score < primary_min_score
 
         if should_try_history:
-            history_query, history_metadata = self.preprocess_query(query, user_id, use_reformulation=True)
+            history_query, history_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=True)
             history_metadata["profile_context"] = profile_context_data
             history_metadata["history_fallback"] = True
             if history_query != primary_query or history_metadata.get("reformulated"):
-                history_chunks = run_attempt("history_guided", history_query, None, True, history_metadata)
+                history_chunks = run_attempt("history_guided", history_query, None, True, history_metadata, profile_id)
                 if self._is_retrieval_sufficient(history_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
                     return {
                         "chunks": history_chunks,
@@ -1499,6 +1845,8 @@ class EnterpriseRAGSystem:
 
         try:
             collection_name = f"{subscription_id}".replace(" ", "_")
+            namespace = _build_namespace(subscription_id, profile_id, self.model_name)
+            metrics = get_metrics_tracker()
 
             # Quick collection diagnostics to avoid silent empty searches
             try:
@@ -1523,7 +1871,7 @@ class EnterpriseRAGSystem:
 
             if self.greeting_handler.is_greeting(query):
                 greeting_response = "Hi! I'm your DocWain assistant. I can help you find specific information in your documents. What would you like to look up?"
-                self.conversation_history.add_turn(user_id, query, greeting_response)
+                self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
                 return {
                     "response": greeting_response,
@@ -1537,7 +1885,7 @@ class EnterpriseRAGSystem:
 
             if self.greeting_handler.is_farewell(query):
                 farewell_response = "Thanks for chatting. If you need anything else, come back anytime."
-                self.conversation_history.clear_history(user_id)
+                self.conversation_history.clear_history(namespace, user_id)
 
                 return {
                     "response": farewell_response,
@@ -1556,6 +1904,7 @@ class EnterpriseRAGSystem:
                 user_id=user_id,
                 profile_id=profile_id,
                 collection_name=collection_name,
+                namespace=namespace,
                 top_k_retrieval=top_k_retrieval
             )
 
@@ -1572,7 +1921,7 @@ class EnterpriseRAGSystem:
             # Cache lookup (per subscription/profile/query + recent memory fingerprint)
             cache = get_redis_client()
             cache_key = None
-            conversation_context_for_cache = self.conversation_history.get_context(user_id, max_turns=2)
+            conversation_context_for_cache = self.conversation_history.get_context(namespace, user_id, max_turns=2)
             memory_fingerprint = "noctx"
             if conversation_context_for_cache:
                 memory_fingerprint = hashlib.md5(conversation_context_for_cache.encode("utf-8")).hexdigest()
@@ -1599,12 +1948,26 @@ class EnterpriseRAGSystem:
                             raise ValueError("Cache version mismatch")
                         logger.info("Cache hit for query; returning cached answer")
                         cached_response = cached_obj.get("response", "")
-                        self.conversation_history.add_turn(user_id, query, cached_response)
+                        self.conversation_history.add_turn(namespace, user_id, query, cached_response)
                         sources = cached_obj.get("sources") or []
-                        self.feedback_memory.add_feedback(user_id, query, cached_response, sources)
+                        self.feedback_memory.add_feedback(namespace, user_id, query, cached_response, sources)
                         doc_ids = cached_obj.get("source_doc_ids") or []
                         if doc_ids:
-                            self.conversation_history.add_sources(user_id, [d for d in doc_ids if d])
+                            self.conversation_history.add_sources(namespace, user_id, [d for d in doc_ids if d])
+                        try:
+                            metrics.record(
+                                model_name=self.model_name,
+                                subscription_id=subscription_id,
+                                profile_id=profile_id,
+                                query_type=cached_obj.get("query_type", "cached"),
+                                context_found=bool(cached_obj.get("context_found", False)),
+                                grounded=bool(cached_obj.get("grounded", True)),
+                                cached=True,
+                                processing_time=float(cached_obj.get("processing_time", 0.0)),
+                                retrieval_stats=cached_obj.get("retrieval_stats") or {}
+                            )
+                        except Exception as metric_exc:
+                            logger.debug("Metrics record (cache hit) failed: %s", metric_exc)
                         return cached_obj
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
@@ -1615,7 +1978,22 @@ class EnterpriseRAGSystem:
                     f"I couldn't find anything in your documents that answers: '{query}'. "
                     "Try rephrasing or tell me which document or section to focus on."
                 )
-                self.conversation_history.add_turn(user_id, query, no_results_response)
+                self.conversation_history.add_turn(namespace, user_id, query, no_results_response)
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="no_results",
+                        context_found=False,
+                        grounded=False,
+                        cached=False,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats={"initial_retrieved": 0, "final_context": 0}
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (no_results) failed: %s", metric_exc)
 
                 return {
                     "response": no_results_response,
@@ -1633,7 +2011,7 @@ class EnterpriseRAGSystem:
                 }
 
             # Boost relevance for recently cited documents to honor session context
-            recent_docs = set(self.conversation_history.get_recent_doc_ids(user_id))
+            recent_docs = set(self.conversation_history.get_recent_doc_ids(namespace, user_id))
             if recent_docs:
                 for chunk in retrieved_chunks:
                     doc_id = (chunk.metadata or {}).get("document_id")
@@ -1646,6 +2024,16 @@ class EnterpriseRAGSystem:
                 top_k=top_k_rerank,
                 use_cross_encoder=True
             )
+
+            if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
+                reranked_chunks = self.retriever.expand_with_neighbors(
+                    collection_name=collection_name,
+                    seed_chunks=reranked_chunks,
+                    profile_id=profile_id,
+                    window=1,
+                    max_new=6
+                )
+                reranked_chunks = sorted(reranked_chunks, key=lambda c: float(c.score), reverse=True)
 
             config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", final_k or 3)
             context_chunk_limit = max(final_k or 0, config_context_limit)
@@ -1679,10 +2067,10 @@ class EnterpriseRAGSystem:
 
             logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
 
-            conversation_context = self.conversation_history.get_context(user_id, max_turns=3)
+            conversation_context = self.conversation_history.get_context(namespace, user_id, max_turns=3)
             conversation_summary = self.conversation_summarizer.summarize(conversation_context)
             adapter_text = DomainPromptAdapter.build_adapter(profile_context_data, query)
-            feedback_text = self.feedback_memory.build_feedback_context(user_id, limit=5)
+            feedback_text = self.feedback_memory.build_feedback_context(namespace, user_id, limit=5)
 
             is_answerable, answerability_reason = self.answerability_detector.check_answerability(
                 query, context, has_chunks=bool(final_chunks)
@@ -1693,7 +2081,25 @@ class EnterpriseRAGSystem:
                     f"I don't have enough detail in the documents to answer that. {answerability_reason} "
                     "If you can point me to a specific document or section, I can check again."
                 )
-                self.conversation_history.add_turn(user_id, query, not_answerable_response)
+                self.conversation_history.add_turn(namespace, user_id, query, not_answerable_response)
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="not_answerable",
+                        context_found=True,
+                        grounded=False,
+                        cached=False,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats=retrieval_plan.get("retrieval_stats") or {
+                            "initial_retrieved": len(retrieved_chunks),
+                            "final_context": len(final_chunks),
+                        }
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (not_answerable) failed: %s", metric_exc)
 
                 return {
                     "response": not_answerable_response,
@@ -1718,6 +2124,8 @@ class EnterpriseRAGSystem:
             if context_sources:
                 top_sources = ", ".join(str(src.get('source_name')) for src in context_sources[:3])
                 retrieval_brief += f"; top_sources={top_sources}"
+            if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
+                retrieval_brief += "; adjacent_expansion=on"
 
             prompt = self.prompt_builder.build_qa_prompt(
                 query=query,
@@ -1737,14 +2145,14 @@ class EnterpriseRAGSystem:
 
             sources = context_sources or self.context_builder.extract_sources(final_chunks)
 
-            self.conversation_history.add_turn(user_id, query, answer)
+            self.conversation_history.add_turn(namespace, user_id, query, answer)
             final_doc_ids = [
                 (chunk.metadata or {}).get("document_id") for chunk in final_chunks
             ]
             final_doc_ids = [d for d in final_doc_ids if d]
             if final_doc_ids:
-                self.conversation_history.add_sources(user_id, final_doc_ids)
-            self.feedback_memory.add_feedback(user_id, query, answer, sources)
+                self.conversation_history.add_sources(namespace, user_id, final_doc_ids)
+            self.feedback_memory.add_feedback(namespace, user_id, query, answer, sources)
 
             has_citations = bool(re.search(r'\[SOURCE-\d+\]', answer))
 
@@ -1785,6 +2193,21 @@ class EnterpriseRAGSystem:
                 }
             }
 
+            try:
+                metrics.record(
+                    model_name=self.model_name,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    query_type=response_obj.get("query_type", "document_qa"),
+                    context_found=True,
+                    grounded=bool(response_obj.get("grounded", True)),
+                    cached=False,
+                    processing_time=processing_time,
+                    retrieval_stats=response_obj.get("retrieval_stats") or {}
+                )
+            except Exception as metric_exc:
+                logger.debug("Metrics record (success) failed: %s", metric_exc)
+
             # Persist the response in Redis before returning. Only cache successful
             # answers (document_qa) to improve subsequent response accuracy.
             if cache and cache_key:
@@ -1800,6 +2223,22 @@ class EnterpriseRAGSystem:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
 
             error_response = "Sorry, something went wrong on my side. Please try again, and let me know if it keeps happening."
+
+            try:
+                metrics = get_metrics_tracker()
+                metrics.record(
+                    model_name=getattr(self, "model_name", "unknown"),
+                    subscription_id=subscription_id if 'subscription_id' in locals() else "unknown",
+                    profile_id=profile_id if 'profile_id' in locals() else "unknown",
+                    query_type="error",
+                    context_found=False,
+                    grounded=False,
+                    cached=False,
+                    processing_time=time.time() - start_time,
+                    retrieval_stats={}
+                )
+            except Exception as metric_exc:
+                logger.debug("Metrics record (error) failed: %s", metric_exc)
 
             return {
                 "response": error_response,
@@ -1831,6 +2270,14 @@ def create_llm_client(model_name: Optional[str] = None):
         return OllamaClient(model_name)
     # default to local Ollama for plug-and-play usage
     return OllamaClient(model_name)
+
+
+def get_metrics_tracker() -> MetricsTracker:
+    """Singleton metrics tracker."""
+    global _METRICS_TRACKER
+    if _METRICS_TRACKER is None:
+        _METRICS_TRACKER = MetricsTracker(get_redis_client())
+    return _METRICS_TRACKER
 
 
 def get_rag_system(model_name: Optional[str] = None) -> EnterpriseRAGSystem:
@@ -1944,19 +2391,31 @@ def add_domain_terms(terms: List[str]):
         logger.error(f"Error adding domain terms: {e}")
 
 
-def clear_conversation_history(user_id: str):
+def clear_conversation_history(user_id: str, subscription_id: str = "default", profile_id: str = "default", model_name: str = ""):
     """
     Clear conversation history for a specific user.
 
     Args:
         user_id: User identifier
+        subscription_id: Tenant/subscription identifier
+        profile_id: Profile identifier
+        model_name: Optional model name to namespace cache keys
     """
     try:
         rag_system = get_rag_system()
-        rag_system.conversation_history.clear_history(user_id)
+        ns = _build_namespace(subscription_id, profile_id, model_name or getattr(rag_system, "model_name", ""))
+        rag_system.conversation_history.clear_history(ns, user_id)
         logger.info(f"Cleared conversation history for user {user_id}")
     except Exception as e:
         logger.error(f"Error clearing conversation history: {e}")
+
+
+def metrics_summary(days: int = 7) -> Dict[str, Any]:
+    """
+    Aggregate metrics for the requested window (defaults to 7 days).
+    """
+    tracker = get_metrics_tracker()
+    return tracker.summary(days=days)
 
 
 class RAGEvaluator:
@@ -2035,5 +2494,6 @@ __all__ = [
     'add_domain_terms',
     'clear_conversation_history',
     'RAGEvaluator',
-    'get_rag_system'
+    'get_rag_system',
+    'metrics_summary'
 ]
