@@ -1,3 +1,4 @@
+
 import logging
 import time
 from typing import Optional
@@ -17,6 +18,7 @@ from src.api.dataHandler import (
     mongoClient,
     trainData,  # trainSingleDocument
     train_single_document,
+    delete_embeddings
 )
 from src.api.dw_chat import (
     add_message_to_history,
@@ -30,7 +32,7 @@ from src.api.dw_newron import answer_question, metrics_summary
 
 app = FastAPI(title="DocWain API")
 
-# ✅ Add CORS middleware
+#  Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Adjust this in production to specific domains
@@ -127,6 +129,77 @@ def trigger_training(subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Training process failed")
 
 
+@app.delete("/document/{doc_id}/embeddings")
+def delete_document_embeddings_api(
+        doc_id: str,
+        subscription_id: str = "default"
+):
+    """
+    API endpoint to manually delete embeddings for a specific document.
+    This is useful when a document is marked as DELETED in MongoDB.
+    """
+    try:
+        from src.api.dataHandler import delete_embeddings, db, Config
+        from bson.objectid import ObjectId
+
+        # Fetch document details from MongoDB
+        doc = db[Config.MongoDB.DOCUMENTS].find_one({"_id": ObjectId(doc_id)})
+
+        if not doc:
+            raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+        # Get subscription_id from document (override query param if present in doc)
+        subscription_id = str(
+            doc.get('subscription') or
+            doc.get('subscriptionId') or
+            subscription_id
+        )
+
+        logging.info(
+            f"[API] Deleting embeddings for doc={doc_id}, "
+            f"subscription={subscription_id}, "
+            f"status={doc.get('status')}"
+        )
+
+        # Delete embeddings (only needs subscription_id and document_id)
+        result = delete_embeddings(
+            subscription_id=subscription_id,
+            document_id=doc_id
+        )
+
+        if result["status"] == "success":
+            logging.info(f" [API] Successfully deleted embeddings for document {doc_id}")
+            return {
+                "status": "success",
+                "document_id": doc_id,
+                "subscription_id": subscription_id,
+                "message": result.get("message", "Embeddings deleted"),
+                "details": result
+            }
+        elif result["status"] == "not_found":
+            # Not an error - document just has no embeddings
+            return {
+                "status": "success",
+                "document_id": doc_id,
+                "message": result.get("message", "No embeddings found to delete"),
+                "details": result
+            }
+        else:
+            raise HTTPException(
+                status_code=500,
+                detail=result.get("message", "Unknown error during deletion")
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"L [API] Failed to delete embeddings: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete embeddings: {str(e)}"
+        )
+
+
 @app.get("/models")
 def list_available_models():
     """API endpoint to list available models."""
@@ -197,7 +270,7 @@ def get_chat_history_api(user_id: str, subscription_id: str = "default"):
             formatted = history  # already correct format
 
         logging.info(f"[CHAT HISTORY] User: {user_id}, Sessions: {len(formatted['sessions'])}")
-        return formatted  # ✅ Now returns {"sessions": [...]}
+        return formatted  #  Now returns {"sessions": [...]}
     except Exception as e:
         logging.error(f"Failed to retrieve chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")

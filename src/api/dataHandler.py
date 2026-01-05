@@ -1,3 +1,4 @@
+
 import json
 import uuid
 import logging
@@ -29,7 +30,6 @@ docEx = None
 _MODEL = None
 _QDRANT_CLIENT = None
 logger = logging.getLogger(__name__)
-
 
 '-------------------------------modified by maha/maria-----------------------'
 '---------------------------------new function for checking PII status in mongodb--------------------'
@@ -432,8 +432,9 @@ def get_azure_docs(files):
 
 def connectData(documentConnection):
     """
-    FIXED: Processes documents and extracts data, updates vetting points.
-    Now only processes files that belong to each specific document.
+     FINAL FIX: Ensures each document processes ONLY its exact file
+
+    Critical fix: Uses EXACT filename matching to prevent document_id collision
     """
     dataDict = {}
 
@@ -460,7 +461,9 @@ def connectData(documentConnection):
 
         if docData.get('status') in allowed_statuses:
             try:
+                logging.info(f"=" * 80)
                 logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
+                logging.info(f"=" * 80)
                 all_extracted_docs = {}
 
                 if docData['type'] == 'S3':
@@ -500,10 +503,9 @@ def connectData(documentConnection):
 
                 elif docData['type'] == 'LOCAL':
                     # ============================================
-                    # CRITICAL FIX: Filter connector files to match THIS document only
+                    #  CRITICAL FIX: EXACT filename matching
                     # ============================================
 
-                    # Get this document's filename
                     doc_name = docData.get('name', '')
 
                     if not doc_name:
@@ -514,29 +516,53 @@ def connectData(documentConnection):
                     # Get all files from connector
                     all_connector_files = connData.get('locations', [])
 
-                    # Filter to find ONLY the file that matches this document's name
-                    matching_files = [
-                        file_path for file_path in all_connector_files
-                        if file_path.endswith(doc_name) or doc_name in file_path
-                    ]
+                    logging.info(f"Looking for EXACT match: '{doc_name}'")
+                    logging.info(f"Connector has {len(all_connector_files)} files")
 
+                    #  FIX: Use EXACT filename matching
+                    matching_files = []
+
+                    for file_path in all_connector_files:
+                        # Extract just the filename from the full path
+                        # Handle both 'az://container/local/filename' and 'local/filename'
+                        if '/' in file_path:
+                            file_name_only = file_path.split('/')[-1]
+                        else:
+                            file_name_only = file_path
+
+                        #  EXACT match (case-sensitive)
+                        if file_name_only == doc_name:
+                            matching_files.append(file_path)
+                            logging.info(f" EXACT MATCH: {file_path} matches {doc_name}")
+                            break  # Stop after first exact match
+
+                    # L If no exact match, DO NOT fallback to partial matching
                     if not matching_files:
-                        logging.error(f"No matching file found in connector for document {docId} (name: {doc_name})")
-                        logging.error(f"Available files in connector: {all_connector_files}")
-                        update_training_status(docId, 'TRAINING_FAILED', f'File {doc_name} not found in connector')
+                        logging.error(f"L NO EXACT MATCH for document {docId} (name: '{doc_name}')")
+                        logging.error(f"Available files in connector:")
+                        for f in all_connector_files:
+                            file_only = f.split('/')[-1] if '/' in f else f
+                            logging.error(f"  - {file_only} (full path: {f})")
+                        update_training_status(docId, 'TRAINING_FAILED', f'Exact file match not found: {doc_name}')
                         continue
 
+                    #  Should only have ONE match due to break statement
                     if len(matching_files) > 1:
-                        logging.warning(f"Multiple files match {doc_name}: {matching_files}. Using first match.")
+                        logging.error(
+                            f"L CRITICAL: Multiple exact matches for {doc_name}: {matching_files}"
+                        )
+                        logging.error("This should not happen with exact matching!")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Multiple file matches')
+                        continue
 
                     file_path = matching_files[0]
-                    logging.info(f"Document {docId} will process ONLY file: {file_path}")
+                    logging.info(f" Document {docId} will process ONLY: {file_path}")
 
                     # Process ONLY this document's specific file
                     try:
                         # Extract the path after 'az://' prefix
                         file_key = file_path.split('/', 4)[-1] if file_path.startswith('az://') else file_path
-                        logging.info(f"Processing file: {file_key} for document {docId}")
+                        logging.info(f"Reading file: {file_key} for document {docId}")
 
                         docContent = get_azure_docs(file_key)
                         if docContent is None:
@@ -551,23 +577,22 @@ def connectData(documentConnection):
                             continue
 
                         all_extracted_docs.update(extractedDoc)
-                        logging.info(f"Successfully extracted content from {file_key}")
+
+                        #  VERIFICATION: Should only have ONE file extracted
+                        if len(all_extracted_docs) != 1:
+                            logging.warning(
+                                f"� Expected 1 extracted file for {docId}, got {len(all_extracted_docs)}: "
+                                f"{list(all_extracted_docs.keys())}"
+                            )
+                        else:
+                            logging.info(f" Successfully extracted 1 file from {file_key}")
 
                     except Exception as file_error:
                         logging.error(f"Error processing file {file_path}: {file_error}")
                         update_training_status(docId, 'TRAINING_FAILED', str(file_error))
                         continue
 
-                    # Calculate vetting points
-                    if all_extracted_docs:
-                        vettingPoints = vettingProcessor(all_extracted_docs)
-                        updateVetting(docId, vettingPoints)
-                    else:
-                        logging.error(f"No content extracted for document {docId}")
-                        update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
-                        continue
-
-                # Apply PII masking if enabled
+                # Apply PII masking and vetting
                 if all_extracted_docs:
                     if pii_masking_enabled:
                         masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
@@ -599,13 +624,19 @@ def connectData(documentConnection):
                     vettingPoints = vettingProcessor(masked_docs)
                     updateVetting(docId, vettingPoints)
 
+                    #  Store with explicit documentId
                     dataDict[docId] = {
                         'subscriptionId': subscriptionId,
                         'profileId': profileId,
+                        'documentId': docId,  #  Explicit document_id
                         'extractedDoc': masked_docs,
                         'docName': docData.get('name', 'Unknown')
                     }
-                    logging.info(f"Stored document {docId} with {len(masked_docs)} file(s) (PII masked: {pii_count})")
+
+                    logging.info(
+                        f" Stored document {docId} with {len(masked_docs)} file(s) "
+                        f"(PII masked: {pii_count})"
+                    )
                 else:
                     logging.error(f"No documents extracted for {docId}")
                     update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
@@ -617,6 +648,10 @@ def connectData(documentConnection):
         elif docData['status'] == 'DELETED':
             profileData = str(docData['profile'])
             delete_embeddings(subscriptionId, profileData, docId)
+
+    logging.info(f"=" * 80)
+    logging.info(f" connectData completed: {len(dataDict)} documents processed")
+    logging.info(f"=" * 80)
 
     return dataDict
 
@@ -694,26 +729,127 @@ def extract_document_info():
         return {}
 
 
-def delete_embeddings(subscription_id, profile_id, file_id):
-    """Delete embeddings from Qdrant for a specific file within a subscription/profile."""
+from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+
+def delete_embeddings(subscription_id: str, document_id: str):
+    """
+    Delete all embeddings for a specific document from Qdrant.
+
+    Args:
+        subscription_id: Subscription ID (used to build collection name)
+        document_id: Document ID to delete
+
+    Returns:
+        Dict with status and details
+    """
     try:
+        logging.info(
+            f"[DELETE_EMBEDDINGS] Deleting embeddings for document_id={document_id}, "
+            f"subscription_id={subscription_id}"
+        )
+
         client = get_qdrant_client()
         collection_name = build_collection_name(subscription_id)
-        filter_criteria = {
-            "must": [
-                {"key": "document_id", "match": {"value": file_id}},
-                {"key": "profile_id", "match": {"value": str(profile_id)}}
+
+        # Check if collection exists
+        try:
+            collection_info = client.get_collection(collection_name)
+            logging.info(
+                f"[DELETE_EMBEDDINGS] Collection '{collection_name}' has {collection_info.points_count} points")
+        except Exception as e:
+            logging.error(f"[DELETE_EMBEDDINGS] Collection '{collection_name}' not found: {e}")
+            return {
+                "status": "error",
+                "message": f"Collection not found: {collection_name}"
+            }
+
+        # Create filter for deletion
+        delete_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="document_id",
+                    match=MatchValue(value=str(document_id))
+                )
             ]
-        }
-        client.delete(
-            collection_name=collection_name,
-            points_selector=filter_criteria
         )
-        logging.info(f"Embeddings successfully deleted for file {file_id} in collection {collection_name}.")
-        return {"status": "success", "message": f"Embeddings deleted for file {file_id}."}
+
+        # Check if points exist before deletion
+        try:
+            scroll_result = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=delete_filter,
+                limit=10,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            # Handle both tuple and object return types
+            if isinstance(scroll_result, tuple):
+                matching_points = scroll_result[0]
+            else:
+                matching_points = getattr(scroll_result, 'points', [])
+
+            logging.info(f"[DELETE_EMBEDDINGS] Found {len(matching_points)} points to delete")
+
+            if not matching_points:
+                logging.warning(f"[DELETE_EMBEDDINGS] No embeddings found for document_id={document_id}")
+                return {
+                    "status": "not_found",
+                    "message": f"No embeddings found for document {document_id}",
+                    "document_id": document_id,
+                    "collection": collection_name
+                }
+        except Exception as scroll_error:
+            logging.error(f"[DELETE_EMBEDDINGS] Error checking points: {scroll_error}")
+
+        # Perform deletion
+        logging.info(f"[DELETE_EMBEDDINGS] Executing delete operation")
+        result = client.delete(
+            collection_name=collection_name,
+            points_selector=delete_filter,
+            wait=True
+        )
+
+        logging.info(f"[DELETE_EMBEDDINGS]  Delete completed: {result}")
+
+        # Verify deletion
+        try:
+            verify_result = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=delete_filter,
+                limit=1,
+                with_payload=False,
+                with_vectors=False
+            )
+
+            if isinstance(verify_result, tuple):
+                remaining = verify_result[0]
+            else:
+                remaining = getattr(verify_result, 'points', [])
+
+            if remaining:
+                logging.warning(f"[DELETE_EMBEDDINGS] � {len(remaining)} points still remain!")
+            else:
+                logging.info(f"[DELETE_EMBEDDINGS]  Verified: All embeddings deleted")
+        except Exception as verify_error:
+            logging.warning(f"[DELETE_EMBEDDINGS] Could not verify deletion: {verify_error}")
+
+        return {
+            "status": "success",
+            "document_id": document_id,
+            "collection": collection_name,
+            "message": f"Successfully deleted embeddings for document {document_id}",  #  ADDED
+            "result": str(result)
+        }
+
     except Exception as e:
-        logging.error(f"Error deleting embeddings: {e}")
-        return {"status": "error", "message": "Error deleting embeddings."}
+        logging.error("[DELETE_EMBEDDINGS] L Failed", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e),
+            "document_id": document_id
+        }
 
 
 def ensure_qdrant_collection(collection_name, vector_size=768):
@@ -790,7 +926,9 @@ def ensure_qdrant_collection(collection_name, vector_size=768):
 
 
 def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, source_filename, batch_size=100):
-    """Ensures the collection exists and saves embeddings to Qdrant (scoped by subscription/profile)."""
+    """
+     FIXED: Added verification that all chunks have correct document_id
+    """
     try:
         client = get_qdrant_client()
         if "embeddings" not in embeddings or embeddings["embeddings"] is None:
@@ -813,6 +951,7 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         if vector_size == 0:
             logging.error(f"Error: Trying to save empty embeddings for document {doctag}!")
             raise ValueError("Empty embeddings array")
+
         # Fetch profile name for tagging
         try:
             profile_doc = db[Config.MongoDB.PROFILES].find_one({"_id": ObjectId(profile_id)})
@@ -823,7 +962,6 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             profile_name = str(profile_id)
 
         collection_name = build_collection_name(subscription_id)
-        # collection_name = build_collection_name(profile_name)
 
         ensure_qdrant_collection(collection_name, vector_size)
 
@@ -845,6 +983,38 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
         summaries = embeddings.get("summaries") or []
         chunk_metadata = embeddings.get("chunk_metadata", [])
 
+        #  CRITICAL VERIFICATION: Check all chunk_metadata has correct document_id
+        if chunk_metadata:
+            doc_ids_in_chunks = set(meta.get('document_id') for meta in chunk_metadata)
+
+            # Remove None values
+            doc_ids_in_chunks.discard(None)
+
+            if len(doc_ids_in_chunks) == 0:
+                logging.error(f"L NO document_id found in chunk_metadata for {doctag}")
+                raise ValueError(f"Missing document_id in chunk_metadata")
+
+            if len(doc_ids_in_chunks) > 1:
+                logging.error(
+                    f"L CRITICAL: Multiple document_ids found in chunk_metadata: {doc_ids_in_chunks}"
+                )
+                raise ValueError(
+                    f"Chunk metadata contains multiple document_ids: {doc_ids_in_chunks}. "
+                    f"Expected only: {doctag}"
+                )
+
+            actual_doc_id = list(doc_ids_in_chunks)[0]
+            if actual_doc_id != doctag:
+                logging.error(
+                    f"L CRITICAL: document_id mismatch! "
+                    f"Expected: {doctag}, Found in chunks: {actual_doc_id}"
+                )
+                raise ValueError(
+                    f"document_id mismatch: expected '{doctag}', got '{actual_doc_id}'"
+                )
+
+            logging.info(f" Verified: All {len(chunk_metadata)} chunks have correct document_id={doctag}")
+
         all_points = []
         for idx in range(max_len):
             vector = normalized_vectors[idx]
@@ -852,13 +1022,6 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             if not vector:
                 logging.warning(f"Skipping empty or invalid vector for text: {text[:50]}...")
                 continue
-
-            logger.debug(
-                "Embedding normalized: type=%s, first_dim_type=%s, dims=%s",
-                type(vector),
-                type(vector[0]) if isinstance(vector, list) and vector else None,
-                len(vector) if isinstance(vector, list) else None,
-            )
 
             page_val = pages[idx] if idx < len(pages) else None
             section_val = sections[idx] if idx < len(sections) else None
@@ -868,7 +1031,6 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             if idx < len(sparse_vectors):
                 sv = sparse_vectors[idx]
                 if sv.get("indices") and sv.get("values"):
-                    # Ensure plain Python types to avoid serialization issues
                     sparse_vector = SparseVector(
                         indices=[int(i) for i in sv["indices"]],
                         values=[float(v) for v in sv["values"]]
@@ -878,18 +1040,27 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             if sparse_vector is not None:
                 vector_payload["keywords_vector"] = sparse_vector
 
+            #  Get document_id from chunk_metadata if available
             chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
+            chunk_document_id = chunk_meta.get('document_id', str(doctag))
+
+            #  FINAL VERIFICATION: Ensure this chunk's document_id matches doctag
+            if chunk_document_id != str(doctag):
+                logging.error(
+                    f"L Chunk {idx} has wrong document_id: {chunk_document_id} (expected {doctag})"
+                )
+                raise ValueError(f"Chunk {idx} document_id mismatch")
+
             all_points.append(
                 PointStruct(
                     id=str(uuid.uuid4()),
                     vector=vector_payload,
-
-                    payload = {
+                    payload={
                         "subscription_id": str(subscription_id),
                         "profile_id": str(profile_id),
                         "tag": profile_name,
                         "text": text,
-                        "document_id": str(doctag),
+                        "document_id": str(doctag),  #  Forced to use doctag
                         "source_file": source_filename,
                         "chunk_index": idx,
                         "chunk_count": max_len,
@@ -905,10 +1076,6 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
                 )
             )
 
-
-
-        logging.info(f"Prepared PointStruct payload for chunk {idx}: {json.dumps(all_points[-1].payload)}")
-
         if not all_points:
             logging.error(f"No valid points to upload for document {doctag}, file {source_filename}")
             raise ValueError("No valid embedding points generated")
@@ -920,14 +1087,14 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             logging.info(
                 f"Uploaded batch {i // batch_size + 1}/{(len(all_points) + batch_size - 1) // batch_size} for {source_filename}")
 
-        logging.info(f"Successfully saved {len(all_points)} embeddings to Qdrant for {source_filename}")
+        logging.info(
+            f" Successfully saved {len(all_points)} embeddings with document_id={doctag} to Qdrant for {source_filename}")
 
         return {"status": "success", "points_saved": len(all_points)}
 
     except Exception as e:
         logging.error(f"Error saving embeddings to Qdrant for document {doctag}, file {source_filename}: {e}")
         raise
-
 
 
 # from enhanced_retrieval import chunk_text_for_embedding
@@ -1023,148 +1190,160 @@ from src.api.enhanced_retrieval import chunk_text_for_embedding
 
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
     """
+     COMPLETELY FIXED: Trains and stores embeddings with strict document_id verification
 
-    FIXED: Trains and stores embeddings with proper document_id tracking
-
+    Critical fixes:
+    1. Always pass doc_tag as document_id parameter
+    2. Verify chunks before generating embeddings
+    3. Verify metadata before saving to Qdrant
     """
-
     try:
-
-        logging.info(f"Starting training for {doc_name}, doc_id={doc_tag}")
+        logging.info(f"=" * 80)
+        logging.info(f"Starting training for {doc_name}")
+        logging.info(f"  Document ID: {doc_tag}")
+        logging.info(f"  Subscription: {subscription_id}")
+        logging.info(f"  Profile: {profile_tag}")
+        logging.info(f"=" * 80)
 
         if isinstance(text, dict):
-
             # Handle pre-embedded structured data (CSV/Excel)
+            #  Verify document_id in structured data
+            if 'chunk_metadata' in text:
+                doc_ids = set(meta.get('document_id') for meta in text['chunk_metadata'])
+                doc_ids.discard(None)
+                if len(doc_ids) > 1:
+                    raise ValueError(f"Multiple document_ids in structured data: {doc_ids}")
+                if doc_ids and list(doc_ids)[0] != doc_tag:
+                    logging.warning(f"Fixing document_id in structured data: {doc_ids} -> {doc_tag}")
+                    for meta in text['chunk_metadata']:
+                        meta['document_id'] = doc_tag
 
             result = save_embeddings_to_qdrant(
-
                 text, subscription_id, profile_tag, doc_tag, doc_name
-
             )
-
+            logging.info(f" Stored {result.get('points_saved', 0)} structured embeddings")
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         elif isinstance(text, str):
-
             if not text.strip():
                 raise ValueError(f"Empty content in {doc_name}")
 
-            # FIXED: Pass document_id to chunking
+            #  CRITICAL: Pass doc_tag as document_id (REQUIRED parameter)
+            logging.info(f"Chunking document with document_id={doc_tag}")
 
-            chunks_with_meta = chunk_text_for_embedding(
-
-                text,
-
-                doc_name,
-
-                document_id=doc_tag  # CRITICAL: Pass doc_tag as document_id
-
-            )
+            try:
+                chunks_with_meta = chunk_text_for_embedding(
+                    text,
+                    doc_name,
+                    document_id=doc_tag  #  REQUIRED - no default fallback
+                )
+            except ValueError as ve:
+                logging.error(f"L Chunking failed for {doc_name}: {ve}")
+                raise ValueError(f"Chunking validation failed: {ve}")
 
             if not chunks_with_meta:
                 raise ValueError(f"No valid chunks in {doc_name}")
 
-            # Extract chunks and metadata
+            #  VERIFICATION STEP 1: Check chunks have correct document_id
+            logging.info(f"Verifying {len(chunks_with_meta)} chunks for document_id={doc_tag}")
 
             chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
-
             chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
 
-            # VERIFY: Log document IDs
+            # Verify all chunks have the EXACT document_id
+            doc_ids_in_chunks = set(meta.get('document_id') for meta in chunk_metadata)
+            doc_ids_in_chunks.discard(None)
 
-            unique_doc_ids = list(set([m.get('document_id') for m in chunk_metadata]))
+            if len(doc_ids_in_chunks) == 0:
+                raise ValueError(f"L No document_id found in chunk metadata for {doc_name}")
 
-            logging.info(f"Created {len(chunks)} chunks for document_ids: {unique_doc_ids}")
+            if len(doc_ids_in_chunks) > 1:
+                raise ValueError(
+                    f"L Multiple document_ids in chunks: {doc_ids_in_chunks}. "
+                    f"Expected only: {doc_tag}"
+                )
+
+            actual_doc_id = list(doc_ids_in_chunks)[0]
+            if actual_doc_id != doc_tag:
+                raise ValueError(
+                    f"L document_id mismatch! Expected: {doc_tag}, Found: {actual_doc_id}"
+                )
+
+            logging.info(f" VERIFIED: All {len(chunks)} chunks have document_id={doc_tag}")
 
             # Generate embeddings
-
+            logging.info(f"Generating embeddings for {len(chunks)} chunks")
             model = get_model()
-
             embeddings_array = model.encode(
-
                 chunks,
-
                 convert_to_numpy=True,
-
                 normalize_embeddings=True
-
             )
 
             # Build sparse vectors
-
             from sklearn.feature_extraction.text import TfidfVectorizer
-
             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
-
             tfidf_matrix = tfidf.fit_transform(chunks)
 
             sparse_vectors = []
-
             for row in tfidf_matrix:
                 coo = row.tocoo()
-
                 sparse_vectors.append({
-
                     "indices": coo.col.tolist(),
-
                     "values": coo.data.astype(np.float32).tolist()
-
                 })
 
             # Create summaries
-
             summaries = [
-
                 chunk[:200] + "..." if len(chunk) > 200 else chunk
-
                 for chunk in chunks
-
             ]
 
+            #  VERIFICATION STEP 2: Final check before saving
+            logging.info(f"Final verification before saving to Qdrant")
+            for idx, meta in enumerate(chunk_metadata):
+                if meta.get('document_id') != doc_tag:
+                    raise ValueError(
+                        f"L Chunk {idx} has wrong document_id: {meta.get('document_id')} "
+                        f"(expected {doc_tag})"
+                    )
+
             # Prepare embeddings dict with metadata
-
             embeddings = {
-
                 "embeddings": embeddings_array,
-
                 "texts": chunks,
-
                 "sparse_vectors": sparse_vectors,
-
                 "summaries": summaries,
-
-                "chunk_metadata": chunk_metadata  # Includes document_id
-
+                "chunk_metadata": chunk_metadata  #  All verified to have correct document_id
             }
 
-            # Save to Qdrant
-
+            # Save to Qdrant (will perform additional verification)
+            logging.info(f"Saving to Qdrant...")
             result = save_embeddings_to_qdrant(
-
                 embeddings,
-
                 subscription_id,
-
                 profile_tag,
-
                 doc_tag,
-
                 doc_name
-
             )
 
-            logging.info(f"✅ Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
+            logging.info(f"=" * 80)
+            logging.info(f" SUCCESS: Stored {result.get('points_saved', 0)} embeddings")
+            logging.info(f"  Document ID: {doc_tag}")
+            logging.info(f"  File: {doc_name}")
+            logging.info(f"=" * 80)
 
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         else:
-
             raise ValueError(f"Unsupported format: {type(text)}")
 
     except Exception as e:
-
-        logging.error(f"Training error for {doc_name}: {e}")
-
+        logging.error(f"=" * 80)
+        logging.error(f"L TRAINING FAILED for {doc_name}")
+        logging.error(f"  Document ID: {doc_tag}")
+        logging.error(f"  Error: {e}")
+        logging.error(f"=" * 80)
         raise
 
 
