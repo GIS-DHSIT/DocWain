@@ -22,6 +22,7 @@ from api.dw_chat import (
     delete_session
 )
 from fastapi.middleware.cors import CORSMiddleware
+from cache_manager import check_cache_health, get_cache, CacheInvalidation
 
 app = FastAPI(title="DocWain API")
 
@@ -44,6 +45,59 @@ class QuestionRequest(BaseModel):
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
     new_session: Optional[bool] = False  # Frontend sends flag here
+
+
+@app.get("/cache/health")
+def cache_health_check():
+    """Check Redis cache health status"""
+    try:
+        health = check_cache_health()
+        return {"status": "success", "cache": health}
+    except Exception as e:
+        logging.error(f"Cache health check failed: {e}")
+        raise HTTPException(status_code=500, detail="Cache health check failed")
+
+
+@app.get("/cache/metrics")
+def cache_metrics():
+    """Get cache performance metrics"""
+    try:
+        cache = get_cache()
+        metrics = cache.get_metrics()
+        return {"status": "success", "metrics": metrics}
+    except Exception as e:
+        logging.error(f"Failed to get cache metrics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get cache metrics")
+
+
+@app.post("/cache/clear/{subscription_id}")
+def clear_subscription_cache(subscription_id: str):
+    """Clear cache for a specific subscription"""
+    try:
+        CacheInvalidation.invalidate_subscription(subscription_id)
+        return {
+            "status": "success",
+            "message": f"Cache cleared for subscription {subscription_id}"
+        }
+    except Exception as e:
+        logging.error(f"Failed to clear cache: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear cache")
+
+
+@app.delete("/cache/all")
+def clear_all_cache():
+    """Clear ALL cache (use with caution!)"""
+    try:
+        cache = get_cache()
+        cache.clear_all()
+        return {
+            "status": "success",
+            "message": "All cache cleared"
+        }
+    except Exception as e:
+        logging.error(f"Failed to clear cache: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear cache")
+
 
 
 @app.post("/ask")
@@ -91,25 +145,33 @@ def ask_question_api(request: QuestionRequest):
 def trigger_single_training(doc_id: str, subscription_id: str = "default"):
     """API endpoint to train a single document by its document ID."""
     try:
-        logging.info(f"Received single document training request for: {doc_id} (subscription: {subscription_id})")
+        logging.info(f"Training request for: {doc_id}")
         result = train_single_document(doc_id)
+
+        # ADDED: Invalidate cache after training
+        CacheInvalidation.invalidate_document(subscription_id, doc_id)
+
         return {"status": "success", "message": result}
     except Exception as e:
         logging.error(f"Single training API error: {e}")
-        raise HTTPException(status_code=500, detail="Single document training failed")
+        raise HTTPException(status_code=500, detail="Training failed")
 
 
 @app.get("/train")
 def trigger_training(subscription_id: str = "default"):
     """API endpoint to trigger document training."""
     try:
-        logging.info(f"Received training request (subscription: {subscription_id})")
+        logging.info(f"Training request for subscription: {subscription_id}")
         status_response = trainData()
+
+        # ADDED: Invalidate cache after training
+        CacheInvalidation.invalidate_subscription(subscription_id)
+
         logging.info(status_response)
-        return {"status": "success", "message": status_response, "response": "Executed"}
+        return {"status": "success", "message": status_response}
     except Exception as e:
         logging.error(f"Training API error: {e}")
-        raise HTTPException(status_code=500, detail="Training process failed")
+        raise HTTPException(status_code=500, detail="Training failed")
 
 
 @app.get("/models")

@@ -22,6 +22,13 @@ from api.config import Config
 import nltk
 from nltk.corpus import wordnet
 from spellchecker import SpellChecker
+from cache_manager import (
+    get_cache,
+    CacheStrategies,
+    cache_result,
+    check_cache_health
+)
+
 
 # Configure logging
 logging.basicConfig(
@@ -943,25 +950,40 @@ class EnterpriseRAGSystem:
             top_k_rerank: int = 10,
             final_k: int = 3
     ) -> Dict[str, Any]:
-        """Main method to answer questions using enhanced RAG pipeline."""
+        """Main method to answer questions using enhanced RAG pipeline with caching."""
         start_time = time.time()
+
 
         try:
             collection_name = f"{subscription_id}".replace(" ", "_")
+            cache = get_cache()
 
-            # Quick collection diagnostics to avoid silent empty searches
+            # ADDED: Try cache first for exact query matches
+            if cache.enabled:
+                cache_key, ttl = CacheStrategies.cache_answer(
+                    query, subscription_id, profile_id, "default"
+                )
+                cached_answer = cache.get(cache_key)
+                if cached_answer:
+                    logger.info("Returning cached answer")
+                    cached_answer['from_cache'] = True
+                    cached_answer['cache_hit'] = True
+                    return cached_answer
+
+            # Collection diagnostics
             try:
                 stats = self.client.count(collection_name=collection_name, exact=False)
                 total_points = getattr(stats, "count", 0)
                 logger.info(f"Collection '{collection_name}' point count: {total_points}")
                 if total_points == 0:
-                    logger.warning(f"Collection '{collection_name}' is empty; retrieval will return no results")
+                    logger.warning(f"Collection '{collection_name}' is empty")
             except Exception as diag_exc:
                 logger.warning(f"Could not count collection '{collection_name}': {diag_exc}")
 
+            # Handle greetings/farewells (cached separately)
             if self.greeting_handler.is_positive_feedback(query):
-                return {
-                    "response": "You're welcome! I'm glad I could help. Feel free to ask any other questions about your documents.",
+                response = {
+                    "response": "You're welcome! I'm glad I could help.",
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
@@ -969,11 +991,11 @@ class EnterpriseRAGSystem:
                     "query_type": "positive_feedback",
                     "grounded": True
                 }
+                return response
 
             if self.greeting_handler.is_greeting(query):
-                greeting_response = f"Hello! I'm your doxa AI assistant. I can help you find specific information from your documents. What would you like to know?"
+                greeting_response = f"Hello! I'm your doxa AI assistant. How can I help you today?"
                 self.conversation_history.add_turn(user_id, query, greeting_response)
-
                 return {
                     "response": greeting_response,
                     "sources": [],
@@ -985,9 +1007,8 @@ class EnterpriseRAGSystem:
                 }
 
             if self.greeting_handler.is_farewell(query):
-                farewell_response = f"Goodbye! Feel free to return whenever you need information from your documents. Have a great day!"
+                farewell_response = f"Goodbye! Have a great day!"
                 self.conversation_history.clear_history(user_id)
-
                 return {
                     "response": farewell_response,
                     "sources": [],
@@ -998,37 +1019,40 @@ class EnterpriseRAGSystem:
                     "grounded": True
                 }
 
-            logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
-
+            logger.info(f"Processing query: {query[:100]}")
             processed_query, preprocessing_metadata = self.preprocess_query(query, user_id)
 
-            # Cache lookup (per subscription/profile/query)
-            cache = get_redis_client()
-            cache_key = None
-            if cache:
-                cache_key = f"rag:{collection_name}:{profile_id}:{hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
-                cached = cache.get(cache_key)
-                if cached:
-                    try:
-                        cached_obj = json.loads(cached)
-                        logger.info("Cache hit for query; returning cached answer")
-                        return cached_obj
-                    except Exception:
-                        logger.warning("Failed to parse cached answer; ignoring")
-            logger.info(f"Preprocessed query: {processed_query}")
-
-            retrieved_chunks = self.retriever.retrieve(
-                collection_name=collection_name,
-                filter_profile=profile_id,
-                query=processed_query,
-                top_k=top_k_retrieval,
-                score_threshold=0.15
+            # ADDED: Cache retrieval results
+            chunks_cache_key, chunks_ttl = CacheStrategies.cache_chunks(
+                processed_query, collection_name, profile_id, top_k_retrieval
             )
 
-            if not retrieved_chunks:
-                no_results_response = f"I searched through all your department documents but couldn't find relevant information for your question: '{query}'. Please try rephrasing or asking about a different topic covered in your documents."
-                self.conversation_history.add_turn(user_id, query, no_results_response)
+            if cache.enabled:
+                cached_chunks = cache.get(chunks_cache_key)
+                if cached_chunks:
+                    logger.info("Using cached retrieval results")
+                    retrieved_chunks = cached_chunks
+                else:
+                    retrieved_chunks = self.retriever.retrieve(
+                        collection_name=collection_name,
+                        filter_profile=profile_id,
+                        query=processed_query,
+                        top_k=top_k_retrieval,
+                        score_threshold=0.15
+                    )
+                    cache.set(chunks_cache_key, retrieved_chunks, chunks_ttl)
+            else:
+                retrieved_chunks = self.retriever.retrieve(
+                    collection_name=collection_name,
+                    filter_profile=profile_id,
+                    query=processed_query,
+                    top_k=top_k_retrieval,
+                    score_threshold=0.15
+                )
 
+            if not retrieved_chunks:
+                no_results_response = f"I couldn't find relevant information for your question."
+                self.conversation_history.add_turn(user_id, query, no_results_response)
                 return {
                     "response": no_results_response,
                     "sources": [],
@@ -1049,22 +1073,17 @@ class EnterpriseRAGSystem:
             )
 
             final_chunks = reranked_chunks[:final_k]
+            context = self.context_builder.build_context(chunks=final_chunks, max_chunks=final_k)
 
-            context = self.context_builder.build_context(
-                chunks=final_chunks,
-                max_chunks=final_k
-            )
-
-            logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
+            logger.info(f"Built context with {len(final_chunks)} chunks")
 
             is_answerable, answerability_reason = self.answerability_detector.check_answerability(
                 query, context
             )
 
             if not is_answerable:
-                not_answerable_response = f"Based on the available  documents, I cannot fully answer your question. {answerability_reason}"
+                not_answerable_response = f"Based on available documents, I cannot fully answer your question. {answerability_reason}"
                 self.conversation_history.add_turn(user_id, query, not_answerable_response)
-
                 return {
                     "response": not_answerable_response,
                     "sources": self.context_builder.extract_sources(final_chunks),
@@ -1085,16 +1104,13 @@ class EnterpriseRAGSystem:
             )
 
             answer = self.llm_client.generate(prompt)
-
             sources = self.context_builder.extract_sources(final_chunks)
-
             self.conversation_history.add_turn(user_id, query, answer)
 
             has_citations = bool(re.search(r'\[SOURCE-\d+\]', answer))
-
             processing_time = time.time() - start_time
 
-            return {
+            result = {
                 "response": answer,
                 "sources": sources,
                 "user_id": user_id,
@@ -1114,42 +1130,21 @@ class EnterpriseRAGSystem:
                     "initial_retrieved": len(retrieved_chunks),
                     "after_rerank": len(reranked_chunks),
                     "final_context": len(final_chunks)
-                }
+                },
+                "from_cache": False,
+                "cache_hit": False
             }
-            if cache and cache_key:
-                try:
-                    cache.setex(cache_key, 3600, json.dumps({
-                        "response": answer,
-                        "sources": sources,
-                        "user_id": user_id,
-                        "collection": collection_name,
-                        "context_found": True,
-                        "query_type": "document_qa",
-                        "num_sources": len(sources),
-                        "preprocessing": preprocessing_metadata,
-                        "answerability": {
-                            "is_answerable": is_answerable,
-                            "reason": answerability_reason
-                        },
-                        "grounded": True,
-                        "has_citations": has_citations,
-                        "processing_time": round(processing_time, 2),
-                        "retrieval_stats": {
-                            "initial_retrieved": len(retrieved_chunks),
-                            "after_rerank": len(reranked_chunks),
-                            "final_context": len(final_chunks)
-                        }
-                    }))
-                except Exception as cache_exc:
-                    logger.warning(f"Failed to cache answer: {cache_exc}")
+
+            # ADDED: Cache the complete answer
+            if cache.enabled:
+                cache.set(cache_key, result, ttl)
+
+            return result
 
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
-
-            error_response = "I apologize, but I encountered an error while processing your question. Please try again or contact support if the issue persists."
-
             return {
-                "response": error_response,
+                "response": "I apologize, but I encountered an error.",
                 "sources": [],
                 "user_id": user_id,
                 "collection": collection_name if 'collection_name' in locals() else profile_id,

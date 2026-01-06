@@ -24,6 +24,8 @@ import copy
 from sklearn.feature_extraction.text import TfidfVectorizer
 from typing import List, Tuple, Dict, Any
 from dataclasses import dataclass
+from cache_manager import get_cache, CacheInvalidation, cache_embeddings_batch
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -845,6 +847,10 @@ def delete_embeddings(subscription_id, profile_id, file_id):
             collection_name=collection_name,
             points_selector=filter_criteria
         )
+
+        # ADDED: Invalidate cache after deletion
+        CacheInvalidation.invalidate_document(subscription_id, file_id)
+
         logging.info(f"Embeddings successfully deleted for file {file_id} in collection {collection_name}.")
         return {"status": "success", "message": f"Embeddings deleted for file {file_id}."}
     except Exception as e:
@@ -1159,148 +1165,100 @@ from enhanced_retrieval import chunk_text_for_embedding
 
 def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
     """
-
-    FIXED: Trains and stores embeddings with proper document_id tracking
-
+    FIXED: Trains and stores embeddings with proper document_id tracking and caching
     """
 
     try:
-
         logging.info(f"Starting training for {doc_name}, doc_id={doc_tag}")
 
         if isinstance(text, dict):
-
             # Handle pre-embedded structured data (CSV/Excel)
-
             result = save_embeddings_to_qdrant(
-
                 text, subscription_id, profile_tag, doc_tag, doc_name
-
             )
+
+            # ADDED: Invalidate answer cache after training
+            CacheInvalidation.invalidate_document(subscription_id, doc_tag)
 
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         elif isinstance(text, str):
-
             if not text.strip():
                 raise ValueError(f"Empty content in {doc_name}")
 
-            # FIXED: Pass document_id to chunking
-
+            # Enhanced semantic chunking
             chunks_with_meta = chunk_text_for_embedding(
-
                 text,
-
                 doc_name,
-
-                document_id=doc_tag  # CRITICAL: Pass doc_tag as document_id
-
+                document_id=doc_tag
             )
 
             if not chunks_with_meta:
                 raise ValueError(f"No valid chunks in {doc_name}")
 
-            # Extract chunks and metadata
-
             chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
-
             chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
 
-            # VERIFY: Log document IDs
-
             unique_doc_ids = list(set([m.get('document_id') for m in chunk_metadata]))
-
             logging.info(f"Created {len(chunks)} chunks for document_ids: {unique_doc_ids}")
 
-            # Generate embeddings
-
+            # MODIFIED: Use cached embedding encoding
             model = get_model()
-
-            embeddings_array = model.encode(
-
+            embeddings_array = cache_embeddings_batch(
                 chunks,
-
-                convert_to_numpy=True,
-
-                normalize_embeddings=True
-
+                Config.Model.SENTENCE_TRANSFORMERS,
+                lambda texts: model.encode(
+                    texts,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True
+                )
             )
 
             # Build sparse vectors
-
             from sklearn.feature_extraction.text import TfidfVectorizer
-
             tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
-
             tfidf_matrix = tfidf.fit_transform(chunks)
 
             sparse_vectors = []
-
             for row in tfidf_matrix:
                 coo = row.tocoo()
-
                 sparse_vectors.append({
-
                     "indices": coo.col.tolist(),
-
                     "values": coo.data.astype(np.float32).tolist()
-
                 })
 
-            # Create summaries
-
             summaries = [
-
                 chunk[:200] + "..." if len(chunk) > 200 else chunk
-
                 for chunk in chunks
-
             ]
 
-            # Prepare embeddings dict with metadata
-
             embeddings = {
-
                 "embeddings": embeddings_array,
-
                 "texts": chunks,
-
                 "sparse_vectors": sparse_vectors,
-
                 "summaries": summaries,
-
-                "chunk_metadata": chunk_metadata  # Includes document_id
-
+                "chunk_metadata": chunk_metadata
             }
 
-            # Save to Qdrant
-
             result = save_embeddings_to_qdrant(
-
                 embeddings,
-
                 subscription_id,
-
                 profile_tag,
-
                 doc_tag,
-
                 doc_name
-
             )
 
-            logging.info(f" Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
+            # ADDED: Invalidate cache after training
+            CacheInvalidation.invalidate_document(subscription_id, doc_tag)
 
+            logging.info(f"Successfully stored {result.get('points_saved', 0)} embeddings with document_id={doc_tag}")
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         else:
-
             raise ValueError(f"Unsupported format: {type(text)}")
 
     except Exception as e:
-
         logging.error(f"Training error for {doc_name}: {e}")
-
         raise
 
 
