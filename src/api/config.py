@@ -115,7 +115,7 @@ class Config:
         CHUNK_SIZE = 800
         CHUNK_OVERLAP = 200
         MIN_CHUNK_SIZE = 150
-        MAX_CONTEXT_CHUNKS = 7
-        SIMILARITY_THRESHOLD = 0.7
-        USE_SPARSE_VECTORS = True  # Enable hybrid search
-        USE_ADJACENT_EXPANSION = True  # Fetch neighboring chunks
+        MAX_CONTEXT_CHUNKS = 7  # ✅ INCREASED FROM 7 (keep this)
+        SIMILARITY_THRESHOLD = 0.10  # ✅ LOWERED FROM 0.7
+        USE_SPARSE_VECTORS = True
+        USE_ADJACENT_EXPANSION = True

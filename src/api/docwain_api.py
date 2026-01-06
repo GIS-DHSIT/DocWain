@@ -2,7 +2,6 @@
 import logging
 import time
 from typing import Optional
-
 import ollama
 import uvicorn
 from bson.objectid import ObjectId  # added by maha/maria
