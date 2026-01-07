@@ -28,10 +28,13 @@ class Config:
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta
 
     class Model:
-        # Single embedding model to keep all vector dimensions consistent (768)
-        SENTENCE_TRANSFORMERS = os.getenv("SENTENCE_TRANSFORMERS", 'sentence-transformers/all-mpnet-base-v2')
+        EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
+        EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+        SENTENCE_TRANSFORMERS = EMBEDDING_MODEL
         SENTENCE_TRANSFORMERS_FALLBACK = SENTENCE_TRANSFORMERS
-        SENTENCE_TRANSFORMERS_CANDIDATES = [SENTENCE_TRANSFORMERS]
+        SENTENCE_TRANSFORMERS_CANDIDATES = [EMBEDDING_MODEL]
+        RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        OCR_ENGINE = os.getenv("OCR_ENGINE", "pytesseract")
         AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
         AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
         AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "")
@@ -119,3 +122,7 @@ class Config:
         SIMILARITY_THRESHOLD = 0.10  # ✅ LOWERED FROM 0.7
         USE_SPARSE_VECTORS = True
         USE_ADJACENT_EXPANSION = True
+        HYBRID_WEIGHTS = {
+            "dense": float(os.getenv("HYBRID_WEIGHT_DENSE", "0.6")),
+            "sparse": float(os.getenv("HYBRID_WEIGHT_SPARSE", "0.4")),
+        }

@@ -1,27 +1,37 @@
 
-import json
-import uuid
-import logging
+import copy
 import hashlib
+import json
+import logging
 import subprocess
+import time
+import uuid
+from io import BytesIO
+from typing import Any, Dict, List, Optional
+
 import boto3 as b3
 import numpy as np
 import pandas as pd
-from io import BytesIO
-from src.api.config import Config
 from Crypto.Cipher import AES
-from pymongo import MongoClient, errors
-from urllib.parse import urlparse
-from bson.objectid import ObjectId
-from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, Distance, VectorParams, SparseVectorParams, SparseVector
-from sentence_transformers import SentenceTransformer
-from src.api.documentVetting import vettingProcessor, mask_document_content
-from src.api.dw_document_extractor import DocumentExtractor
 from azure.storage.blob import BlobServiceClient
-import time
-import copy
-from sklearn.feature_extraction.text import TfidfVectorizer
+from bson.objectid import ObjectId
+from pymongo import MongoClient, errors
+from qdrant_client import QdrantClient
+from qdrant_client.models import SparseVector
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import HashingVectorizer
+from urllib.parse import urlparse
+
+from src.api.config import Config
+from src.api.context_understanding import ContextUnderstanding
+from src.api.documentVetting import mask_document_content, vettingProcessor
+from src.api.dw_document_extractor import DocumentExtractor
+from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
+from src.api.vector_store import (
+    QdrantVectorStore,
+    build_collection_name,
+    compute_chunk_id,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -29,6 +39,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 docEx = None
 _MODEL = None
 _QDRANT_CLIENT = None
+_VECTOR_STORE = None
+_HASH_VECTORIZER = None
 logger = logging.getLogger(__name__)
 
 '-------------------------------modified by maha/maria-----------------------'
@@ -131,6 +143,60 @@ def normalize_embedding_matrix(raw_vectors, expected_dim=None):
     return normalized_vectors, (dim or expected_dim)
 
 
+def build_sparse_vectors(texts: List[str]) -> List[Dict[str, List[float]]]:
+    """Build hashing-based sparse vectors for keyword search."""
+    vectorizer = get_hash_vectorizer()
+    matrix = vectorizer.transform(texts)
+    sparse_vectors = []
+    for row in matrix:
+        coo = row.tocoo()
+        sparse_vectors.append(
+            {
+                "indices": coo.col.tolist(),
+                "values": coo.data.astype(np.float32).tolist(),
+            }
+        )
+    return sparse_vectors
+
+
+def compute_section_summaries(
+    chunks: List[str], chunk_metadata: List[dict], extracted: Optional[ExtractedDocument] = None
+) -> List[str]:
+    """Generate per-section summaries for chunk payloads."""
+    if not chunks or not chunk_metadata:
+        return []
+
+    ctx = ContextUnderstanding()
+
+    if extracted:
+        doc_summary = ctx.summarize_document(extracted)
+        section_summaries = doc_summary.get("section_summaries", {})
+        return ContextUnderstanding.attach_summaries_to_chunks(chunk_metadata, section_summaries)
+
+    section_map: Dict[str, Dict[str, Any]] = {}
+    for chunk, meta in zip(chunks, chunk_metadata):
+        section_id = meta.get("section_id") or meta.get("section_title") or "section"
+        record = section_map.setdefault(
+            section_id,
+            {"title": meta.get("section_title") or "Section", "page": meta.get("page_number") or 0, "texts": []},
+        )
+        record["texts"].append(chunk)
+
+    sections = [
+        Section(
+            section_id=sec_id,
+            title=rec["title"],
+            level=1,
+            start_page=rec["page"],
+            end_page=rec["page"],
+            text="\n".join(rec["texts"]),
+        )
+        for sec_id, rec in section_map.items()
+    ]
+    section_summaries = {sec.section_id: ctx.summarize_section(sec) for sec in sections}
+    return ContextUnderstanding.attach_summaries_to_chunks(chunk_metadata, section_summaries)
+
+
 def create_mongo_client():
     """Create a Mongo client with a graceful fallback when the primary URI is misconfigured."""
     primary_uri = Config.MongoDB.URI
@@ -177,10 +243,16 @@ def get_model():
     """Lazy init for sentence transformer model to cut import-time cost."""
     global _MODEL
     if _MODEL is None:
-        name = getattr(Config.Model, "SENTENCE_TRANSFORMERS", "sentence-transformers/all-mpnet-base-v2")
+        name = getattr(Config.Model, "EMBEDDING_MODEL", None) or getattr(
+            Config.Model, "SENTENCE_TRANSFORMERS", "BAAI/bge-large-en-v1.5"
+        )
         logging.info(f"Loading sentence transformer model: {name}")
         _MODEL = SentenceTransformer(name)
-        logging.info(f"Loaded sentence transformer model: {name}")
+        expected_dim = getattr(Config.Model, "EMBEDDING_DIM", None)
+        model_dim = _MODEL.get_sentence_embedding_dimension()
+        if expected_dim and model_dim != expected_dim:
+            logging.warning(f"Configured EMBEDDING_DIM={expected_dim} but model dimension is {model_dim}")
+        logging.info(f"Loaded sentence transformer model: {name} (dim={model_dim})")
     return _MODEL
 
 
@@ -190,6 +262,28 @@ def get_qdrant_client():
     if _QDRANT_CLIENT is None:
         _QDRANT_CLIENT = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
     return _QDRANT_CLIENT
+
+
+def get_vector_store() -> QdrantVectorStore:
+    """Shared vector store wrapper to centralize collection handling."""
+    global _VECTOR_STORE
+    if _VECTOR_STORE is None:
+        _VECTOR_STORE = QdrantVectorStore(client=get_qdrant_client())
+    return _VECTOR_STORE
+
+
+def get_hash_vectorizer():
+    """Return a stable hashing vectorizer for sparse keyword vectors."""
+    global _HASH_VECTORIZER
+    if _HASH_VECTORIZER is None:
+        _HASH_VECTORIZER = HashingVectorizer(
+            n_features=4096,
+            alternate_sign=False,
+            norm="l2",
+            ngram_range=(1, 2),
+            stop_words="english",
+        )
+    return _HASH_VECTORIZER
 
 
 def decrypt_data(encrypted_value: str, encryption_key=Config.Encryption.ENCRYPTION_KEY) -> str:
@@ -401,16 +495,6 @@ def get_pii_stats(document_id):
     except Exception as e:
         logging.error(f"Error fetching PII stats for {document_id}: {e}")
         return None
-
-
-# -----------------------------
-# Qdrant helpers (subscription scoped)
-# -----------------------------
-
-def build_collection_name(subscription_id: str) -> str:
-    """Build a collection name scoped by subscription only."""
-    safe_sub = str(subscription_id).replace(" ", "_")
-    return f"{safe_sub}"
 
 
 def get_azure_docs(files):
@@ -732,12 +816,13 @@ def extract_document_info():
 from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 
-def delete_embeddings(subscription_id: str, document_id: str):
+def delete_embeddings(subscription_id: str, profile_id: str, document_id: str):
     """
     Delete all embeddings for a specific document from Qdrant.
 
     Args:
         subscription_id: Subscription ID (used to build collection name)
+        profile_id: Profile ID for strict scoping
         document_id: Document ID to delete
 
     Returns:
@@ -746,191 +831,48 @@ def delete_embeddings(subscription_id: str, document_id: str):
     try:
         logging.info(
             f"[DELETE_EMBEDDINGS] Deleting embeddings for document_id={document_id}, "
-            f"subscription_id={subscription_id}"
+            f"subscription_id={subscription_id}, profile_id={profile_id}"
         )
 
-        client = get_qdrant_client()
-        collection_name = build_collection_name(subscription_id)
+        if not profile_id:
+            raise ValueError("profile_id is required for deleting embeddings")
 
-        # Check if collection exists
-        try:
-            collection_info = client.get_collection(collection_name)
-            logging.info(
-                f"[DELETE_EMBEDDINGS] Collection '{collection_name}' has {collection_info.points_count} points")
-        except Exception as e:
-            logging.error(f"[DELETE_EMBEDDINGS] Collection '{collection_name}' not found: {e}")
-            return {
-                "status": "error",
-                "message": f"Collection not found: {collection_name}"
-            }
-
-        # Create filter for deletion
-        delete_filter = Filter(
-            must=[
-                FieldCondition(
-                    key="document_id",
-                    match=MatchValue(value=str(document_id))
-                )
-            ]
-        )
-
-        # Check if points exist before deletion
-        try:
-            scroll_result = client.scroll(
-                collection_name=collection_name,
-                scroll_filter=delete_filter,
-                limit=10,
-                with_payload=True,
-                with_vectors=False
-            )
-
-            # Handle both tuple and object return types
-            if isinstance(scroll_result, tuple):
-                matching_points = scroll_result[0]
-            else:
-                matching_points = getattr(scroll_result, 'points', [])
-
-            logging.info(f"[DELETE_EMBEDDINGS] Found {len(matching_points)} points to delete")
-
-            if not matching_points:
-                logging.warning(f"[DELETE_EMBEDDINGS] No embeddings found for document_id={document_id}")
-                return {
-                    "status": "not_found",
-                    "message": f"No embeddings found for document {document_id}",
-                    "document_id": document_id,
-                    "collection": collection_name
-                }
-        except Exception as scroll_error:
-            logging.error(f"[DELETE_EMBEDDINGS] Error checking points: {scroll_error}")
-
-        # Perform deletion
-        logging.info(f"[DELETE_EMBEDDINGS] Executing delete operation")
-        result = client.delete(
-            collection_name=collection_name,
-            points_selector=delete_filter,
-            wait=True
-        )
-
-        logging.info(f"[DELETE_EMBEDDINGS]  Delete completed: {result}")
-
-        # Verify deletion
-        try:
-            verify_result = client.scroll(
-                collection_name=collection_name,
-                scroll_filter=delete_filter,
-                limit=1,
-                with_payload=False,
-                with_vectors=False
-            )
-
-            if isinstance(verify_result, tuple):
-                remaining = verify_result[0]
-            else:
-                remaining = getattr(verify_result, 'points', [])
-
-            if remaining:
-                logging.warning(f"[DELETE_EMBEDDINGS] � {len(remaining)} points still remain!")
-            else:
-                logging.info(f"[DELETE_EMBEDDINGS]  Verified: All embeddings deleted")
-        except Exception as verify_error:
-            logging.warning(f"[DELETE_EMBEDDINGS] Could not verify deletion: {verify_error}")
-
-        return {
-            "status": "success",
-            "document_id": document_id,
-            "collection": collection_name,
-            "message": f"Successfully deleted embeddings for document {document_id}",  #  ADDED
-            "result": str(result)
-        }
+        store = get_vector_store()
+        result = store.delete_document(subscription_id, profile_id, document_id)
+        return result
 
     except Exception as e:
-        logging.error("[DELETE_EMBEDDINGS] L Failed", exc_info=True)
+        logging.error("[DELETE_EMBEDDINGS] Failed", exc_info=True)
         return {
             "status": "error",
             "message": str(e),
-            "document_id": document_id
+            "document_id": document_id,
         }
 
 
-def ensure_qdrant_collection(collection_name, vector_size=768):
-    """Ensures the Qdrant collection exists with the correct settings and payload indexes."""
+def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
+    """Ensure Qdrant collection exists with multi-vector schema and payload indexes."""
     try:
-        client = get_qdrant_client()
-        collections = client.get_collections().collections
-        existing_collections = {col.name for col in collections}
-
-        if collection_name not in existing_collections:
-            logging.info(f"Creating Qdrant collection: {collection_name}")
-            client.create_collection(
-                collection_name=collection_name,
-                vectors_config={
-                    "content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)
-                },
-                sparse_vectors_config={
-                    "keywords_vector": SparseVectorParams()
-                }
-            )
-            logging.info(f"Collection '{collection_name}' created successfully.")
-        else:
-            logging.info(f"Collection '{collection_name}' already exists.")
-            try:
-                info = client.get_collection(collection_name)
-
-                def _extract_dim(collection_info):
-                    cfg = getattr(collection_info, "config", None) or {}
-                    params = getattr(cfg, "params", None) or {}
-                    vectors = getattr(params, "vectors", None) or getattr(params, "vector_size", None) or {}
-                    # qdrant_client may return vectors as dict or as a dataclass with .size
-                    if hasattr(vectors, "size"):
-                        return vectors.size
-                    if isinstance(vectors, dict):
-                        if "size" in vectors:
-                            return vectors.get("size")
-                        if "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
-                            return vectors["content_vector"].get("size")
-                    return None
-
-                existing_dim = _extract_dim(info)
-                if existing_dim is None:
-                    logging.warning(
-                        f"Existing collection '{collection_name}' has unknown dim; "
-                        f"assuming {vector_size} and continuing without recreation to avoid data loss"
-                    )
-                else:
-                    logging.info(f"Collection '{collection_name}' expects dim={existing_dim}")
-                    if existing_dim != vector_size:
-                        raise ValueError(
-                            f"Collection '{collection_name}' vector dim mismatch: existing {existing_dim}, new {vector_size}. "
-                            f"Use a model with dim {existing_dim} or recreate the collection."
-                        )
-            except Exception as dim_exc:
-                logging.error(f"Failed dimension check for collection '{collection_name}': {dim_exc}")
-                raise
-
-        # Ensure payload indexes exist for common filters
-        for field in ["subscription_id", "profile_id", "document_id", "tag"]:
-            try:
-                client.create_payload_index(
-                    collection_name=collection_name,
-                    field_name=field,
-                    field_schema="keyword"
-                )
-                logging.info(f"Created payload index for field '{field}' in collection '{collection_name}'")
-            except Exception as idx_exc:
-                # Likely already exists; log at debug level
-                logging.debug(f"Payload index for '{field}' may already exist: {idx_exc}")
-
+        store = get_vector_store()
+        store.ensure_collection(collection_name, vector_size)
     except Exception as e:
         logging.error(f"Error ensuring collection in Qdrant: {e}")
         raise
 
 
-def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, source_filename, batch_size=100):
-    """
-     FIXED: Added verification that all chunks have correct document_id
-    """
+def save_embeddings_to_qdrant(
+    embeddings: Dict,
+    subscription_id: str,
+    profile_id: str,
+    doctag: str,
+    source_filename: str,
+    batch_size: int = 100,
+):
+    """Persist embeddings with deterministic chunk IDs and strict scoping."""
     try:
-        client = get_qdrant_client()
+        if not profile_id:
+            raise ValueError("profile_id is required for saving embeddings")
+
         if "embeddings" not in embeddings or embeddings["embeddings"] is None:
             logging.error(f"Error: 'embeddings' key missing or None for document {doctag}!")
             raise ValueError("Embeddings data is invalid")
@@ -945,152 +887,98 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
             model = get_model()
             raw_vectors = model.encode(raw_vectors, convert_to_numpy=True, normalize_embeddings=True)
 
-        # Normalize matrix -> List[List[float]]
         normalized_vectors, vector_size = normalize_embedding_matrix(raw_vectors)
-
         if vector_size == 0:
-            logging.error(f"Error: Trying to save empty embeddings for document {doctag}!")
             raise ValueError("Empty embeddings array")
 
-        # Fetch profile name for tagging
-        try:
-            profile_doc = db[Config.MongoDB.PROFILES].find_one({"_id": ObjectId(profile_id)})
-            profile_name = profile_doc["name"].replace(" ", "_") if profile_doc and "name" in profile_doc else str(
-                profile_id)
-        except Exception as e:
-            logging.warning(f"Could not fetch profile name for {profile_id}: {e}")
-            profile_name = str(profile_id)
-
-        collection_name = build_collection_name(subscription_id)
-
-        ensure_qdrant_collection(collection_name, vector_size)
-
-        logging.info(
-            f"Saving embeddings to Qdrant for subscription: {subscription_id}, profile: {profile_id}, document: {doctag}, file: {source_filename}")
-
         texts = embeddings.get("texts") or []
-        chunk_count = len(texts)
-        if chunk_count != len(normalized_vectors):
-            logging.warning(
-                f"Mismatch between number of texts ({len(texts)}) and vectors ({len(normalized_vectors)}) "
-                f"for document {doctag}. Truncating to minimum."
-            )
-        max_len = min(len(texts), len(normalized_vectors))
-
+        chunk_metadata = embeddings.get("chunk_metadata", []) or []
         pages = embeddings.get("pages") or []
         sections = embeddings.get("sections") or []
-        sparse_vectors = embeddings.get("sparse_vectors") or []
         summaries = embeddings.get("summaries") or []
-        chunk_metadata = embeddings.get("chunk_metadata", [])
+        sparse_vectors = embeddings.get("sparse_vectors") or []
 
-        #  CRITICAL VERIFICATION: Check all chunk_metadata has correct document_id
+        if not texts:
+            raise ValueError(f"No texts found for document {doctag}")
+
+        max_len = min(len(texts), len(normalized_vectors))
+        if max_len == 0:
+            raise ValueError(f"No valid vectors for document {doctag}")
+
+        if not sparse_vectors:
+            sparse_vectors = build_sparse_vectors(texts)
+
+        # Verify document_id in metadata
         if chunk_metadata:
-            doc_ids_in_chunks = set(meta.get('document_id') for meta in chunk_metadata)
+            doc_ids_in_chunks = {meta.get("document_id") for meta in chunk_metadata if meta.get("document_id")}
+            if len(doc_ids_in_chunks) != 1 or doctag not in doc_ids_in_chunks:
+                raise ValueError(f"Chunk metadata must contain only document_id {doctag}")
 
-            # Remove None values
-            doc_ids_in_chunks.discard(None)
+        collection_name = build_collection_name(subscription_id, profile_id)
+        ensure_qdrant_collection(collection_name, vector_size)
 
-            if len(doc_ids_in_chunks) == 0:
-                logging.error(f"L NO document_id found in chunk_metadata for {doctag}")
-                raise ValueError(f"Missing document_id in chunk_metadata")
-
-            if len(doc_ids_in_chunks) > 1:
-                logging.error(
-                    f"L CRITICAL: Multiple document_ids found in chunk_metadata: {doc_ids_in_chunks}"
-                )
-                raise ValueError(
-                    f"Chunk metadata contains multiple document_ids: {doc_ids_in_chunks}. "
-                    f"Expected only: {doctag}"
-                )
-
-            actual_doc_id = list(doc_ids_in_chunks)[0]
-            if actual_doc_id != doctag:
-                logging.error(
-                    f"L CRITICAL: document_id mismatch! "
-                    f"Expected: {doctag}, Found in chunks: {actual_doc_id}"
-                )
-                raise ValueError(
-                    f"document_id mismatch: expected '{doctag}', got '{actual_doc_id}'"
-                )
-
-            logging.info(f" Verified: All {len(chunk_metadata)} chunks have correct document_id={doctag}")
-
-        all_points = []
+        records: List[ChunkRecord] = []
         for idx in range(max_len):
             vector = normalized_vectors[idx]
             text = texts[idx]
             if not vector:
-                logging.warning(f"Skipping empty or invalid vector for text: {text[:50]}...")
                 continue
 
-            page_val = pages[idx] if idx < len(pages) else None
-            section_val = sections[idx] if idx < len(sections) else None
-            summary_val = summaries[idx] if idx < len(summaries) else None
+            chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
+            chunk_document_id = chunk_meta.get("document_id", str(doctag))
+            if chunk_document_id != str(doctag):
+                raise ValueError(f"Chunk {idx} document_id mismatch: {chunk_document_id} != {doctag}")
+
+            chunk_id = chunk_meta.get(
+                "chunk_id",
+                compute_chunk_id(subscription_id, profile_id, doctag, source_filename, idx, text),
+            )
+
+            page_val = pages[idx] if idx < len(pages) else chunk_meta.get("page_number")
+            section_val = chunk_meta.get("section_title", sections[idx] if idx < len(sections) else "")
+            summary_val = summaries[idx] if idx < len(summaries) else chunk_meta.get("summary")
 
             sparse_vector = None
             if idx < len(sparse_vectors):
                 sv = sparse_vectors[idx]
                 if sv.get("indices") and sv.get("values"):
-                    sparse_vector = SparseVector(
-                        indices=[int(i) for i in sv["indices"]],
-                        values=[float(v) for v in sv["values"]]
-                    )
+                    sparse_vector = sv
 
-            vector_payload = {"content_vector": vector}
-            if sparse_vector is not None:
-                vector_payload["keywords_vector"] = sparse_vector
+            payload = {
+                "subscription_id": str(subscription_id),
+                "profile_id": str(profile_id),
+                "text": text,
+                "document_id": str(doctag),
+                "source_file": source_filename,
+                "chunk_index": idx,
+                "chunk_count": max_len,
+                "page": page_val,
+                "section_title": section_val or chunk_meta.get("section"),
+                "summary": summary_val,
+                "chunk_id": chunk_id,
+                "prev_chunk_id": chunk_meta.get("prev_chunk_id"),
+                "next_chunk_id": chunk_meta.get("next_chunk_id"),
+                "chunk_type": chunk_meta.get("chunk_type", "text"),
+                "section_id": chunk_meta.get("section_id"),
+            }
 
-            #  Get document_id from chunk_metadata if available
-            chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
-            chunk_document_id = chunk_meta.get('document_id', str(doctag))
-
-            #  FINAL VERIFICATION: Ensure this chunk's document_id matches doctag
-            if chunk_document_id != str(doctag):
-                logging.error(
-                    f"L Chunk {idx} has wrong document_id: {chunk_document_id} (expected {doctag})"
-                )
-                raise ValueError(f"Chunk {idx} document_id mismatch")
-
-            all_points.append(
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=vector_payload,
-                    payload={
-                        "subscription_id": str(subscription_id),
-                        "profile_id": str(profile_id),
-                        "tag": profile_name,
-                        "text": text,
-                        "document_id": str(doctag),  #  Forced to use doctag
-                        "source_file": source_filename,
-                        "chunk_index": idx,
-                        "chunk_count": max_len,
-                        "page": page_val,
-                        "section": section_val,
-                        "summary": summary_val,
-                        "chunk_id": chunk_meta.get('chunk_id', f"{doctag}_chunk_{idx}"),
-                        "section_title": chunk_meta.get('section_title', ''),
-                        "prev_chunk_id": chunk_meta.get('prev_chunk_id'),
-                        "next_chunk_id": chunk_meta.get('next_chunk_id'),
-                        "chunk_type": chunk_meta.get('chunk_type', 'text')
-                    }
+            records.append(
+                ChunkRecord(
+                    chunk_id=str(chunk_id),
+                    dense_vector=[float(x) for x in vector],
+                    sparse_vector=sparse_vector,
+                    payload=payload,
                 )
             )
 
-        if not all_points:
-            logging.error(f"No valid points to upload for document {doctag}, file {source_filename}")
-            raise ValueError("No valid embedding points generated")
+        if not records:
+            raise ValueError(f"No valid embedding records generated for document {doctag}")
 
-        # Upload in batches
-        for i in range(0, len(all_points), batch_size):
-            batch = all_points[i:i + batch_size]
-            client.upsert(collection_name=collection_name, points=batch)
-            logging.info(
-                f"Uploaded batch {i // batch_size + 1}/{(len(all_points) + batch_size - 1) // batch_size} for {source_filename}")
-
+        saved = get_vector_store().upsert_records(collection_name, records, batch_size=batch_size)
         logging.info(
-            f" Successfully saved {len(all_points)} embeddings with document_id={doctag} to Qdrant for {source_filename}")
-
-        return {"status": "success", "points_saved": len(all_points)}
+            f"Saved {saved} embeddings for document {doctag} in collection {collection_name} (profile={profile_id})"
+        )
+        return {"status": "success", "points_saved": saved}
 
     except Exception as e:
         logging.error(f"Error saving embeddings to Qdrant for document {doctag}, file {source_filename}: {e}")
@@ -1188,7 +1076,7 @@ def save_embeddings_to_qdrant(embeddings, subscription_id, profile_id, doctag, s
 from src.api.enhanced_retrieval import chunk_text_for_embedding
 
 
-def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
+def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
     """
      COMPLETELY FIXED: Trains and stores embeddings with strict document_id verification
 
@@ -1202,8 +1090,11 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
         logging.info(f"Starting training for {doc_name}")
         logging.info(f"  Document ID: {doc_tag}")
         logging.info(f"  Subscription: {subscription_id}")
-        logging.info(f"  Profile: {profile_tag}")
+        logging.info(f"  Profile: {profile_id}")
         logging.info(f"=" * 80)
+
+        if not profile_id:
+            raise ValueError("profile_id is required for training")
 
         if isinstance(text, dict):
             # Handle pre-embedded structured data (CSV/Excel)
@@ -1219,9 +1110,92 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                         meta['document_id'] = doc_tag
 
             result = save_embeddings_to_qdrant(
-                text, subscription_id, profile_tag, doc_tag, doc_name
+                text, subscription_id, profile_id, doc_tag, doc_name
             )
             logging.info(f" Stored {result.get('points_saved', 0)} structured embeddings")
+            return f"Stored {result.get('points_saved', 0)} embeddings"
+        elif isinstance(text, ExtractedDocument):
+            candidates: List[ChunkCandidate] = text.chunk_candidates or []
+            if not candidates and text.full_text:
+                logging.info("No structured candidates found; falling back to raw text chunking")
+                candidates = [
+                    ChunkCandidate(
+                        text=text.full_text,
+                        page=None,
+                        section_title="Document",
+                        section_id=None,
+                        chunk_type="text",
+                    )
+                ]
+
+            def _merge_candidates(input_candidates: List[ChunkCandidate], min_len: int = 200):
+                merged = []
+                buffer_text = ""
+                buffer_meta: Optional[ChunkCandidate] = None
+                for cand in input_candidates:
+                    if not cand.text:
+                        continue
+                    if buffer_meta is None:
+                        buffer_text = cand.text.strip()
+                        buffer_meta = cand
+                        continue
+
+                    if len(buffer_text) < min_len and cand.section_id == buffer_meta.section_id:
+                        buffer_text = f"{buffer_text}\n{cand.text.strip()}"
+                    else:
+                        merged.append((buffer_text, buffer_meta))
+                        buffer_text = cand.text.strip()
+                        buffer_meta = cand
+
+                if buffer_meta and buffer_text:
+                    merged.append((buffer_text, buffer_meta))
+                return merged
+
+            merged_candidates = _merge_candidates(candidates)
+            if not merged_candidates:
+                raise ValueError(f"No chunk candidates extracted for {doc_name}")
+
+            chunks = []
+            chunk_metadata = []
+            for idx, (chunk_text, cand_meta) in enumerate(merged_candidates):
+                chunks.append(chunk_text)
+                chunk_metadata.append(
+                    {
+                        "document_id": doc_tag,
+                        "section_title": cand_meta.section_title,
+                        "section_id": cand_meta.section_id
+                        or hashlib.sha1(f"{doc_tag}|{cand_meta.section_title}".encode("utf-8")).hexdigest()[:12],
+                        "chunk_index": idx,
+                        "chunk_type": cand_meta.chunk_type,
+                        "page_number": cand_meta.page,
+                    }
+                )
+
+            logging.info(f"Generated {len(chunks)} chunks from structured extraction for {doc_name}")
+
+            model = get_model()
+            embeddings_array = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
+            sparse_vectors = build_sparse_vectors(chunks)
+            summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
+
+            for idx, meta in enumerate(chunk_metadata):
+                meta["chunk_id"] = compute_chunk_id(subscription_id, profile_id, doc_tag, doc_name, idx, chunks[idx])
+                meta["chunk_type"] = meta.get("chunk_type", "text")
+
+            embeddings_payload = {
+                "embeddings": embeddings_array,
+                "texts": chunks,
+                "sparse_vectors": sparse_vectors,
+                "summaries": summaries,
+                "chunk_metadata": chunk_metadata,
+                "pages": [m.get("page_number") for m in chunk_metadata],
+                "sections": [m.get("section_title") for m in chunk_metadata],
+            }
+
+            result = save_embeddings_to_qdrant(
+                embeddings_payload, subscription_id, profile_id, doc_tag, doc_name
+            )
+            logging.info(f" Stored {result.get('points_saved', 0)} structured extraction embeddings")
             return f"Stored {result.get('points_saved', 0)} embeddings"
 
         elif isinstance(text, str):
@@ -1280,24 +1254,15 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                 normalize_embeddings=True
             )
 
-            # Build sparse vectors
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            tfidf = TfidfVectorizer(max_features=2000, ngram_range=(1, 2))
-            tfidf_matrix = tfidf.fit_transform(chunks)
-
-            sparse_vectors = []
-            for row in tfidf_matrix:
-                coo = row.tocoo()
-                sparse_vectors.append({
-                    "indices": coo.col.tolist(),
-                    "values": coo.data.astype(np.float32).tolist()
-                })
+            sparse_vectors = build_sparse_vectors(chunks)
 
             # Create summaries
-            summaries = [
-                chunk[:200] + "..." if len(chunk) > 200 else chunk
-                for chunk in chunks
-            ]
+            summaries = compute_section_summaries(chunks, chunk_metadata)
+            if not any(summaries):
+                summaries = [
+                    chunk[:200] + "..." if len(chunk) > 200 else chunk
+                    for chunk in chunks
+                ]
 
             #  VERIFICATION STEP 2: Final check before saving
             logging.info(f"Final verification before saving to Qdrant")
@@ -1307,6 +1272,11 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
                         f"L Chunk {idx} has wrong document_id: {meta.get('document_id')} "
                         f"(expected {doc_tag})"
                     )
+                meta["section_id"] = meta.get("section_id") or hashlib.sha1(
+                    f"{doc_tag}|{meta.get('section_title') or 'section'}".encode("utf-8")
+                ).hexdigest()[:12]
+                meta["chunk_type"] = meta.get("chunk_type", "text")
+                meta["chunk_id"] = compute_chunk_id(subscription_id, profile_id, doc_tag, doc_name, idx, chunks[idx])
 
             # Prepare embeddings dict with metadata
             embeddings = {
@@ -1322,7 +1292,7 @@ def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
             result = save_embeddings_to_qdrant(
                 embeddings,
                 subscription_id,
-                profile_tag,
+                profile_id,
                 doc_tag,
                 doc_name
             )
@@ -1407,6 +1377,9 @@ def trainData():
                 subscription_id = doc_data.get('subscriptionId', 'default')
                 extracted_doc = doc_data['extractedDoc']
                 doc_name = doc_data.get('docName', 'Unknown')
+
+                if not profile_id:
+                    raise ValueError(f"profile_id is required for training document {doc_id}")
 
                 logging.info("-" * 80)
                 logging.info(f"Training document: {doc_name} (ID: {doc_id})")
@@ -1546,6 +1519,9 @@ def train_single_document(doc_id: str):
                 subscription_id = doc_data.get('subscriptionId', 'default')
                 extracted_doc = doc_data['extractedDoc']
                 doc_name = doc_data.get('docName', 'Unknown')
+
+                if not profile_id:
+                    raise ValueError(f"profile_id is required for training document {d_id}")
 
                 logging.info(f"Training document: {doc_name} (ID: {d_id})")
 

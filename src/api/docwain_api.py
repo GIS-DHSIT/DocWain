@@ -72,6 +72,8 @@ def ask_question_api(request: QuestionRequest):
 
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")
+    if not request.profile_id:
+        raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
 
     # Generate answer
     answer = answer_question(
@@ -131,7 +133,8 @@ def trigger_training(subscription_id: str = "default"):
 @app.delete("/document/{doc_id}/embeddings")
 def delete_document_embeddings_api(
         doc_id: str,
-        subscription_id: str = "default"
+        subscription_id: str = "default",
+        profile_id: Optional[str] = None
 ):
     """
     API endpoint to manually delete embeddings for a specific document.
@@ -153,16 +156,26 @@ def delete_document_embeddings_api(
             doc.get('subscriptionId') or
             subscription_id
         )
+        profile_id = str(
+            profile_id
+            or doc.get('profile')
+            or doc.get('profile_id')
+            or ""
+        )
+        if not profile_id:
+            raise HTTPException(status_code=400, detail="profile_id is required for deletion")
 
         logging.info(
             f"[API] Deleting embeddings for doc={doc_id}, "
             f"subscription={subscription_id}, "
+            f"profile={profile_id}, "
             f"status={doc.get('status')}"
         )
 
-        # Delete embeddings (only needs subscription_id and document_id)
+        # Delete embeddings scoped to subscription and profile
         result = delete_embeddings(
             subscription_id=subscription_id,
+            profile_id=profile_id,
             document_id=doc_id
         )
 
@@ -172,6 +185,7 @@ def delete_document_embeddings_api(
                 "status": "success",
                 "document_id": doc_id,
                 "subscription_id": subscription_id,
+                "profile_id": profile_id,
                 "message": result.get("message", "Embeddings deleted"),
                 "details": result
             }
@@ -180,6 +194,7 @@ def delete_document_embeddings_api(
             return {
                 "status": "success",
                 "document_id": doc_id,
+                "profile_id": profile_id,
                 "message": result.get("message", "No embeddings found to delete"),
                 "details": result
             }
