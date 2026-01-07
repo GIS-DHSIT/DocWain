@@ -21,6 +21,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from src.api.config import Config
 from src.api.enhanced_context_builder import IntelligentContextBuilder
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 # Configure logging
 logging.basicConfig(
@@ -38,7 +39,7 @@ _MODEL_CACHE: Dict[int, SentenceTransformer] = {}
 _METRICS_TRACKER = None
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
 ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
-ANSWER_CACHE_VERSION = "v2"
+ANSWER_CACHE_VERSION = "v3"
 
 
 def _parse_redis_connection_string(conn_str: str):
@@ -185,69 +186,50 @@ def get_qdrant_client():
 
 
 def get_redis_client():
-    """Lazy init for Redis client."""
+    """Lazy init for Redis client with comprehensive error handling."""
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
         try:
             conn_str = (
-                os.getenv("REDIS_URL")
-                or os.getenv("REDIS_CONNECTION_STRING")
-                or getattr(Config.Redis, "CONNECTION_STRING", "")
+                    os.getenv("REDIS_URL")
+                    or os.getenv("REDIS_CONNECTION_STRING")
+                    or getattr(Config.Redis, "CONNECTION_STRING", "")
             )
             parsed = _parse_redis_connection_string(conn_str)
 
             host = os.getenv("REDIS_HOST") or parsed["host"] or "localhost"
-            port = int(os.getenv("REDIS_PORT") or parsed["port"] or 6379)
+            port = int(os.getenv("REDIS_PORT") or parsed["port"] or 6380)  # Azure default
             username = (os.getenv("REDIS_USERNAME") or parsed.get("username") or "").strip() or None
             password = (os.getenv("REDIS_PASSWORD") or parsed.get("password") or "").strip() or None
 
-            ssl_enabled = parsed.get("ssl", False)
+            ssl_enabled = parsed.get("ssl", True)  # DEFAULT TRUE for Azure
             ssl_override = os.getenv("REDIS_SSL")
             if ssl_override is not None:
                 ssl_enabled = str(ssl_override).lower() in {"true", "1", "yes", "on"}
 
-            if conn_str.startswith(("redis://", "rediss://")) and not os.getenv("REDIS_HOST"):
-                _REDIS_CLIENT = redis.from_url(
-                    conn_str,
-                    db=Config.Redis.DB,
-                    decode_responses=True,
-                    socket_timeout=5,
-                )
-            else:
-                _REDIS_CLIENT = redis.Redis(
-                    host=host,
-                    port=port,
-                    username=username,
-                    password=password,
-                    db=Config.Redis.DB,
-                    decode_responses=True,
-                    socket_timeout=5,
-                    ssl=ssl_enabled,
-                )
-            # simple ping
-            _REDIS_CLIENT.ping()
-            logger.info(
-                "Initialized Redis client at %s:%s (ssl=%s)",
-                host,
-                port,
-                ssl_enabled
+            #  Try direct connection first
+            _REDIS_CLIENT = redis.Redis(
+                host=host,
+                port=port,
+                username=username,
+                password=password,
+                db=Config.Redis.DB,
+                decode_responses=True,
+                socket_timeout=10,  # Increased timeout
+                socket_connect_timeout=10,
+                ssl=ssl_enabled,
+                ssl_cert_reqs=None  # Don't verify certs for Azure
             )
+
+            #  Verify connection
+            _REDIS_CLIENT.ping()
+            logger.info(f"Redis connected: {host}:{port} (ssl={ssl_enabled})")
+
         except Exception as e:
-            logger.warning(f"Failed to initialize Redis client, attempting local fallback: {e}")
-            # Optional local fallback for dev/testing
-            try:
-                _REDIS_CLIENT = redis.Redis(
-                    host="localhost",
-                    port=6379,
-                    decode_responses=True,
-                    socket_timeout=3,
-                    ssl=False,
-                )
-                _REDIS_CLIENT.ping()
-                logger.info("Initialized Redis client using local fallback at localhost:6379")
-            except Exception as fallback_exc:
-                logger.warning(f"Local Redis fallback unavailable; caching disabled: {fallback_exc}")
-                _REDIS_CLIENT = None
+            logger.error(f" Redis connection failed: {e}")
+            logger.warning("RAG system will work WITHOUT caching/history persistence")
+            _REDIS_CLIENT = None  # Graceful degradation
+
     return _REDIS_CLIENT
 
 
@@ -266,12 +248,11 @@ def configure_gemini():
 
 @dataclass
 class RetrievedChunk:
-    """Data class for retrieved document chunks with metadata."""
     id: str
     text: str
     score: float
-    source: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: dict
+    method: str = "dense"
 
 
 @dataclass
@@ -622,7 +603,7 @@ class GreetingHandler:
 
 
 class OllamaClient:
-    """Handles local Ollama model calls with structured output and retries."""
+    """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = model_name or os.getenv("OLLAMA_MODEL", "llama3.2")
@@ -631,34 +612,45 @@ class OllamaClient:
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
 
     def generate(
-            self,
-            prompt: str,
-            max_retries: int = 3,
-            backoff: float = 1.0
+        self,
+        prompt: str,
+        max_retries: int = 3,
+        backoff: float = 1.0
     ) -> str:
-        """Generate response with retry logic and robust parsing."""
         for attempt in range(1, max_retries + 1):
             try:
-                response = ollama.generate(model=self.model_name, prompt=prompt)
+                response = ollama.generate(
+                    model=self.model_name,
+                    prompt=prompt,
+                    options={
+                        "temperature": 0.2,   #  LOWER = less hallucination
+                        "top_p": 0.85,
+                        "top_k": 40,
+                        "repeat_penalty": 1.1,
+                        "num_ctx": 4096
+                    }
+                )
+
                 text = (response.get("response") or "").strip()
-                if text:
-                    return text
-                logger.warning(f"No text in Ollama response: {response}")
-                return "I apologize, but I couldn't generate a proper response."
+
+                if not text:
+                    logger.warning(f"Ollama returned empty response: {response}")
+                    return "I don’t have enough information in the documents to answer that."
+
+                return text
+
             except Exception as e:
                 logger.warning(f"Ollama attempt {attempt}/{max_retries} failed: {e}")
                 if attempt < max_retries:
                     time.sleep(backoff * attempt)
                 else:
-                    logger.error(f"All retry attempts failed: {e}")
+                    logger.error(f"All Ollama retries failed")
                     raise
 
-        return "I apologize, but I encountered an error generating a response."
+        return "I’m unable to answer that based on the available information."
 
 
 class GeminiClient:
-    """Handles Gemini API calls with structured output and retries."""
-
     def __init__(self, model_name: Optional[str] = None):
         configure_gemini()
         self.model_name = model_name or Config.Model.GEMINI_MODEL_NAME
@@ -666,7 +658,7 @@ class GeminiClient:
             raise ValueError("Gemini model name is not configured")
         self.model = genai.GenerativeModel(self.model_name)
         self.generation_config = genai.GenerationConfig(
-            temperature=0.0,
+            temperature=0.3,  # ✅ OPTIMAL: 0.3 balances accuracy + fluency
             top_p=0.95,
             top_k=40,
             max_output_tokens=2048,
@@ -904,7 +896,7 @@ class QdrantRetriever:
             query: str,
             filter_profile: str = None,
             top_k: int = 50,
-            score_threshold: float = None
+            score_threshold: float = 0.10  # ✅ CHANGED FROM 0.15
     ) -> List[RetrievedChunk]:
         """Retrieve relevant chunks using Qdrant's native search."""
         try:
@@ -1510,6 +1502,8 @@ class MetricsTracker:
 class PromptBuilder:
     """Builds structured prompts with strict grounding and citation requirements."""
 
+    # In dw_newron.py, replace PromptBuilder.build_qa_prompt method (around line 1700)
+
     @staticmethod
     def build_qa_prompt(
             query: str,
@@ -1525,43 +1519,39 @@ class PromptBuilder:
         domain_block = f"\nDOMAIN ADAPTER:\n{domain_guidance}\n" if domain_guidance else ""
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
-        prompt = f"""You are a {persona} specialized in providing accurate, document-based answers with STRICT GROUNDING.
 
-CRITICAL RULES FOR GROUNDING:
-1. Answer ONLY using information explicitly stated in the DOCUMENT CONTEXT below
-2. You MUST cite sources using [SOURCE-X] notation for EVERY factual claim
-3. If information is not in the DOCUMENT CONTEXT, try to get the related insights on [specific topic]"
-4. NEVER add facts, opinions, estimates, or information not present in the DOCUMENT CONTEXT
-5. When quoting, use exact phrases from the DOCUMENT CONTEXT
-6. If the DOCUMENT CONTEXT provide partial information, state what is available and what is missing
-7. If DOCUMENT CONTEXT conflict, cite both sources and note the discrepancy
+        prompt = f"""You are a {persona} specialized in providing accurate, document-based answers.
 
-DOCUMENT CONTEXT:
-{context}
-{convo_block}
-{domain_block}
-{retrieval_block}
-{feedback_block}
+     CRITICAL CITATION RULES (VIOLATIONS = FAILURE):
+    1. EVERY factual statement MUST have [SOURCE-X] notation IMMEDIATELY after it
+    2. Answer ONLY using information explicitly in the DOCUMENT CONTEXT below
+    3. If information is NOT in documents, say: "The documents don't contain information about [topic]. Can you clarify which document to check?"
+    4. When quoting, use exact phrases from context and cite the source
+    5. For partial info, state what IS available and what's missing
+    6. If multiple sources support a claim, cite all: [SOURCE-1, SOURCE-2]
 
-USER QUESTION: {query}
+    DOCUMENT CONTEXT:
+    {context}
+    {convo_block}
+    {domain_block}
+    {retrieval_block}
+    {feedback_block}
 
-RESPONSE REQUIREMENTS:
-- Write in a natural, human tone; contractions are fine. Use 2-6 concise, vivid sentences.
-- Keep it conversational and approachable, like explaining to a teammate, but stay precise.
-- If sharing multiple facts, use short bullet lines with citations after each bullet.
-- Lead with the clearest direct answer; keep sentences short and active-voice.
-- Do NOT repeat or paraphrase the user question; go straight to the answer.
-- Lead with the direct answer; include brief reasoning or supporting evidence.
-- Cite sources using [SOURCE] notation after each factual claim or quoted phrase.
-- If information is partial, say what is known and what is missing (without generic disclaimers).
-- Avoid filler like "based on the available documents"; just state the supported facts.
-- NEVER speculate or add external knowledge.
-- If the question is ambiguous and the context is thin, ask one short clarifying question at the end (no citation needed for the question).
+    USER QUESTION: {query}
 
-Provide your grounded answer now:"""
+     ANSWER FORMAT (MANDATORY):
+    - Write 2-6 clear sentences in natural, conversational tone
+    - Place [SOURCE-X] citation IMMEDIATELY after each factual claim
+    - Example: "The Q4 revenue was $5M [SOURCE-1]. This represents 15% growth [SOURCE-2]."
+    - Start with the direct answer (don't restate the question)
+    - Use active voice and short sentences
+    - If using bullets, cite after each bullet
+    - If info is incomplete, acknowledge gaps WITHOUT generic disclaimers
+    - NEVER add facts not in the DOCUMENT CONTEXT above
+
+    Provide your answer with citations now:"""
 
         return prompt
-
 
 class ConversationSummarizer:
     """Summarizes the last few turns to keep context tight."""
@@ -1604,6 +1594,7 @@ class EnterpriseRAGSystem:
             model = get_model()
             cross_encoder = get_cross_encoder()
 
+            self.model = model
             self.client = qdrant_client
             self.retriever = QdrantRetriever(qdrant_client, model)
             self.reranker = HybridReranker(alpha=0.7, cross_encoder=cross_encoder)
@@ -1630,12 +1621,14 @@ class EnterpriseRAGSystem:
             logger.error(f"Failed to initialize EnterpriseRAGSystem: {e}")
             raise
 
+    # In dw_newron.py, line ~1800 in preprocess_query method
+
     def preprocess_query(
             self,
             query: str,
             user_id: str,
             namespace: str,
-            use_reformulation: bool = True
+            use_reformulation: bool = False  # ← CHANGED FROM True TO False
     ) -> Tuple[str, Dict[str, Any]]:
         """Preprocess query with normalization and optional reformulation."""
         metadata = {
@@ -1648,13 +1641,14 @@ class EnterpriseRAGSystem:
         processed_query = re.sub(r"\s+", " ", query or "").strip()
         metadata['normalized'] = processed_query
 
-        # Reformulate for vaguer prompts to tighten intent
-        if use_reformulation and len(processed_query.split()) >= 4:
-            conv_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
-            reformulated = self.query_reformulator.reformulate(processed_query, conv_context)
-            if reformulated and reformulated != processed_query:
-                processed_query = reformulated
-                metadata['reformulated'] = True
+        # DISABLED: Reformulation causing semantic drift
+        # Uncomment only if you need it for specific use cases
+        # if use_reformulation and len(processed_query.split()) >= 4:
+        #     conv_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
+        #     reformulated = self.query_reformulator.reformulate(processed_query, conv_context)
+        #     if reformulated and reformulated != processed_query:
+        #         processed_query = reformulated
+        #         metadata['reformulated'] = True
 
         return processed_query, metadata
 
@@ -1666,6 +1660,7 @@ class EnterpriseRAGSystem:
         if len(chunks) >= min_hits:
             return True
         top_score = float(chunks[0].score)
+
         return top_score >= min_score
 
     @staticmethod
@@ -1694,6 +1689,91 @@ class EnterpriseRAGSystem:
         contextual_query = " ; ".join([query] + extras)
         return contextual_query, {"profile_keywords_used": keywords, "profile_hints_used": hints}
 
+
+    def extract_person_name_from_query(self, query: str) -> Optional[str]:
+        """
+        Extract person's name from query to filter by specific document.
+        """
+        import re
+
+        if not query:
+            return None
+
+        query = query.strip()
+
+        patterns = [
+            # education/skills/experience of Name
+            r'\b(?:education|skills?|experience|background|qualification|details?)\s+of\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})',
+
+            # Name's education / skills
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})[\'’]s\s+(?:education|skills?|experience)',
+
+            # tell me about Name
+            r'\btell\s+me\s+about\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, query, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+
+        return None
+
+    def find_document_id_by_name(
+            self,
+            collection_name: str,
+            person_name: str,
+            profile_id: str
+    ) -> str | None:
+        try:
+            #  Encode name
+            query_vector = self.model.encode(
+                person_name,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype(np.float32).tolist()
+
+            #  Build filter (CORRECT way)
+            qdrant_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="profile_id",
+                        match=MatchValue(value=str(profile_id))
+                    )
+                ]
+            )
+
+            #  Call Qdrant
+            results = self.client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                using="content_vector",  # ✅ REQUIRED
+                query_filter=qdrant_filter,
+                limit=10,
+                with_payload=True,
+                with_vectors=False
+            )
+
+            #  Validate response
+            if not results or not results.points:
+                return None
+
+            #  Extract matching document_id
+            for pt in results.points:
+                payload = pt.payload or {}
+                text = payload.get("text", "").lower()
+                source = payload.get("source_file", "").lower()
+
+                for part in person_name.lower().split():
+                    if part in text or part in source:
+                        return payload.get("document_id")
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error finding document by name '{person_name}': {e}")
+            return None
+
     def retrieve_with_priorities(
             self,
             query: str,
@@ -1704,8 +1784,7 @@ class EnterpriseRAGSystem:
             top_k_retrieval: int = 50
     ) -> Dict[str, Any]:
         """
-        Try Qdrant retrieval first, fall back to relaxed thresholds, then chat-history
-        reformulation as a last resort.
+        Try Qdrant retrieval with smart document filtering for person-specific queries.
         """
         profile_context = self.retriever.get_profile_context(collection_name, profile_id)
         profile_context_data = {
@@ -1714,103 +1793,180 @@ class EnterpriseRAGSystem:
             "sampled_chunks": profile_context.total_chunks
         }
 
+        #  NEW: Extract person name and find their document
+        person_name = self.extract_person_name_from_query(query)
+        target_document_id = None
+
+        if person_name:
+            logger.info(f" Detected person-specific query for: '{person_name}'")
+            target_document_id = self.find_document_id_by_name(collection_name, person_name, profile_id)
+
+            if target_document_id:
+                logger.info(f" Will filter results to document: {target_document_id}")
+            else:
+                logger.warning(f" Could not find document for '{person_name}' - will search all docs")
+
         is_vague = self._is_query_vague(query)
         primary_min_hits = 2 if is_vague else 3
-        primary_min_score = 0.12 if is_vague else 0.18
-        primary_threshold = 0.18 if is_vague else 0.25
+        primary_min_score = 0.10 if is_vague else 0.15  # Lowered thresholds
+        primary_threshold = 0.12 if is_vague else 0.18  # Lowered thresholds
 
         attempt_records = []
         retrieval_runs = []
 
-        def run_attempt(label: str, query_text: str, threshold: Optional[float], use_history: bool,
-                        metadata: Dict[str, Any], profile_filter: Optional[str]):
-            chunks = self.retriever.retrieve(
-                collection_name=collection_name,
-                filter_profile=profile_filter,
-                query=query_text,
-                top_k=top_k_retrieval,
-                score_threshold=threshold
-            )
+        def run_attempt(label: str, query_text: str, threshold: Optional[float],
+                        metadata: Dict[str, Any], profile_filter: Optional[str],
+                        doc_filter: Optional[str] = None):  # NEW parameter
+
+            #  Build filter with document_id
+            must_conditions = []
+
+            if profile_filter:
+                must_conditions.append(
+                    FieldCondition(
+                        key="profile_id",
+                        match=MatchValue(value=str(profile_filter))
+                    )
+                )
+
+            if doc_filter:
+                must_conditions.append(
+                    FieldCondition(
+                        key="document_id",
+                        match=MatchValue(value=str(doc_filter))
+                    )
+                )
+
+            query_filter = Filter(must=must_conditions) if must_conditions else None
+
+            # Embed query
+            query_vector = self.model.encode(
+                query_text,
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype(np.float32).tolist()
+
+            # Search
+            kwargs = {
+                "collection_name": collection_name,
+                "query": query_vector,
+                "using": "content_vector",
+                "limit": top_k_retrieval,
+                "with_payload": True,
+                "with_vectors": False
+            }
+
+            if query_filter:
+                kwargs["query_filter"] = query_filter
+            if threshold is not None:
+                kwargs["score_threshold"] = threshold
+
+            results = self.client.query_points(**kwargs)
+
+            chunks = []
+            for pt in (results.points or []):
+                payload = pt.payload or {}
+                chunks.append(
+                    RetrievedChunk(
+                        id=str(pt.id),
+                        text=payload.get("text", ""),
+                        score=float(pt.score),
+                        metadata=payload,
+                        method="dense"
+                    )
+                )
+
             top_score = float(chunks[0].score) if chunks else 0.0
+
             record = {
                 "label": label,
                 "query": query_text,
                 "score_threshold": threshold,
                 "hits": len(chunks),
                 "top_score": round(top_score, 4),
-                "used_history": use_history,
-                "profile_filter": profile_filter
+                "profile_filter": profile_filter,
+                "document_filter": doc_filter  # Track document filter
             }
             attempt_records.append(record)
             retrieval_runs.append((chunks, record, metadata, query_text))
+
+            logger.info(f" {label}: {len(chunks)} hits, top_score={round(top_score, 4)}, doc_filter={doc_filter}")
             return chunks
 
+        #  STRATEGY 1: Direct search with document filter (if person detected)
         primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=False)
         primary_metadata["vague_query"] = is_vague
         primary_metadata["profile_context"] = profile_context_data
+        primary_metadata["person_name"] = person_name
+        primary_metadata["target_document_id"] = target_document_id
 
-        primary_chunks = run_attempt("direct_qdrant", primary_query, primary_threshold, False, primary_metadata, profile_id)
+        primary_chunks = run_attempt(
+            "document_filtered",
+            primary_query,
+            primary_threshold,
+            primary_metadata,
+            profile_id,
+            target_document_id  # Pass document filter
+        )
+
         if self._is_retrieval_sufficient(primary_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
             return {
                 "chunks": primary_chunks,
                 "query": primary_query,
                 "metadata": primary_metadata,
                 "attempts": attempt_records,
-                "selected_strategy": "direct_qdrant",
+                "selected_strategy": "document_filtered",
                 "profile_context": profile_context_data
             }
 
-        contextual_query, contextual_meta = self._contextualize_query(primary_query, profile_context)
-        if contextual_query != primary_query:
-            contextual_metadata = {**primary_metadata, **contextual_meta, "contextualized": True}
-            contextual_threshold = 0.15 if is_vague else 0.2
-            contextual_chunks = run_attempt("contextual_qdrant", contextual_query, contextual_threshold, False,
-                                            contextual_metadata, profile_id)
-            if self._is_retrieval_sufficient(contextual_chunks, min_hits=primary_min_hits,
-                                             min_score=primary_min_score):
+        #  STRATEGY 2: Fallback without document filter (if filter was too restrictive)
+        if target_document_id:
+            logger.warning(" Document filter too restrictive, trying without it")
+            fallback_chunks = run_attempt(
+                "no_doc_filter",
+                primary_query,
+                primary_threshold,
+                primary_metadata,
+                profile_id,
+                None  # Remove document filter
+            )
+
+            if self._is_retrieval_sufficient(fallback_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
                 return {
-                    "chunks": contextual_chunks,
-                    "query": contextual_query,
-                    "metadata": contextual_metadata,
+                    "chunks": fallback_chunks,
+                    "query": primary_query,
+                    "metadata": primary_metadata,
                     "attempts": attempt_records,
-                    "selected_strategy": "contextual_qdrant",
+                    "selected_strategy": "no_doc_filter",
                     "profile_context": profile_context_data
                 }
 
-        relaxed_chunks = run_attempt("relaxed_qdrant", primary_query, None, False, primary_metadata, profile_id)
+        #  STRATEGY 3: No threshold (last resort)
+        relaxed_chunks = run_attempt(
+            "no_threshold",
+            primary_query,
+            None,
+            primary_metadata,
+            profile_id,
+            target_document_id  # Try with doc filter again
+        )
+
         if self._is_retrieval_sufficient(relaxed_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
             return {
                 "chunks": relaxed_chunks,
                 "query": primary_query,
                 "metadata": primary_metadata,
                 "attempts": attempt_records,
-                "selected_strategy": "relaxed_qdrant",
+                "selected_strategy": "no_threshold",
                 "profile_context": profile_context_data
             }
 
-        best_hits = max((rec.get("hits", 0) for rec in attempt_records), default=0)
-        best_score = max((rec.get("top_score", 0.0) for rec in attempt_records), default=0.0)
-        history_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
-        should_try_history = bool(history_context.strip()) and best_hits < primary_min_hits and best_score < primary_min_score
-
-        if should_try_history:
-            history_query, history_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=True)
-            history_metadata["profile_context"] = profile_context_data
-            history_metadata["history_fallback"] = True
-            if history_query != primary_query or history_metadata.get("reformulated"):
-                history_chunks = run_attempt("history_guided", history_query, None, True, history_metadata, profile_id)
-                if self._is_retrieval_sufficient(history_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
-                    return {
-                        "chunks": history_chunks,
-                        "query": history_query,
-                        "metadata": history_metadata,
-                        "attempts": attempt_records,
-                        "selected_strategy": "history_guided",
-                        "profile_context": profile_context_data
-                    }
-
+        # Return best result
         best_run = max(retrieval_runs, key=lambda r: r[1]["top_score"], default=None)
-        selected_chunks, selected_record, selected_meta, selected_query = best_run if best_run else ([], {}, primary_metadata, primary_query)
+        selected_chunks, selected_record, selected_meta, selected_query = best_run if best_run else ([], {},
+                                                                                                     primary_metadata,
+                                                                                                     primary_query)
+
         return {
             "chunks": selected_chunks,
             "query": selected_query,
@@ -1819,6 +1975,7 @@ class EnterpriseRAGSystem:
             "selected_strategy": selected_record.get("label", "none"),
             "profile_context": profile_context_data
         }
+
 
     def _warm_up_llm(self):
         """Warm LLM backend so first user calls do not fail cold."""
@@ -1837,8 +1994,8 @@ class EnterpriseRAGSystem:
             user_id: str,
             persona: str = "professional document analysis assistant",
             top_k_retrieval: int = 50,
-            top_k_rerank: int = 10,
-            final_k: int = 3
+            top_k_rerank: int = 15,  # ✅ INCREASED FROM 10
+            final_k: int = 7  # ✅ INCREASED FROM 3
     ) -> Dict[str, Any]:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
@@ -1935,10 +2092,14 @@ class EnterpriseRAGSystem:
             if cache:
                 cache_key = (
                     f"rag:{ANSWER_CACHE_VERSION}:"
-                    f"{_slug(collection_name)}:{_slug(profile_id)}:"
-                    f"{_slug(self.model_name)}:{_slug(persona)}:"
-                    f"{selected_strategy}:{memory_fingerprint}:{profile_context_fingerprint}:"
-                    f"{hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
+                    f"sub={_slug(subscription_id)}:"  # ✅ Added subscription
+                    f"col={_slug(collection_name)}:"
+                    f"prof={_slug(profile_id)}:"
+                    f"usr={hashlib.md5(user_id.encode('utf-8')).hexdigest()[:8]}:"  # ✅ Added user
+                    f"model={_slug(self.model_name)}:"
+                    f"strat={selected_strategy}:"
+                    f"mem={memory_fingerprint[:8]}:"  # ✅ Shortened to avoid key bloat
+                    f"q={hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
                 )
                 cached = cache.get(cache_key)
                 if cached:
@@ -2035,8 +2196,8 @@ class EnterpriseRAGSystem:
                 )
                 reranked_chunks = sorted(reranked_chunks, key=lambda c: float(c.score), reverse=True)
 
-            config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", final_k or 3)
-            context_chunk_limit = max(final_k or 0, config_context_limit)
+            config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)  # ✅ default 7
+            context_chunk_limit = max(final_k or 7, config_context_limit)  # ✅ default 7
             context_chunk_limit = min(context_chunk_limit, len(reranked_chunks))
             final_chunks = reranked_chunks[:context_chunk_limit]
 
@@ -2072,13 +2233,22 @@ class EnterpriseRAGSystem:
             adapter_text = DomainPromptAdapter.build_adapter(profile_context_data, query)
             feedback_text = self.feedback_memory.build_feedback_context(namespace, user_id, limit=5)
 
-            is_answerable, answerability_reason = self.answerability_detector.check_answerability(
-                query, context, has_chunks=bool(final_chunks)
-            )
+            # ✅ FIXED: Skip answerability check when we have retrieved chunks
+            if final_chunks and context.strip():
+                # We have context - let LLM decide if it can answer
+                is_answerable = True
+                answerability_reason = "Context available from retrieved chunks"
+                logger.info("✅ Skipping answerability check - have valid context")
+            else:
+                # Only check when no chunks retrieved
+                is_answerable, answerability_reason = self.answerability_detector.check_answerability(
+                    query, context, has_chunks=bool(final_chunks)
+                )
 
-            if not is_answerable:
+            # ✅ FIXED: Only block if we truly have NO context at all
+            if not is_answerable and not final_chunks:
                 not_answerable_response = (
-                    f"I don't have enough detail in the documents to answer that. {answerability_reason} "
+                    f"I don't have enough detail in the documents to answer that. "
                     "If you can point me to a specific document or section, I can check again."
                 )
                 self.conversation_history.add_turn(namespace, user_id, query, not_answerable_response)
@@ -2089,13 +2259,13 @@ class EnterpriseRAGSystem:
                         subscription_id=subscription_id,
                         profile_id=profile_id,
                         query_type="not_answerable",
-                        context_found=True,
+                        context_found=False,  # ✅ Changed to False (no chunks)
                         grounded=False,
                         cached=False,
                         processing_time=time.time() - start_time,
-                        retrieval_stats=retrieval_plan.get("retrieval_stats") or {
+                        retrieval_stats={
                             "initial_retrieved": len(retrieved_chunks),
-                            "final_context": len(final_chunks),
+                            "final_context": 0  # ✅ Changed to 0 (no final chunks)
                         }
                     )
                 except Exception as metric_exc:
@@ -2103,17 +2273,17 @@ class EnterpriseRAGSystem:
 
                 return {
                     "response": not_answerable_response,
-                    "sources": context_sources,
+                    "sources": [],  # ✅ Changed to empty (no sources)
                     "user_id": user_id,
                     "collection": collection_name,
-                    "context_found": True,
+                    "context_found": False,  # ✅ Changed to False
                     "query_type": "not_answerable",
                     "answerability_reason": answerability_reason,
                     "preprocessing": preprocessing_metadata,
                     "retrieval_attempts": retrieval_attempts,
                     "selected_strategy": selected_strategy,
                     "profile_context": profile_context_data,
-                    "grounded": True,
+                    "grounded": False,  # ✅ Changed to False (couldn't answer)
                     "processing_time": time.time() - start_time
                 }
 
