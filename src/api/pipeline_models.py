@@ -1,0 +1,51 @@
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+
+@dataclass
+class Section:
+    section_id: str
+    title: str
+    level: int
+    start_page: int
+    end_page: int
+    text: str
+
+
+@dataclass
+class Table:
+    page: int
+    text: str
+    csv: Optional[str] = None
+
+
+@dataclass
+class Figure:
+    page: int
+    caption: str
+
+
+@dataclass
+class ChunkCandidate:
+    text: str
+    page: Optional[int]
+    section_title: str
+    section_id: Optional[str]
+    chunk_type: str = "text"
+
+
+@dataclass
+class ExtractedDocument:
+    full_text: str
+    sections: List[Section]
+    tables: List[Table]
+    figures: List[Figure]
+    chunk_candidates: List[ChunkCandidate]
+
+
+@dataclass
+class ChunkRecord:
+    chunk_id: str
+    dense_vector: List[float]
+    sparse_vector: Optional[Any]
+    payload: Dict[str, Any]

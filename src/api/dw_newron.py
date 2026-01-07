@@ -10,7 +10,7 @@ from collections import deque, Counter
 from datetime import datetime, timedelta
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct
+from qdrant_client.models import Distance, PointStruct, SparseVector
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import ollama
 import os
@@ -21,7 +21,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from src.api.config import Config
 from src.api.enhanced_context_builder import IntelligentContextBuilder
-from qdrant_client.models import Filter, FieldCondition, MatchValue
+from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
+from sklearn.feature_extraction.text import HashingVectorizer
+from src.api.vector_store import build_collection_name
 
 # Configure logging
 logging.basicConfig(
@@ -122,7 +124,9 @@ def _build_namespace(subscription_id: str, profile_id: str, model_name: str = ""
 
 
 def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransformer:
-    candidates = [getattr(Config.Model, "SENTENCE_TRANSFORMERS", "sentence-transformers/all-mpnet-base-v2")]
+    candidates = [getattr(Config.Model, "EMBEDDING_MODEL", None) or getattr(
+        Config.Model, "SENTENCE_TRANSFORMERS", "BAAI/bge-large-en-v1.5"
+    )]
     last_error = None
     for name in candidates:
         try:
@@ -159,12 +163,16 @@ def get_cross_encoder():
     """Lazy load cross encoder model."""
     global _CROSS_ENCODER
     if _CROSS_ENCODER is None:
+        model_name = getattr(Config.Model, "RERANKER_MODEL", "")
+        if not model_name:
+            logger.info("Cross-encoder reranker disabled via configuration")
+            return None
         try:
-            _CROSS_ENCODER = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-            logger.info("Loaded cross-encoder model")
-        except Exception as e:
-            logger.error(f"Failed to load cross-encoder: {e}")
-            raise
+            _CROSS_ENCODER = CrossEncoder(model_name)
+            logger.info("Loaded cross-encoder model: %s", model_name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to load cross-encoder '{model_name}', continuing without reranker: {e}")
+            _CROSS_ENCODER = None
     return _CROSS_ENCODER
 
 
@@ -830,6 +838,82 @@ class QdrantRetriever:
         self.preprocessor = TextPreprocessor()
         self.profile_context_cache: Dict[Tuple[str, str], ProfileContextSnapshot] = {}
         self.collection_dims: Dict[str, int] = {}
+        self._hash_vectorizer = HashingVectorizer(
+            n_features=4096,
+            alternate_sign=False,
+            norm="l2",
+            ngram_range=(1, 2),
+            stop_words="english",
+        )
+
+    @staticmethod
+    def _ensure_profile(profile_id: Optional[str]):
+        if not profile_id:
+            logger.error("Security: retrieval attempted without profile_id filter")
+            raise ValueError("profile_id is required for retrieval to enforce isolation")
+
+    def _build_filter(
+        self, profile_id: str, document_ids: Optional[List[str]] = None, source_files: Optional[List[str]] = None
+    ) -> Filter:
+        self._ensure_profile(profile_id)
+        conditions = [
+            FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
+        ]
+        if document_ids:
+            conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
+        if source_files:
+            conditions.append(FieldCondition(key="source_file", match=MatchAny(any=[str(s) for s in source_files])))
+        return Filter(must=conditions)
+
+    def _build_sparse_query(self, query: str) -> SparseVector:
+        matrix = self._hash_vectorizer.transform([query])
+        coo = matrix.tocoo()
+        return SparseVector(indices=coo.col.tolist(), values=coo.data.astype(np.float32).tolist())
+
+    @staticmethod
+    def _points_to_chunks(results, method: str) -> List[RetrievedChunk]:
+        chunks: List[RetrievedChunk] = []
+        points = []
+        if hasattr(results, "points"):
+            points = results.points or []
+        elif isinstance(results, tuple) and results:
+            points = results[0] or []
+
+        for pt in points:
+            payload = pt.payload or {}
+            chunks.append(
+                RetrievedChunk(
+                    id=str(pt.id),
+                    text=payload.get("text", ""),
+                    score=float(pt.score),
+                    metadata=payload,
+                    method=method,
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _rrf_merge(dense: List[RetrievedChunk], sparse: List[RetrievedChunk], k: int = 60) -> List[RetrievedChunk]:
+        scored: Dict[str, RetrievedChunk] = {}
+        weights = getattr(Config.Retrieval, "HYBRID_WEIGHTS", {"dense": 0.6, "sparse": 0.4})
+        dense_w = float(weights.get("dense", 0.6))
+        sparse_w = float(weights.get("sparse", 0.4))
+
+        for rank, chunk in enumerate(dense, start=1):
+            score = dense_w * (1.0 / (k + rank))
+            scored.setdefault(chunk.id, chunk)
+            scored[chunk.id].score = scored[chunk.id].score + score if scored[chunk.id].score else score
+
+        for rank, chunk in enumerate(sparse, start=1):
+            score = sparse_w * (1.0 / (k + rank))
+            if chunk.id in scored:
+                scored[chunk.id].score += score
+                scored[chunk.id].metadata.setdefault("methods", []).append("sparse")
+            else:
+                chunk.score = score
+                scored[chunk.id] = chunk
+
+        return sorted(scored.values(), key=lambda c: float(c.score), reverse=True)
 
     def run_search(
             self,
@@ -900,6 +984,7 @@ class QdrantRetriever:
     ) -> List[RetrievedChunk]:
         """Retrieve relevant chunks using Qdrant's native search."""
         try:
+            self._ensure_profile(filter_profile)
             target_dim = self.get_collection_vector_dim(collection_name)
             model = get_model(required_dim=target_dim)
             q_dim = getattr(model, "get_sentence_embedding_dimension", lambda: None)()
@@ -916,12 +1001,7 @@ class QdrantRetriever:
 
         logger.info(f"Searching collection '{collection_name}' for query: {query[:100]}")
 
-        profile_filter_val = str(filter_profile).strip() if filter_profile is not None else None
-        filter_clauses = []
-        if profile_filter_val:
-            filter_clauses.append({"key": "profile_id", "match": {"value": profile_filter_val}})
-
-        query_filter = {"must": filter_clauses} if filter_clauses else None
+        query_filter = self._build_filter(str(filter_profile))
 
         results = self.run_search(
             collection_name=collection_name,
@@ -956,6 +1036,51 @@ class QdrantRetriever:
             chunks.append(chunk)
 
         return chunks
+
+    def hybrid_retrieve(
+            self,
+            collection_name: str,
+            query: str,
+            profile_id: str,
+            top_k: int = 50,
+            document_ids: Optional[List[str]] = None,
+            source_files: Optional[List[str]] = None,
+            score_threshold: float = 0.05,
+    ) -> List[RetrievedChunk]:
+        """Hybrid dense + sparse retrieval with reciprocal rank fusion."""
+        self._ensure_profile(profile_id)
+        query_filter = self._build_filter(profile_id, document_ids=document_ids, source_files=source_files)
+
+        target_dim = self.get_collection_vector_dim(collection_name)
+        model = get_model(required_dim=target_dim)
+        dense_vector = model.encode(query, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32).tolist()
+        sparse_vector = self._build_sparse_query(query)
+
+        dense_results = self.run_search(
+            collection_name=collection_name,
+            query_vector=dense_vector,
+            query_filter=query_filter,
+            limit=top_k,
+            vector_name="content_vector",
+            score_threshold=score_threshold,
+        )
+        sparse_results = self.run_search(
+            collection_name=collection_name,
+            query_vector=sparse_vector,
+            query_filter=query_filter,
+            limit=top_k,
+            vector_name="keywords_vector",
+            score_threshold=None,
+        )
+
+        dense_chunks = self._points_to_chunks(dense_results, method="dense")
+        sparse_chunks = self._points_to_chunks(sparse_results, method="sparse")
+
+        if not dense_chunks and not sparse_chunks:
+            return []
+
+        merged = self._rrf_merge(dense_chunks, sparse_chunks)
+        return merged[:top_k]
 
     def expand_with_neighbors(
             self,
@@ -1628,27 +1753,31 @@ class EnterpriseRAGSystem:
             query: str,
             user_id: str,
             namespace: str,
-            use_reformulation: bool = False  # ← CHANGED FROM True TO False
+            use_reformulation: bool = True
     ) -> Tuple[str, Dict[str, Any]]:
         """Preprocess query with normalization and optional reformulation."""
         metadata = {
             'original_query': query,
             'corrections': [],
             'reformulated': False,
-            'expanded': False
+            'expanded': False,
+            'intent': self._detect_intent(query)
         }
 
         processed_query = re.sub(r"\s+", " ", query or "").strip()
         metadata['normalized'] = processed_query
 
-        # DISABLED: Reformulation causing semantic drift
-        # Uncomment only if you need it for specific use cases
-        # if use_reformulation and len(processed_query.split()) >= 4:
-        #     conv_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
-        #     reformulated = self.query_reformulator.reformulate(processed_query, conv_context)
-        #     if reformulated and reformulated != processed_query:
-        #         processed_query = reformulated
-        #         metadata['reformulated'] = True
+        if use_reformulation and self._is_query_vague(processed_query):
+            conv_context = self.conversation_history.get_context(namespace, user_id, max_turns=2)
+            reformulated = self.query_reformulator.reformulate(processed_query, conv_context)
+            if reformulated and reformulated != processed_query:
+                processed_query = reformulated
+                metadata['reformulated'] = True
+
+        expanded = self._expand_query_terms(processed_query)
+        if expanded and expanded != processed_query:
+            processed_query = expanded
+            metadata['expanded'] = True
 
         return processed_query, metadata
 
@@ -1671,6 +1800,34 @@ class EnterpriseRAGSystem:
             return True
         meaningful_tokens = [t for t in tokens if len(t) > 3]
         return len(meaningful_tokens) <= 2
+
+    @staticmethod
+    def _detect_intent(query: str) -> str:
+        q = query.lower()
+        if any(word in q for word in ["how", "steps", "procedure", "configure", "setup"]):
+            return "procedural"
+        if any(word in q for word in ["error", "issue", "fail", "troubleshoot", "bug"]):
+            return "troubleshooting"
+        if any(word in q for word in ["difference", "compare", "vs", "versus", "comparison"]):
+            return "comparison"
+        return "factual"
+
+    @staticmethod
+    def _expand_query_terms(query: str) -> str:
+        synonyms = {
+            "install": ["setup", "configure"],
+            "error": ["failure", "issue", "exception"],
+            "policy": ["guideline", "rule", "standard"],
+            "process": ["procedure", "workflow"],
+        }
+        additions = []
+        lower_q = query.lower()
+        for term, syns in synonyms.items():
+            if term in lower_q:
+                additions.extend(syns)
+        if additions:
+            return query + " " + " ".join(additions)
+        return query
 
     @staticmethod
     def _contextualize_query(query: str, profile_context: ProfileContextSnapshot) -> Tuple[str, Dict[str, Any]]:
@@ -1784,8 +1941,11 @@ class EnterpriseRAGSystem:
             top_k_retrieval: int = 50
     ) -> Dict[str, Any]:
         """
-        Try Qdrant retrieval with smart document filtering for person-specific queries.
+        Hybrid retrieval with mandatory profile filters, query rewriting, and intent detection.
         """
+        if not profile_id:
+            raise ValueError("profile_id is required for retrieval")
+
         profile_context = self.retriever.get_profile_context(collection_name, profile_id)
         profile_context_data = {
             "keywords": profile_context.top_keywords[:12],
@@ -1793,7 +1953,6 @@ class EnterpriseRAGSystem:
             "sampled_chunks": profile_context.total_chunks
         }
 
-        #  NEW: Extract person name and find their document
         person_name = self.extract_person_name_from_query(query)
         target_document_id = None
 
@@ -1807,173 +1966,56 @@ class EnterpriseRAGSystem:
                 logger.warning(f" Could not find document for '{person_name}' - will search all docs")
 
         is_vague = self._is_query_vague(query)
-        primary_min_hits = 2 if is_vague else 3
-        primary_min_score = 0.10 if is_vague else 0.15  # Lowered thresholds
-        primary_threshold = 0.12 if is_vague else 0.18  # Lowered thresholds
-
         attempt_records = []
-        retrieval_runs = []
 
-        def run_attempt(label: str, query_text: str, threshold: Optional[float],
-                        metadata: Dict[str, Any], profile_filter: Optional[str],
-                        doc_filter: Optional[str] = None):  # NEW parameter
-
-            #  Build filter with document_id
-            must_conditions = []
-
-            if profile_filter:
-                must_conditions.append(
-                    FieldCondition(
-                        key="profile_id",
-                        match=MatchValue(value=str(profile_filter))
-                    )
-                )
-
-            if doc_filter:
-                must_conditions.append(
-                    FieldCondition(
-                        key="document_id",
-                        match=MatchValue(value=str(doc_filter))
-                    )
-                )
-
-            query_filter = Filter(must=must_conditions) if must_conditions else None
-
-            # Embed query
-            query_vector = self.model.encode(
-                query_text,
-                convert_to_numpy=True,
-                normalize_embeddings=True
-            ).astype(np.float32).tolist()
-
-            # Search
-            kwargs = {
-                "collection_name": collection_name,
-                "query": query_vector,
-                "using": "content_vector",
-                "limit": top_k_retrieval,
-                "with_payload": True,
-                "with_vectors": False
-            }
-
-            if query_filter:
-                kwargs["query_filter"] = query_filter
-            if threshold is not None:
-                kwargs["score_threshold"] = threshold
-
-            results = self.client.query_points(**kwargs)
-
-            chunks = []
-            for pt in (results.points or []):
-                payload = pt.payload or {}
-                chunks.append(
-                    RetrievedChunk(
-                        id=str(pt.id),
-                        text=payload.get("text", ""),
-                        score=float(pt.score),
-                        metadata=payload,
-                        method="dense"
-                    )
-                )
-
-            top_score = float(chunks[0].score) if chunks else 0.0
-
-            record = {
-                "label": label,
-                "query": query_text,
-                "score_threshold": threshold,
-                "hits": len(chunks),
-                "top_score": round(top_score, 4),
-                "profile_filter": profile_filter,
-                "document_filter": doc_filter  # Track document filter
-            }
-            attempt_records.append(record)
-            retrieval_runs.append((chunks, record, metadata, query_text))
-
-            logger.info(f" {label}: {len(chunks)} hits, top_score={round(top_score, 4)}, doc_filter={doc_filter}")
-            return chunks
-
-        #  STRATEGY 1: Direct search with document filter (if person detected)
-        primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=False)
+        primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=True)
         primary_metadata["vague_query"] = is_vague
         primary_metadata["profile_context"] = profile_context_data
         primary_metadata["person_name"] = person_name
         primary_metadata["target_document_id"] = target_document_id
 
-        primary_chunks = run_attempt(
-            "document_filtered",
-            primary_query,
-            primary_threshold,
-            primary_metadata,
-            profile_id,
-            target_document_id  # Pass document filter
+        chunks = self.retriever.hybrid_retrieve(
+            collection_name=collection_name,
+            query=primary_query,
+            profile_id=profile_id,
+            top_k=top_k_retrieval,
+            document_ids=[target_document_id] if target_document_id else None,
+        )
+        attempt_records.append(
+            {
+                "label": "hybrid",
+                "query": primary_query,
+                "hits": len(chunks),
+                "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
+                "document_filter": target_document_id,
+            }
         )
 
-        if self._is_retrieval_sufficient(primary_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
-            return {
-                "chunks": primary_chunks,
-                "query": primary_query,
-                "metadata": primary_metadata,
-                "attempts": attempt_records,
-                "selected_strategy": "document_filtered",
-                "profile_context": profile_context_data
-            }
-
-        #  STRATEGY 2: Fallback without document filter (if filter was too restrictive)
-        if target_document_id:
-            logger.warning(" Document filter too restrictive, trying without it")
-            fallback_chunks = run_attempt(
-                "no_doc_filter",
-                primary_query,
-                primary_threshold,
-                primary_metadata,
-                profile_id,
-                None  # Remove document filter
+        if not chunks and target_document_id:
+            chunks = self.retriever.hybrid_retrieve(
+                collection_name=collection_name,
+                query=primary_query,
+                profile_id=profile_id,
+                top_k=top_k_retrieval,
+                document_ids=None,
+            )
+            attempt_records.append(
+                {
+                    "label": "hybrid_no_doc_filter",
+                    "query": primary_query,
+                    "hits": len(chunks),
+                    "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
+                    "document_filter": None,
+                }
             )
 
-            if self._is_retrieval_sufficient(fallback_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
-                return {
-                    "chunks": fallback_chunks,
-                    "query": primary_query,
-                    "metadata": primary_metadata,
-                    "attempts": attempt_records,
-                    "selected_strategy": "no_doc_filter",
-                    "profile_context": profile_context_data
-                }
-
-        #  STRATEGY 3: No threshold (last resort)
-        relaxed_chunks = run_attempt(
-            "no_threshold",
-            primary_query,
-            None,
-            primary_metadata,
-            profile_id,
-            target_document_id  # Try with doc filter again
-        )
-
-        if self._is_retrieval_sufficient(relaxed_chunks, min_hits=primary_min_hits, min_score=primary_min_score):
-            return {
-                "chunks": relaxed_chunks,
-                "query": primary_query,
-                "metadata": primary_metadata,
-                "attempts": attempt_records,
-                "selected_strategy": "no_threshold",
-                "profile_context": profile_context_data
-            }
-
-        # Return best result
-        best_run = max(retrieval_runs, key=lambda r: r[1]["top_score"], default=None)
-        selected_chunks, selected_record, selected_meta, selected_query = best_run if best_run else ([], {},
-                                                                                                     primary_metadata,
-                                                                                                     primary_query)
-
         return {
-            "chunks": selected_chunks,
-            "query": selected_query,
-            "metadata": selected_meta,
+            "chunks": chunks,
+            "query": primary_query,
+            "metadata": primary_metadata,
             "attempts": attempt_records,
-            "selected_strategy": selected_record.get("label", "none"),
-            "profile_context": profile_context_data
+            "selected_strategy": "hybrid",
+            "profile_context": profile_context_data,
         }
 
 
@@ -2001,7 +2043,9 @@ class EnterpriseRAGSystem:
         start_time = time.time()
 
         try:
-            collection_name = f"{subscription_id}".replace(" ", "_")
+            if not profile_id:
+                raise ValueError("profile_id is required for retrieval")
+            collection_name = build_collection_name(subscription_id, profile_id)
             namespace = _build_namespace(subscription_id, profile_id, self.model_name)
             metrics = get_metrics_tracker()
 
@@ -2507,7 +2551,7 @@ def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[
         Collection statistics
     """
     try:
-        collection_name = f"{subscription_id}".replace(" ", "_")
+        collection_name = build_collection_name(subscription_id, profile_id)
         qdrant_client = get_qdrant_client()
         collection_info = qdrant_client.get_collection(collection_name)
 
