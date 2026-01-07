@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import uuid
 from typing import Iterable, List, Optional
 
 from qdrant_client import QdrantClient
@@ -31,16 +32,13 @@ PAYLOAD_INDEX_FIELDS = [
 ]
 
 
-def build_collection_name(subscription_id: str, profile_id: str) -> str:
-    """Per-subscription-per-profile collection naming for strict isolation."""
+def build_collection_name(subscription_id: str, profile_id: Optional[str] = None) -> str:
+    """Collection name scoped only by subscription; profile isolation is enforced via payload filters."""
     if not subscription_id:
         raise ValueError("subscription_id is required to build collection name")
-    if not profile_id:
-        raise ValueError("profile_id is required to build collection name")
 
     safe_sub = str(subscription_id).strip().replace(" ", "_")
-    safe_profile = str(profile_id).strip().replace(" ", "_")
-    return f"{safe_sub}__{safe_profile}"
+    return f"{safe_sub}"
 
 
 def compute_chunk_id(
@@ -84,33 +82,45 @@ class QdrantVectorStore:
         if not vector_size or vector_size <= 0:
             raise ValueError("vector_size must be a positive integer")
 
-        collections = self.client.get_collections().collections
-        existing = {col.name for col in collections}
-
-        if collection_name not in existing:
-            logger.info("Creating Qdrant collection %s", collection_name)
-            self.client.create_collection(
-                collection_name=collection_name,
-                vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
-                sparse_vectors_config={"keywords_vector": SparseVectorParams()},
-            )
-        else:
-            info = self.client.get_collection(collection_name)
+        def _existing_dim(info):
             cfg = getattr(info, "config", None) or {}
             params = getattr(cfg, "params", None) or {}
             vectors = getattr(params, "vectors", None) or getattr(params, "vector_size", None) or {}
-            existing_dim = None
             if hasattr(vectors, "size"):
-                existing_dim = vectors.size
-            elif isinstance(vectors, dict):
+                return vectors.size
+            if isinstance(vectors, dict):
                 if "size" in vectors:
-                    existing_dim = vectors["size"]
-                elif "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
-                    existing_dim = vectors["content_vector"].get("size")
+                    return vectors["size"]
+                if "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
+                    return vectors["content_vector"].get("size")
+            return None
 
-            if existing_dim is not None and int(existing_dim) != int(vector_size):
-                raise ValueError(
-                    f"Collection '{collection_name}' dimension mismatch: {existing_dim} vs {vector_size}"
+        exists = False
+        try:
+            collections = self.client.get_collections().collections
+            existing = {col.name for col in collections}
+            exists = collection_name in existing
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Could not list collections; will check directly: %s", exc)
+
+        if exists:
+            info = self.client.get_collection(collection_name)
+            dim = _existing_dim(info)
+            if dim is not None and int(dim) != int(vector_size):
+                raise ValueError(f"Collection '{collection_name}' dimension mismatch: {dim} vs {vector_size}")
+        else:
+            try:
+                info = self.client.get_collection(collection_name)
+                dim = _existing_dim(info)
+                if dim is not None and int(dim) != int(vector_size):
+                    raise ValueError(f"Collection '{collection_name}' dimension mismatch: {dim} vs {vector_size}")
+                exists = True
+            except Exception:
+                logger.info("Creating Qdrant collection %s", collection_name)
+                self.client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
+                    sparse_vectors_config={"keywords_vector": SparseVectorParams()},
                 )
 
         for field in PAYLOAD_INDEX_FIELDS:
@@ -138,7 +148,9 @@ class QdrantVectorStore:
             if sparse_vec is not None:
                 vector_payload["keywords_vector"] = sparse_vec
 
-            all_points.append(PointStruct(id=record.chunk_id, vector=vector_payload, payload=record.payload))
+            # Qdrant accepts UUID or integer IDs; derive a deterministic UUID from chunk_id
+            point_id = uuid.uuid5(uuid.NAMESPACE_URL, record.chunk_id)
+            all_points.append(PointStruct(id=point_id, vector=vector_payload, payload=record.payload))
 
         for i in range(0, len(all_points), batch_size):
             batch = all_points[i : i + batch_size]
@@ -146,10 +158,10 @@ class QdrantVectorStore:
         return len(all_points)
 
     def delete_document(self, subscription_id: str, profile_id: str, document_id: str) -> dict:
-        """Delete all embeddings for a document scoped to subscription+profile."""
+        """Delete all embeddings for a document scoped to subscription collection and profile filter."""
         if not profile_id:
             raise ValueError("profile_id is required for deletion")
-        collection_name = build_collection_name(subscription_id, profile_id)
+        collection_name = build_collection_name(subscription_id)
         delete_filter = Filter(
             must=[
                 FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),

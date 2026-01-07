@@ -11,6 +11,10 @@ import pandas as pd
 import pytesseract
 from PIL import Image
 from pptx import Presentation
+try:
+    import pdfplumber
+except Exception:  # noqa: BLE001
+    pdfplumber = None
 from src.api.config import Config
 from src.api.pipeline_models import ChunkCandidate, ExtractedDocument, Figure, Section, Table
 
@@ -109,70 +113,106 @@ class DocumentExtractor:
         section_buffer: List[str] = []
         last_page = 1
 
-        with fitz.open(stream=pdf_content, filetype="pdf") as doc:
-            for page_index, page in enumerate(doc, start=1):
-                last_page = page_index
-                blocks = page.get_text("blocks") or []
-                page_text_parts: List[str] = []
+        if hasattr(fitz, "open"):
+            with fitz.open(stream=pdf_content, filetype="pdf") as doc:
+                for page_index, page in enumerate(doc, start=1):
+                    last_page = page_index
+                    blocks = page.get_text("blocks") or []
+                    page_text_parts: List[str] = []
 
-                for block in blocks:
-                    if len(block) < 5:
-                        continue
-                    block_text = (block[4] or "").strip()
-                    if not block_text:
-                        continue
+                    for block in blocks:
+                        if len(block) < 5:
+                            continue
+                        block_text = (block[4] or "").strip()
+                        if not block_text:
+                            continue
 
-                    first_line = block_text.splitlines()[0].strip()
-                    if self._is_heading(first_line):
-                        self._finalize_section(
-                            sections, current_title, current_section_id, current_start_page, page_index, section_buffer
+                        first_line = block_text.splitlines()[0].strip()
+                        if self._is_heading(first_line):
+                            self._finalize_section(
+                                sections, current_title, current_section_id, current_start_page, page_index, section_buffer
+                            )
+                            section_buffer = []
+                            current_title = first_line
+                            current_section_id = self._make_section_id(first_line, page_index)
+                            current_start_page = page_index
+                            continue
+
+                        section_buffer.append(block_text)
+                        chunk_type = "table" if self._looks_like_table(block_text) else "text"
+                        chunk_candidates.append(
+                            ChunkCandidate(
+                                text=block_text,
+                                page=page_index,
+                                section_title=current_title,
+                                section_id=current_section_id,
+                                chunk_type=chunk_type,
+                            )
                         )
-                        section_buffer = []
-                        current_title = first_line
-                        current_section_id = self._make_section_id(first_line, page_index)
-                        current_start_page = page_index
-                        continue
+                        page_text_parts.append(block_text)
+                        if chunk_type == "table":
+                            tables.append(Table(page=page_index, text=block_text))
 
-                    section_buffer.append(block_text)
-                    chunk_type = "table" if self._looks_like_table(block_text) else "text"
-                    chunk_candidates.append(
-                        ChunkCandidate(
-                            text=block_text,
-                            page=page_index,
-                            section_title=current_title,
-                            section_id=current_section_id,
-                            chunk_type=chunk_type,
-                        )
-                    )
-                    page_text_parts.append(block_text)
-                    if chunk_type == "table":
-                        tables.append(Table(page=page_index, text=block_text))
-
-                images = page.get_images(full=True)
-                page_text = "\n".join(page_text_parts).strip()
-                if self._detect_scanned_page(page_text, len(images)):
-                    for img in images:
-                        try:
-                            base_image = doc.extract_image(img[0])
-                            image = Image.open(io.BytesIO(base_image["image"]))
-                            ocr_text = self._ocr_image(image)
-                            if ocr_text:
-                                figures.append(Figure(page=page_index, caption=ocr_text))
-                                chunk_candidates.append(
-                                    ChunkCandidate(
-                                        text=ocr_text,
-                                        page=page_index,
-                                        section_title=current_title,
-                                        section_id=current_section_id,
-                                        chunk_type="ocr",
+                    images = page.get_images(full=True)
+                    page_text = "\n".join(page_text_parts).strip()
+                    if self._detect_scanned_page(page_text, len(images)):
+                        for img in images:
+                            try:
+                                base_image = doc.extract_image(img[0])
+                                image = Image.open(io.BytesIO(base_image["image"]))
+                                ocr_text = self._ocr_image(image)
+                                if ocr_text:
+                                    figures.append(Figure(page=page_index, caption=ocr_text))
+                                    chunk_candidates.append(
+                                        ChunkCandidate(
+                                            text=ocr_text,
+                                            page=page_index,
+                                            section_title=current_title,
+                                            section_id=current_section_id,
+                                            chunk_type="ocr",
+                                        )
                                     )
-                                )
-                                page_text_parts.append(ocr_text)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
+                                    page_text_parts.append(ocr_text)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
 
-                if page_text_parts:
-                    full_text_parts.append(f"\n--- Page {page_index} ---\n" + "\n".join(page_text_parts))
+                    if page_text_parts:
+                        full_text_parts.append(f"\n--- Page {page_index} ---\n" + "\n".join(page_text_parts))
+        elif pdfplumber:
+            with pdfplumber.open(io.BytesIO(pdf_content)) as doc:
+                for page_index, page in enumerate(doc.pages, start=1):
+                    last_page = page_index
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        for para in text.split("\n"):
+                            para = para.strip()
+                            if not para:
+                                continue
+                            if self._is_heading(para):
+                                self._finalize_section(
+                                    sections, current_title, current_section_id, current_start_page, page_index, section_buffer
+                                )
+                                section_buffer = []
+                                current_title = para
+                                current_section_id = self._make_section_id(para, page_index)
+                                current_start_page = page_index
+                                continue
+                            section_buffer.append(para)
+                            chunk_type = "table" if self._looks_like_table(para) else "text"
+                            chunk_candidates.append(
+                                ChunkCandidate(
+                                    text=para,
+                                    page=page_index,
+                                    section_title=current_title,
+                                    section_id=current_section_id,
+                                    chunk_type=chunk_type,
+                                )
+                            )
+                            if chunk_type == "table":
+                                tables.append(Table(page=page_index, text=para))
+                        full_text_parts.append(f"\n--- Page {page_index} ---\n{text}")
+        else:
+            raise RuntimeError("No PDF parser available: PyMuPDF (fitz) missing and pdfplumber not installed")
 
         self._finalize_section(
             sections, current_title, current_section_id, current_start_page, last_page, section_buffer

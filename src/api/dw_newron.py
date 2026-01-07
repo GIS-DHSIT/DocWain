@@ -55,7 +55,7 @@ def _parse_redis_connection_string(conn_str: str):
         "host": getattr(Config.Redis, "HOST", "localhost"),
         "port": getattr(Config.Redis, "PORT", 6379),
         "password": getattr(Config.Redis, "PASSWORD", None) or None,
-        "username": getattr(Config.Redis, "USERNAME", None) or None,
+        "username": None,  # default to None unless explicitly provided
         "ssl": getattr(Config.Redis, "SSL", False),
     }
 
@@ -124,9 +124,13 @@ def _build_namespace(subscription_id: str, profile_id: str, model_name: str = ""
 
 
 def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransformer:
-    candidates = [getattr(Config.Model, "EMBEDDING_MODEL", None) or getattr(
-        Config.Model, "SENTENCE_TRANSFORMERS", "BAAI/bge-large-en-v1.5"
-    )]
+    candidates = []
+    for name in getattr(Config.Model, "SENTENCE_TRANSFORMERS_CANDIDATES", []):
+        if name and name not in candidates:
+            candidates.append(name)
+    if not candidates:
+        candidates.append(getattr(Config.Model, "SENTENCE_TRANSFORMERS", "sentence-transformers/all-mpnet-base-v2"))
+
     last_error = None
     for name in candidates:
         try:
@@ -136,8 +140,7 @@ def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransf
             logger.info(f"Loaded model '{name}' with dim={dim}")
             if required_dim is None or dim == required_dim:
                 return model
-            # cache for later but continue if dim mismatch
-            _MODEL_CACHE[dim] = model
+            _MODEL_CACHE[dim] = model  # cache for possible future use
         except Exception as e:
             last_error = e
             logger.warning(f"Failed to load model '{name}': {e}")
@@ -154,9 +157,23 @@ def get_model(required_dim: Optional[int] = None):
         return _MODEL
 
     dim = _MODEL.get_sentence_embedding_dimension()
-    if dim != required_dim:
-        raise ValueError(f"Loaded model dim {dim} does not match required {required_dim}; using single model only.")
-    return _MODEL
+    if dim == required_dim:
+        return _MODEL
+
+    # Try cached models by dimension
+    if required_dim in _MODEL_CACHE:
+        logger.info(f"Using cached model with dim {required_dim}")
+        return _MODEL_CACHE[required_dim]
+
+    # Try loading a candidate that matches required_dim
+    try:
+        candidate = _load_model_candidates(required_dim=required_dim)
+        _MODEL_CACHE[required_dim] = candidate
+        logger.info(f"Loaded fallback model with dim {required_dim}")
+        return candidate
+    except Exception as exc:
+        logger.warning(f"Failed to load fallback model for dim {required_dim}: {exc}; continuing with primary model")
+        return _MODEL
 
 
 def get_cross_encoder():
@@ -207,7 +224,11 @@ def get_redis_client():
 
             host = os.getenv("REDIS_HOST") or parsed["host"] or "localhost"
             port = int(os.getenv("REDIS_PORT") or parsed["port"] or 6380)  # Azure default
-            username = (os.getenv("REDIS_USERNAME") or parsed.get("username") or "").strip() or None
+            # If a connection string is provided, do not send a username unless explicitly supplied via env.
+            if conn_str:
+                username = None
+            else:
+                username = (os.getenv("REDIS_USERNAME") or parsed.get("username") or "").strip() or None
             password = (os.getenv("REDIS_PASSWORD") or parsed.get("password") or "").strip() or None
 
             ssl_enabled = parsed.get("ssl", True)  # DEFAULT TRUE for Azure
@@ -2045,7 +2066,7 @@ class EnterpriseRAGSystem:
         try:
             if not profile_id:
                 raise ValueError("profile_id is required for retrieval")
-            collection_name = build_collection_name(subscription_id, profile_id)
+            collection_name = build_collection_name(subscription_id)
             namespace = _build_namespace(subscription_id, profile_id, self.model_name)
             metrics = get_metrics_tracker()
 
@@ -2551,7 +2572,7 @@ def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[
         Collection statistics
     """
     try:
-        collection_name = build_collection_name(subscription_id, profile_id)
+        collection_name = build_collection_name(subscription_id)
         qdrant_client = get_qdrant_client()
         collection_info = qdrant_client.get_collection(collection_name)
 

@@ -59,45 +59,44 @@ def migrate_subscription(collection_name: str, client: QdrantClient):
 
     logger.info("Found profiles in %s: %s", collection_name, profiles)
 
-    for profile_id in profiles:
-        target_collection = build_collection_name(collection_name, profile_id)
-        store.ensure_collection(target_collection, vector_dim or Config.Model.EMBEDDING_DIM)
-        offset = None
-        total = 0
-        while True:
-            scroll_result = client.scroll(
-                collection_name=collection_name,
-                scroll_filter=Filter(must=[FieldCondition(key="profile_id", match=MatchValue(value=profile_id))]),
-                with_payload=True,
-                with_vectors=True,
-                limit=128,
-                offset=offset,
-            )
-            if isinstance(scroll_result, tuple):
-                batch = scroll_result[0] or []
-                offset = scroll_result[1]
-            else:
-                batch = getattr(scroll_result, "points", []) or []
-                offset = getattr(scroll_result, "next_page_offset", None)
+    target_collection = build_collection_name(collection_name)
+    store.ensure_collection(target_collection, vector_dim or Config.Model.EMBEDDING_DIM)
 
-            if not batch:
-                break
+    offset = None
+    total = 0
+    while True:
+        scroll_result = client.scroll(
+            collection_name=collection_name,
+            with_payload=True,
+            with_vectors=True,
+            limit=128,
+            offset=offset,
+        )
+        if isinstance(scroll_result, tuple):
+            batch = scroll_result[0] or []
+            offset = scroll_result[1]
+        else:
+            batch = getattr(scroll_result, "points", []) or []
+            offset = getattr(scroll_result, "next_page_offset", None)
 
-            points_to_upsert: List[PointStruct] = []
-            for pt in batch:
-                vectors = _extract_vectors(pt)
-                points_to_upsert.append(
-                    PointStruct(
-                        id=pt.id,
-                        vector=vectors,
-                        payload=pt.payload,
-                    )
+        if not batch:
+            break
+
+        points_to_upsert: List[PointStruct] = []
+        for pt in batch:
+            vectors = _extract_vectors(pt)
+            points_to_upsert.append(
+                PointStruct(
+                    id=pt.id,
+                    vector=vectors,
+                    payload=pt.payload,
                 )
-            client.upsert(collection_name=target_collection, points=points_to_upsert, wait=True)
-            total += len(points_to_upsert)
-            if not offset:
-                break
-        logger.info("Migrated %s points to %s", total, target_collection)
+            )
+        client.upsert(collection_name=target_collection, points=points_to_upsert, wait=True)
+        total += len(points_to_upsert)
+        if not offset:
+            break
+    logger.info("Migrated %s points to %s", total, target_collection)
 
 
 def main():

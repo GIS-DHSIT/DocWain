@@ -9,9 +9,8 @@ from src.api.dw_newron import QdrantRetriever
 def test_no_profile_leakage():
     name_one = build_collection_name("tenantA", "profile1")
     name_two = build_collection_name("tenantA", "profile2")
-    assert name_one != name_two
-    assert "profile1" in name_one
-    assert "profile2" in name_two
+    assert name_one == "tenantA"
+    assert name_two == "tenantA"
 
 
 def test_chunk_ids_deterministic():

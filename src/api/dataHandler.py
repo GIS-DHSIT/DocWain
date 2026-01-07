@@ -27,11 +27,7 @@ from src.api.context_understanding import ContextUnderstanding
 from src.api.documentVetting import mask_document_content, vettingProcessor
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
-from src.api.vector_store import (
-    QdrantVectorStore,
-    build_collection_name,
-    compute_chunk_id,
-)
+from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -914,7 +910,7 @@ def save_embeddings_to_qdrant(
             if len(doc_ids_in_chunks) != 1 or doctag not in doc_ids_in_chunks:
                 raise ValueError(f"Chunk metadata must contain only document_id {doctag}")
 
-        collection_name = build_collection_name(subscription_id, profile_id)
+        collection_name = build_collection_name(subscription_id)
         ensure_qdrant_collection(collection_name, vector_size)
 
         records: List[ChunkRecord] = []
