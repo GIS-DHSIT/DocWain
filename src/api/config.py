@@ -32,7 +32,10 @@ class Config:
         EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
         SENTENCE_TRANSFORMERS = EMBEDDING_MODEL
         SENTENCE_TRANSFORMERS_FALLBACK = SENTENCE_TRANSFORMERS
-        SENTENCE_TRANSFORMERS_CANDIDATES = [EMBEDDING_MODEL]
+        SENTENCE_TRANSFORMERS_CANDIDATES = [
+            EMBEDDING_MODEL,
+            os.getenv("EMBEDDING_FALLBACK_MODEL", "sentence-transformers/all-mpnet-base-v2"),
+        ]
         RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
         OCR_ENGINE = os.getenv("OCR_ENGINE", "pytesseract")
         AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
@@ -97,7 +100,7 @@ class Config:
         CONNECTION_STRING = DEFAULT_REDIS_CONNECTION_STRING
         HOST = "rediscache.redis.cache.windows.net"
         PORT = 6380
-        USERNAME = "default"
+        USERNAME = ""  # username removed per new connection string
         PASSWORD = "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo="
         DB = 0
         SSL = True
