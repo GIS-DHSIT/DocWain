@@ -24,6 +24,7 @@ from src.api.enhanced_context_builder import IntelligentContextBuilder
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
+from src.finetune import resolve_model_for_profile
 
 # Configure logging
 logging.basicConfig(
@@ -42,46 +43,47 @@ _METRICS_TRACKER = None
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
 ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v3"
+ENABLE_ANSWER_CACHE = os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
 
 
 def _parse_redis_connection_string(conn_str: str):
     """
     Lightweight parser for Azure Redis Cache connection strings.
 
-    Returns a dict with host, port, password, username, and ssl settings. Falls
+    Returns a dict with host, port, password, and ssl settings. Falls
     back to conservative defaults when parsing fails so the app can still start.
     """
     settings = {
-        "host": getattr(Config.Redis, "HOST", "localhost"),
-        "port": getattr(Config.Redis, "PORT", 6379),
+        "host": (getattr(Config.Redis, "HOST", "localhost") or "").strip(),
+        "port": getattr(Config.Redis, "PORT", 6380),
         "password": getattr(Config.Redis, "PASSWORD", None) or None,
-        "username": None,  # default to None unless explicitly provided
-        "ssl": getattr(Config.Redis, "SSL", False),
+        "ssl": getattr(Config.Redis, "SSL", True),
     }
 
     if not conn_str:
         return settings
 
+    conn_str = conn_str.strip()
     try:
         if conn_str.startswith(("redis://", "rediss://")):
             parsed_url = urlparse(conn_str)
             if parsed_url.hostname:
-                settings["host"] = parsed_url.hostname
+                settings["host"] = parsed_url.hostname.strip()
             if parsed_url.port:
-                settings["port"] = parsed_url.port
-            if parsed_url.username:
-                settings["username"] = parsed_url.username
+                settings["port"] = int(parsed_url.port)
             if parsed_url.password:
-                settings["password"] = parsed_url.password
-            settings["ssl"] = parsed_url.scheme == "rediss" or settings["ssl"]
+                settings["password"] = parsed_url.password.strip()
+            settings["ssl"] = conn_str.startswith("rediss://") or getattr(Config.Redis, "SSL", True)
             return settings
 
         parts = conn_str.split(",")
         host_port = parts[0]
         if ":" in host_port:
             host, port = host_port.split(":", 1)
-            settings["host"] = host
-            settings["port"] = int(port)
+            settings["host"] = host.strip() or settings["host"]
+            settings["port"] = int(port or settings["port"])
+        elif host_port:
+            settings["host"] = host_port.strip() or settings["host"]
 
         for part in parts[1:]:
             if "=" not in part:
@@ -91,13 +93,15 @@ def _parse_redis_connection_string(conn_str: str):
             value = value.strip()
             if key == "password":
                 settings["password"] = value
-            elif key in ("user", "username"):
-                settings["username"] = value
             elif key == "ssl":
                 settings["ssl"] = value.lower() in {"true", "1", "yes", "on"}
     except Exception:
         return settings
 
+    if isinstance(settings.get("password"), str):
+        settings["password"] = settings["password"].strip() or None
+    settings["port"] = int(settings.get("port") or getattr(Config.Redis, "PORT", 6380))
+    settings["ssl"] = bool(settings.get("ssl"))
     return settings
 
 
@@ -107,6 +111,23 @@ def _slug(value: str) -> str:
         return "default"
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return cleaned or "default"
+
+
+def _clean_password(password: Optional[str]) -> Optional[str]:
+    """Normalize password strings, trimming accidental whitespace and empty values."""
+    if password is None:
+        return None
+    cleaned = password.strip()
+    return cleaned or None
+
+
+def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
+    """Coerce truthy string/env values into a boolean with a sensible default."""
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
 def _build_namespace(subscription_id: str, profile_id: str, model_name: str = "") -> str:
@@ -215,48 +236,55 @@ def get_redis_client():
     global _REDIS_CLIENT
     if _REDIS_CLIENT is None:
         try:
-            conn_str = (
-                    os.getenv("REDIS_URL")
-                    or os.getenv("REDIS_CONNECTION_STRING")
-                    or getattr(Config.Redis, "CONNECTION_STRING", "")
+            raw_conn = (
+                os.getenv("REDIS_URL")
+                or os.getenv("REDIS_CONNECTION_STRING")
+                or getattr(Config.Redis, "CONNECTION_STRING", "")
             )
-            parsed = _parse_redis_connection_string(conn_str)
 
-            host = os.getenv("REDIS_HOST") or parsed["host"] or "localhost"
-            port = int(os.getenv("REDIS_PORT") or parsed["port"] or 6380)  # Azure default
-            # If a connection string is provided, do not send a username unless explicitly supplied via env.
-            if conn_str:
-                username = None
-            else:
-                username = (os.getenv("REDIS_USERNAME") or parsed.get("username") or "").strip() or None
-            password = (os.getenv("REDIS_PASSWORD") or parsed.get("password") or "").strip() or None
+            parsed = _parse_redis_connection_string(raw_conn)
+            host = (
+                os.getenv("REDIS_HOST")
+                or parsed.get("host")
+                or getattr(Config.Redis, "HOST", "rediscache.redis.cache.windows.net")
+                or ""
+            ).strip()
+            if not host:
+                host = getattr(Config.Redis, "HOST", "localhost")
 
-            ssl_enabled = parsed.get("ssl", True)  # DEFAULT TRUE for Azure
-            ssl_override = os.getenv("REDIS_SSL")
-            if ssl_override is not None:
-                ssl_enabled = str(ssl_override).lower() in {"true", "1", "yes", "on"}
+            password = _clean_password(
+                os.getenv("REDIS_PASSWORD")
+                or parsed.get("password")
+                or getattr(Config.Redis, "PASSWORD", "")
+            )
 
-            #  Try direct connection first
-            _REDIS_CLIENT = redis.Redis(
+            db_idx = int(os.getenv("REDIS_DB", getattr(Config.Redis, "DB", 0)))
+            port = int(os.getenv("REDIS_PORT", parsed.get("port", getattr(Config.Redis, "PORT", 6380))))
+            ssl_enabled = _coerce_bool(
+                os.getenv("REDIS_SSL"),
+                parsed.get("ssl", getattr(Config.Redis, "SSL", True)),
+            )
+            socket_timeout = float(os.getenv("REDIS_SOCKET_TIMEOUT", "10"))
+            socket_connect_timeout = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", str(socket_timeout)))
+
+            client = redis.Redis(
                 host=host,
                 port=port,
-                username=username,
                 password=password,
-                db=Config.Redis.DB,
-                decode_responses=True,
-                socket_timeout=10,  # Increased timeout
-                socket_connect_timeout=10,
+                db=db_idx,
                 ssl=ssl_enabled,
-                ssl_cert_reqs=None  # Don't verify certs for Azure
+                decode_responses=True,
+                socket_connect_timeout=socket_connect_timeout,
+                socket_timeout=socket_timeout,
             )
-
-            #  Verify connection
-            _REDIS_CLIENT.ping()
-            logger.info(f"Redis connected: {host}:{port} (ssl={ssl_enabled})")
+            client.ping()
+            _REDIS_CLIENT = client
+            logger.info("Redis connected via SSL=%s to %s:%s/%s", ssl_enabled, host, port, db_idx)
 
         except Exception as e:
             logger.error(f" Redis connection failed: {e}")
-            logger.warning("RAG system will work WITHOUT caching/history persistence")
+            logger.warning("RAG system will work WITHOUT caching/history persistence. "
+                           "Check REDIS_CONNECTION_STRING/REDIS_PASSWORD and network reachability.")
             _REDIS_CLIENT = None  # Graceful degradation
 
     return _REDIS_CLIENT
@@ -987,13 +1015,21 @@ class QdrantRetriever:
                 elif "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
                     dim = vectors["content_vector"].get("size")
             if dim is None:
-                dim = 768  # default to mpnet dimension
+                dim = getattr(Config.Model, "EMBEDDING_DIM", None) or 768
+            dim = int(dim)
             self.collection_dims[collection_name] = dim
             logger.info(f"Collection '{collection_name}' expects dim={dim}")
             return dim
         except Exception as e:
-            logger.warning(f"Could not fetch vector dim for collection '{collection_name}': {e}")
-            return None
+            fallback_dim = getattr(Config.Model, "EMBEDDING_DIM", None) or 768
+            logger.warning(
+                "Could not fetch vector dim for collection '%s': %s; using fallback dim=%s",
+                collection_name,
+                e,
+                fallback_dim,
+            )
+            self.collection_dims[collection_name] = int(fallback_dim)
+            return int(fallback_dim)
 
     def retrieve(
             self,
@@ -1016,6 +1052,8 @@ class QdrantRetriever:
                 convert_to_numpy=True,
                 normalize_embeddings=True
             ).astype(np.float32).tolist()
+            if target_dim and len(query_vector) != target_dim:
+                raise ValueError(f"Embedding dim {len(query_vector)} does not match collection dim {target_dim}")
         except Exception as err:
             logger.error(f"Failed to embed query for retrieval: {err}", exc_info=True)
             return []
@@ -1075,6 +1113,14 @@ class QdrantRetriever:
         target_dim = self.get_collection_vector_dim(collection_name)
         model = get_model(required_dim=target_dim)
         dense_vector = model.encode(query, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32).tolist()
+        if target_dim and len(dense_vector) != target_dim:
+            logger.error(
+                "Embedding dim %s does not match collection dim %s for collection '%s'",
+                len(dense_vector),
+                target_dim,
+                collection_name,
+            )
+            return []
         sparse_vector = self._build_sparse_query(query)
 
         dense_results = self.run_search(
@@ -1666,36 +1712,31 @@ class PromptBuilder:
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
 
-        prompt = f"""You are a {persona} specialized in providing accurate, document-based answers.
+        prompt = f"""You are a {persona}. Deliver a complete, reader-friendly answer that weaves in the richest details available from the documents.
 
-     CRITICAL CITATION RULES (VIOLATIONS = FAILURE):
-    1. EVERY factual statement MUST have [SOURCE-X] notation IMMEDIATELY after it
-    2. Answer ONLY using information explicitly in the DOCUMENT CONTEXT below
-    3. If information is NOT in documents, say: "The documents don't contain information about [topic]. Can you clarify which document to check?"
-    4. When quoting, use exact phrases from context and cite the source
-    5. For partial info, state what IS available and what's missing
-    6. If multiple sources support a claim, cite all: [SOURCE-1, SOURCE-2]
+DOCUMENT CONTEXT:
+{context}
+{convo_block}
+{domain_block}
+{retrieval_block}
+{feedback_block}
 
-    DOCUMENT CONTEXT:
-    {context}
-    {convo_block}
-    {domain_block}
-    {retrieval_block}
-    {feedback_block}
+USER QUESTION: {query}
 
-    USER QUESTION: {query}
+GROUNDING & CITATION RULES (MANDATORY):
+1) Use ONLY the document context above; if something is missing, say so plainly.
+2) EVERY factual claim must cite immediately with [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-3].
+3) Prefer quoting exact figures, names, dates, section titles, and short snippets with citations.
+4) If sources disagree, briefly note the discrepancy with citations.
+5) Do not invent, pad, or generalize beyond the provided text.
 
-     ANSWER FORMAT (MANDATORY):
-    - Write 2-6 clear sentences in natural, conversational tone
-    - Place [SOURCE-X] citation IMMEDIATELY after each factual claim
-    - Example: "The Q4 revenue was $5M [SOURCE-1]. This represents 15% growth [SOURCE-2]."
-    - Start with the direct answer (don't restate the question)
-    - Use active voice and short sentences
-    - If using bullets, cite after each bullet
-    - If info is incomplete, acknowledge gaps WITHOUT generic disclaimers
-    - NEVER add facts not in the DOCUMENT CONTEXT above
+ANSWER STYLE (MANDATORY):
+- 4–8 sentences (or 2 short paragraphs) that read like a knowledgeable colleague, not a chatbot.
+- Lead with the direct answer, then add key specifics (who/what/when/where/why/how) pulled from the documents.
+- Tie related facts together so the narrative flows; avoid list-like staccato unless clarity demands bullets (cite each bullet).
+- If the question is about an entity not present, say the documents cover someone/something else and stop.
 
-    Provide your answer with citations now:"""
+Provide the answer now with citations inline after each claim."""
 
         return prompt
 
@@ -1728,11 +1769,21 @@ class EnterpriseRAGSystem:
     cross-encoder reranking, and grounding.
     """
 
-    def __init__(self, model_name: Optional[str] = None):
+    def __init__(
+            self,
+            model_name: Optional[str] = None,
+            profile_id: Optional[str] = None,
+            backend_override: Optional[str] = None,
+            model_path: Optional[str] = None
+    ):
         """Initialize the RAG system with lazy-loaded components."""
         try:
             # Initialize LLM client (Ollama by default, Gemini when requested)
-            self.llm_client = create_llm_client(model_name)
+            self.llm_client = create_llm_client(
+                model_name,
+                backend_override=backend_override,
+                model_path=model_path
+            )
             self.model_name = getattr(self.llm_client, "model_name", model_name or "default")
 
             # Initialize other components
@@ -1794,6 +1845,8 @@ class EnterpriseRAGSystem:
             if reformulated and reformulated != processed_query:
                 processed_query = reformulated
                 metadata['reformulated'] = True
+            elif conv_context:
+                processed_query = f"{processed_query} ; context: {conv_context}"
 
         expanded = self._expand_query_terms(processed_query)
         if expanded and expanded != processed_query:
@@ -2056,9 +2109,9 @@ class EnterpriseRAGSystem:
             subscription_id: str,
             user_id: str,
             persona: str = "professional document analysis assistant",
-            top_k_retrieval: int = 50,
-            top_k_rerank: int = 15,  # ✅ INCREASED FROM 10
-            final_k: int = 7  # ✅ INCREASED FROM 3
+            top_k_retrieval: int = 80,
+            top_k_rerank: int = 25,
+            final_k: int = 12
     ) -> Dict[str, Any]:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
@@ -2141,7 +2194,7 @@ class EnterpriseRAGSystem:
             profile_context_data = retrieval_plan.get("profile_context", {})
 
             # Cache lookup (per subscription/profile/query + recent memory fingerprint)
-            cache = get_redis_client()
+            cache = get_redis_client() if ENABLE_ANSWER_CACHE else None
             cache_key = None
             conversation_context_for_cache = self.conversation_history.get_context(namespace, user_id, max_turns=2)
             memory_fingerprint = "noctx"
@@ -2252,12 +2305,14 @@ class EnterpriseRAGSystem:
             )
 
             if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
+                neighbor_window = getattr(Config.Retrieval, "NEIGHBOR_WINDOW", 2) or 2
+                neighbor_max_new = getattr(Config.Retrieval, "NEIGHBOR_MAX_NEW", 10) or 10
                 reranked_chunks = self.retriever.expand_with_neighbors(
                     collection_name=collection_name,
                     seed_chunks=reranked_chunks,
                     profile_id=profile_id,
-                    window=1,
-                    max_new=6
+                    window=int(neighbor_window),
+                    max_new=int(neighbor_max_new)
                 )
                 reranked_chunks = sorted(reranked_chunks, key=lambda c: float(c.score), reverse=True)
 
@@ -2361,6 +2416,8 @@ class EnterpriseRAGSystem:
                 retrieval_brief += f"; top_sources={top_sources}"
             if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
                 retrieval_brief += "; adjacent_expansion=on"
+                if conversation_summary:
+                    retrieval_brief += "; convo_summary=on"
 
             prompt = self.prompt_builder.build_qa_prompt(
                 query=query,
@@ -2491,16 +2548,27 @@ class EnterpriseRAGSystem:
 # Global RAG system instance (lazy initialization)
 _RAG_SYSTEM = None
 _RAG_MODEL = None
+_RAG_PROFILE = None
+_RAG_BACKEND = None
+_RAG_MODEL_PATH = None
 
 
-def create_llm_client(model_name: Optional[str] = None):
+def create_llm_client(
+        model_name: Optional[str] = None,
+        backend_override: Optional[str] = None,
+        model_path: Optional[str] = None
+):
     """Factory to select LLM backend based on requested model name or env."""
     name = (model_name or "").lower()
-    backend = os.getenv("LLM_BACKEND", "").lower().strip()
+    backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
     if backend in {"openai", "openai_compatible", "local_http"}:
         return OpenAICompatibleClient(model_name)
     if backend == "gemini" or name.startswith("gemini"):
         return GeminiClient(model_name)
+    if backend == "unsloth" or model_path:
+        from src.finetune.llm_client import UnslothLLMClient
+        target = model_path or model_name
+        return UnslothLLMClient(target)
     if backend == "ollama":
         return OllamaClient(model_name)
     # default to local Ollama for plug-and-play usage
@@ -2515,13 +2583,33 @@ def get_metrics_tracker() -> MetricsTracker:
     return _METRICS_TRACKER
 
 
-def get_rag_system(model_name: Optional[str] = None) -> EnterpriseRAGSystem:
+def get_rag_system(
+        model_name: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        backend_override: Optional[str] = None,
+        model_path: Optional[str] = None
+) -> EnterpriseRAGSystem:
     """Get or create the RAG system instance (singleton with lazy loading)."""
-    global _RAG_SYSTEM, _RAG_MODEL
-    if _RAG_SYSTEM is None or (model_name and model_name != _RAG_MODEL):
+    global _RAG_SYSTEM, _RAG_MODEL, _RAG_PROFILE, _RAG_BACKEND, _RAG_MODEL_PATH
+    needs_new = (
+        _RAG_SYSTEM is None
+        or (model_name and model_name != _RAG_MODEL)
+        or (_RAG_PROFILE != profile_id)
+        or (_RAG_BACKEND != backend_override)
+        or (_RAG_MODEL_PATH != model_path)
+    )
+    if needs_new:
         try:
-            _RAG_SYSTEM = EnterpriseRAGSystem(model_name=model_name)
+            _RAG_SYSTEM = EnterpriseRAGSystem(
+                model_name=model_name,
+                profile_id=profile_id,
+                backend_override=backend_override,
+                model_path=model_path
+            )
             _RAG_MODEL = model_name
+            _RAG_PROFILE = profile_id
+            _RAG_BACKEND = backend_override
+            _RAG_MODEL_PATH = model_path
             logger.info("RAG system initialized")
         except Exception as e:
             logger.error(f"Failed to initialize RAG system: {e}")
@@ -2550,7 +2638,14 @@ def answer_question(
     Returns:
         Response dictionary with enhanced metadata
     """
-    rag_system = get_rag_system(model_name)
+    resolved_model = resolve_model_for_profile(profile_id, model_name)
+    effective_model = resolved_model.model_name or model_name
+    rag_system = get_rag_system(
+        effective_model,
+        profile_id=profile_id,
+        backend_override=resolved_model.backend,
+        model_path=resolved_model.model_path
+    )
     return rag_system.answer_question(
         query=query,
         profile_id=profile_id,

@@ -76,6 +76,7 @@ class QdrantVectorStore:
         self.client = client or QdrantClient(
             url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120
         )
+        self.collection_dims: dict[str, int] = {}
 
     def ensure_collection(self, collection_name: str, vector_size: int) -> None:
         """Create or validate a collection with dense + sparse vectors and payload indexes."""
@@ -122,6 +123,7 @@ class QdrantVectorStore:
                     vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
                     sparse_vectors_config={"keywords_vector": SparseVectorParams()},
                 )
+        self.collection_dims[collection_name] = int(vector_size)
 
         for field in PAYLOAD_INDEX_FIELDS:
             try:
@@ -131,12 +133,41 @@ class QdrantVectorStore:
             except Exception as idx_exc:  # noqa: BLE001
                 logger.debug("Payload index for %s exists or failed softly: %s", field, idx_exc)
 
+    def _get_collection_dim(self, collection_name: str) -> Optional[int]:
+        if collection_name in self.collection_dims:
+            return self.collection_dims[collection_name]
+        try:
+            info = self.client.get_collection(collection_name)
+            cfg = getattr(info, "config", None) or {}
+            params = getattr(cfg, "params", None) or {}
+            vectors = getattr(params, "vectors", None) or getattr(params, "vector_size", None) or {}
+            dim = None
+            if hasattr(vectors, "size"):
+                dim = vectors.size
+            elif isinstance(vectors, dict):
+                if "size" in vectors:
+                    dim = vectors["size"]
+                elif "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
+                    dim = vectors["content_vector"].get("size")
+            if dim:
+                self.collection_dims[collection_name] = int(dim)
+            return int(dim) if dim else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not fetch collection dim for %s: %s", collection_name, exc)
+            return None
+
     def upsert_records(
         self, collection_name: str, records: Iterable[ChunkRecord], batch_size: int = 100
     ) -> int:
         """Idempotent upsert using deterministic chunk ids."""
+        expected_dim = self._get_collection_dim(collection_name)
         all_points: List[PointStruct] = []
         for record in records:
+            if expected_dim and len(record.dense_vector) != expected_dim:
+                raise ValueError(
+                    f"Vector dim mismatch for collection {collection_name}: "
+                    f"{len(record.dense_vector)} != {expected_dim}"
+                )
             sparse_vec = record.sparse_vector
             if sparse_vec and not isinstance(sparse_vec, SparseVector):
                 sparse_vec = SparseVector(

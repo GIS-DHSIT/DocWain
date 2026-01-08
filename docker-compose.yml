@@ -27,12 +27,6 @@ services:
       - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_SSL=false
-      - REDIS_DB=0
-      - REDIS_USERNAME=
-      - REDIS_PASSWORD=
     volumes:
       - ./:/app
     restart: unless-stopped

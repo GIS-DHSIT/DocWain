@@ -4,6 +4,7 @@ Replaces context building logic in dw_newron.py
 """
 
 import re
+import time
 import logging
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict
@@ -23,6 +24,22 @@ class IntelligentContextBuilder:
 
     def __init__(self, max_context_chunks: int = 7):
         self.max_context_chunks = max_context_chunks
+
+    def _deduplicate_by_chunk_id(self, chunks: List[Dict]) -> List[Dict]:
+        """Keep highest scoring chunk per unique chunk_id or doc/index tuple."""
+        best = {}
+        for chunk in chunks:
+            meta = chunk.get("metadata") or {}
+            key = meta.get("chunk_id") or (
+                meta.get("document_id"),
+                meta.get("chunk_index"),
+            )
+            if key not in best or chunk.get("score", 0) > best[key].get("score", 0):
+                best[key] = chunk
+        deduped = list(best.values())
+        if len(deduped) != len(chunks):
+            logger.info("Deduplicated by chunk_id: %s -> %s", len(chunks), len(deduped))
+        return deduped
 
     def _calculate_text_similarity(self, text1: str, text2: str) -> float:
         """Calculate Jaccard similarity between two texts"""
@@ -79,6 +96,96 @@ class IntelligentContextBuilder:
 
         return dict(doc_groups)
 
+    @staticmethod
+    def _recency_factor(meta: Dict) -> float:
+        """Light recency boost based on known timestamp fields."""
+        for key in ("ingested_at", "updated_at", "created_at", "timestamp"):
+            if key in meta:
+                try:
+                    ts = float(meta[key])
+                    age_days = max(0.0, (time.time() - ts) / 86400.0)
+                    return 1.0 + max(0.0, (30.0 - age_days)) / 60.0
+                except Exception:
+                    continue
+        return 1.0
+
+    @staticmethod
+    def _source_priority(meta: Dict) -> float:
+        """Optional authority boost."""
+        priority = meta.get("source_priority")
+        try:
+            return float(priority)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _filter_low_signal(chunks: List[Dict], min_len: int = 30) -> List[Dict]:
+        filtered = []
+        for chunk in chunks:
+            text = (chunk.get("text") or "").strip()
+            if len(text) < min_len:
+                continue
+            filtered.append(chunk)
+        return filtered
+
+    def _merge_adjacent_doc_chunks(self, doc_chunks: List[Dict]) -> List[Dict]:
+        """Merge back-to-back chunks from the same document to keep context continuous."""
+        merged: List[Dict] = []
+        for chunk in doc_chunks:
+            meta = chunk.get("metadata") or {}
+            idx = meta.get("chunk_index")
+
+            if merged:
+                prev = merged[-1]
+                prev_meta = prev.get("metadata") or {}
+                prev_idx = prev_meta.get("chunk_index")
+
+                if prev_idx is not None and idx is not None and idx - prev_idx == 1:
+                    # Combine text with a newline boundary
+                    prev_text = prev.get("text", "").rstrip()
+                    next_text = chunk.get("text", "").lstrip()
+                    prev["text"] = (prev_text + "\n" + next_text).strip()
+
+                    # Preserve best score and union retrieval methods
+                    prev["score"] = max(prev.get("score", 0), chunk.get("score", 0))
+                    methods = set()
+                    for candidate in (prev.get("methods"), prev.get("method"), chunk.get("methods"), chunk.get("method")):
+                        if not candidate:
+                            continue
+                        if isinstance(candidate, (list, tuple, set)):
+                            methods.update(candidate)
+                        else:
+                            methods.add(candidate)
+                    if methods:
+                        prev["methods"] = list(methods)
+
+                    # Track merged spans for traceability
+                    span = prev_meta.get("chunk_indices") or []
+                    if prev_idx is not None:
+                        span.append(prev_idx)
+                    if idx is not None:
+                        span.append(idx)
+                    if span:
+                        prev_meta["chunk_indices"] = sorted(set(span))
+
+                    id_span = prev_meta.get("chunk_ids") or []
+                    base_id = prev_meta.get("chunk_id")
+                    if base_id and base_id not in id_span:
+                        id_span.append(base_id)
+                    next_id = meta.get("chunk_id")
+                    if next_id:
+                        id_span.append(next_id)
+                    if id_span:
+                        # Preserve insertion order while removing duplicates
+                        prev_meta["chunk_ids"] = list(dict.fromkeys(id_span))
+
+                    prev["metadata"] = prev_meta
+                    continue
+
+            merged.append(chunk)
+
+        return merged
+
     def _order_chunks_logically(self, chunks: List[Dict]) -> List[Dict]:
         """
         Order chunks to present information logically.
@@ -97,8 +204,8 @@ class IntelligentContextBuilder:
             doc_chunks_sorted = sorted(
                 doc_chunks,
                 key=lambda x: (
-                    -x['score'],  # Higher score first
-                    x['metadata'].get('chunk_index', 999)  # Lower index first
+                    -(x['score'] * self._recency_factor(x.get("metadata", {})) + self._source_priority(x.get("metadata", {}))),
+                    x['metadata'].get('chunk_index', 999)
                 )
             )
 
@@ -141,6 +248,15 @@ class IntelligentContextBuilder:
                         else:
                             break
 
+            # Preserve natural document order for readability
+            final_doc_chunks = sorted(
+                final_doc_chunks,
+                key=lambda x: (
+                    x['metadata'].get('chunk_index') is None,
+                    x['metadata'].get('chunk_index', 0)
+                )
+            )
+            final_doc_chunks = self._merge_adjacent_doc_chunks(final_doc_chunks)
             ordered.extend(final_doc_chunks)
 
         return ordered
@@ -165,11 +281,43 @@ class IntelligentContextBuilder:
         if not chunks:
             return "", []
 
-        # Deduplicate similar chunks
-        unique_chunks = self._deduplicate_chunks(chunks)
+        # Deduplicate exact chunk ids before text-level dedup
+        dedup_by_id = self._deduplicate_by_chunk_id(self._filter_low_signal(chunks))
 
-        # Limit to max chunks
-        selected_chunks = unique_chunks[:self.max_context_chunks]
+        # Deduplicate similar chunks
+        unique_chunks = self._deduplicate_chunks(dedup_by_id)
+
+        # Ensure multi-document coverage by round-robin selection across docs
+        def _doc_key(chunk: Dict) -> str:
+            meta = chunk.get('metadata', {})
+            return meta.get('document_id') or meta.get('source_file') or "unknown"
+
+        buckets: Dict[str, List[Dict]] = {}
+        for c in unique_chunks:
+            buckets.setdefault(_doc_key(c), []).append(c)
+
+        for doc_chunks in buckets.values():
+            doc_chunks.sort(key=lambda x: float(x.get('score', 0.0)), reverse=True)
+
+        selected_chunks: List[Dict] = []
+        while len(selected_chunks) < self.max_context_chunks and buckets:
+            # Order docs by best available score to favor stronger evidence
+            doc_order = sorted(
+                buckets.items(),
+                key=lambda item: float(item[1][0].get('score', 0.0)) if item[1] else 0.0,
+                reverse=True
+            )
+            progress = False
+            for doc_id, doc_chunks in doc_order:
+                if not doc_chunks:
+                    continue
+                selected_chunks.append(doc_chunks.pop(0))
+                progress = True
+                if len(selected_chunks) >= self.max_context_chunks:
+                    break
+            buckets = {k: v for k, v in buckets.items() if v}
+            if not progress:
+                break
 
         # Order logically
         ordered_chunks = self._order_chunks_logically(selected_chunks)
@@ -255,32 +403,23 @@ class AnswerGenerator:
     ) -> str:
         """Build optimized prompt for answer generation"""
 
-        prompt = f"""You are a {persona}. Your job is to provide accurate, well-sourced answers.
+        prompt = f"""You are a friendly, precise {persona}. Answer like a knowledgeable teammate: conversational, concise, and grounded in the provided sources.
 
-CRITICAL RULES:
-1. Answer ONLY using information in the SOURCES below
-2. Cite every factual claim using [SOURCE-X] notation
-3. If information is not in sources, explicitly state: "The documents do not contain information about [topic]"
-4. Never add external knowledge or speculation
-5. For uncertain information, acknowledge limitations
-
+SOURCES:
 {context}
 
-CONVERSATION HISTORY:
+RECENT CONVERSATION:
 {conversation_context if conversation_context else "None"}
 
 USER QUESTION: {query}
 
-ANSWER REQUIREMENTS:
-- Start directly with the answer (don't repeat the question)
-- Write 2-4 clear, concise sentences
-- Use natural, conversational language
-- Cite sources immediately after each claim: [SOURCE-X]
-- If multiple sources support a claim, cite all: [SOURCE-1, SOURCE-2]
-- For partial information, state what is known and what is missing
-- If documents conflict, note the discrepancy and cite both
+Answer requirements:
+- 3–6 sentences, flowing naturally (avoid bullet lists unless essential).
+- Every factual claim must cite [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-2].
+- If the docs lack the answer or focus on someone/something else, say that plainly.
+- If sources disagree, acknowledge briefly with citations.
 
-ANSWER:"""
+Answer:"""
 
         return prompt
 
@@ -446,4 +585,3 @@ def generate_accurate_answer(
     )
 
     return result
-

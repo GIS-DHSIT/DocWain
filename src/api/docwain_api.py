@@ -1,16 +1,18 @@
 
+import json
 import logging
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 import ollama
 import uvicorn
 from bson.objectid import ObjectId  # added by maha/maria
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from src.api.config import Config
-from src.api import teams_adapter
+from src.teams import adapter as teams_adapter
 from src.api.dataHandler import (
     db,
     get_subscription_pii_setting,
@@ -27,9 +29,22 @@ from src.api.dw_chat import (
     get_session_by_id,
     get_session_list,
 )
-from src.api.dw_newron import answer_question, metrics_summary
+from src.finetune import get_finetune_manager, list_models
+from src.finetune.models import FinetuneRequest, AutoFinetuneRequest
+from src.finetune.dataset_builder import build_dataset_from_qdrant
 
 app = FastAPI(title="DocWain API")
+logger = logging.getLogger(__name__)
+
+
+def _get_dw_newron():
+    """
+    Lazy loader for RAG pipeline functions to avoid heavy imports on module load.
+    This keeps Teams/chat endpoints responsive even when optional deps are absent
+    (tests, lightweight deployments) while preserving behavior for the main API.
+    """
+    from src.api import dw_newron  # local import to defer heavy deps
+    return dw_newron
 
 #  Add CORS middleware
 app.add_middleware(
@@ -52,10 +67,98 @@ class QuestionRequest(BaseModel):
     new_session: Optional[bool] = False  # Frontend sends flag here
 
 
+def _normalize_answer(answer):
+    """Ensure API responses are structured consistently."""
+    if isinstance(answer, dict):
+        structured = {
+            "response": answer.get("response") or answer.get("answer"),
+            "sources": answer.get("sources", []),
+            "grounded": answer.get("grounded", False),
+            "context_found": answer.get("context_found", False),
+            "metadata": {k: v for k, v in answer.items() if k not in {"response", "answer", "sources"}},
+        }
+        return structured
+    return {
+        "response": str(answer),
+        "sources": [],
+        "grounded": False,
+        "context_found": False,
+        "metadata": {},
+    }
+
+
+def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> Dict[str, Any] | None:
+    """Construct a minimal Teams-like activity from a plain text payload."""
+    try:
+        text = raw_body.decode("utf-8", errors="ignore").strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+
+    convo_id = (
+        headers.get("x-teams-conversation-id")
+        or headers.get("conversation-id")
+        or "teams-text-fallback"
+    )
+    user_id = headers.get("x-teams-user-id") or "teams_user"
+
+    return {"text": text, "conversation": {"id": convo_id}, "from": {"id": user_id}}
+
+
+async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
+    """
+    Parse Teams activity payload, tolerating empty/invalid bodies.
+    Returns a dict on success; None when the body cannot be parsed.
+    """
+    raw_body = await request.body()
+    content_type = request.headers.get("content-type", "")
+    if not raw_body or not raw_body.strip():
+        logger.debug(
+            "Teams payload missing/empty body; responding with friendly message | content_type=%s",
+            content_type,
+        )
+        return None
+
+    try:
+        activity = json.loads(raw_body)
+    except json.JSONDecodeError:
+        # Fallback: treat text/plain bodies as simple messages
+        if content_type.lower().startswith("text/plain"):
+            fallback = _build_text_fallback_activity(raw_body, dict(request.headers))
+            if fallback:
+                logger.debug(
+                    "Teams payload decoded as text/plain fallback | content_type=%s | body_len=%d",
+                    content_type,
+                    len(raw_body or b""),
+                )
+                return fallback
+
+        logger.debug(
+            "Invalid Teams payload: JSON decode failed; responding with friendly message | content_type=%s | body_len=%d",
+            content_type,
+            len(raw_body or b""),
+        )
+        return None
+
+    if not isinstance(activity, dict):
+        logger.warning("Invalid Teams payload type: %s", type(activity))
+        return None
+
+    return activity
+
+
 @app.post("/teams/messages")
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
-    activity = await request.json()
+    activity = await _parse_teams_activity(request)
+    if activity is None:
+        # Return a Bot-style message so Teams sees a graceful response instead of 4xx
+        return {
+            "type": "message",
+            "text": "I couldn't read that Teams message. Please try sending it again.",
+        }
+
     try:
         return await teams_adapter.handle_teams_activity(activity, headers=dict(request.headers))
     except teams_adapter.TeamsAuthError as exc:
@@ -76,7 +179,7 @@ def ask_question_api(request: QuestionRequest):
         raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
 
     # Generate answer
-    answer = answer_question(
+    raw_answer = _get_dw_newron().answer_question(
         request.query,
         request.user_id,
         request.profile_id,
@@ -84,6 +187,7 @@ def ask_question_api(request: QuestionRequest):
         request.model_name,
         request.persona
     )
+    answer = _normalize_answer(raw_answer)
 
     # Add to history - backend uses frontend's session_id
     _history, active_session_id = add_message_to_history(
@@ -103,6 +207,43 @@ def ask_question_api(request: QuestionRequest):
         "answer": answer,
         "current_session_id": active_session_id
     }
+
+
+@app.post("/askStream")
+def ask_question_stream_api(request: QuestionRequest):
+    """
+    Streams the LLM response for a query. Uses the same RAG pipeline as /ask but
+    streams the generated answer text to the client.
+    """
+    logging.info(f"[ASK_STREAM] User: {request.user_id} | Query: {request.query}")
+
+    if not request.query:
+        raise HTTPException(status_code=400, detail="Query is required")
+    if not request.profile_id:
+        raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
+
+    def _stream():
+        try:
+            raw_answer = _get_dw_newron().answer_question(
+                request.query,
+                request.user_id,
+                request.profile_id,
+                request.subscription_id,
+                request.model_name,
+                request.persona
+            )
+            answer = _normalize_answer(raw_answer)
+            text = answer.get("response") or ""
+            if not text:
+                text = "No response generated."
+            chunk_size = 256
+            for i in range(0, len(text), chunk_size):
+                yield text[i:i + chunk_size]
+        except Exception as exc:
+            logging.error(f"[ASK_STREAM] Streaming failed: {exc}")
+            yield f"[error] {exc}"
+
+    return StreamingResponse(_stream(), media_type="text/plain")
 
 
 @app.post("/train/{doc_id}")
@@ -128,6 +269,53 @@ def trigger_training(subscription_id: str = "default"):
     except Exception as e:
         logging.error(f"Training API error: {e}")
         raise HTTPException(status_code=500, detail="Training process failed")
+
+
+@app.post("/finetune")
+def trigger_finetune(request: FinetuneRequest):
+    """Kick off an Unsloth fine-tune for a profile/domain."""
+    manager = get_finetune_manager()
+    status = manager.start_job(request)
+    return status.dict()
+
+
+@app.get("/finetune/{job_id}")
+def finetune_status(job_id: str):
+    manager = get_finetune_manager()
+    status = manager.get_status(job_id)
+    if not status:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return status.dict()
+
+
+@app.get("/models")
+def list_available_models():
+    return list_models()
+
+
+@app.post("/finetune/auto")
+def auto_finetune(request: AutoFinetuneRequest):
+    """Generate a synthetic dataset from Qdrant chunks and kick off Unsloth fine-tune."""
+    manager = get_finetune_manager()
+    try:
+        dataset_path = build_dataset_from_qdrant(
+            profile_id=request.profile_id,
+            subscription_id=request.subscription_id,
+            max_points=request.max_points,
+            questions_per_chunk=request.questions_per_chunk,
+            generation_model=request.generation_model,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to build dataset: {exc}")
+
+    base_payload = request.dict()
+    for k in ("subscription_id", "max_points", "questions_per_chunk", "generation_model"):
+        base_payload.pop(k, None)
+    base_payload["dataset_path"] = str(dataset_path)
+    base_payload["include_actual_data"] = False
+    ft_request = FinetuneRequest(**base_payload)
+    status = manager.start_job(ft_request)
+    return {"job": status.dict(), "dataset_path": str(dataset_path)}
 
 
 @app.delete("/document/{doc_id}/embeddings")
@@ -232,7 +420,7 @@ def list_available_models():
 def get_metrics(days: int = 7):
     """API endpoint to retrieve model/retrieval performance statistics."""
     try:
-        summary = metrics_summary(days=days)
+        summary = _get_dw_newron().metrics_summary(days=days)
         return {
             "status": "success",
             "window_days": days,
