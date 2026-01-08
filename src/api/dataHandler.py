@@ -886,6 +886,9 @@ def save_embeddings_to_qdrant(
         normalized_vectors, vector_size = normalize_embedding_matrix(raw_vectors)
         if vector_size == 0:
             raise ValueError("Empty embeddings array")
+        expected_dim = getattr(Config.Model, "EMBEDDING_DIM", None)
+        if expected_dim and vector_size != expected_dim:
+            raise ValueError(f"Embedding dimension mismatch: expected {expected_dim}, got {vector_size}")
 
         texts = embeddings.get("texts") or []
         chunk_metadata = embeddings.get("chunk_metadata", []) or []
@@ -1069,7 +1072,7 @@ def save_embeddings_to_qdrant(
 
 # Replace your existing train_on_document function with this:
 
-from src.api.enhanced_retrieval import chunk_text_for_embedding
+from src.api.enhanced_retrieval import chunk_text_for_embedding, normalize_chunk_links
 
 
 def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
@@ -1174,8 +1177,18 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             sparse_vectors = build_sparse_vectors(chunks)
             summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
 
+            chunk_metadata = normalize_chunk_links(
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                doc_name=doc_name,
+                chunks=chunks
+            )
             for idx, meta in enumerate(chunk_metadata):
-                meta["chunk_id"] = compute_chunk_id(subscription_id, profile_id, doc_tag, doc_name, idx, chunks[idx])
+                meta["section_id"] = meta.get("section_id") or hashlib.sha1(
+                    f"{doc_tag}|{meta.get('section_title') or 'section'}".encode("utf-8")
+                ).hexdigest()[:12]
                 meta["chunk_type"] = meta.get("chunk_type", "text")
 
             embeddings_payload = {
@@ -1241,6 +1254,16 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
 
             logging.info(f" VERIFIED: All {len(chunks)} chunks have document_id={doc_tag}")
 
+            # Normalize chunk linkage and ids to avoid mismatched prev/next references
+            chunk_metadata = normalize_chunk_links(
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                doc_name=doc_name,
+                chunks=chunks
+            )
+
             # Generate embeddings
             logging.info(f"Generating embeddings for {len(chunks)} chunks")
             model = get_model()
@@ -1272,7 +1295,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     f"{doc_tag}|{meta.get('section_title') or 'section'}".encode("utf-8")
                 ).hexdigest()[:12]
                 meta["chunk_type"] = meta.get("chunk_type", "text")
-                meta["chunk_id"] = compute_chunk_id(subscription_id, profile_id, doc_tag, doc_name, idx, chunks[idx])
+                # chunk_id/prev/next already normalized by normalize_chunk_links
 
             # Prepare embeddings dict with metadata
             embeddings = {

@@ -4,7 +4,17 @@ import re
 from typing import Any, Dict, List, Optional
 
 import requests
-from azure.storage.blob import BlobServiceClient
+
+try:
+    from azure.storage.blob import BlobServiceClient
+    _BLOB_AVAILABLE = True
+    _BLOB_WARNING_EMITTED = False
+    _BLOB_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as exc:
+    BlobServiceClient = None  # type: ignore
+    _BLOB_AVAILABLE = False
+    _BLOB_WARNING_EMITTED = False
+    _BLOB_IMPORT_ERROR = exc
 
 try:
     from botbuilder.core.teams import FileDownloadInfo  # type: ignore
@@ -18,9 +28,11 @@ except ImportError:  # pragma: no cover - fallback for alternate package layout
 
 from src.api.config import Config
 from src.api.dataHandler import fileProcessor, train_on_document
-from src.api.dw_newron import answer_question
+from src.api.dw_chat import add_message_to_history
+from src.teams.logic import TeamsAnswerResult, TeamsChatError, TeamsChatService
 
 logger = logging.getLogger(__name__)
+TEAMS_CHAT_SERVICE = TeamsChatService()
 
 
 class TeamsAuthError(Exception):
@@ -106,8 +118,43 @@ def build_teams_message(answer_payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def answer_question(*args, **kwargs):
+    """
+    Lazy import wrapper to avoid loading heavy RAG deps when the Teams adapter
+    is imported in environments without the full stack (e.g., unit tests).
+    """
+    try:
+        from src.api.dw_newron import answer_question as _answer_question  # type: ignore
+    except Exception as exc:  # pragma: no cover - defensive guard for missing deps
+        raise RuntimeError(
+            "DocWain RAG dependencies are missing; install requirements.txt to enable Teams Q&A"
+        ) from exc
+    return _answer_question(*args, **kwargs)
+
+
+def _blob_uploads_enabled() -> bool:
+    """
+    Check whether blob uploads can run. This avoids crashes when the optional
+    azure-storage-blob dependency is not installed in environments that do not
+    need blob persistence.
+    """
+    if not _BLOB_AVAILABLE:
+        global _BLOB_WARNING_EMITTED
+        if not _BLOB_WARNING_EMITTED:
+            logger.warning(
+                "azure-storage-blob is not installed; Teams attachments will be processed "
+                "but not uploaded to blob storage. Install azure-storage-blob to enable uploads."
+            )
+            _BLOB_WARNING_EMITTED = True
+        return False
+    return True
+
+
 def _upload_to_blob(file_path: str, filename: str, subscription_id: str) -> None:
     """Upload a processed attachment to Azure Blob Storage if configured."""
+    if not _blob_uploads_enabled():
+        return
+
     connection_string = getattr(Config.Teams, "BLOB_CONNECTION_STRING", "")
     container_name = getattr(Config.Teams, "BLOB_CONTAINER", "")
     prefix = getattr(Config.Teams, "BLOB_PATH_PREFIX", "") or getattr(Config.Teams, "UPLOAD_DIR", "")
@@ -145,9 +192,10 @@ async def handle_attachment_activity(activity: Dict[str, Any]) -> Dict[str, Any]
     upload_dir = os.environ.get("TEAMS_UPLOAD_DIR", getattr(Config.Teams, "UPLOAD_DIR", "/tmp"))
     os.makedirs(upload_dir, exist_ok=True)
 
-    subscription_id = (activity.get("conversation") or {}).get("id") or getattr(
-        Config.Teams, "DEFAULT_SUBSCRIPTION", "default"
-    )
+    session_id = extract_session_id(activity)
+    user_id = extract_user_id(activity)
+    context = TEAMS_CHAT_SERVICE.build_context(user_id=user_id, session_id=session_id)
+    TEAMS_CHAT_SERVICE.ensure_collection(context.subscription_id)
 
     processed = False
 
@@ -194,13 +242,13 @@ async def handle_attachment_activity(activity: Dict[str, Any]) -> Dict[str, Any]
             for doc_name, doc_content in extracted_docs.items():
                 train_on_document(
                     doc_content,
-                    subscription_id=subscription_id,
-                    profile_tag=Config.Teams.DEFAULT_PROFILE,
+                    subscription_id=context.subscription_id,
+                    profile_tag=context.profile_id,
                     doc_tag=doc_tag,
                     doc_name=doc_name,
                 )
 
-            _upload_to_blob(temp_file_path, filename, subscription_id)
+            _upload_to_blob(temp_file_path, filename, context.subscription_id)
             processed = True
         except Exception as exc:
             logger.error("Failed to process Teams attachment %s: %s", filename, exc)
@@ -237,17 +285,37 @@ async def handle_teams_activity(activity: Dict[str, Any], headers: Optional[Dict
 
     user_id = extract_user_id(activity)
     session_id = extract_session_id(activity)
+    context = TEAMS_CHAT_SERVICE.build_context(
+        user_id=user_id,
+        session_id=session_id,
+        model_name=Config.Teams.DEFAULT_MODEL,
+        persona=Config.Teams.DEFAULT_PERSONA,
+    )
 
     try:
-        answer = answer_question(
-            query=question,
-            user_id=user_id,
-            profile_id=Config.Teams.DEFAULT_PROFILE,
-            subscription_id=Config.Teams.DEFAULT_SUBSCRIPTION,
-            model_name=Config.Teams.DEFAULT_MODEL,
-            persona=Config.Teams.DEFAULT_PERSONA,
-        )
-    except Exception as exc:
+        answer_result: TeamsAnswerResult = TEAMS_CHAT_SERVICE.answer_question(question, context)
+        answer = answer_result.answer
+        subscription_id = answer_result.subscription_id
+        profile_id = answer_result.profile_id
+
+        # Persist conversation history for context-aware follow-ups
+        try:
+            add_message_to_history(
+                user_id=user_id,
+                query=question,
+                answer=answer,
+                session_id=session_id,
+                new_session=False,
+            )
+        except Exception as history_exc:
+            logger.debug("Teams history persistence failed: %s", history_exc)
+    except TeamsChatError as exc:
+        logger.error("Failed to answer Teams question: %s", exc)
+        return {
+            "type": "message",
+            "text": "I hit a snag answering your question. Please try again in a moment.",
+        }
+    except Exception as exc:  # noqa: BLE001
         logger.error("Failed to answer Teams question: %s", exc)
         return {
             "type": "message",
@@ -255,6 +323,13 @@ async def handle_teams_activity(activity: Dict[str, Any], headers: Optional[Dict
         }
 
     # Log session mapping to help debug multi-user chats.
-    logger.info("Teams message handled | user=%s session=%s", user_id, session_id)
+    logger.info(
+        "Teams message handled | user=%s session=%s subscription=%s profile=%s internet_fallback=%s",
+        user_id,
+        session_id,
+        subscription_id,
+        profile_id,
+        answer_result.internet_mode,
+    )
 
     return build_teams_message(answer)

@@ -15,6 +15,7 @@ from qdrant_client.models import SparseVector, Filter, FieldCondition, MatchValu
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
+from src.api.vector_store import compute_chunk_id
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +251,38 @@ def chunk_text_for_embedding(text: str, doc_name: str, document_id: str) -> List
         raise ValueError(f"L CRITICAL: Multiple document_ids in chunks: {doc_ids}")
 
     return result
+
+
+def normalize_chunk_links(
+        chunk_metadata: List[dict],
+        subscription_id: str,
+        profile_id: str,
+        document_id: str,
+        doc_name: str,
+        chunks: List[str],
+) -> List[dict]:
+    """
+    Recompute chunk_id/prev/next to ensure they are consistent and deterministic.
+    """
+    if len(chunk_metadata) != len(chunks):
+        raise ValueError("chunk_metadata and chunks length mismatch")
+
+    computed_ids = [
+        compute_chunk_id(subscription_id, profile_id, document_id, doc_name, idx, chunks[idx])
+        for idx in range(len(chunks))
+    ]
+
+    normalized = []
+    for idx, meta in enumerate(chunk_metadata):
+        m = dict(meta) if meta else {}
+        m["chunk_index"] = idx
+        m["chunk_id"] = computed_ids[idx]
+        m["prev_chunk_id"] = computed_ids[idx - 1] if idx > 0 else None
+        m["next_chunk_id"] = computed_ids[idx + 1] if idx < len(computed_ids) - 1 else None
+        m["document_id"] = document_id
+        normalized.append(m)
+
+    return normalized
 
 
 class AdaptiveRetriever:

@@ -144,7 +144,7 @@ class SmartPromptBuilder:
             conversation_context: str = ""
     ) -> str:
         """
-        FIXED: Ultra-strict prompt to prevent hallucinations
+        Conversational, grounded prompt to keep answers accurate and human.
         """
 
         # Build components
@@ -157,62 +157,29 @@ class SmartPromptBuilder:
             for c in chunks
         ]))
 
-        # FIXED: More aggressive prompt
-        prompt = f"""You are a {persona}. Your ONLY job is to answer questions using information that EXISTS in the documents below.
-
-{source_map}
-
- CRITICAL GROUNDING RULES - VIOLATION = FAILURE 
-
-1. **READ THE QUESTION CAREFULLY**
-   - Identify exactly what entity/document/person is being asked about
-   - Check if that entity EXISTS in the available sources
-
-2. **VERIFY DOCUMENT MATCH**
-   - If question asks about "Person X" but sources contain "Person Y"
-   - YOU MUST IMMEDIATELY STATE: "The provided documents are about [Person Y], not [Person X]. I cannot answer questions about [Person X] using these sources."
-   - DO NOT try to answer anyway
-
-3. **ANSWER ONLY IF INFORMATION EXISTS**
-   - Every sentence MUST be directly supported by the sources
-   - If information is not in sources, state: "This information is not present in the provided documents."
-   - NEVER fill gaps with general knowledge or assumptions
-
-4. **MANDATORY CITATIONS**
-   - Every factual claim MUST have [SOURCE-X] citation
-   - Format: "According to [SOURCE-1], the city is Mumbai."
-   - Multiple sources: "[SOURCE-1, SOURCE-3]"
-
-5. **HANDLE CONFLICTS**
-   - If sources contradict, cite both: "According to [SOURCE-1]... however [SOURCE-2] states..."
-
-6. **MULTI-DOCUMENT SCENARIOS**
-   - If multiple documents are present, specify which document you're referring to
-   - Example: "In the resume for John Doe [SOURCE-1], the location is listed as..."
+        prompt = f"""You are a thoughtful, personable {persona}. Speak like a helpful colleague: clear, concise, and warm while staying 100% grounded in the documents below.
 
 Available documents: {', '.join(unique_docs)}
 
-DOCUMENT CONTENT:
+SOURCES (keep citations aligned to these): 
+{source_map}
+
+DOCUMENT EXCERPTS:
 {context}
 
-{"CONVERSATION HISTORY:\n" + conversation_context + "\n" if conversation_context else ""}
+{"RECENT CONVERSATION:\n" + conversation_context + "\n" if conversation_context else ""}
 
 USER QUESTION: {query}
 
-BEFORE ANSWERING, ASK YOURSELF:
-- Is the entity/person mentioned in the question actually in these documents?
-- Can I answer this question using ONLY the text above?
-- Have I cited every factual claim?
+Answering guidelines:
+- Use only information from the sources; if something is missing, say so plainly.
+- Keep the tone human and context-aware (no robotic bullet dumps).
+- Cite each factual claim with [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-3].
+- If the question is about an entity not in the sources, say the docs cover someone/something else and stop.
+- 3–6 sentences max, flowing as a short narrative, not a list.
+- Note contradictions or gaps briefly with citations.
 
-ANSWER REQUIREMENTS:
-- First, verify you're answering about the correct entity/document
-- Write 2-4 clear, factual sentences
-- Cite sources [SOURCE-X] after EVERY claim
-- If wrong documents provided, explicitly state this
-- Use natural but precise language
-- NEVER speculate or add external knowledge
-
-ANSWER:"""
+Now provide the answer with citations:"""
 
         return prompt
 

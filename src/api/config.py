@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # back to the hard-coded defaults below.
 load_dotenv()
 
-DEFAULT_REDIS_CONNECTION_STRING = "rediscache.redis.cache.windows.net:6380,password=IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo=,ssl=True,abortConnect=False"
+DEFAULT_REDIS_CONNECTION_STRING = "docwain-rediscache.redis.cache.windows.net:6380,password=2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo=,ssl=True,abortConnect=False"
 
 
 class Config:
@@ -98,10 +98,9 @@ class Config:
 
     class Redis:
         CONNECTION_STRING = DEFAULT_REDIS_CONNECTION_STRING
-        HOST = "rediscache.redis.cache.windows.net"
+        HOST = "docwain-rediscache.redis.cache.windows.net"
         PORT = 6380
-        USERNAME = ""  # username removed per new connection string
-        PASSWORD = "IEVCP6EgAC8d4oG1X3nwUkwVK9WHU12leAzCaGWWPuo="
+        PASSWORD = "2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo="
         DB = 0
         SSL = True
         ABORT_CONNECT = False
@@ -116,15 +115,19 @@ class Config:
         BLOB_CONNECTION_STRING = os.getenv("TEAMS_BLOB_CONNECTION_STRING", "")
         BLOB_CONTAINER = os.getenv("TEAMS_BLOB_CONTAINER", "local-uploads")
         BLOB_PATH_PREFIX = os.getenv("TEAMS_BLOB_PATH_PREFIX", "teams")
+        SESSION_AS_SUBSCRIPTION = os.getenv("TEAMS_SESSION_AS_SUBSCRIPTION", "true").lower() == "true"
+        PROFILE_PER_USER = os.getenv("TEAMS_PROFILE_PER_USER", "true").lower() == "true"
 
     class Retrieval:
         CHUNK_SIZE = 800
         CHUNK_OVERLAP = 200
         MIN_CHUNK_SIZE = 150
-        MAX_CONTEXT_CHUNKS = 7  # ✅ INCREASED FROM 7 (keep this)
+        MAX_CONTEXT_CHUNKS = 12  # allow deeper context packing for richer answers
         SIMILARITY_THRESHOLD = 0.10  # ✅ LOWERED FROM 0.7
         USE_SPARSE_VECTORS = True
         USE_ADJACENT_EXPANSION = True
+        NEIGHBOR_WINDOW = 2
+        NEIGHBOR_MAX_NEW = 10
         HYBRID_WEIGHTS = {
             "dense": float(os.getenv("HYBRID_WEIGHT_DENSE", "0.6")),
             "sparse": float(os.getenv("HYBRID_WEIGHT_SPARSE", "0.4")),

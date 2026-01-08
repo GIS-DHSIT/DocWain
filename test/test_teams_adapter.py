@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.api import teams_adapter
+from src.teams import adapter as teams_adapter
 from src.api.config import Config
 
 
@@ -26,10 +26,10 @@ class HandleAttachmentActivityTests(unittest.IsolatedAsyncioTestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch.dict(os.environ, {"TEAMS_UPLOAD_DIR": tmpdir}, clear=False), \
-                patch("src.api.teams_adapter.FileDownloadInfo.deserialize", return_value=fake_download), \
-                patch("src.api.teams_adapter.requests.get") as mock_get, \
-                patch("src.api.teams_adapter.fileProcessor", return_value={"sample.txt": "document content"}), \
-                patch("src.api.teams_adapter.train_on_document") as mock_train:
+                patch("src.teams.adapter.FileDownloadInfo.deserialize", return_value=fake_download), \
+                patch("src.teams.adapter.requests.get") as mock_get, \
+                patch("src.teams.adapter.fileProcessor", return_value={"sample.txt": "document content"}), \
+                patch("src.teams.adapter.train_on_document") as mock_train:
 
             mock_response = MagicMock()
             mock_response.content = b"dummy content"
@@ -45,7 +45,7 @@ class HandleAttachmentActivityTests(unittest.IsolatedAsyncioTestCase):
             mock_train.assert_called_once_with(
                 "document content",
                 subscription_id="conversation-id",
-                profile_tag=Config.Teams.DEFAULT_PROFILE,
+                profile_tag="teams_user",
                 doc_tag="file-123",
                 doc_name="sample.txt",
             )
@@ -72,10 +72,10 @@ class HandleTeamsActivityTests(unittest.IsolatedAsyncioTestCase):
         expected = {"type": "message", "text": "from attachment handler"}
 
         with patch(
-            "src.api.teams_adapter.handle_attachment_activity",
+            "src.teams.adapter.handle_attachment_activity",
             new_callable=AsyncMock,
             return_value=expected,
-        ) as mock_handle, patch("src.api.teams_adapter.answer_question") as mock_answer:
+        ) as mock_handle, patch("src.teams.adapter.TEAMS_CHAT_SERVICE.answer_question") as mock_answer:
             response = await teams_adapter.handle_teams_activity(activity)
 
         self.assertEqual(response, expected)
@@ -84,11 +84,38 @@ class HandleTeamsActivityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_question_path_handles_answer_errors(self):
         activity = {"text": "Hello", "conversation": {"id": "abc"}}
-        with patch("src.api.teams_adapter.answer_question", side_effect=RuntimeError("boom")):
+        with patch(
+            "src.teams.adapter.TEAMS_CHAT_SERVICE.answer_question",
+            side_effect=teams_adapter.TeamsChatError("boom"),
+        ):
             response = await teams_adapter.handle_teams_activity(activity)
 
         self.assertEqual(response["type"], "message")
         self.assertIn("snag", response["text"])
+
+    async def test_question_path_persists_history_and_uses_session(self):
+        activity = {
+            "text": "Hi there",
+            "conversation": {"id": "conv-1"},
+            "from": {"id": "user-1"},
+        }
+        answer_payload = {"response": "hello", "sources": []}
+        with patch(
+            "src.teams.adapter.TEAMS_CHAT_SERVICE.answer_question",
+            return_value=teams_adapter.TeamsAnswerResult(
+                answer=answer_payload,
+                subscription_id="conv-1",
+                profile_id="user-1",
+                fallback_used=False,
+            ),
+        ) as mock_answer, \
+                patch("src.teams.adapter.add_message_to_history") as mock_history:
+            response = await teams_adapter.handle_teams_activity(activity)
+
+        self.assertEqual(response["type"], "message")
+        self.assertIn("hello", response["text"])
+        mock_answer.assert_called_once()
+        mock_history.assert_called_once()
 
 
 if __name__ == "__main__":
