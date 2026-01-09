@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
@@ -41,6 +41,8 @@ class ExtractedDocument:
     tables: List[Table]
     figures: List[Figure]
     chunk_candidates: List[ChunkCandidate]
+    doc_type: Optional[str] = None
+    errors: List[str] = field(default_factory=list)
 
 
 @dataclass

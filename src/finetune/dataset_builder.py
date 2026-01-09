@@ -2,7 +2,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 
 from qdrant_client import QdrantClient
 
@@ -22,10 +22,11 @@ def _get_llm_client(model_name: Optional[str] = None):
 def _sample_chunks(
         profile_id: str,
         subscription_id: str,
-        limit: int = 100
+        limit: int = 100,
+        client: Optional[QdrantClient] = None
 ) -> List[Dict]:
     """Fetch chunk payloads from Qdrant for a profile/collection."""
-    client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+    client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
     collection = build_collection_name(subscription_id)
 
     def _scroll(filter_key: str):
@@ -74,6 +75,85 @@ def _sample_chunks(
             }
         )
     return chunks
+
+
+def _discover_profiles_in_collection(
+        client: QdrantClient,
+        collection_name: str,
+        max_profiles: Optional[int] = None,
+        scan_limit: int = 512,
+        batch_size: int = 64,
+) -> List[str]:
+    """
+    Scan a Qdrant collection to find unique profile ids stored in payloads.
+    Limits the scan to avoid pulling the entire collection.
+    """
+    profiles: Set[str] = set()
+    offset = None
+    scanned = 0
+
+    while True:
+        if scan_limit and scanned >= scan_limit:
+            break
+        limit = batch_size if not scan_limit else min(batch_size, scan_limit - scanned)
+        if limit <= 0:
+            break
+        batch, offset = client.scroll(
+            collection_name=collection_name,
+            limit=limit,
+            with_vectors=False,
+            with_payload=True,
+            offset=offset,
+        )
+        if not batch:
+            break
+        scanned += len(batch)
+        for pt in batch:
+            payload = pt.payload or {}
+            profile = payload.get("profile_id") or payload.get("profileId")
+            if profile:
+                profiles.add(str(profile))
+                if max_profiles and len(profiles) >= max_profiles:
+                    return sorted(profiles)
+        if offset is None or scanned >= scan_limit:
+            break
+    return sorted(profiles)
+
+
+def discover_collections_and_profiles(
+        subscription_ids: Optional[List[str]] = None,
+        max_profiles_per_collection: Optional[int] = None,
+        client: Optional[QdrantClient] = None,
+) -> Dict[str, List[str]]:
+    """
+    Enumerate Qdrant collections and the profile ids they contain.
+    If subscription_ids are provided, scanning is limited to that list; otherwise
+    every available collection is scanned.
+    """
+    client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+    try:
+        collections = subscription_ids
+        if collections is None:
+            resp = client.get_collections()
+            collections = [c.name for c in getattr(resp, "collections", [])]
+    except Exception as exc:
+        raise RuntimeError(f"Unable to list Qdrant collections: {exc}") from exc
+
+    discovered: Dict[str, List[str]] = {}
+    for sub in collections or []:
+        collection_name = build_collection_name(sub)
+        try:
+            profiles = _discover_profiles_in_collection(
+                client,
+                collection_name=collection_name,
+                max_profiles=max_profiles_per_collection,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Skipping collection %s due to discovery error: %s", collection_name, exc)
+            continue
+        if profiles:
+            discovered[sub] = profiles
+    return discovered
 
 
 def _parse_qa_pairs(raw: str, expected: int) -> List[Dict[str, str]]:
@@ -138,12 +218,13 @@ def build_dataset_from_qdrant(
         max_points: int = 120,
         questions_per_chunk: int = 2,
         generation_model: Optional[str] = None,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None,
+        client: Optional[QdrantClient] = None
 ) -> Path:
     """
     Auto-build a JSONL dataset by sampling chunks from Qdrant and generating QA pairs.
     """
-    chunks = _sample_chunks(profile_id, subscription_id, limit=max_points)
+    chunks = _sample_chunks(profile_id, subscription_id, limit=max_points, client=client)
     if not chunks:
         raise ValueError(f"No chunks found for profile {profile_id} in subscription {subscription_id}")
 

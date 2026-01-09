@@ -308,10 +308,12 @@ def fileProcessor(content, file):
             logging.info(f"Extracting File {file_name}")
             if file_name.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
-                extracted_data[file_name] = extractor.extract_dataframe(df, get_model())
+                extracted_data[file_name] = extractor.extract_dataframe(df, sheet_name=file_name)
             elif file_name.endswith((".xlsx", ".xls")):
-                df = pd.read_excel(BytesIO(content))
-                extracted_data[file_name] = extractor.extract_dataframe(df, get_model())
+                sheets = pd.read_excel(BytesIO(content), sheet_name=None)
+                for sheet_name, df in sheets.items():
+                    key = f"{file_name}#{sheet_name}"
+                    extracted_data[key] = extractor.extract_dataframe(df, sheet_name=sheet_name)
             elif file_name.endswith(".json"):
                 extracted_data[file_name] = json.loads(content.decode("utf-8"))
             elif file_name.endswith(".pdf"):

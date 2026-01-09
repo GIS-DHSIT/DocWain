@@ -309,6 +309,7 @@ class RetrievedChunk:
     text: str
     score: float
     metadata: dict
+    source: str | None = None
     method: str = "dense"
 
 
@@ -930,12 +931,14 @@ class QdrantRetriever:
 
         for pt in points:
             payload = pt.payload or {}
+            source = payload.get("source_file") or payload.get("source") or ""
             chunks.append(
                 RetrievedChunk(
                     id=str(pt.id),
                     text=payload.get("text", ""),
                     score=float(pt.score),
                     metadata=payload,
+                    source=source or None,
                     method=method,
                 )
             )
@@ -1085,11 +1088,12 @@ class QdrantRetriever:
             text = payload.get("text", "")
             snippet = text[:120].replace("\n", " ")
             logger.debug("Hit score=%.4f snippet=%s", pt.score, snippet)
+            source = payload.get("source_file") or payload.get("source") or "unknown"
             chunk = RetrievedChunk(
                 id=str(pt.id),
                 text=text,
                 score=float(pt.score),
-                source=payload.get("source_file", "unknown"),
+                source=source,
                 metadata=payload
             )
             chunks.append(chunk)
@@ -1168,66 +1172,116 @@ class QdrantRetriever:
         expanded = []
 
         for chunk in seed_chunks:
-            doc_id = (chunk.metadata or {}).get("document_id")
-            idx = (chunk.metadata or {}).get("chunk_index")
+            meta = chunk.metadata or {}
+            doc_id = meta.get("document_id")
+            idx = meta.get("chunk_index")
             if doc_id is None or idx is None:
                 expanded.append(chunk)
                 continue
 
-            key = (str(doc_id), int(idx))
+            key = (str(doc_id), str(idx))
             seen.add(key)
             expanded.append(chunk)
 
             if len(expanded) >= len(seed_chunks) + max_new:
                 continue
 
-            filter_clauses = [
-                {"key": "document_id", "match": {"value": str(doc_id)}},
-                {"key": "chunk_index", "range": {"gte": int(idx) - window, "lte": int(idx) + window}},
-            ]
-            if profile_id is not None:
-                filter_clauses.append({"key": "profile_id", "match": {"value": str(profile_id)}})
+            neighbor_filters = []
 
+            # Prefer exact prev/next chunk ids to avoid schema/type issues on chunk_index.
+            neighbor_ids = []
+            for key_name in ("prev_chunk_id", "next_chunk_id"):
+                neighbor_val = meta.get(key_name)
+                if neighbor_val:
+                    neighbor_ids.append(str(neighbor_val))
+            if neighbor_ids:
+                must = [
+                    {"key": "document_id", "match": {"value": str(doc_id)}},
+                    {"key": "chunk_id", "match": {"any": neighbor_ids}},
+                ]
+                if profile_id is not None:
+                    must.append({"key": "profile_id", "match": {"value": str(profile_id)}})
+                neighbor_filters.append({"must": must})
+
+            # Fallback to chunk_index equality (not range) to avoid 400s when stored as keyword.
             try:
-                scroll = self.client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter={"must": filter_clauses},
-                    with_payload=True,
-                    with_vectors=False,
-                    limit=window * 4  # small fetch per seed
-                )
-            except Exception as exc:
-                logger.debug("Neighbor fetch failed for doc %s idx %s: %s", doc_id, idx, exc)
+                idx_int = int(idx)
+            except Exception:
+                idx_int = None
+            if idx_int is not None and window > 0:
+                neighbor_values = []
+                for delta in range(-window, window + 1):
+                    if delta == 0:
+                        continue
+                    candidate = idx_int + delta
+                    if candidate < 0:
+                        continue
+                    neighbor_values.extend([candidate, str(candidate)])
+                # Deduplicate while preserving order
+                seen_values = set()
+                neighbor_values = [v for v in neighbor_values if not (v in seen_values or seen_values.add(v))]
+                if neighbor_values:
+                    must = [
+                        {"key": "document_id", "match": {"value": str(doc_id)}},
+                        {"key": "chunk_index", "match": {"any": neighbor_values}},
+                    ]
+                    if profile_id is not None:
+                        must.append({"key": "profile_id", "match": {"value": str(profile_id)}})
+                    neighbor_filters.append({"must": must})
+
+            if not neighbor_filters:
                 continue
 
-            points = []
-            if hasattr(scroll, "points"):
-                points = scroll.points or []
-            elif isinstance(scroll, tuple) and scroll:
-                points = scroll[0] or []
-
-            for pt in points:
-                payload = pt.payload or {}
-                neighbor_idx = payload.get("chunk_index")
-                neighbor_key = (str(payload.get("document_id", doc_id)), int(neighbor_idx)) if neighbor_idx is not None else None
-                if neighbor_key and neighbor_key in seen:
-                    continue
-                text = payload.get("text") or ""
-                if not text:
-                    continue
-                seen.add(neighbor_key)
-                neighbor_score = max(float(chunk.score) - 0.05, 0.0)
-                expanded.append(
-                    RetrievedChunk(
-                        id=str(pt.id),
-                        text=text,
-                        score=neighbor_score,
-                        source=payload.get("source_file", chunk.source),
-                        metadata=payload
+            for scroll_filter in neighbor_filters:
+                try:
+                    scroll = self.client.scroll(
+                        collection_name=collection_name,
+                        scroll_filter=scroll_filter,
+                        with_payload=True,
+                        with_vectors=False,
+                        limit=max(window * 4, 2),  # small fetch per seed
                     )
-                )
-                if len(expanded) >= len(seed_chunks) + max_new:
-                    break
+                except Exception as exc:
+                    logger.debug("Neighbor fetch failed for doc %s idx %s: %s", doc_id, idx, exc)
+                    continue
+
+                points = []
+                if hasattr(scroll, "points"):
+                    points = scroll.points or []
+                elif isinstance(scroll, tuple) and scroll:
+                    points = scroll[0] or []
+
+                for pt in points:
+                    payload = pt.payload or {}
+                    neighbor_idx = payload.get("chunk_index")
+                    neighbor_key = None
+                    if neighbor_idx is not None:
+                        neighbor_key = (str(payload.get("document_id", doc_id)), str(neighbor_idx))
+                    if neighbor_key and neighbor_key in seen:
+                        continue
+                    text = payload.get("text") or ""
+                    if not text:
+                        continue
+                    if neighbor_key:
+                        seen.add(neighbor_key)
+                    neighbor_score = max(float(chunk.score) - 0.05, 0.0)
+                    neighbor_source = (
+                        payload.get("source_file")
+                        or payload.get("source")
+                        or chunk.source
+                        or "unknown"
+                    )
+                    expanded.append(
+                        RetrievedChunk(
+                            id=str(pt.id),
+                            text=text,
+                            score=neighbor_score,
+                            source=neighbor_source,
+                            metadata=payload
+                        )
+                    )
+                    if len(expanded) >= len(seed_chunks) + max_new:
+                        break
 
         return expanded
 
@@ -1712,7 +1766,7 @@ class PromptBuilder:
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
 
-        prompt = f"""You are a {persona}. Deliver a complete, reader-friendly answer that weaves in the richest details available from the documents.
+        prompt = f"""You are a {persona}. Deliver a clear, reader-friendly answer that feels human and intentional, not robotic. Start with a tight summary, then unpack the best evidence.
 
 DOCUMENT CONTEXT:
 {context}
@@ -1731,10 +1785,10 @@ GROUNDING & CITATION RULES (MANDATORY):
 5) Do not invent, pad, or generalize beyond the provided text.
 
 ANSWER STYLE (MANDATORY):
-- 4–8 sentences (or 2 short paragraphs) that read like a knowledgeable colleague, not a chatbot.
-- Lead with the direct answer, then add key specifics (who/what/when/where/why/how) pulled from the documents.
-- Tie related facts together so the narrative flows; avoid list-like staccato unless clarity demands bullets (cite each bullet).
-- If the question is about an entity not present, say the documents cover someone/something else and stop.
+- Format: 1-2 sentence overview, then 3-6 concise bullet points with citations, then a one-line takeaway.
+- Tone: warm, confident colleague; vary sentence openings; avoid filler and repetition.
+- Bullets must be full sentences that stitch facts together (who/what/when/where/why/how) with inline citations.
+- If the question is about an entity not present, say so and list what the documents do cover (with citations), then stop.
 
 Provide the answer now with citations inline after each claim."""
 
