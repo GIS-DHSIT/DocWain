@@ -300,6 +300,21 @@ class IntelligentContextBuilder:
             doc_chunks.sort(key=lambda x: float(x.get('score', 0.0)), reverse=True)
 
         selected_chunks: List[Dict] = []
+
+        # Let the top doc contribute a deeper slice to preserve narrative, then
+        # round-robin the remainder for coverage.
+        if buckets:
+            top_doc_id = max(
+                buckets.keys(),
+                key=lambda k: float(buckets[k][0].get('score', 0.0)) if buckets[k] else 0.0
+            )
+            top_doc = buckets[top_doc_id]
+            max_from_top = min(len(top_doc), max(3, self.max_context_chunks // 2))
+            selected_chunks.extend(top_doc[:max_from_top])
+            buckets[top_doc_id] = top_doc[max_from_top:]
+            if not buckets[top_doc_id]:
+                buckets.pop(top_doc_id, None)
+
         while len(selected_chunks) < self.max_context_chunks and buckets:
             # Order docs by best available score to favor stronger evidence
             doc_order = sorted(

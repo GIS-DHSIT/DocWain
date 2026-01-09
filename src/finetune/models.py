@@ -46,7 +46,37 @@ class ResolvedModel(BaseModel):
 
 
 class AutoFinetuneRequest(FinetuneRequest):
-    subscription_id: str = Field("default", description="Tenant/subscription")
+    # Make profile/subscription optional for discovery-based auto runs
+    profile_id: Optional[str] = Field(
+        None,
+        description="Optional profile to target. When omitted, profiles are discovered from Qdrant.",
+    )
+    subscription_id: Optional[str] = Field(
+        None,
+        description="Optional single subscription/collection to target. When omitted, all collections are scanned.",
+    )
+    subscription_ids: Optional[List[str]] = Field(
+        None,
+        description="Optional list of subscriptions/collections to target. When omitted, all collections are scanned.",
+    )
     max_points: int = Field(120, ge=1, description="Max chunks to sample from Qdrant")
     questions_per_chunk: int = Field(2, ge=1, le=5, description="QA pairs per chunk")
     generation_model: Optional[str] = Field(None, description="Model used to generate synthetic QA")
+
+    def finetune_payload(self, profile_id: str, dataset_path: str) -> dict:
+        """
+        Build a FinetuneRequest payload by merging auto-discovery data with user overrides.
+        Auto-only fields are stripped before constructing the finetune job.
+        """
+        payload = self.dict()
+        payload.update(
+            {
+                "profile_id": profile_id,
+                "dataset_path": str(dataset_path),
+                # Auto runs should not silently pull production data into the dataset.
+                "include_actual_data": False,
+            }
+        )
+        for field in ("subscription_id", "subscription_ids", "max_points", "questions_per_chunk", "generation_model"):
+            payload.pop(field, None)
+        return payload

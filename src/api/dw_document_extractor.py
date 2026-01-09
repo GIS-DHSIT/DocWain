@@ -32,6 +32,7 @@ class DocumentExtractor:
     def __init__(self, ocr_engine: Optional[str] = None):
         self.ocr_engine = (ocr_engine or getattr(Config.Model, "OCR_ENGINE", "pytesseract")).lower()
         self._easyocr_reader = None
+        self._doc_intel = DocumentIntelligence()
 
     # ---------- Helpers ----------
     @staticmethod
@@ -100,12 +101,13 @@ class DocumentExtractor:
             )
 
     # ---------- Extraction routines ----------
-    def extract_text_from_pdf(self, pdf_content: bytes) -> ExtractedDocument:
+    def extract_text_from_pdf(self, pdf_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
         sections: List[Section] = []
         tables: List[Table] = []
         figures: List[Figure] = []
         chunk_candidates: List[ChunkCandidate] = []
         full_text_parts: List[str] = []
+        errors: List[str] = []
 
         current_title = "Introduction"
         current_section_id = self._make_section_id(current_title, 1)
@@ -114,11 +116,12 @@ class DocumentExtractor:
         last_page = 1
 
         if hasattr(fitz, "open"):
-            with fitz.open(stream=pdf_content, filetype="pdf") as doc:
-                for page_index, page in enumerate(doc, start=1):
-                    last_page = page_index
-                    blocks = page.get_text("blocks") or []
-                    page_text_parts: List[str] = []
+            try:
+                with fitz.open(stream=pdf_content, filetype="pdf") as doc:
+                    for page_index, page in enumerate(doc, start=1):
+                        last_page = page_index
+                        blocks = page.get_text("blocks") or []
+                        page_text_parts: List[str] = []
 
                     for block in blocks:
                         if len(block) < 5:
@@ -153,87 +156,118 @@ class DocumentExtractor:
                         if chunk_type == "table":
                             tables.append(Table(page=page_index, text=block_text))
 
-                    images = page.get_images(full=True)
-                    page_text = "\n".join(page_text_parts).strip()
-                    if self._detect_scanned_page(page_text, len(images)):
-                        for img in images:
-                            try:
-                                base_image = doc.extract_image(img[0])
-                                image = Image.open(io.BytesIO(base_image["image"]))
-                                ocr_text = self._ocr_image(image)
-                                if ocr_text:
-                                    figures.append(Figure(page=page_index, caption=ocr_text))
+                        images = page.get_images(full=True)
+                        page_text = "\n".join(page_text_parts).strip()
+                        if self._detect_scanned_page(page_text, len(images)):
+                            for img in images:
+                                try:
+                                    base_image = doc.extract_image(img[0])
+                                    image = Image.open(io.BytesIO(base_image["image"]))
+                                    ocr_text = self._ocr_image(image)
+                                    if ocr_text:
+                                        figures.append(Figure(page=page_index, caption=ocr_text))
+                                        chunk_candidates.append(
+                                            ChunkCandidate(
+                                                text=ocr_text,
+                                                page=page_index,
+                                                section_title=current_title,
+                                                section_id=current_section_id,
+                                                chunk_type="ocr_text",
+                                            )
+                                        )
+                                        page_text_parts.append(ocr_text)
+                                except Exception as exc:  # noqa: BLE001
+                                    logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
+                                    errors.append(f"image_extraction_failed: page={page_index} err={exc}")
+
+                        for img_index, _ in enumerate(images):
+                            figures.append(Figure(page=page_index, caption=f"Image_{page_index}_{img_index}"))
+
+                        if page_text_parts:
+                            full_text_parts.append(f"\n--- Page {page_index} ---\n" + "\n".join(page_text_parts))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"pdf_layout_parse_failed: {exc}")
+        if pdfplumber:
+            try:
+                with pdfplumber.open(io.BytesIO(pdf_content)) as doc:
+                    for page_index, page in enumerate(doc.pages, start=1):
+                        last_page = max(last_page, page_index)
+                        text = page.extract_text() or ""
+                        if text.strip():
+                            for para in text.split("\n"):
+                                para = para.strip()
+                                if not para:
+                                    continue
+                                if self._is_heading(para):
+                                    self._finalize_section(
+                                        sections, current_title, current_section_id, current_start_page, page_index, section_buffer
+                                    )
+                                    section_buffer = []
+                                    current_title = para
+                                    current_section_id = self._make_section_id(para, page_index)
+                                    current_start_page = page_index
+                                    continue
+                                section_buffer.append(para)
+                                chunk_type = "table" if self._looks_like_table(para) else "text"
+                                chunk_candidates.append(
+                                    ChunkCandidate(
+                                        text=para,
+                                        page=page_index,
+                                        section_title=current_title,
+                                        section_id=current_section_id,
+                                        chunk_type=chunk_type,
+                                    )
+                                )
+                                if chunk_type == "table":
+                                    tables.append(Table(page=page_index, text=para))
+                            full_text_parts.append(f"\n--- Page {page_index} ---\n{text}")
+
+                        try:
+                            extracted_tables = page.extract_tables()
+                            if extracted_tables:
+                                for tbl in extracted_tables:
+                                    formatted_table = "\n".join([", ".join(row) for row in tbl])
+                                    tables.append(Table(page=page_index, text=formatted_table, csv=formatted_table))
                                     chunk_candidates.append(
                                         ChunkCandidate(
-                                            text=ocr_text,
+                                            text=formatted_table,
                                             page=page_index,
                                             section_title=current_title,
                                             section_id=current_section_id,
-                                            chunk_type="ocr",
+                                            chunk_type="table",
                                         )
                                     )
-                                    page_text_parts.append(ocr_text)
-                            except Exception as exc:  # noqa: BLE001
-                                logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
-
-                    if page_text_parts:
-                        full_text_parts.append(f"\n--- Page {page_index} ---\n" + "\n".join(page_text_parts))
-        elif pdfplumber:
-            with pdfplumber.open(io.BytesIO(pdf_content)) as doc:
-                for page_index, page in enumerate(doc.pages, start=1):
-                    last_page = page_index
-                    text = page.extract_text() or ""
-                    if text.strip():
-                        for para in text.split("\n"):
-                            para = para.strip()
-                            if not para:
-                                continue
-                            if self._is_heading(para):
-                                self._finalize_section(
-                                    sections, current_title, current_section_id, current_start_page, page_index, section_buffer
-                                )
-                                section_buffer = []
-                                current_title = para
-                                current_section_id = self._make_section_id(para, page_index)
-                                current_start_page = page_index
-                                continue
-                            section_buffer.append(para)
-                            chunk_type = "table" if self._looks_like_table(para) else "text"
-                            chunk_candidates.append(
-                                ChunkCandidate(
-                                    text=para,
-                                    page=page_index,
-                                    section_title=current_title,
-                                    section_id=current_section_id,
-                                    chunk_type=chunk_type,
-                                )
-                            )
-                            if chunk_type == "table":
-                                tables.append(Table(page=page_index, text=para))
-                        full_text_parts.append(f"\n--- Page {page_index} ---\n{text}")
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"pdf_table_extract_failed: page={page_index} err={exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"pdfplumber_open_failed: {exc}")
         else:
-            raise RuntimeError("No PDF parser available: PyMuPDF (fitz) missing and pdfplumber not installed")
+            errors.append("No PDF parser available: PyMuPDF/pdfplumber missing")
 
         self._finalize_section(
             sections, current_title, current_section_id, current_start_page, last_page, section_buffer
         )
 
         full_text = "\n".join(full_text_parts).strip()
+        doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "document.pdf")
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
             tables=tables,
             figures=figures,
             chunk_candidates=chunk_candidates,
+            doc_type=doc_type,
+            errors=errors,
         )
 
-    def extract_text_from_docx(self, doc_content: bytes) -> ExtractedDocument:
+    def extract_text_from_docx(self, doc_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
         document = docx.Document(doc_content)
         sections: List[Section] = []
         tables: List[Table] = []
         figures: List[Figure] = []
         chunk_candidates: List[ChunkCandidate] = []
         full_text_parts: List[str] = []
+        errors: List[str] = []
 
         current_title = "Introduction"
         current_section_id = self._make_section_id(current_title, 1)
@@ -287,27 +321,42 @@ class DocumentExtractor:
         self._finalize_section(sections, current_title, current_section_id, 1, 1, section_buffer)
 
         # Figures via document relationships (captions/alt-text if present)
-        for rel in document.part.rels.values():
-            if "image" in rel.target_ref:
-                caption = getattr(rel, "alt_text", None) or rel.target_ref
-                figures.append(Figure(page=None, caption=caption))
+        try:
+            for rel in document.part.rels.values():
+                if "image" in rel.target_ref:
+                    caption = getattr(rel, "alt_text", None) or rel.target_ref
+                    figures.append(Figure(page=None, caption=caption))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"docx_image_parse_failed: {exc}")
+
+        try:
+            for shape in getattr(document, "inline_shapes", []):
+                alt_text = getattr(shape, "alt_text", "") or getattr(shape, "description", "")
+                if alt_text:
+                    figures.append(Figure(page=None, caption=alt_text))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"docx_inline_shapes_failed: {exc}")
 
         full_text = "\n".join(full_text_parts).strip()
+        doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "document.docx")
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
             tables=tables,
             figures=figures,
             chunk_candidates=chunk_candidates,
+            doc_type=doc_type,
+            errors=errors,
         )
 
-    def extract_text_from_pptx(self, ppt_content: bytes) -> ExtractedDocument:
+    def extract_text_from_pptx(self, ppt_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
         presentation = Presentation(ppt_content)
         sections: List[Section] = []
         tables: List[Table] = []
         figures: List[Figure] = []
         chunk_candidates: List[ChunkCandidate] = []
         full_text_parts: List[str] = []
+        errors: List[str] = []
 
         for slide_num, slide in enumerate(presentation.slides, start=1):
             slide_title = f"Slide {slide_num}"
@@ -366,33 +415,131 @@ class DocumentExtractor:
                 )
 
         full_text = "\n".join(full_text_parts).strip()
+        doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "slides.pptx")
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
             tables=tables,
             figures=figures,
             chunk_candidates=chunk_candidates,
+            doc_type=doc_type,
+            errors=errors,
         )
 
-    def extract_dataframe(self, df, MODEL):
+    def extract_dataframe(self, df: pd.DataFrame, sheet_name: str = "Sheet1", filename: Optional[str] = None) -> ExtractedDocument:
+        """
+        Build a structured ExtractedDocument from tabular data (CSV/Excel).
+        Preserves headers, row-level detail, and a CSV rendition for downstream chunking.
+        """
         try:
-            df = df.select_dtypes(include=[np.number, 'object']).copy()
-            for col in df.select_dtypes(include=['object']).columns:
-                try:
-                    df[col] = pd.to_datetime(df[col])
-                    df[f"Days Since {col}"] = (df[col] - df[col].min()).dt.days
-                    df.drop(columns=[col], inplace=True)
-                except Exception:
-                    logger.warning(f"Column {col} could not be converted to datetime. Keeping it as categorical.")
-                    df[col] = df[col].astype(str)
-
+            df = df.copy()
+            df = df.fillna("")
             df.columns = df.columns.astype(str)
-            categorical_cols = df.select_dtypes(include=['object']).columns.tolist()
-            if categorical_cols:
-                text_data = df[categorical_cols].astype(str).apply(lambda x: ' '.join(x.dropna()), axis=1).tolist()
-                embeddings = MODEL.encode(text_data, convert_to_numpy=True)
-                return {"embeddings": embeddings, "texts": text_data}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to normalize dataframe for extraction: %s", exc)
+            raise
 
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error processing dataframe: {e}")
-            return None
+        # Create a CSV-like text block for reference and table capture
+        table_csv = df.to_csv(index=False)
+        tables = [Table(page=None, text=table_csv, csv=table_csv)]
+
+        sections: List[Section] = []
+        chunk_candidates: List[ChunkCandidate] = []
+        figures: List[Figure] = []
+        full_text_parts: List[str] = []
+
+        # Build a simple section representing this sheet/table
+        section_id = self._make_section_id(sheet_name, 1)
+
+        # Generate row-wise text for richer chunking
+        row_texts: List[str] = []
+        headers = list(df.columns)
+        for idx, row in df.iterrows():
+            pairs = [f"{col}: {row[col]}" for col in headers if str(row[col]).strip() != ""]
+            row_text = "; ".join(pairs).strip()
+            if not row_text:
+                continue
+            row_texts.append(row_text)
+            chunk_candidates.append(
+                ChunkCandidate(
+                    text=row_text,
+                    page=None,
+                    section_title=sheet_name,
+                    section_id=section_id,
+                    chunk_type="table_row",
+                )
+            )
+
+        # Add column-summary chunk to retain header context
+        header_text = " | ".join(headers)
+        if header_text:
+            chunk_candidates.insert(
+                0,
+                ChunkCandidate(
+                    text=f"Columns: {header_text}",
+                    page=None,
+                    section_title=sheet_name,
+                    section_id=section_id,
+                    chunk_type="table_header",
+                ),
+            )
+            full_text_parts.append(f"Columns: {header_text}")
+
+        if row_texts:
+            full_text_parts.append("\n".join(row_texts))
+
+        sections.append(
+            Section(
+                section_id=section_id,
+                title=sheet_name,
+                level=1,
+                start_page=1,
+                end_page=1,
+                text="\n".join(row_texts) if row_texts else header_text,
+            )
+        )
+
+        full_text_parts.append(table_csv)
+        full_text = "\n".join([part for part in full_text_parts if part]).strip()
+
+        doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or sheet_name)
+        return ExtractedDocument(
+            full_text=full_text,
+            sections=sections,
+            tables=tables,
+            figures=figures,
+            chunk_candidates=chunk_candidates,
+            doc_type=doc_type,
+            errors=[],
+        )
+class DocumentIntelligence:
+    """Lightweight classifier to tag document type from observed layout/content."""
+
+    @staticmethod
+    def infer_type(
+        tables: List[Table],
+        figures: List[Figure],
+        sections: List[Section],
+        full_text: str,
+        filename_hint: Optional[str] = None,
+    ) -> str:
+        name = (filename_hint or "").lower()
+        if name.endswith((".ppt", ".pptx")):
+            return "presentation"
+        if name.endswith(".docx"):
+            return "document"
+        if name.endswith(".pdf"):
+            # Heuristics based on structure
+            if len(tables) >= 3:
+                return "report_table_heavy"
+            if len(figures) >= 3:
+                return "report_visual"
+            if sections and len(sections) <= 5 and any("slide" in s.title.lower() for s in sections):
+                return "presentation_pdf"
+            return "report"
+        if tables and not figures:
+            return "table_dataset"
+        if figures and not tables:
+            return "visual_brief"
+        # Fallback to narrative doc
+        return "document"

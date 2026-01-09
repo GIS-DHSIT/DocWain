@@ -5,6 +5,7 @@ import time
 from typing import Any, Dict, Optional
 import ollama
 import uvicorn
+from qdrant_client import QdrantClient
 from bson.objectid import ObjectId  # added by maha/maria
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,7 +32,7 @@ from src.api.dw_chat import (
 )
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.models import FinetuneRequest, AutoFinetuneRequest
-from src.finetune.dataset_builder import build_dataset_from_qdrant
+from src.finetune.dataset_builder import build_dataset_from_qdrant, discover_collections_and_profiles
 
 app = FastAPI(title="DocWain API")
 logger = logging.getLogger(__name__)
@@ -294,28 +295,87 @@ def list_available_models():
 
 
 @app.post("/finetune/auto")
-def auto_finetune(request: AutoFinetuneRequest):
-    """Generate a synthetic dataset from Qdrant chunks and kick off Unsloth fine-tune."""
+def auto_finetune(request: Optional[AutoFinetuneRequest] = None):
+    """
+    Connect to Qdrant, discover collections/profiles, build datasets automatically,
+    and kick off Unsloth fine-tunes for each discovered profile.
+    """
     manager = get_finetune_manager()
+    params = request or AutoFinetuneRequest()
+    # Merge legacy single-subscription field with new multi-subscription support
+    requested_subs = list(params.subscription_ids or [])
+    if params.subscription_id:
+        requested_subs.append(params.subscription_id)
+    if requested_subs:
+        # Remove duplicates while preserving order
+        seen = set()
+        requested_subs = [s for s in requested_subs if not (s in seen or seen.add(s))]
+    else:
+        requested_subs = None
+
+    qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
     try:
-        dataset_path = build_dataset_from_qdrant(
-            profile_id=request.profile_id,
-            subscription_id=request.subscription_id,
-            max_points=request.max_points,
-            questions_per_chunk=request.questions_per_chunk,
-            generation_model=request.generation_model,
+        discovered = discover_collections_and_profiles(
+            subscription_ids=requested_subs,
+            client=qdrant_client,
         )
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to build dataset: {exc}")
+        raise HTTPException(status_code=400, detail=f"Failed to discover Qdrant collections: {exc}")
 
-    base_payload = request.dict()
-    for k in ("subscription_id", "max_points", "questions_per_chunk", "generation_model"):
-        base_payload.pop(k, None)
-    base_payload["dataset_path"] = str(dataset_path)
-    base_payload["include_actual_data"] = False
-    ft_request = FinetuneRequest(**base_payload)
-    status = manager.start_job(ft_request)
-    return {"job": status.dict(), "dataset_path": str(dataset_path)}
+    if not discovered:
+        raise HTTPException(status_code=404, detail="No Qdrant collections with profile data found")
+
+    if params.profile_id:
+        filtered = {sub: [pid for pid in pids if pid == params.profile_id] for sub, pids in discovered.items()}
+        filtered = {sub: ids for sub, ids in filtered.items() if ids}
+        discovered = filtered
+        if not discovered:
+            raise HTTPException(status_code=404, detail=f"Profile {params.profile_id} not found in Qdrant payloads")
+
+    jobs = []
+    dataset_paths = []
+    failures = {}
+
+    for subscription_id, profile_ids in discovered.items():
+        for profile_id in profile_ids:
+            try:
+                dataset_path = build_dataset_from_qdrant(
+                    profile_id=profile_id,
+                    subscription_id=subscription_id,
+                    max_points=params.max_points,
+                    questions_per_chunk=params.questions_per_chunk,
+                    generation_model=params.generation_model,
+                    client=qdrant_client,
+                )
+            except Exception as exc:
+                failures[f"{subscription_id}:{profile_id}"] = f"dataset_error: {exc}"
+                continue
+
+            try:
+                payload = params.finetune_payload(profile_id=profile_id, dataset_path=str(dataset_path))
+                status = manager.start_job(FinetuneRequest(**payload))
+                jobs.append(status.dict())
+                dataset_paths.append(str(dataset_path))
+            except Exception as exc:  # noqa: BLE001
+                failures[f"{subscription_id}:{profile_id}"] = f"finetune_error: {exc}"
+
+    if not jobs:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "No finetune jobs started",
+                "errors": failures or "Unable to build datasets or schedule jobs",
+            },
+        )
+
+    response = {
+        "jobs": jobs,
+        "dataset_paths": dataset_paths,
+        "discovered_profiles": discovered,
+    }
+    if failures:
+        response["skipped"] = failures
+    return response
 
 
 @app.delete("/document/{doc_id}/embeddings")
