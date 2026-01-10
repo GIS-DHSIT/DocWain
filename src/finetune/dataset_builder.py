@@ -1,13 +1,16 @@
 import json
 import logging
 import time
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.api.vector_store import build_collection_name
+from src.finetune import qdrant_discovery
 
 logger = logging.getLogger(__name__)
 
@@ -55,25 +58,36 @@ def _sample_chunks(
         points = _scroll("profileId")
 
     chunks = []
-    seen = set()
+    seen: Set[str] = set()
+    groups: Dict[Tuple[str, str], List[Dict]] = {}
     for pt in points[:limit]:
         payload = pt.payload or {}
         text = payload.get("text") or payload.get("chunk") or ""
         if not text:
             continue
         text = str(text).strip()
-        if len(text) < 80:
+        min_len = int(getattr(Config.Retrieval, "MIN_CHUNK_SIZE", 150))
+        if len(text) < min_len:
             continue
-        sig = hash(text[:256])
-        if sig in seen:
+        identity = hashlib.sha256(
+            f"{text}|{payload.get('source_file')}|{payload.get('document_id')}|{payload.get('chunk_index')}".encode("utf-8")
+        ).hexdigest()
+        if identity in seen:
             continue
-        seen.add(sig)
-        chunks.append(
-            {
-                "text": text,
-                "metadata": payload,
-            }
-        )
+        seen.add(identity)
+        entry = {"text": text, "metadata": payload}
+        group_key = (str(payload.get("source_file") or ""), str(payload.get("document_id") or ""))
+        groups.setdefault(group_key, []).append(entry)
+
+    # Sample diversely across documents
+    while groups and len(chunks) < limit:
+        for key in list(groups.keys()):
+            if not groups[key]:
+                groups.pop(key, None)
+                continue
+            chunks.append(groups[key].pop(0))
+            if len(chunks) >= limit:
+                break
     return chunks
 
 
@@ -134,8 +148,7 @@ def discover_collections_and_profiles(
     try:
         collections = subscription_ids
         if collections is None:
-            resp = client.get_collections()
-            collections = [c.name for c in getattr(resp, "collections", [])]
+            collections = qdrant_discovery.list_collections(client=client)
     except Exception as exc:
         raise RuntimeError(f"Unable to list Qdrant collections: {exc}") from exc
 
@@ -143,11 +156,8 @@ def discover_collections_and_profiles(
     for sub in collections or []:
         collection_name = build_collection_name(sub)
         try:
-            profiles = _discover_profiles_in_collection(
-                client,
-                collection_name=collection_name,
-                max_profiles=max_profiles_per_collection,
-            )
+            stats = qdrant_discovery.list_profile_ids(collection_name, client=client)
+            profiles = stats.get("profile_ids", [])
         except Exception as exc:  # noqa: BLE001
             logger.warning("Skipping collection %s due to discovery error: %s", collection_name, exc)
             continue
@@ -199,7 +209,21 @@ def _parse_qa_pairs(raw: str, expected: int) -> List[Dict[str, str]]:
     return pairs[:expected]
 
 
-def _generate_pairs_for_chunk(chunk_text: str, profile_id: str, model_name: Optional[str], k: int) -> List[Dict[str, str]]:
+def _validate_pair(chunk_text: str, pair: Dict[str, str]) -> bool:
+    instruction = (pair.get("instruction") or "").strip()
+    output = (pair.get("output") or "").strip()
+    if not instruction or not output:
+        return False
+    return output.lower() in chunk_text.lower()
+
+
+def _generate_pairs_for_chunk(
+    chunk_text: str,
+    profile_id: str,
+    model_name: Optional[str],
+    k: int,
+    retries: int,
+) -> List[Dict[str, str]]:
     llm = _get_llm_client(model_name)
     prompt = f"""You are generating high-quality domain-specific training pairs for profile '{profile_id}'.
 Given the document chunk below, produce {k} diverse, factual question/answer pairs that stay within the chunk.
@@ -208,8 +232,55 @@ Return strict JSON list of objects: [{{"instruction": "...", "output": "..."}}].
 CHUNK:
 {chunk_text[:4000]}
 """
-    raw = llm.generate(prompt, max_retries=2)
-    return _parse_qa_pairs(raw, k)
+    attempts = 0
+    while attempts <= retries:
+        raw = llm.generate(prompt, max_retries=2)
+        pairs = _parse_qa_pairs(raw, k)
+        valid = [pair for pair in pairs if _validate_pair(chunk_text, pair)]
+        if valid:
+            return valid[:k]
+        attempts += 1
+    return []
+
+
+def _get_profile_snapshot(
+    client: QdrantClient,
+    collection: str,
+    profile_id: str,
+) -> Dict[str, int]:
+    try:
+        count = client.count(
+            collection_name=collection,
+            count_filter={"must": [{"key": "profile_id", "match": {"value": str(profile_id)}}]},
+            exact=True,
+        )
+        return {"count": int(getattr(count, "count", 0))}
+    except Exception:
+        try:
+            count = client.count(
+                collection_name=collection,
+                count_filter={"must": [{"key": "profileId", "match": {"value": str(profile_id)}}]},
+                exact=True,
+            )
+            return {"count": int(getattr(count, "count", 0))}
+        except Exception:
+            return {}
+
+
+def _load_dataset_cache(cache_path: Path) -> Dict[str, Dict]:
+    if not cache_path.exists():
+        return {}
+    try:
+        return json.loads(cache_path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_dataset_cache(cache_path: Path, cache: Dict[str, Dict]) -> None:
+    try:
+        cache_path.write_text(json.dumps(cache, indent=2))
+    except Exception as exc:
+        logger.warning("Failed to persist dataset cache: %s", exc)
 
 
 def build_dataset_from_qdrant(
@@ -224,28 +295,59 @@ def build_dataset_from_qdrant(
     """
     Auto-build a JSONL dataset by sampling chunks from Qdrant and generating QA pairs.
     """
+    client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+    collection = build_collection_name(subscription_id)
+    snapshot = _get_profile_snapshot(client, collection, profile_id)
+    cache_root = Path(output_dir) if output_dir else Path(Config.Path.APP_HOME) / "finetune_artifacts"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_root / "dataset_cache.json"
+    cache = _load_dataset_cache(cache_path)
+    cache_key = f"{subscription_id}:{profile_id}"
+    if snapshot and cache.get(cache_key):
+        cached = cache[cache_key]
+        if cached.get("count") == snapshot.get("count"):
+            cached_path = Path(cached.get("dataset_path", ""))
+            if cached_path.exists():
+                logger.info("Skipping dataset build for %s; no new Qdrant data detected", cache_key)
+                return cached_path
+
     chunks = _sample_chunks(profile_id, subscription_id, limit=max_points, client=client)
     if not chunks:
         raise ValueError(f"No chunks found for profile {profile_id} in subscription {subscription_id}")
 
     records = []
-    for chunk in chunks:
-        text = chunk["text"]
-        pairs = _generate_pairs_for_chunk(text, profile_id, generation_model, questions_per_chunk)
-        for pair in pairs:
-            records.append(
-                {
-                    "instruction": pair["instruction"],
-                    "output": pair["output"],
-                    "input": "",
-                    "profile_id": profile_id,
-                    "metadata": {
-                        "source_file": chunk["metadata"].get("source_file"),
-                        "document_id": chunk["metadata"].get("document_id"),
-                        "chunk_index": chunk["metadata"].get("chunk_index"),
-                    },
-                }
-            )
+    teacher_model = generation_model or getattr(Config.Finetune, "TEACHER_MODEL", "") or Config.Teams.DEFAULT_MODEL
+    retries = int(getattr(Config.Finetune, "QA_RETRY_MAX", 2))
+    max_workers = max(1, int(getattr(Config.Finetune, "MAX_CONCURRENCY", 4)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _generate_pairs_for_chunk,
+                chunk["text"],
+                profile_id,
+                teacher_model,
+                questions_per_chunk,
+                retries,
+            ): chunk
+            for chunk in chunks
+        }
+        for future in as_completed(futures):
+            chunk = futures[future]
+            pairs = future.result()
+            for pair in pairs:
+                records.append(
+                    {
+                        "instruction": pair["instruction"],
+                        "output": pair["output"],
+                        "input": "",
+                        "profile_id": profile_id,
+                        "metadata": {
+                            "source_file": chunk["metadata"].get("source_file"),
+                            "document_id": chunk["metadata"].get("document_id"),
+                            "chunk_index": chunk["metadata"].get("chunk_index"),
+                        },
+                    }
+                )
 
     root = Path(output_dir) if output_dir else Path(Config.Path.APP_HOME) / "finetune_artifacts" / profile_id / "auto_datasets"
     root.mkdir(parents=True, exist_ok=True)
@@ -253,6 +355,10 @@ def build_dataset_from_qdrant(
     with path.open("w", encoding="utf-8") as f:
         for rec in records:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    if snapshot:
+        cache[cache_key] = {"dataset_path": str(path), "count": snapshot.get("count", 0)}
+        _save_dataset_cache(cache_path, cache)
 
     logger.info("Built auto dataset at %s with %d records", path, len(records))
     return path
