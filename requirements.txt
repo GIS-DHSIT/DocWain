@@ -1,5 +1,6 @@
 # --- Core Web Framework ---
 fastapi
+httpx
 uvicorn[standard]
 python-multipart  # required for FastAPI file uploads
 
@@ -58,5 +59,4 @@ ollama
 python-dotenv
 loguru
 gunicorn
-
 

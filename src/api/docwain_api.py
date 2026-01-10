@@ -31,10 +31,17 @@ from src.api.dw_chat import (
     get_session_list,
 )
 from src.finetune import get_finetune_manager, list_models
-from src.finetune.models import FinetuneRequest, AutoFinetuneRequest
+from src.finetune.auto_orchestrator import get_auto_orchestrator
+from src.finetune.models import FinetuneRequest, AutoFinetuneRequest, AutoFinetuneRunRequest
 from src.finetune.dataset_builder import build_dataset_from_qdrant, discover_collections_and_profiles
 
 app = FastAPI(title="DocWain API")
+
+
+@app.on_event("startup")
+def start_auto_finetune_scheduler():
+    orchestrator = get_auto_orchestrator()
+    orchestrator.start_scheduler()
 logger = logging.getLogger(__name__)
 
 
@@ -107,7 +114,7 @@ def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> D
     return {"text": text, "conversation": {"id": convo_id}, "from": {"id": user_id}}
 
 
-async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
+async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None, bytes]:
     """
     Parse Teams activity payload, tolerating empty/invalid bodies.
     Returns a dict on success; None when the body cannot be parsed.
@@ -119,7 +126,7 @@ async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
             "Teams payload missing/empty body; responding with friendly message | content_type=%s",
             content_type,
         )
-        return None
+        return None, raw_body
 
     try:
         activity = json.loads(raw_body)
@@ -133,26 +140,26 @@ async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
                     content_type,
                     len(raw_body or b""),
                 )
-                return fallback
+                return fallback, raw_body
 
         logger.debug(
             "Invalid Teams payload: JSON decode failed; responding with friendly message | content_type=%s | body_len=%d",
             content_type,
             len(raw_body or b""),
         )
-        return None
+        return None, raw_body
 
     if not isinstance(activity, dict):
         logger.warning("Invalid Teams payload type: %s", type(activity))
-        return None
+        return None, raw_body
 
-    return activity
+    return activity, raw_body
 
 
 @app.post("/teams/messages")
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
-    activity = await _parse_teams_activity(request)
+    activity, raw_body = await _parse_teams_activity(request)
     if activity is None:
         # Return a Bot-style message so Teams sees a graceful response instead of 4xx
         return {
@@ -161,7 +168,11 @@ async def handle_teams_messages(request: Request):
         }
 
     try:
-        return await teams_adapter.handle_teams_activity(activity, headers=dict(request.headers))
+        return await teams_adapter.handle_teams_activity(
+            activity,
+            headers=dict(request.headers),
+            raw_body=raw_body,
+        )
     except teams_adapter.TeamsAuthError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
 
@@ -376,6 +387,19 @@ def auto_finetune(request: Optional[AutoFinetuneRequest] = None):
     if failures:
         response["skipped"] = failures
     return response
+
+
+@app.post("/finetune/auto/run")
+def run_auto_finetune(request: AutoFinetuneRunRequest):
+    orchestrator = get_auto_orchestrator()
+    results = orchestrator.run_for_all_collections(request)
+    return {"jobs": [status.dict() for status in results]}
+
+
+@app.get("/finetune/auto/status")
+def auto_finetune_status():
+    orchestrator = get_auto_orchestrator()
+    return {"jobs": [status.dict() for status in orchestrator.status()]}
 
 
 @app.delete("/document/{doc_id}/embeddings")
