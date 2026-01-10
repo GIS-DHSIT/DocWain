@@ -107,6 +107,7 @@ class Config:
 
     class Teams:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
+        SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
         DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "default")
         DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
@@ -117,18 +118,41 @@ class Config:
         BLOB_PATH_PREFIX = os.getenv("TEAMS_BLOB_PATH_PREFIX", "teams")
         SESSION_AS_SUBSCRIPTION = os.getenv("TEAMS_SESSION_AS_SUBSCRIPTION", "true").lower() == "true"
         PROFILE_PER_USER = os.getenv("TEAMS_PROFILE_PER_USER", "true").lower() == "true"
+        MAX_ATTACHMENT_MB = int(os.getenv("TEAMS_MAX_ATTACHMENT_MB", "50"))
+        HTTP_TIMEOUT_SEC = float(os.getenv("TEAMS_HTTP_TIMEOUT_SEC", "20"))
+        HTTP_RETRIES = int(os.getenv("TEAMS_HTTP_RETRIES", "2"))
+        BOT_ACCESS_TOKEN = os.getenv("TEAMS_BOT_ACCESS_TOKEN", "")
 
     class Retrieval:
-        CHUNK_SIZE = 800
-        CHUNK_OVERLAP = 200
-        MIN_CHUNK_SIZE = 150
-        MAX_CONTEXT_CHUNKS = 12  # allow deeper context packing for richer answers
-        SIMILARITY_THRESHOLD = 0.10  # ✅ LOWERED FROM 0.7
-        USE_SPARSE_VECTORS = True
-        USE_ADJACENT_EXPANSION = True
-        NEIGHBOR_WINDOW = 2
-        NEIGHBOR_MAX_NEW = 10
+        CHUNK_SIZE = int(os.getenv("RETRIEVAL_CHUNK_SIZE", "800"))
+        CHUNK_OVERLAP = int(os.getenv("RETRIEVAL_CHUNK_OVERLAP", "200"))
+        MIN_CHUNK_SIZE = int(os.getenv("RETRIEVAL_MIN_CHUNK_SIZE", "150"))
+        MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
+        SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
+        USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
+        USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"
+        NEIGHBOR_WINDOW = int(os.getenv("RETRIEVAL_NEIGHBOR_WINDOW", "2"))
+        NEIGHBOR_MAX_NEW = int(os.getenv("RETRIEVAL_NEIGHBOR_MAX_NEW", "10"))
         HYBRID_WEIGHTS = {
             "dense": float(os.getenv("HYBRID_WEIGHT_DENSE", "0.6")),
             "sparse": float(os.getenv("HYBRID_WEIGHT_SPARSE", "0.4")),
         }
+        RERANKER_ENABLED = os.getenv("RETRIEVAL_RERANKER_ENABLED", "true").lower() == "true"
+
+    class LLM:
+        TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+        TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
+        MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+        MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
+
+    class Finetune:
+        AUTO_ENABLED = os.getenv("FINETUNE_AUTO_ENABLED", "false").lower() == "true"
+        AUTO_INTERVAL_HOURS = float(os.getenv("FINETUNE_AUTO_INTERVAL_HOURS", "6"))
+        TEACHER_MODEL = os.getenv("FINETUNE_TEACHER_MODEL", "")
+        MAX_CONCURRENCY = int(os.getenv("FINETUNE_MAX_CONCURRENCY", "4"))
+        QA_RETRY_MAX = int(os.getenv("FINETUNE_QA_RETRY_MAX", "2"))
+        AUTO_MIN_POINTS = int(os.getenv("FINETUNE_AUTO_MIN_POINTS", "40"))
+        AUTO_MIN_RECORDS = int(os.getenv("FINETUNE_AUTO_MIN_RECORDS", "20"))
+        AUTO_MAX_PROFILES_PER_RUN = int(os.getenv("FINETUNE_AUTO_MAX_PROFILES_PER_RUN", "10"))
+        CLEANUP_ENABLED = os.getenv("FINETUNE_CLEANUP_ENABLED", "false").lower() == "true"
+        CLEANUP_KEEP_LAST = int(os.getenv("FINETUNE_CLEANUP_KEEP_LAST", "3"))

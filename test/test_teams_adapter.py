@@ -1,9 +1,10 @@
-import os
-import tempfile
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
+
+import httpx
 
 from src.teams import adapter as teams_adapter
+from src.teams import attachments as teams_attachments
 from src.api.config import Config
 
 
@@ -18,48 +19,103 @@ class HandleAttachmentActivityTests(unittest.IsolatedAsyncioTestCase):
                 }
             ],
         }
+        with patch("src.teams.attachments._download_bytes", return_value=b"dummy content") as mock_download, \
+                patch("src.teams.attachments.fileProcessor", return_value={"sample.txt": "document content"}), \
+                patch("src.teams.attachments.train_on_document") as mock_train:
+            response = await teams_adapter.handle_attachment_activity(activity, correlation_id="corr-1")
 
-        fake_download = MagicMock()
-        fake_download.download_url = "http://example.com/file.txt"
-        fake_download.name = "sample.txt"
-        fake_download.unique_id = "file-123"
+        self.assertEqual(response["type"], "message")
+        self.assertIn("Successfully processed", response["text"])
+        mock_download.assert_awaited_once()
+        mock_train.assert_called_once()
 
-        with tempfile.TemporaryDirectory() as tmpdir, \
-                patch.dict(os.environ, {"TEAMS_UPLOAD_DIR": tmpdir}, clear=False), \
-                patch("src.teams.adapter.FileDownloadInfo.deserialize", return_value=fake_download), \
-                patch("src.teams.adapter.requests.get") as mock_get, \
-                patch("src.teams.adapter.fileProcessor", return_value={"sample.txt": "document content"}), \
-                patch("src.teams.adapter.train_on_document") as mock_train:
+    async def test_download_url_snake_case(self):
+        activity = {
+            "conversation": {"id": "conversation-id"},
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.teams.file.download.info",
+                    "content": {"download_url": "http://example.com/file.txt"},
+                }
+            ],
+        }
+        with patch("src.teams.attachments._download_bytes", return_value=b"dummy content"), \
+                patch("src.teams.attachments.fileProcessor", return_value={"sample.txt": "document content"}), \
+                patch("src.teams.attachments.train_on_document"):
+            response = await teams_adapter.handle_attachment_activity(activity, correlation_id="corr-2")
 
-            mock_response = MagicMock()
-            mock_response.content = b"dummy content"
-            mock_response.raise_for_status = MagicMock()
-            mock_get.return_value = mock_response
+        self.assertEqual(response["type"], "message")
+        self.assertIn("Successfully processed", response["text"])
 
-            response = await teams_adapter.handle_attachment_activity(activity)
-            temp_path = os.path.join(tmpdir, "sample.txt")
+    async def test_missing_download_url(self):
+        activity = {
+            "conversation": {"id": "conversation-id"},
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.teams.file.download.info",
+                    "content": {},
+                }
+            ],
+        }
+        response = await teams_adapter.handle_attachment_activity(activity, correlation_id="corr-3")
+        self.assertEqual(response["type"], "message")
+        self.assertIn("could not be processed", response["text"])
 
-            self.assertEqual(response["type"], "message")
-            self.assertIn("File processed successfully", response["text"])
-            mock_get.assert_called_once_with("http://example.com/file.txt")
-            mock_train.assert_called_once_with(
-                "document content",
-                subscription_id="conversation-id",
-                profile_tag="teams_user",
-                doc_tag="file-123",
-                doc_name="sample.txt",
-            )
-            self.assertFalse(os.path.exists(temp_path))
+    async def test_oversized_file_rejected(self):
+        activity = {
+            "conversation": {"id": "conversation-id"},
+            "attachments": [
+                {
+                    "contentType": "application/vnd.microsoft.teams.file.download.info",
+                    "content": {"downloadUrl": "http://example.com/file.txt"},
+                }
+            ],
+        }
+        with patch("src.teams.attachments._download_bytes", side_effect=ValueError("Attachment exceeds size limit")):
+            response = await teams_adapter.handle_attachment_activity(activity, correlation_id="corr-4")
+        self.assertEqual(response["type"], "message")
+        self.assertIn("failed", response["text"].lower())
 
     async def test_bypasses_non_file_attachments(self):
         activity = {
             "conversation": {"id": "conversation-id"},
             "attachments": [{"contentType": "image/png", "content": {}}],
         }
-
-        response = await teams_adapter.handle_attachment_activity(activity)
+        response = await teams_adapter.handle_attachment_activity(activity, correlation_id="corr-5")
         self.assertEqual(response["type"], "message")
-        self.assertIn("Unable to process the attachment", response["text"])
+        self.assertIn("upload the image", response["text"])
+
+    async def test_http_client_timeout_used(self):
+        async def _fake_stream(*args, **kwargs):
+            raise httpx.RequestError("boom", request=None)  # type: ignore[arg-type]
+
+        class _FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.kwargs = kwargs
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+            def stream(self, *args, **kwargs):
+                return _FakeStream()
+
+        class _FakeStream:
+            async def __aenter__(self):
+                raise httpx.RequestError("boom", request=None)  # type: ignore[arg-type]
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        with patch("src.teams.attachments.httpx.AsyncClient", side_effect=_FakeClient) as mock_client:
+            with self.assertRaises(httpx.RequestError):
+                await teams_attachments._download_bytes(
+                    "http://example.com/file.txt",
+                    headers=None,
+                    timeout=1.5,
+                    retries=0,
+                    max_bytes=10,
+                )
+        self.assertTrue(mock_client.called)
+        self.assertEqual(mock_client.call_args.kwargs.get("timeout"), 1.5)
 
 
 class HandleTeamsActivityTests(unittest.IsolatedAsyncioTestCase):
@@ -116,6 +172,20 @@ class HandleTeamsActivityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("hello", response["text"])
         mock_answer.assert_called_once()
         mock_history.assert_called_once()
+
+
+class VerifySharedSecretTests(unittest.TestCase):
+    def test_verify_shared_secret_uses_constant_time_compare(self):
+        headers = {"x-teams-shared-secret": "secret"}
+        with patch.object(Config.Teams, "SHARED_SECRET", "secret"), \
+                patch("src.teams.adapter.hmac.compare_digest", return_value=True) as mock_compare:
+            teams_adapter.verify_shared_secret(headers, raw_body=b"")
+        mock_compare.assert_called()
+
+    def test_verify_shared_secret_missing_returns_401(self):
+        with patch.object(Config.Teams, "SHARED_SECRET", "secret"):
+            with self.assertRaises(teams_adapter.TeamsAuthError):
+                teams_adapter.verify_shared_secret({})
 
 
 if __name__ == "__main__":
