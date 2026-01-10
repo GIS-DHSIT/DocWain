@@ -4,6 +4,8 @@ import logging
 import threading
 import time
 import uuid
+import hashlib
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -97,6 +99,7 @@ class UnslothFinetuneManager:
         self._update_status(job_id, status="running", message="initializing")
         try:
             dataset = self._prepare_dataset(request)
+            dataset_hash = self._hash_dataset(request.dataset_path)
             if len(dataset) < 5:
                 raise ValueError("Dataset too small for finetuning (min 5 rows)")
             eval_ds = None
@@ -115,6 +118,7 @@ class UnslothFinetuneManager:
             self._update_status(job_id, status="running", message="training with Unsloth SFTTrainer")
 
             eval_metrics = self._train(model, tokenizer, train_ds, request, output_dir, eval_dataset=eval_ds)
+            eval_loss = None
             if eval_ds:
                 eval_loss = eval_metrics.get("eval_loss")
                 if eval_loss is None or math.isnan(eval_loss):
@@ -122,7 +126,14 @@ class UnslothFinetuneManager:
                 self._update_status(job_id, status="running", message=f"eval_loss={eval_loss:.4f}")
 
             merged_dir = output_dir / "merged"
-            self._activate_profile_model(request.profile_id, merged_dir)
+            self._activate_profile_model(
+                request.profile_id,
+                merged_dir,
+                base_model=request.base_model,
+                dataset_hash=dataset_hash,
+                qdrant_snapshot=request.qdrant_snapshot,
+                eval_loss=eval_loss,
+            )
 
             self._update_status(
                 job_id,
@@ -206,6 +217,16 @@ class UnslothFinetuneManager:
             return []
 
     @staticmethod
+    def _hash_dataset(dataset_path: Optional[str]) -> Optional[str]:
+        if not dataset_path:
+            return None
+        try:
+            data = Path(dataset_path).read_bytes()
+            return hashlib.sha256(data).hexdigest()
+        except Exception:
+            return None
+
+    @staticmethod
     def _build_output_dir(profile_id: str, job_id: str, root_dir: str) -> Path:
         out_dir = Path(root_dir)
         if not out_dir.is_absolute():
@@ -275,14 +296,60 @@ class UnslothFinetuneManager:
         )
         return eval_metrics
 
-    def _activate_profile_model(self, profile_id: str, model_dir: Path):
-        entry = {
+    def _activate_profile_model(
+        self,
+        profile_id: str,
+        model_dir: Path,
+        base_model: str,
+        dataset_hash: Optional[str],
+        qdrant_snapshot: Optional[dict],
+        eval_loss: Optional[float],
+    ):
+        entry = self.state.get(profile_id, {})
+        runs = entry.get("runs", [])
+        run_record = {
             "profile_id": profile_id,
             "model_path": str(model_dir),
-            "backend": "unsloth",
-            "served_model_name": f"finetuned-{profile_id}",
-            "updated_at": time.time(),
+            "base_model": base_model,
+            "dataset_hash": dataset_hash,
+            "qdrant_snapshot": qdrant_snapshot,
+            "eval_loss": eval_loss,
+            "created_at": time.time(),
         }
+        runs.append(run_record)
+        entry.update(
+            {
+                "profile_id": profile_id,
+                "model_path": str(model_dir),
+                "backend": "unsloth",
+                "served_model_name": f"finetuned-{profile_id}",
+                "updated_at": time.time(),
+                "runs": runs,
+            }
+        )
+        self.state[profile_id] = entry
+        self._persist_state()
+        self._cleanup_old_runs(profile_id)
+
+    def _cleanup_old_runs(self, profile_id: str) -> None:
+        if not getattr(Config.Finetune, "CLEANUP_ENABLED", False):
+            return
+        keep = int(getattr(Config.Finetune, "CLEANUP_KEEP_LAST", 3))
+        entry = self.state.get(profile_id, {})
+        runs = entry.get("runs", [])
+        if len(runs) <= keep:
+            return
+        runs_sorted = sorted(runs, key=lambda r: r.get("created_at", 0), reverse=True)
+        to_keep = runs_sorted[:keep]
+        to_remove = runs_sorted[keep:]
+        for run in to_remove:
+            model_path = run.get("model_path")
+            if model_path:
+                try:
+                    shutil.rmtree(Path(model_path).parent, ignore_errors=True)
+                except Exception:
+                    pass
+        entry["runs"] = to_keep
         self.state[profile_id] = entry
         self._persist_state()
 
@@ -303,7 +370,10 @@ class UnslothFinetuneManager:
         if not self.state_path.exists():
             return {}
         try:
-            return json.loads(self.state_path.read_text())
+            raw = json.loads(self.state_path.read_text())
+            for profile_id, rec in raw.items():
+                rec.setdefault("runs", [])
+            return raw
         except Exception:
             return {}
 
