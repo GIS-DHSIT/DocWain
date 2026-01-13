@@ -1,34 +1,33 @@
 
-# Step 1: Base setup for RAG-style pipeline
-# We'll structure the RAG module in the following components:
-# - GeminiManager: to call Gemini API
-# - QdrantRetriever: to retrieve relevant documents
-# - RAGPipeline: combines query, retrieval, and generation
-
 from typing import List
 from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, SearchRequest
-from src.api.config import Config
 from sentence_transformers import SentenceTransformer
 
-# ---- Commented out Ollama since we are switching to Gemini ----
-# import ollama
-
-# Gemini API import
-import google.generativeai as genai
+from src.api.config import Config
+from src.api.genai_client import generate_text, get_genai_client
 
 
 # GeminiManager: handles Gemini API calls
 class GeminiManager:
     def __init__(self, model_name: str = "gemini-2.5-flash"):
-        genai.configure(api_key=Config.Model.GEMINI_API_KEY)
+        if not getattr(Config.Model, "GEMINI_API_KEY", None):
+            raise ValueError("GEMINI_API_KEY is not configured")
+        get_genai_client(Config.Model.GEMINI_API_KEY)
         self.model_name = model_name
-        self.client = genai.GenerativeModel(self.model_name)
+        self.generation_config = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.3),
+            "top_p": getattr(Config.LLM, "TOP_P", 0.95),
+        }
 
     def run_model(self, prompt: str) -> str:
         """Run Gemini model with the given prompt"""
-        response = self.client.generate_content(prompt)
-        return response.text
+        text, _ = generate_text(
+            api_key=Config.Model.GEMINI_API_KEY,
+            model=self.model_name,
+            prompt=prompt,
+            generation_config=self.generation_config,
+        )
+        return text
 
 
 # QdrantRetriever: connects to Qdrant and fetches top-k results

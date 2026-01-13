@@ -22,8 +22,23 @@ def _get_header(headers: Dict[str, str], key: str) -> str:
     return headers.get(key) or headers.get(key.lower()) or headers.get(key.upper()) or ""
 
 
+def _is_botframework_jwt(headers: Optional[Dict[str, str]]) -> bool:
+    """Detect a Bot Framework bearer token (JWT) to bypass shared-secret auth."""
+    if not headers:
+        return False
+    auth_header = _get_header(headers, "authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return False
+    token = auth_header[7:].strip()
+    return token.count(".") == 2
+
+
 def verify_shared_secret(headers: Dict[str, str], raw_body: Optional[bytes] = None) -> None:
     """Check shared secret (simple header-based auth for Teams outbound calls)."""
+    if _is_botframework_jwt(headers):
+        # Bot Framework JWT present; rely on adapter validation instead.
+        return
+
     expected = Config.Teams.SHARED_SECRET
     if not expected:
         # No secret configured; allow for local/dev use.

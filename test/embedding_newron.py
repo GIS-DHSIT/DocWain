@@ -1,4 +1,3 @@
-
 import ollama
 import faiss
 import logging
@@ -9,21 +8,17 @@ from sentence_transformers import SentenceTransformer
 from qdrant_client.models import Distance, VectorParams, Filter
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-# from openai import AzureOpenAI   # ❌ Commented out (we no longer use Azure OpenAI)
 import uvicorn
 from src.api.config import Config
 from src.api.dataHandler import trainData
-import google.generativeai as genai   # ✅ New Gemini import
+from src.api.genai_client import generate_text, get_genai_client
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 MODEL = SentenceTransformer(Config.Model.SENTENCE_TRANSFORMERS)
 
-# AzureOpenAI.api_key = Config.Model.AZURE_OPENAI_API_KEY   # ❌ Not needed anymore
 mongoClient = MongoClient(Config.MongoDB.URI)
 qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
-
-# ✅ Configure Gemini
-genai.configure(api_key=Config.Model.GEMINI_API_KEY)
+get_genai_client(Config.Model.GEMINI_API_KEY)
 
 app = FastAPI(title="DocWain API")
 
@@ -122,10 +117,6 @@ def answer_question(query, collection_name, tag="default", model='llama3.2'):
 
 
 # ❌ Old Azure function (commented out)
-# def azure_answer_question(...):
-#     ...
-
-# ✅ New Gemini function
 def gemini_answer_question(query, collection_name, tag="default", model="gemini-1.5-flash"):
     """Answers a question based on stored embeddings using Gemini."""
     embeddings = load_embeddings_from_qdrant(collection_name, tag)
@@ -140,9 +131,12 @@ def gemini_answer_question(query, collection_name, tag="default", model="gemini-
     logging.info(f"Retrieving response using Gemini {model}.")
     prompt = f"Answer based on this context:\n{retrieved_text}\n\nQuestion: {query}"
 
-    gemini_model = genai.GenerativeModel(model)
-    response = gemini_model.generate_content(prompt)
-    return response.text
+    text, _ = generate_text(
+        api_key=Config.Model.GEMINI_API_KEY,
+        model=model,
+        prompt=prompt,
+    )
+    return text
 
 
 @app.post("/ask")
@@ -155,8 +149,8 @@ def ask_question_api(request: QuestionRequest):
     return {"answer": answer}
 
 
-@app.post("/ask_gemini")   # ✅ renamed endpoint safely
-def ask_gemini_api(request: GeminiQuestionRequest):   # ✅ function name unique
+@app.post("/ask_gemini")
+def ask_gemini_api(request: GeminiQuestionRequest):
     """Gemini API endpoint for answering questions."""
     if not request.query:
         raise HTTPException(status_code=400, detail="Query is required")

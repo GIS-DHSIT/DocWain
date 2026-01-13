@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-
 from dotenv import load_dotenv
 
 # Load environment overrides from a .env file when present. This makes sure the
@@ -109,7 +108,7 @@ class Config:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
-        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "default")
+        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "15e0c724-4de0-492e-9861-9e637b3f9076")
         DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
@@ -122,6 +121,9 @@ class Config:
         HTTP_TIMEOUT_SEC = float(os.getenv("TEAMS_HTTP_TIMEOUT_SEC", "20"))
         HTTP_RETRIES = int(os.getenv("TEAMS_HTTP_RETRIES", "2"))
         BOT_ACCESS_TOKEN = os.getenv("TEAMS_BOT_ACCESS_TOKEN", "")
+        # Support common Azure Bot env var spellings; defaults intentionally blank to force explicit configuration
+        BOT_APP_ID = os.getenv("MICROSOFT_APP_ID")
+        BOT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PWD")
 
     class Retrieval:
         CHUNK_SIZE = int(os.getenv("RETRIEVAL_CHUNK_SIZE", "800"))

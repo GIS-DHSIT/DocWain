@@ -16,7 +16,6 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 import ollama
 import os
 import redis
-import google.generativeai as genai
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -25,6 +24,7 @@ from src.api.enhanced_context_builder import IntelligentContextBuilder
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
+from src.api.genai_client import generate_text, get_genai_client
 from src.finetune import resolve_model_for_profile
 
 # Configure logging
@@ -300,8 +300,9 @@ def configure_gemini():
         api_key = getattr(Config.Model, "GEMINI_API_KEY", None) or getattr(Config.Gemini, "GEMINI_API_KEY", None)
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set in configuration")
-        genai.configure(api_key=api_key)
+        get_genai_client(api_key)
         logger.info("Gemini API configured successfully")
+        return api_key
     except Exception as e:
         logger.error(f"Failed to configure Gemini API: {e}")
         raise
@@ -718,17 +719,16 @@ class OllamaClient:
 
 class GeminiClient:
     def __init__(self, model_name: Optional[str] = None):
-        configure_gemini()
+        self.api_key = configure_gemini()
         self.model_name = model_name or Config.Model.GEMINI_MODEL_NAME
         if not self.model_name:
             raise ValueError("Gemini model name is not configured")
-        self.model = genai.GenerativeModel(self.model_name)
-        self.generation_config = genai.GenerationConfig(
-            temperature=getattr(Config.LLM, "TEMPERATURE", 0.3),
-            top_p=getattr(Config.LLM, "TOP_P", 0.95),
-            top_k=40,
-            max_output_tokens=getattr(Config.LLM, "MAX_TOKENS", 2048),
-        )
+        self.generation_config = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.3),
+            "top_p": getattr(Config.LLM, "TOP_P", 0.95),
+            "top_k": 40,
+            "max_output_tokens": getattr(Config.LLM, "MAX_TOKENS", 2048),
+        }
         logger.info(f"Initialized GeminiClient with model: {self.model_name}")
 
     def generate(
@@ -740,29 +740,16 @@ class GeminiClient:
         """Generate response with retry logic and robust parsing."""
         for attempt in range(1, max_retries + 1):
             try:
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config=self.generation_config
+                text, response = generate_text(
+                    api_key=self.api_key,
+                    model=self.model_name,
+                    prompt=prompt,
+                    generation_config=self.generation_config,
                 )
-
-                text = None
-
-                if hasattr(response, 'text') and response.text:
-                    text = response.text.strip()
-                elif hasattr(response, 'candidates') and response.candidates:
-                    candidate = response.candidates[0]
-                    if hasattr(candidate, 'content'):
-                        if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                            text = candidate.content.parts[0].text.strip()
-                        elif hasattr(candidate.content, 'text'):
-                            text = candidate.content.text.strip()
-
                 if text:
                     return text
-                else:
-                    logger.warning(f"No text in response: {response}")
-                    return "I apologize, but I couldn't generate a proper response."
-
+                logger.warning(f"No text in response: {response}")
+                return "I apologize, but I couldn't generate a proper response."
             except Exception as e:
                 logger.warning(f"Gemini API attempt {attempt}/{max_retries} failed: {e}")
                 if attempt < max_retries:
