@@ -2,25 +2,26 @@
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
+
+from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
+from botbuilder.schema import Activity
 import ollama
 import uvicorn
-from qdrant_client import QdrantClient
-from bson.objectid import ObjectId  # added by maha/maria
+from bson.objectid import ObjectId
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from qdrant_client import QdrantClient
 
 from src.api.config import Config
-from src.teams import adapter as teams_adapter
 from src.api.dataHandler import (
     db,
     get_subscription_pii_setting,
-    mongoClient,
-    trainData,  # trainSingleDocument
+    trainData,
     train_single_document,
-    delete_embeddings
 )
 from src.api.dw_chat import (
     add_message_to_history,
@@ -30,19 +31,44 @@ from src.api.dw_chat import (
     get_session_by_id,
     get_session_list,
 )
-from src.finetune import get_finetune_manager, list_models
+from src.finetune import get_finetune_manager
 from src.finetune.auto_orchestrator import get_auto_orchestrator
-from src.finetune.models import FinetuneRequest, AutoFinetuneRequest, AutoFinetuneRunRequest
 from src.finetune.dataset_builder import build_dataset_from_qdrant, discover_collections_and_profiles
+from src.finetune.models import AutoFinetuneRequest, AutoFinetuneRunRequest, FinetuneRequest
+from src.teams import adapter as teams_adapter
 
-app = FastAPI(title="DocWain API")
+logger = logging.getLogger(__name__)
 
 
-@app.on_event("startup")
-def start_auto_finetune_scheduler():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     orchestrator = get_auto_orchestrator()
     orchestrator.start_scheduler()
-logger = logging.getLogger(__name__)
+    yield
+
+
+app = FastAPI(title="DocWain API", lifespan=lifespan)
+
+UNSUPPORTED_MSI_APP_ID = "fd5d5c9d-12b9-441f-b72f-4e94a50da1af"
+MICROSOFT_APP_ID = (Config.Teams.BOT_APP_ID or "").strip()
+MICROSOFT_APP_PASSWORD = Config.Teams.BOT_APP_PASSWORD or ""
+# Fail fast to avoid accidental Managed Identity usage for Bot Framework auth
+if not MICROSOFT_APP_ID or not MICROSOFT_APP_PASSWORD:
+    raise RuntimeError(
+        "MicrosoftAppId and MicrosoftAppPassword must be set for the Bot Framework adapter; Managed Identity is not supported."
+    )
+if MICROSOFT_APP_ID == UNSUPPORTED_MSI_APP_ID:
+    raise RuntimeError(
+        "MicrosoftAppId is set to the DocWain managed identity clientId (fd5d...); use the Bot App Registration's App ID + client secret instead."
+    )
+
+logger.info("[BOT CONFIG] MicrosoftAppId=%s PasswordSet=%s", MICROSOFT_APP_ID, bool(MICROSOFT_APP_PASSWORD))
+bot_settings = BotFrameworkAdapterSettings(
+    app_id=MICROSOFT_APP_ID,
+    app_password=MICROSOFT_APP_PASSWORD,
+)
+teams_bot_adapter = BotFrameworkAdapter(bot_settings)
+BOT_CREDENTIALS_CONFIGURED = True
 
 
 def _get_dw_newron():
@@ -54,7 +80,6 @@ def _get_dw_newron():
     from src.api import dw_newron  # local import to defer heavy deps
     return dw_newron
 
-#  Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Adjust this in production to specific domains
@@ -95,6 +120,16 @@ def _normalize_answer(answer):
     }
 
 
+def _is_botframework_jwt(auth_header: str) -> bool:
+    """Determine if the Authorization header contains a Bot Framework JWT."""
+    if not auth_header:
+        return False
+    if not auth_header.lower().startswith("bearer "):
+        return False
+    token = auth_header[7:].strip()
+    return token.count(".") == 2
+
+
 def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> Dict[str, Any] | None:
     """Construct a minimal Teams-like activity from a plain text payload."""
     try:
@@ -111,7 +146,12 @@ def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> D
     )
     user_id = headers.get("x-teams-user-id") or "teams_user"
 
-    return {"text": text, "conversation": {"id": convo_id}, "from": {"id": user_id}}
+    return {
+        "type": "message",
+        "text": text,
+        "conversation": {"id": convo_id},
+        "from": {"id": user_id},
+    }
 
 
 async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None, bytes]:
@@ -159,18 +199,63 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
 @app.post("/teams/messages")
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
-    activity, raw_body = await _parse_teams_activity(request)
-    if activity is None:
+    activity_payload, raw_body = await _parse_teams_activity(request)
+    if activity_payload is None:
         # Return a Bot-style message so Teams sees a graceful response instead of 4xx
         return {
             "type": "message",
             "text": "I couldn't read that Teams message. Please try sending it again.",
         }
 
+    headers = dict(request.headers)
+    auth_header = request.headers.get("Authorization", "")
+    use_bot_framework = _is_botframework_jwt(auth_header)
+
+    if use_bot_framework and not BOT_CREDENTIALS_CONFIGURED:
+        logger.error(
+            "Microsoft bot credentials are not configured; cannot validate Teams JWT. "
+            "Set MicrosoftAppId/MicrosoftAppPassword in the environment."
+        )
+        raise HTTPException(status_code=401, detail="Bot credentials are not configured")
+
+    if use_bot_framework:
+        try:
+            activity_obj = Activity.deserialize(activity_payload)
+        except Exception as exc:
+            logger.error("Failed to deserialize Teams activity: %s", exc)
+            raise HTTPException(status_code=400, detail="Invalid Teams activity payload")
+
+        async def bot_logic(turn_context: TurnContext):
+            response_payload = await teams_adapter.handle_teams_activity(
+                turn_context.activity.as_dict(),
+                headers=headers,
+                raw_body=raw_body,
+            )
+            if isinstance(response_payload, dict):
+                try:
+                    outgoing = Activity.deserialize(response_payload)
+                except Exception:
+                    outgoing = Activity(
+                        type=response_payload.get("type") or "message",
+                        text=response_payload.get("text"),
+                    )
+            else:
+                outgoing = response_payload
+            await turn_context.send_activity(outgoing)
+
+        try:
+            await teams_bot_adapter.process_activity(activity_obj, auth_header, bot_logic)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to process Teams activity via Bot Framework adapter: %s", exc, exc_info=True)
+            detail = "Unauthorized Teams request" if "auth" in str(exc).lower() or "unauthoriz" in str(exc).lower() else "Failed to process Teams activity"
+            status = 401 if "auth" in detail.lower() else 500
+            raise HTTPException(status_code=status, detail=detail)
+        return {}
+
     try:
         return await teams_adapter.handle_teams_activity(
-            activity,
-            headers=dict(request.headers),
+            activity_payload,
+            headers=headers,
             raw_body=raw_body,
         )
     except teams_adapter.TeamsAuthError as exc:
@@ -300,11 +385,6 @@ def finetune_status(job_id: str):
     return status.dict()
 
 
-@app.get("/models")
-def list_available_models():
-    return list_models()
-
-
 @app.post("/finetune/auto")
 def auto_finetune(request: Optional[AutoFinetuneRequest] = None):
     """
@@ -313,12 +393,10 @@ def auto_finetune(request: Optional[AutoFinetuneRequest] = None):
     """
     manager = get_finetune_manager()
     params = request or AutoFinetuneRequest()
-    # Merge legacy single-subscription field with new multi-subscription support
     requested_subs = list(params.subscription_ids or [])
     if params.subscription_id:
         requested_subs.append(params.subscription_id)
     if requested_subs:
-        # Remove duplicates while preserving order
         seen = set()
         requested_subs = [s for s in requested_subs if not (s in seen or seen.add(s))]
     else:
@@ -452,7 +530,7 @@ def delete_document_embeddings_api(
         )
 
         if result["status"] == "success":
-            logging.info(f" [API] Successfully deleted embeddings for document {doc_id}")
+            logging.info(f"[API] Successfully deleted embeddings for document {doc_id}")
             return {
                 "status": "success",
                 "document_id": doc_id,
@@ -479,7 +557,7 @@ def delete_document_embeddings_api(
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"L [API] Failed to delete embeddings: {e}", exc_info=True)
+        logging.error(f"[API] Failed to delete embeddings: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to delete embeddings: {str(e)}"
@@ -513,22 +591,7 @@ def get_metrics(days: int = 7):
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
-
-'''
-@app.get("/chat-history/{user_id}")
-def get_chat_history_api(user_id: str):
-    """API endpoint to retrieve full chat history for a user."""
-    try:
-        history = get_chat_history(user_id)
-        if history is None:
-            raise HTTPException(status_code=404, detail="Chat history not found")
-
-        logging.info(f"[CHAT HISTORY] User: {user_id}")
-        return {"user_id": user_id, "chat_history": history}
-    except Exception as e:
-        logging.error(f"Failed to retrieve chat history: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
-'''
+ 
 
 @app.get("/chat-history/{user_id}")
 def get_chat_history_api(user_id: str, subscription_id: str = "default"):
@@ -556,7 +619,7 @@ def get_chat_history_api(user_id: str, subscription_id: str = "default"):
             formatted = history  # already correct format
 
         logging.info(f"[CHAT HISTORY] User: {user_id}, Sessions: {len(formatted['sessions'])}")
-        return formatted  #  Now returns {"sessions": [...]}
+        return formatted
     except Exception as e:
         logging.error(f"Failed to retrieve chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
@@ -607,25 +670,6 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
     except Exception as e:
         logging.error(f"Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
-
-'''
-@app.get("/pii/{doc_id}")
-def get_pii_info(doc_id: str, subscription_id: str = "default"):
-    """API endpoint to retrieve PII masking stats for a document."""
-    try:
-        stats = get_pii_stats(doc_id)
-        if not stats:
-            raise HTTPException(status_code=404, detail=f"Document not found for id {doc_id}")
-        return stats
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.error(f"Failed to retrieve PII stats: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve PII stats")
-'''
-
-'-------------added by maha/maria ------------------'
-'--------------for PII setting management ------------------'
 
 class PIISettingUpdate(BaseModel):
     pii_enabled: bool
