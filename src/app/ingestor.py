@@ -14,6 +14,13 @@ sys.path.append(path)
 
 from .config import Config
 from .model import create_embeddings
+try:
+    from src.vetting.engine import vet_and_attach_metadata
+    from src.vetting.config import VettingConfig
+    _VETTING_CONFIG = VettingConfig.load()
+except Exception:  # pragma: no cover - optional dependency path
+    vet_and_attach_metadata = None  # type: ignore
+    _VETTING_CONFIG = None
 
 
 class Ingestor:
@@ -57,13 +64,22 @@ class Ingestor:
             semantic_documents = self._semantic_expand(loaded_documents)
             if not semantic_documents:
                 continue
-            base_documents = [
-                Document(
-                    page_content=doc.page_content,
-                    metadata={**doc.metadata, "source": str(doc_path)},
+            base_documents = []
+            for doc in semantic_documents:
+                metadata = {**doc.metadata, "source": str(doc_path)}
+                if _VETTING_CONFIG and _VETTING_CONFIG.auto_attach_on_ingest and vet_and_attach_metadata:
+                    try:
+                        # Optional vetting hook: annotate metadata without blocking ingestion.
+                        metadata = vet_and_attach_metadata(doc.page_content, metadata)
+                    except Exception:
+                        # Vetting should never break ingestion.
+                        metadata = metadata
+                base_documents.append(
+                    Document(
+                        page_content=doc.page_content,
+                        metadata=metadata,
+                    )
                 )
-                for doc in semantic_documents
-            ]
             documents.extend(
                 self.recursive_splitter.split_documents(base_documents)
             )

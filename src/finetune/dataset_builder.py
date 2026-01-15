@@ -16,18 +16,33 @@ def _get_llm_client(model_name: Optional[str] = None):
     # Lazy import to avoid circular dependencies
     from src.api.dw_newron import create_llm_client
 
-    return create_llm_client(model_name)
+    # Cache per-model to avoid reinitializing Ollama/Gemini clients on every chunk
+    global _LLM_CLIENT_CACHE
+    try:
+        _LLM_CLIENT_CACHE
+    except NameError:
+        _LLM_CLIENT_CACHE = {}
+
+    key = model_name or "default"
+    if key not in _LLM_CLIENT_CACHE:
+        _LLM_CLIENT_CACHE[key] = create_llm_client(model_name)
+    return _LLM_CLIENT_CACHE[key]
 
 
 def _sample_chunks(
         profile_id: str,
-        subscription_id: str,
+        subscription_id: Optional[str],
         limit: int = 100,
-        client: Optional[QdrantClient] = None
+        client: Optional[QdrantClient] = None,
+        collection_name: Optional[str] = None,
 ) -> List[Dict]:
     """Fetch chunk payloads from Qdrant for a profile/collection."""
     client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
-    collection = build_collection_name(subscription_id)
+    if not collection_name:
+        if not subscription_id:
+            raise ValueError("collection_name or subscription_id is required to sample chunks")
+        collection_name = build_collection_name(subscription_id)
+    target_collection = collection_name
 
     def _scroll(filter_key: str):
         pts: List[Dict] = []
@@ -35,7 +50,7 @@ def _sample_chunks(
         offset = None
         while len(pts) < limit:
             res = client.scroll(
-                collection_name=collection,
+                collection_name=target_collection,
                 scroll_filter=scroll_filter,
                 limit=min(64, limit - len(pts)),
                 with_vectors=False,
@@ -143,10 +158,10 @@ def discover_collections_and_profiles(
     for sub in collections or []:
         collection_name = build_collection_name(sub)
         try:
-            profiles = _discover_profiles_in_collection(
-                client,
+            profiles = discover_profiles_for_collection(
                 collection_name=collection_name,
                 max_profiles=max_profiles_per_collection,
+                client=client,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Skipping collection %s due to discovery error: %s", collection_name, exc)
@@ -154,6 +169,36 @@ def discover_collections_and_profiles(
         if profiles:
             discovered[sub] = profiles
     return discovered
+
+
+def discover_profiles_for_collection(
+        collection_name: str,
+        max_profiles: Optional[int] = None,
+        scan_limit: int = 512,
+        batch_size: int = 64,
+        client: Optional[QdrantClient] = None,
+) -> List[str]:
+    """
+    Return a list of profile ids present in a specific Qdrant collection.
+    """
+    client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+    try:
+        return _discover_profiles_in_collection(
+            client=client,
+            collection_name=collection_name,
+            max_profiles=max_profiles,
+            scan_limit=scan_limit,
+            batch_size=batch_size,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Unable to read collection {collection_name}: {exc}") from exc
+
+
+def list_profile_ids_in_collection(collection_name: str, client: Optional[QdrantClient] = None) -> List[str]:
+    """
+    Public helper to resolve all profile ids contained in a collection.
+    """
+    return discover_profiles_for_collection(collection_name=collection_name, client=client)
 
 
 def _parse_qa_pairs(raw: str, expected: int) -> List[Dict[str, str]]:
@@ -214,17 +259,25 @@ CHUNK:
 
 def build_dataset_from_qdrant(
         profile_id: str,
-        subscription_id: str = "default",
+        subscription_id: Optional[str] = "default",
         max_points: int = 120,
         questions_per_chunk: int = 2,
         generation_model: Optional[str] = None,
         output_dir: Optional[str] = None,
-        client: Optional[QdrantClient] = None
+        client: Optional[QdrantClient] = None,
+        collection_name: Optional[str] = None,
 ) -> Path:
     """
     Auto-build a JSONL dataset by sampling chunks from Qdrant and generating QA pairs.
+    Provide collection_name to bypass subscription-derived naming.
     """
-    chunks = _sample_chunks(profile_id, subscription_id, limit=max_points, client=client)
+    chunks = _sample_chunks(
+        profile_id=profile_id,
+        subscription_id=subscription_id,
+        limit=max_points,
+        client=client,
+        collection_name=collection_name,
+    )
     if not chunks:
         raise ValueError(f"No chunks found for profile {profile_id} in subscription {subscription_id}")
 
