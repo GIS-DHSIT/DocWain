@@ -1,0 +1,14 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      IN:
+        - "DPDP Act disclosures (if applicable)"
+        - "Consent withdrawal process"
+        - "Grievance officer contact"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "Reference applicable Indian state law when relevant."
+region_notes:
+  IN:
+    - "Check localization for DPDP definitions and notice/consent flows."

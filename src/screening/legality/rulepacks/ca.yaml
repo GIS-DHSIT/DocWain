@@ -1,0 +1,14 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      CA:
+        - "PIPEDA/CPPA purpose limitations"
+        - "Access and correction rights"
+        - "Cross-border transfer notice"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "Identify the applicable Canadian province."
+region_notes:
+  CA:
+    - "Clarify whether provincial privacy law applies (e.g., Quebec, BC, Alberta)."

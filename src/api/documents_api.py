@@ -1,11 +1,12 @@
 from fastapi import APIRouter, HTTPException, Query
 
+from src.api.schemas import DocumentListResponse
 from src.documents.document_store_adapter import list_documents
 
 documents_router = APIRouter()
 
 
-@documents_router.get("/documents")
+@documents_router.get("/documents", response_model=DocumentListResponse)
 def get_documents(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
@@ -34,4 +35,7 @@ def get_documents(
             "total": total,
         }
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Failed to list documents: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail={"error": {"code": "documents_list_failed", "message": str(exc)}},
+        )

@@ -1,0 +1,14 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      UK:
+        - "UK GDPR lawful basis"
+        - "Data Subject Rights (UK)"
+        - "ICO contact details (if applicable)"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "State England and Wales, Scotland, or Northern Ireland as governing law."
+region_notes:
+  UK:
+    - "Confirm references to ICO guidance when applicable."

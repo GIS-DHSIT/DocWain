@@ -6,24 +6,24 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
 import ollama
 import uvicorn
-from qdrant_client import QdrantClient
 from bson.objectid import ObjectId  # added by maha/maria
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, constr
+from qdrant_client import QdrantClient
 
 from src.api.config import Config
-from src.teams import adapter as teams_adapter
 from src.api.dataHandler import (
     db,
+    delete_embeddings,
     get_subscription_pii_setting,
     mongoClient,
     trainData,  # trainSingleDocument
     train_single_document,
-    delete_embeddings
 )
 from src.api.dw_chat import (
     add_message_to_history,
@@ -33,16 +33,34 @@ from src.api.dw_chat import (
     get_session_by_id,
     get_session_list,
 )
-from src.finetune import get_finetune_manager, list_models
-from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
-from src.finetune.dataset_builder import build_dataset_from_qdrant
-from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
-from src.vetting.api import router as vetting_router
+from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
+from src.finetune import get_finetune_manager, list_models
+from src.finetune.dataset_builder import build_dataset_from_qdrant
+from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
+from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
+from src.mode.session_state import SessionStateStore
+from src.execution.router import execute_request
+from src.execution.common import normalize_answer, chunk_text_stream
+from src.screening.api import screening_router
+from src.teams import adapter as teams_adapter
+from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
+from src.runtime.request_context import RequestContext
 
-app = FastAPI(title="DocWain API")
 logger = logging.getLogger(__name__)
+
+
+def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {"error": {"code": code, "message": message, "details": details or {}}}
+
+
+def _cors_origins() -> List[str]:
+    if getattr(Config.API, "ALLOW_ALL_ORIGINS", False):
+        return ["*"]
+    if getattr(Config.API, "ALLOW_ORIGINS", None):
+        return Config.API.ALLOW_ORIGINS
+    return ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
 def _get_dw_newron():
@@ -54,30 +72,67 @@ def _get_dw_newron():
     from src.api import dw_newron  # local import to defer heavy deps
     return dw_newron
 
-#  Add CORS middleware
+
+app = FastAPI(title="DocWain API")
+api_router = APIRouter(prefix="/api")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production to specific domains
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Optional Guardrails (formerly vetting) endpoints; they do not change default behavior.
-app.include_router(vetting_router)
-# Document listing endpoints
-app.include_router(documents_router, prefix="/api", tags=["Documents"])
+api_router.include_router(screening_router)
+api_router.include_router(documents_router, tags=["Documents"])
+
+session_state_store = SessionStateStore()
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    payload = detail if isinstance(detail, dict) and isinstance(detail.get("error"), dict) else _error(
+        str(getattr(exc, "status_code", "error")), str(detail)
+    )
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error for %s %s", request.method, request.url, exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=_error("internal_error", "Unexpected error occurred", {"reason": str(exc)}),
+    )
 
 
 class QuestionRequest(BaseModel):
-    query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
+    query: constr(min_length=1)
+    user_id: str = "someone@email.com"
+    profile_id: constr(min_length=1) = "67ac62ddfaa3aee44d38f4a5"
     subscription_id: str = "default"
     model_name: str = "llama3.2"
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
-    new_session: Optional[bool] = False  # Frontend sends flag here
+    new_session: bool = False  # Frontend sends flag here
+    agent_mode: Optional[bool] = None
+    debug: bool = False
+
+
+class AnswerPayload(BaseModel):
+    response: Any
+    sources: List[Any] = Field(default_factory=list)
+    grounded: bool = False
+    context_found: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AskResponse(BaseModel):
+    answer: AnswerPayload
+    current_session_id: Optional[str]
+    debug: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
@@ -95,23 +150,16 @@ def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
 
 
 def _normalize_answer(answer):
-    """Ensure API responses are structured consistently."""
-    if isinstance(answer, dict):
-        structured = {
-            "response": answer.get("response") or answer.get("answer"),
-            "sources": answer.get("sources", []),
-            "grounded": answer.get("grounded", False),
-            "context_found": answer.get("context_found", False),
-            "metadata": {k: v for k, v in answer.items() if k not in {"response", "answer", "sources"}},
-        }
-        return structured
-    return {
-        "response": str(answer),
-        "sources": [],
-        "grounded": False,
-        "context_found": False,
-        "metadata": {},
-    }
+    """Backward-compatible wrapper around the shared normalizer."""
+    return normalize_answer(answer)
+
+
+def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "…"
 
 
 def _resolve_output_root(path_str: str) -> Path:
@@ -350,12 +398,11 @@ async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
     return activity
 
 
-@app.post("/teams/messages", tags=["Teams"])
+@api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
     activity = await _parse_teams_activity(request)
     if activity is None:
-        # Return a Bot-style message so Teams sees a graceful response instead of 4xx
         return {
             "type": "message",
             "text": "I couldn't read that Teams message. Please try sending it again.",
@@ -364,99 +411,121 @@ async def handle_teams_messages(request: Request):
     try:
         return await teams_adapter.handle_teams_activity(activity, headers=dict(request.headers))
     except teams_adapter.TeamsAuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_error("unauthorized", str(exc)))
 
 
-@app.post("/ask", tags=["Default"])
-def ask_question_api(request: QuestionRequest):
-    logging.info(f"[ASK] ========== START ==========")
-    logging.info(f"[ASK] User: {request.user_id}")
-    logging.info(f"[ASK] Query: {request.query}")
-    logging.info(f"[ASK] Session ID from frontend: {request.session_id}")
-    logging.info(f"[ASK] New session flag: {request.new_session}")
-
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    if not request.profile_id:
-        raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
+@api_router.post("/ask", tags=["Default"], response_model=AskResponse)
+def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
+    logger.info(
+        "[ASK] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s query_snippet=%s",
+        request.user_id,
+        request.session_id,
+        request.new_session,
+        request.agent_mode,
+        agent_mode,
+        _safe_snippet(request.query),
+    )
 
     session_id = _resolve_session_id(request)
+    request.session_id = session_id
+    if agent_mode is not None:
+        object.__setattr__(request, "agent_mode_query", agent_mode)
 
-    # Generate answer
-    raw_answer = _get_dw_newron().answer_question(
+    session_state = session_state_store.get(session_id)
+    mode = resolve_execution_mode(request, session_state)
+    ctx = RequestContext.build(
         query=request.query,
+        session_id=session_id,
         user_id=request.user_id,
+        mode=mode.value,
+        debug=bool(request.debug),
         profile_id=request.profile_id,
         subscription_id=request.subscription_id,
         model_name=request.model_name,
         persona=request.persona,
-        session_id=session_id,
-        new_session=bool(request.new_session)
     )
-    answer = _normalize_answer(raw_answer)
+    result = execute_request(request, session_state=session_state, ctx=ctx, stream=False, debug=bool(request.debug))
 
-    # Add to history - backend uses frontend's session_id
-    _history, active_session_id = add_message_to_history(
+    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
+    if explicit_toggle is not None:
+        session_state_store.set_preferred_mode(
+            session_id,
+            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
+        )
+
+    answer = AnswerPayload.model_validate(result.answer)
+
+    _, active_session_id = add_message_to_history(
         request.user_id,
         request.query,
-        answer,
-        session_id=session_id,  # Use resolved session_id (existing or generated)
-        new_session=request.new_session  # Use frontend's flag
+        answer.model_dump(),
+        session_id=session_id,
+        new_session=request.new_session,
     )
 
-    logging.info(f"[ASK] Answer generated")
-    logging.info(f"[ASK] < Active Session ID: {active_session_id}")
-    logging.info(f"[ASK] ========== END ==========\n")
+    logger.info("[ASK] completed session_id=%s mode=%s", active_session_id, result.mode.value)
 
-    # Return session_id back to frontend
-    return {
-        "answer": answer,
-        "current_session_id": active_session_id
-    }
+    enriched_debug = {**(result.debug or {}), "request_id": ctx.request_id}
+    return AskResponse(answer=answer, current_session_id=active_session_id, debug=enriched_debug)
 
 
-@app.post("/askStream", tags=["Default"])
-def ask_question_stream_api(request: QuestionRequest):
+@api_router.post("/askStream", tags=["Default"])
+def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
     """
-    Streams the LLM response for a query. Uses the same RAG pipeline as /ask but
-    streams the generated answer text to the client.
+    Streams the LLM response for a query. Uses the same execution router as /ask but
+    yields text progressively based on the selected mode.
     """
-    logging.info(f"[ASK_STREAM] User: {request.user_id} | Query: {request.query}")
-
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    if not request.profile_id:
-        raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
+    logger.info(
+        "[ASK_STREAM] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s query_snippet=%s",
+        request.user_id,
+        request.session_id,
+        request.new_session,
+        request.agent_mode,
+        agent_mode,
+        _safe_snippet(request.query),
+    )
 
     session_id = _resolve_session_id(request)
+    request.session_id = session_id
+    if agent_mode is not None:
+        object.__setattr__(request, "agent_mode_query", agent_mode)
+
+    session_state = session_state_store.get(session_id)
+    mode = resolve_execution_mode(request, session_state)
+    ctx = RequestContext.build(
+        query=request.query,
+        session_id=session_id,
+        user_id=request.user_id,
+        mode=mode.value,
+        debug=bool(request.debug),
+        profile_id=request.profile_id,
+        subscription_id=request.subscription_id,
+        model_name=request.model_name,
+        persona=request.persona,
+    )
+
+    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
+    if explicit_toggle is not None:
+        session_state_store.set_preferred_mode(
+            session_id,
+            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
+        )
 
     def _stream():
         try:
-            raw_answer = _get_dw_newron().answer_question(
-                query=request.query,
-                user_id=request.user_id,
-                profile_id=request.profile_id,
-                subscription_id=request.subscription_id,
-                model_name=request.model_name,
-                persona=request.persona,
-                session_id=session_id,
-                new_session=bool(request.new_session)
-            )
-            answer = _normalize_answer(raw_answer)
-            text = answer.get("response") or ""
-            if not text:
-                text = "No response generated."
-            chunk_size = 256
-            for i in range(0, len(text), chunk_size):
-                yield text[i:i + chunk_size]
+            result = execute_request(request, session_state=session_state, ctx=ctx, stream=True, debug=bool(request.debug))
+            stream_iterable = result.stream or chunk_text_stream(result.answer.get("response") or "")
+            logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
+            for chunk in stream_iterable:
+                yield chunk
         except Exception as exc:
-            logging.error(f"[ASK_STREAM] Streaming failed: {exc}")
-            yield f"[error] {exc}"
+            logger.error("[ASK_STREAM] Streaming failed for session=%s: %s", session_id, exc, exc_info=True)
+            yield "[error] Unable to stream response right now."
 
     return StreamingResponse(_stream(), media_type="text/plain")
 
 
-@app.post("/train/{doc_id}", tags=["Default"])
+@api_router.post("/train/{doc_id}", tags=["Default"])
 def trigger_single_training(doc_id: str, subscription_id: str = "default"):
     """API endpoint to train a single document by its document ID."""
     try:
@@ -468,7 +537,7 @@ def trigger_single_training(doc_id: str, subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Single document training failed")
 
 
-@app.get("/train", tags=["Default"])
+@api_router.get("/train", tags=["Default"])
 def trigger_training(subscription_id: str = "default"):
     """API endpoint to trigger document training."""
     try:
@@ -481,7 +550,7 @@ def trigger_training(subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Training process failed")
 
 
-@app.post("/finetune/by-profile", tags=["Finetuning"])
+@api_router.post("/finetune/by-profile", tags=["Finetuning"])
 def finetune_single_profile(request: FinetuneRequest):
     """
     Kick off a fine-tune job for a single profile using the provided dataset/training parameters.
@@ -493,8 +562,8 @@ def finetune_single_profile(request: FinetuneRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc))
 
-@app.post("/finetune", tags=["Finetuning"])
-@app.post("/finetune/by-collection", tags=["Finetuning"])
+@api_router.post("/finetune", tags=["Finetuning"])
+@api_router.post("/finetune/by-collection", tags=["Finetuning"])
 def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
     """
     Fine-tune all profiles discovered inside a Qdrant collection (collection-only request).
@@ -627,7 +696,7 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
     return _build_training_summary(run_record, total_profiles_discovered=len(discovered_profiles))
 
 
-@app.get("/finetune/{job_id}", tags=["Finetuning"])
+@api_router.get("/finetune/{job_id}", tags=["Finetuning"])
 def finetune_status(job_id: str):
     manager = get_finetune_manager()
     status = manager.get_status(job_id)
@@ -636,12 +705,54 @@ def finetune_status(job_id: str):
     return status.dict()
 
 
-@app.get("/models", tags=["Default"])
+def _collect_available_models() -> List[ModelInfo]:
+    models: Dict[str, ModelInfo] = {}
+    try:
+        for entry in list_models():
+            name = entry.get("name") or entry.get("model")
+            if not name:
+                continue
+            models[name] = ModelInfo(
+                model=name,
+                source=entry.get("backend") or "finetune",
+                backend=entry.get("backend"),
+                profile_id=entry.get("profile_id"),
+                path=entry.get("path") or entry.get("model_path"),
+                updated_at=entry.get("updated_at"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to list managed models: %s", exc)
+
+    try:
+        raw = ollama.list().model_dump()
+        for entry in raw.get("models", []):
+            name = entry.get("model") or entry.get("name")
+            if not name:
+                continue
+            models.setdefault(
+                name,
+                ModelInfo(
+                    model=name,
+                    source="ollama",
+                    backend="ollama",
+                    size=entry.get("size"),
+                    digest=entry.get("digest"),
+                    updated_at=entry.get("modified_at"),
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to list Ollama models: %s", exc)
+
+    models.setdefault("gemini-2.5-flash", ModelInfo(model="gemini-2.5-flash", source="gemini", backend="gemini"))
+    return list(models.values())
+
+
+@api_router.get("/models", tags=["Default"], response_model=ModelsResponse)
 def list_available_models():
-    return list_models()
+    return ModelsResponse(models=_collect_available_models())
 
 
-@app.delete("/document/{doc_id}/embeddings", tags=["Default"])
+@api_router.delete("/document/{doc_id}/embeddings", tags=["Default"])
 def delete_document_embeddings_api(
         doc_id: str,
         subscription_id: str = "default",
@@ -725,21 +836,7 @@ def delete_document_embeddings_api(
         )
 
 
-@app.get("/models", tags=["Default"])
-def list_available_models():
-    """API endpoint to list available models."""
-    try:
-        models = ollama.list().model_dump()
-        model_list = models['models']
-        gemini = {'model': 'gemini-2.5-flash'}
-        model_list.append(gemini)
-        return {"models": model_list}
-    except Exception as e:
-        logging.error(f"Failed to list models: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve available models")
-
-
-@app.get("/metrics", tags=["Default"])
+@api_router.get("/metrics", tags=["Default"])
 def get_metrics(days: int = 7):
     """API endpoint to retrieve model/retrieval performance statistics."""
     try:
@@ -757,7 +854,7 @@ def get_metrics(days: int = 7):
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
 
 '''
-@app.get("/chat-history/{user_id}")
+@api_router.get("/chat-history/{user_id}")
 def get_chat_history_api(user_id: str):
     """API endpoint to retrieve full chat history for a user."""
     try:
@@ -772,7 +869,7 @@ def get_chat_history_api(user_id: str):
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
 '''
 
-@app.get("/chat-history/{user_id}", tags=["Default"])
+@api_router.get("/chat-history/{user_id}", tags=["Default"])
 def get_chat_history_api(user_id: str, subscription_id: str = "default"):
     """
     Returns all chat sessions for a user in the structure expected by NestJS.
@@ -803,7 +900,7 @@ def get_chat_history_api(user_id: str, subscription_id: str = "default"):
         logging.error(f"Failed to retrieve chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
 
-@app.get("/sessions/{user_id}", tags=["Default"])
+@api_router.get("/sessions/{user_id}", tags=["Default"])
 def get_sessions_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to get list of all sessions (for sidebar)."""
     try:
@@ -815,7 +912,7 @@ def get_sessions_api(user_id: str, subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
 
 
-@app.get("/session/{user_id}/{session_id}", tags=["Default"])
+@api_router.get("/session/{user_id}/{session_id}", tags=["Default"])
 def get_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to get a specific session's messages."""
     try:
@@ -829,7 +926,7 @@ def get_session_api(user_id: str, session_id: str, subscription_id: str = "defau
         raise HTTPException(status_code=500, detail="Failed to retrieve session")
 
 
-@app.delete("/chat-history/{user_id}", tags=["Default"])
+@api_router.delete("/chat-history/{user_id}", tags=["Default"])
 def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to delete all chat history for a user."""
     try:
@@ -840,7 +937,7 @@ def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Failed to delete chat history")
 
 
-@app.delete("/session/{user_id}/{session_id}", tags=["Default"])
+@api_router.delete("/session/{user_id}/{session_id}", tags=["Default"])
 def delete_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to delete a specific session."""
     try:
@@ -851,7 +948,7 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
         raise HTTPException(status_code=500, detail="Failed to delete session")
 
 '''
-@app.get("/pii/{doc_id}")
+@api_router.get("/pii/{doc_id}")
 def get_pii_info(doc_id: str, subscription_id: str = "default"):
     """API endpoint to retrieve PII masking stats for a document."""
     try:
@@ -873,7 +970,7 @@ class PIISettingUpdate(BaseModel):
     pii_enabled: bool
 
 
-@app.get("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
+@api_router.get("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def get_pii_setting(subscription_id: str):
     """
     Get current PII masking setting for a subscription
@@ -890,7 +987,7 @@ def get_pii_setting(subscription_id: str):
         raise HTTPException(status_code=500, detail="Failed to retrieve PII setting")
 
 
-@app.put("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
+@api_router.put("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
     """
     Update PII masking setting for a subscription
@@ -946,7 +1043,7 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
         raise HTTPException(status_code=500, detail="Failed to update PII setting")
 
 
-@app.post("/subscription/{subscription_id}/reprocess-documents", tags=["Subscriptions"])
+@api_router.post("/subscription/{subscription_id}/reprocess-documents", tags=["Subscriptions"])
 def reprocess_documents_with_new_pii_setting(subscription_id: str):
     """
     Reprocess all documents in a subscription with updated PII setting
@@ -986,6 +1083,11 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
     except Exception as e:
         logging.error(f"Failed to reprocess documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to reprocess documents")
+
+
+app.include_router(api_router)
+app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
+app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 
 
 if __name__ == "__main__":

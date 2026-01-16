@@ -44,7 +44,8 @@ _METRICS_TRACKER = None
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
 ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v3"
-ENABLE_ANSWER_CACHE = os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
+NO_ANSWER_CACHE = os.getenv("NO_ANSWER_CACHE", "true").strip().lower() in {"true", "1", "yes", "on"}
+ENABLE_ANSWER_CACHE = False if NO_ANSWER_CACHE else os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
 
 
 def _parse_redis_connection_string(conn_str: str):
@@ -547,7 +548,6 @@ class ConversationHistory:
 
         for turn in recent_turns:
             context_parts.append(f"User: {turn.user_message}")
-            context_parts.append(f"Assistant: {turn.assistant_response}")
 
         return "\n".join(context_parts)
 
@@ -2242,7 +2242,11 @@ class EnterpriseRAGSystem:
             top_k_rerank: int = 25,
             final_k: int = 12,
             session_id: Optional[str] = None,
-            new_session: bool = False
+            new_session: bool = False,
+            disable_answer_cache: bool = False,
+            force_refresh: bool = False,
+            request_id: Optional[str] = None,
+            index_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
@@ -2255,7 +2259,8 @@ class EnterpriseRAGSystem:
             namespace = _build_namespace(subscription_id, profile_id, self.model_name, session_id)
             metrics = get_metrics_tracker()
 
-            if new_session:
+            effective_new_session = new_session or force_refresh
+            if effective_new_session:
                 logger.info("Resetting conversation context for new session: %s", session_id or "default")
                 self.conversation_history.clear_history(namespace, user_id)
                 try:
@@ -2279,6 +2284,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": True,
                     "query_type": "positive_feedback",
                     "grounded": True
@@ -2296,6 +2303,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": True,
                     "query_type": "greeting",
                     "grounded": True
@@ -2310,6 +2319,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": True,
                     "query_type": "farewell",
                     "grounded": True
@@ -2358,7 +2369,7 @@ class EnterpriseRAGSystem:
                     telemetry.record_doc_metric(doc_id, "last_retrieval_time", time.time())
 
             # Cache lookup (per subscription/profile/query + recent memory fingerprint)
-            cache = get_redis_client() if ENABLE_ANSWER_CACHE else None
+            cache = get_redis_client() if (ENABLE_ANSWER_CACHE and not disable_answer_cache) else None
             cache_key = None
             conversation_context_for_cache = self.conversation_history.get_context(namespace, user_id, max_turns=2)
             memory_fingerprint = "noctx"
@@ -2391,29 +2402,7 @@ class EnterpriseRAGSystem:
                         cached_obj = json.loads(cached)
                         if cached_obj.get("cache_version") and cached_obj["cache_version"] != ANSWER_CACHE_VERSION:
                             raise ValueError("Cache version mismatch")
-                        logger.info("Cache hit for query; returning cached answer")
-                        cached_response = cached_obj.get("response", "")
-                        self.conversation_history.add_turn(namespace, user_id, query, cached_response)
-                        sources = cached_obj.get("sources") or []
-                        self.feedback_memory.add_feedback(namespace, user_id, query, cached_response, sources)
-                        doc_ids = cached_obj.get("source_doc_ids") or []
-                        if doc_ids:
-                            self.conversation_history.add_sources(namespace, user_id, [d for d in doc_ids if d])
-                        try:
-                            metrics.record(
-                                model_name=self.model_name,
-                                subscription_id=subscription_id,
-                                profile_id=profile_id,
-                                query_type=cached_obj.get("query_type", "cached"),
-                                context_found=bool(cached_obj.get("context_found", False)),
-                                grounded=bool(cached_obj.get("grounded", True)),
-                                cached=True,
-                                processing_time=float(cached_obj.get("processing_time", 0.0)),
-                                retrieval_stats=cached_obj.get("retrieval_stats") or {}
-                            )
-                        except Exception as metric_exc:
-                            logger.debug("Metrics record (cache hit) failed: %s", metric_exc)
-                        return cached_obj
+                        logger.info("Cache hit for query; ignoring because answer cache is disabled")
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
             logger.info(f"Preprocessed query: {processed_query}")
@@ -2445,6 +2434,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": False,
                     "query_type": "no_results",
                     "preprocessing": preprocessing_metadata,
@@ -2562,6 +2553,8 @@ class EnterpriseRAGSystem:
                     "sources": [],  # ✅ Changed to empty (no sources)
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": False,  # ✅ Changed to False
                     "query_type": "not_answerable",
                     "answerability_reason": answerability_reason,
@@ -2622,6 +2615,8 @@ class EnterpriseRAGSystem:
                 "sources": sources,
                 "user_id": user_id,
                 "collection": collection_name,
+                "request_id": request_id,
+                "index_version": index_version,
                 "context_found": True,
                 "query_type": "document_qa",
                 "num_sources": len(sources),
@@ -2648,7 +2643,9 @@ class EnterpriseRAGSystem:
                     "initial_retrieved": len(retrieved_chunks),
                     "after_rerank": len(reranked_chunks),
                     "final_context": len(final_chunks)
-                }
+                },
+                "force_refresh": force_refresh,
+                "disable_answer_cache": disable_answer_cache,
             }
 
             try:
@@ -2708,6 +2705,8 @@ class EnterpriseRAGSystem:
                 "sources": [],
                 "user_id": user_id,
                 "collection": collection_name if 'collection_name' in locals() else profile_id,
+                "request_id": request_id,
+                "index_version": index_version,
                 "context_found": False,
                 "query_type": "error",
                 "error": str(e),
@@ -2796,7 +2795,11 @@ def answer_question(
         model_name: str = "llama3.2",
         persona: str = "professional document analysis assistant",
         session_id: Optional[str] = None,
-        new_session: bool = False
+        new_session: bool = False,
+        disable_answer_cache: bool = False,
+        force_refresh: bool = False,
+        request_id: Optional[str] = None,
+        index_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main entry point for answering questions with enhanced NLU.
@@ -2826,7 +2829,11 @@ def answer_question(
         user_id=user_id,
         persona=persona,
         session_id=session_id,
-        new_session=new_session
+        new_session=new_session,
+        disable_answer_cache=disable_answer_cache,
+        force_refresh=force_refresh,
+        request_id=request_id,
+        index_version=index_version,
     )
 
 
