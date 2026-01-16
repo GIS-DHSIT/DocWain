@@ -5,9 +5,7 @@ from typing import Any, Dict, Optional
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
-from src.api import dw_newron
 from src.api.config import Config
-from src.api.dw_newron import create_llm_client
 from src.api.vector_store import QdrantVectorStore, build_collection_name
 
 logger = logging.getLogger(__name__)
@@ -67,8 +65,15 @@ class TeamsChatService:
         effective_model = model_name or Config.Teams.DEFAULT_MODEL
         effective_persona = persona or Config.Teams.DEFAULT_PERSONA
 
-        subscription_id = session_id or "teams-session"
-        profile_id = user_id or "teams_user"
+        if Config.Teams.SESSION_AS_SUBSCRIPTION:
+            subscription_id = session_id or "teams-session"
+        else:
+            subscription_id = Config.Teams.DEFAULT_SUBSCRIPTION
+
+        if Config.Teams.PROFILE_PER_USER:
+            profile_id = user_id or "teams_user"
+        else:
+            profile_id = Config.Teams.DEFAULT_PROFILE
 
         return TeamsChatContext(
             user_id=user_id or "teams_user",
@@ -112,6 +117,8 @@ class TeamsChatService:
             f"Question: {question}"
         )
         try:
+            from src.api.dw_newron import create_llm_client
+
             llm_client = create_llm_client(context.model_name)
             response_text = llm_client.generate(prompt)
         except Exception as exc:  # noqa: BLE001
@@ -136,6 +143,8 @@ class TeamsChatService:
         self.ensure_collection(context.subscription_id)
 
         try:
+            from src.api import dw_newron
+
             answer = dw_newron.answer_question(
                 query=question,
                 user_id=context.user_id,
