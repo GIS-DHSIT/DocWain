@@ -28,6 +28,7 @@ from src.api.documentVetting import mask_document_content, vettingProcessor
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
+from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -317,15 +318,15 @@ def fileProcessor(content, file):
             elif file_name.endswith(".json"):
                 extracted_data[file_name] = json.loads(content.decode("utf-8"))
             elif file_name.endswith(".pdf"):
-                extracted_data[file_name] = extractor.extract_text_from_pdf(content)
+                extracted_data[file_name] = extractor.extract_text_from_pdf(content, filename=file_name)
             elif file_name.endswith(".docx"):
-                extracted_data[file_name] = extractor.extract_text_from_docx(content)
+                extracted_data[file_name] = extractor.extract_text_from_docx(content, filename=file_name)
             elif file_name.endswith((".pptx", ".ppt")):
-                extracted_data[file_name] = extractor.extract_text_from_pptx(content)
+                extracted_data[file_name] = extractor.extract_text_from_pptx(content, filename=file_name)
             elif file_name.endswith(".txt"):
-                extracted_data[file_name] = content.decode("utf-8")
+                extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
             else:
-                extracted_data[file_name] = content.decode("utf-8")
+                extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
         return extracted_data
     except Exception as e:
         logging.error(f"Error processing file {file}: {e}")
@@ -525,6 +526,7 @@ def connectData(documentConnection):
         connData = v['connDict']
         profileId = str(docData['profile'])
         docId = str(docData['_id'])
+        telemetry = telemetry_store() if METRICS_V2_ENABLED else None
 
         subscriptionId = str(
             docData.get('subscriptionId')
@@ -546,6 +548,11 @@ def connectData(documentConnection):
                 logging.info(f"=" * 80)
                 logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
                 logging.info(f"=" * 80)
+                if telemetry:
+                    try:
+                        telemetry.record_metadata_quality(docId, docData, expected_fields=list(docData.keys()))
+                    except Exception:
+                        telemetry.increment("metadata_parse_failures_count")
                 all_extracted_docs = {}
 
                 if docData['type'] == 'S3':
@@ -1087,6 +1094,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
     3. Verify metadata before saving to Qdrant
     """
     try:
+        telemetry = telemetry_store() if METRICS_V2_ENABLED else None
         logging.info(f"=" * 80)
         logging.info(f"Starting training for {doc_name}")
         logging.info(f"  Document ID: {doc_tag}")
@@ -1175,7 +1183,15 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             logging.info(f"Generated {len(chunks)} chunks from structured extraction for {doc_name}")
 
             model = get_model()
+            embed_start = time.time()
             embeddings_array = model.encode(chunks, convert_to_numpy=True, normalize_embeddings=True)
+            embed_latency_ms = (time.time() - embed_start) * 1000
+            if telemetry:
+                telemetry.increment("embedding_requests_count")
+                telemetry.increment("total_chunks_embedded", amount=len(chunks))
+                telemetry.observe("embedding_latency_ms", embed_latency_ms)
+                telemetry.record_doc_metric(doc_tag, "chunks_embedded", len(chunks))
+                telemetry.set_gauge("last_embedding_time", time.time())
             sparse_vectors = build_sparse_vectors(chunks)
             summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
 
@@ -1269,11 +1285,19 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             # Generate embeddings
             logging.info(f"Generating embeddings for {len(chunks)} chunks")
             model = get_model()
+            embed_start = time.time()
             embeddings_array = model.encode(
                 chunks,
                 convert_to_numpy=True,
                 normalize_embeddings=True
             )
+            embed_latency_ms = (time.time() - embed_start) * 1000
+            if telemetry:
+                telemetry.increment("embedding_requests_count")
+                telemetry.increment("total_chunks_embedded", amount=len(chunks))
+                telemetry.observe("embedding_latency_ms", embed_latency_ms)
+                telemetry.record_doc_metric(doc_tag, "chunks_embedded", len(chunks))
+                telemetry.set_gauge("last_embedding_time", time.time())
 
             sparse_vectors = build_sparse_vectors(chunks)
 
@@ -1335,6 +1359,11 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
         logging.error(f"  Document ID: {doc_tag}")
         logging.error(f"  Error: {e}")
         logging.error(f"=" * 80)
+        try:
+            if telemetry:
+                telemetry.increment("embedding_failures_count")
+        except Exception:
+            pass
         raise
 
 

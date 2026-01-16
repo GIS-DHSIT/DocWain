@@ -65,7 +65,7 @@ async def ask_question(chain, question: str, session_id: str) -> AsyncGenerator[
     if sources:
         yield sources
 
-app = FastAPI(title="DocWain API")
+demo_app = FastAPI(title="DocWain Demo API")
 
 # Store chains for different sessions
 session_chains = {}
@@ -76,7 +76,7 @@ class Question(BaseModel):
     session_id: str
 
 
-@app.post("/api/v1/upload")
+@demo_app.post("/api/v1/upload")
 async def upload_documents(files: List[UploadFile] = File(...)):
     """
     Upload PDF documents and create a QA chain for the session.
@@ -111,7 +111,7 @@ async def upload_documents(files: List[UploadFile] = File(...)):
                 file_path.unlink()
 
 
-@app.post("/api/v1/ask")
+@demo_app.post("/api/v1/ask")
 async def ask(question: Question):
     """
     Ask a question about the uploaded documents.
@@ -144,7 +144,7 @@ async def ask(question: Question):
     )
 
 
-@app.delete("/api/v1/session/{session_id}")
+@demo_app.delete("/api/v1/session/{session_id}")
 async def delete_session(session_id: str):
     """
     Delete a session and clean up associated resources.
@@ -156,7 +156,7 @@ async def delete_session(session_id: str):
     return {"message": "Session deleted successfully"}
 
 
-@app.get("/api/v1/health")
+@demo_app.get("/api/v1/health")
 async def health_check():
     """
     Simple health check endpoint.
@@ -166,4 +166,4 @@ async def health_check():
 
 # Save this file as api.py in the DocWain directory
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(demo_app, host="0.0.0.0", port=8000)

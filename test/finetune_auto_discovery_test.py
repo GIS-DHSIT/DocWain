@@ -1,4 +1,7 @@
-from src.finetune.dataset_builder import discover_collections_and_profiles
+from src.finetune.dataset_builder import (
+    discover_collections_and_profiles,
+    discover_profiles_for_collection,
+)
 
 
 class _FakePoint:
@@ -55,3 +58,15 @@ def test_discover_collections_and_profiles_honors_subscription_filter():
     discovered = discover_collections_and_profiles(subscription_ids=["other"], client=client)
 
     assert discovered == {"other": ["gamma"]}
+
+
+def test_discover_profiles_for_collection_reads_payloads():
+    client = _FakeQdrantClient(
+        {
+            "default": [{"profile_id": "alpha"}, {"profileId": "beta"}, {"profile_id": "alpha"}],
+        }
+    )
+
+    profiles = discover_profiles_for_collection("default", client=client)
+
+    assert profiles == ["alpha", "beta"]

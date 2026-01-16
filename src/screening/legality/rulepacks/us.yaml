@@ -1,0 +1,14 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      US:
+        - "CCPA/CPRA disclosures (if applicable)"
+        - "Opt-out for sale/share (if applicable)"
+        - "Appeal rights for denials (if applicable)"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "Reference the state law that governs the contract."
+region_notes:
+  US:
+    - "Consider stating whether federal or state law controls disputes."
