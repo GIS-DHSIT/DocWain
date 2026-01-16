@@ -55,6 +55,9 @@ class RequestChain:
             force_refresh=force_refresh,
             request_id=self.ctx.request_id,
             index_version=self.ctx.index_version,
+            tools=self.ctx.tools,
+            use_tools=getattr(self.ctx, "use_tools", False),
+            tool_inputs=getattr(self.ctx, "tool_inputs", None),
         )
 
         normalized = normalize_answer(raw_answer)

@@ -2242,10 +2242,15 @@ class EnterpriseRAGSystem:
             force_refresh: bool = False,
             request_id: Optional[str] = None,
             index_version: Optional[str] = None,
+            tools: Optional[List[str]] = None,
+            use_tools: bool = False,
+            tool_inputs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
         telemetry = telemetry_store() if METRICS_V2_ENABLED else None
+        tool_list = tools or []
+        use_tooling = bool(use_tools or tool_list)
 
         try:
             if not profile_id:
@@ -2402,7 +2407,7 @@ class EnterpriseRAGSystem:
                         logger.warning("Failed to parse cached answer; ignoring")
             logger.info(f"Preprocessed query: {processed_query}")
 
-            if not retrieved_chunks:
+            if not retrieved_chunks and not use_tooling:
                 no_results_response = (
                     f"I couldn't find anything in your documents that answers: '{query}'. "
                     "Try rephrasing or tell me which document or section to focus on."
@@ -2499,6 +2504,45 @@ class EnterpriseRAGSystem:
                     context_sources = self.context_builder.extract_sources(final_chunks)
 
             logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
+
+            if use_tooling and tool_list:
+                try:
+                    import asyncio
+                    from src.tools.base import registry
+                except Exception as tool_import_exc:  # noqa: BLE001
+                    logger.warning("Tool registry not available: %s", tool_import_exc)
+                    tool_list = []
+                tool_chunks: List[str] = []
+                for tool_name in tool_list:
+                    payload = {
+                        "input": {"query": query, "context": context},
+                        "context": {"profile_id": profile_id, "subscription_id": subscription_id},
+                        "options": {"requested_by": "rag_pipeline"},
+                    }
+                    extra_input = (tool_inputs or {}).get(tool_name) if tool_inputs else None
+                    if isinstance(extra_input, dict):
+                        payload["input"].update(extra_input)
+                    elif extra_input is not None:
+                        payload["input"]["value"] = extra_input
+                    try:
+                        tool_resp = asyncio.run(
+                            registry.invoke(tool_name, payload, correlation_id=request_id)
+                        )
+                        if tool_resp.get("status") == "success":
+                            tool_result = tool_resp.get("result") or {}
+                            snippet = json.dumps(tool_result, default=str)
+                            tool_chunks.append(f"[{tool_name}] {snippet[:800]}")
+                            for src in tool_resp.get("sources") or []:
+                                meta = src.get("metadata") or {}
+                                meta["tool_output"] = True
+                                src["metadata"] = meta
+                                context_sources.append(src)
+                        else:
+                            logger.warning("Tool %s returned status=%s", tool_name, tool_resp.get("status"))
+                    except Exception as tool_exc:  # noqa: BLE001
+                        logger.warning("Tool %s failed: %s", tool_name, tool_exc)
+                if tool_chunks:
+                    context = (context or "") + "\n\n".join(tool_chunks)
 
             conversation_context = self.conversation_history.get_context(namespace, user_id, max_turns=3)
             conversation_summary = self.conversation_summarizer.summarize(conversation_context)
@@ -2829,6 +2873,9 @@ def answer_question(
         force_refresh: bool = False,
         request_id: Optional[str] = None,
         index_version: Optional[str] = None,
+        tools: Optional[List[str]] = None,
+        use_tools: bool = False,
+        tool_inputs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Main entry point for answering questions with enhanced NLU.
@@ -2863,6 +2910,9 @@ def answer_question(
         force_refresh=force_refresh,
         request_id=request_id,
         index_version=index_version,
+        tools=tools,
+        use_tools=use_tools,
+        tool_inputs=tool_inputs,
     )
 
 

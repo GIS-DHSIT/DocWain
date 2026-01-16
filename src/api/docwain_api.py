@@ -44,6 +44,7 @@ from src.execution.router import execute_request
 from src.execution.common import normalize_answer, chunk_text_stream
 from src.screening.api import screening_router
 from src.teams import adapter as teams_adapter
+from src.tools.router import tools_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
 
@@ -85,6 +86,7 @@ app.add_middleware(
 
 api_router.include_router(screening_router)
 api_router.include_router(documents_router, tags=["Documents"])
+api_router.include_router(tools_router, tags=["Tools"])
 
 session_state_store = SessionStateStore()
 
@@ -118,6 +120,9 @@ class QuestionRequest(BaseModel):
     new_session: bool = False  # Frontend sends flag here
     agent_mode: Optional[bool] = None
     debug: bool = False
+    tools: Optional[List[str]] = None
+    tool_inputs: Optional[Dict[str, Any]] = None
+    use_tools: bool = False
 
 
 class AnswerPayload(BaseModel):
@@ -506,6 +511,9 @@ def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Quer
         subscription_id=request.subscription_id,
         model_name=request.model_name,
         persona=request.persona,
+        tools=request.tools,
+        use_tools=bool(getattr(request, "use_tools", False)),
+        tool_inputs=request.tool_inputs,
     )
     result = execute_request(request, session_state=session_state, ctx=ctx, stream=False, debug=bool(request.debug))
 
@@ -565,6 +573,9 @@ def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool]
         subscription_id=request.subscription_id,
         model_name=request.model_name,
         persona=request.persona,
+        tools=request.tools,
+        use_tools=bool(getattr(request, "use_tools", False)),
+        tool_inputs=request.tool_inputs,
     )
 
     explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
