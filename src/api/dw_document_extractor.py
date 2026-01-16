@@ -2,7 +2,7 @@ import hashlib
 import io
 import logging
 import re
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import docx
 import fitz
@@ -99,6 +99,30 @@ class DocumentExtractor:
                     text="\n".join(buffer).strip(),
                 )
             )
+
+    @staticmethod
+    def _coerce_file_like(content: object):
+        """
+        Normalize raw payloads into a seekable stream for libraries like python-docx/pptx.
+        Handles bytes, memoryview, and already-open file-like objects.
+        """
+        if isinstance(content, memoryview):
+            content = content.tobytes()
+        if isinstance(content, (bytes, bytearray)):
+            return io.BytesIO(content)
+        if isinstance(content, str):
+            # Treat as raw text payload, not a path; decode to bytes
+            return io.BytesIO(content.encode("utf-8"))
+        if hasattr(content, "read"):
+            try:
+                content.seek(0)
+            except Exception:
+                pass
+            return content
+        try:
+            return io.BytesIO(bytes(content))
+        except Exception:
+            return io.BytesIO()
 
     # ---------- Extraction routines ----------
     def extract_text_from_pdf(self, pdf_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
@@ -260,8 +284,8 @@ class DocumentExtractor:
             errors=errors,
         )
 
-    def extract_text_from_docx(self, doc_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
-        document = docx.Document(doc_content)
+    def extract_text_from_docx(self, doc_content: Union[bytes, bytearray, memoryview, str, io.IOBase], filename: Optional[str] = None) -> ExtractedDocument:
+        document = docx.Document(self._coerce_file_like(doc_content))
         sections: List[Section] = []
         tables: List[Table] = []
         figures: List[Figure] = []
@@ -349,8 +373,8 @@ class DocumentExtractor:
             errors=errors,
         )
 
-    def extract_text_from_pptx(self, ppt_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
-        presentation = Presentation(ppt_content)
+    def extract_text_from_pptx(self, ppt_content: Union[bytes, bytearray, memoryview, str, io.IOBase], filename: Optional[str] = None) -> ExtractedDocument:
+        presentation = Presentation(self._coerce_file_like(ppt_content))
         sections: List[Section] = []
         tables: List[Table] = []
         figures: List[Figure] = []
@@ -421,6 +445,72 @@ class DocumentExtractor:
             sections=sections,
             tables=tables,
             figures=figures,
+            chunk_candidates=chunk_candidates,
+            doc_type=doc_type,
+            errors=errors,
+        )
+
+    def extract_text_from_txt(self, text_content: Union[bytes, str], filename: Optional[str] = None) -> ExtractedDocument:
+        """
+        Normalize plain text into the structured ExtractedDocument used by other parsers.
+        This keeps chunking/metadata consistent with richer document types.
+        """
+        errors: List[str] = []
+        try:
+            if isinstance(text_content, (bytes, bytearray)):
+                text = text_content.decode("utf-8", errors="ignore")
+            else:
+                text = str(text_content)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"txt_decode_failed: {exc}")
+            text = ""
+
+        text = text.replace("\r\n", "\n").strip()
+        if not text:
+            return ExtractedDocument(
+                full_text="",
+                sections=[],
+                tables=[],
+                figures=[],
+                chunk_candidates=[],
+                doc_type="document",
+                errors=errors or ["empty_text"],
+            )
+
+        paragraphs = [para.strip() for para in re.split(r"\n\s*\n", text) if para.strip()]
+        section_title = "Text Document"
+        section_id = self._make_section_id(section_title, 1)
+
+        chunk_candidates: List[ChunkCandidate] = []
+        for para in paragraphs:
+            chunk_candidates.append(
+                ChunkCandidate(
+                    text=para,
+                    page=None,
+                    section_title=section_title,
+                    section_id=section_id,
+                    chunk_type="text",
+                )
+            )
+
+        sections = [
+            Section(
+                section_id=section_id,
+                title=section_title,
+                level=1,
+                start_page=1,
+                end_page=1,
+                text="\n\n".join(paragraphs),
+            )
+        ]
+
+        full_text = "\n\n".join(paragraphs)
+        doc_type = self._doc_intel.infer_type([], [], sections, full_text, filename_hint=filename or "document.txt")
+        return ExtractedDocument(
+            full_text=full_text,
+            sections=sections,
+            tables=[],
+            figures=[],
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=errors,

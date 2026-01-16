@@ -1,24 +1,25 @@
 
+import hashlib
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+import uuid
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
-from botbuilder.schema import Activity
 import ollama
 import uvicorn
-from bson.objectid import ObjectId
-from fastapi import FastAPI, HTTPException, Request
+from bson.objectid import ObjectId  # added by maha/maria
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, constr
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.api.dataHandler import (
     db,
+    delete_embeddings,
     get_subscription_pii_setting,
     trainData,
     train_single_document,
@@ -31,44 +32,34 @@ from src.api.dw_chat import (
     get_session_by_id,
     get_session_list,
 )
-from src.finetune import get_finetune_manager
-from src.finetune.auto_orchestrator import get_auto_orchestrator
-from src.finetune.dataset_builder import build_dataset_from_qdrant, discover_collections_and_profiles
-from src.finetune.models import AutoFinetuneRequest, AutoFinetuneRunRequest, FinetuneRequest
+from src.api.schemas import ModelInfo, ModelsResponse
+from src.api.documents_api import documents_router
+from src.finetune import get_finetune_manager, list_models
+from src.finetune.dataset_builder import build_dataset_from_qdrant
+from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
+from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
+from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
+from src.mode.session_state import SessionStateStore
+from src.execution.router import execute_request
+from src.execution.common import normalize_answer, chunk_text_stream
+from src.screening.api import screening_router
 from src.teams import adapter as teams_adapter
+from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
+from src.runtime.request_context import RequestContext
 
 logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    orchestrator = get_auto_orchestrator()
-    orchestrator.start_scheduler()
-    yield
+def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {"error": {"code": code, "message": message, "details": details or {}}}
 
 
-app = FastAPI(title="DocWain API", lifespan=lifespan)
-
-UNSUPPORTED_MSI_APP_ID = "fd5d5c9d-12b9-441f-b72f-4e94a50da1af"
-MICROSOFT_APP_ID = (Config.Teams.BOT_APP_ID or "").strip()
-MICROSOFT_APP_PASSWORD = Config.Teams.BOT_APP_PASSWORD or ""
-# Fail fast to avoid accidental Managed Identity usage for Bot Framework auth
-if not MICROSOFT_APP_ID or not MICROSOFT_APP_PASSWORD:
-    raise RuntimeError(
-        "MicrosoftAppId and MicrosoftAppPassword must be set for the Bot Framework adapter; Managed Identity is not supported."
-    )
-if MICROSOFT_APP_ID == UNSUPPORTED_MSI_APP_ID:
-    raise RuntimeError(
-        "MicrosoftAppId is set to the DocWain managed identity clientId (fd5d...); use the Bot App Registration's App ID + client secret instead."
-    )
-
-logger.info("[BOT CONFIG] MicrosoftAppId=%s PasswordSet=%s", MICROSOFT_APP_ID, bool(MICROSOFT_APP_PASSWORD))
-bot_settings = BotFrameworkAdapterSettings(
-    app_id=MICROSOFT_APP_ID,
-    app_password=MICROSOFT_APP_PASSWORD,
-)
-teams_bot_adapter = BotFrameworkAdapter(bot_settings)
-BOT_CREDENTIALS_CONFIGURED = True
+def _cors_origins() -> List[str]:
+    if getattr(Config.API, "ALLOW_ALL_ORIGINS", False):
+        return ["*"]
+    if getattr(Config.API, "ALLOW_ORIGINS", None):
+        return Config.API.ALLOW_ORIGINS
+    return ["http://localhost:3000", "http://127.0.0.1:3000"]
 
 
 def _get_dw_newron():
@@ -80,43 +71,268 @@ def _get_dw_newron():
     from src.api import dw_newron  # local import to defer heavy deps
     return dw_newron
 
+
+app = FastAPI(title="DocWain API")
+api_router = APIRouter(prefix="/api")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production to specific domains
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+api_router.include_router(screening_router)
+api_router.include_router(documents_router, tags=["Documents"])
+
+session_state_store = SessionStateStore()
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    payload = detail if isinstance(detail, dict) and isinstance(detail.get("error"), dict) else _error(
+        str(getattr(exc, "status_code", "error")), str(detail)
+    )
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error for %s %s", request.method, request.url, exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=_error("internal_error", "Unexpected error occurred", {"reason": str(exc)}),
+    )
+
 
 class QuestionRequest(BaseModel):
-    query: str
-    user_id: str = 'someone@email.com'
-    profile_id: str = "67ac62ddfaa3aee44d38f4a5"
+    query: constr(min_length=1)
+    user_id: str = "someone@email.com"
+    profile_id: constr(min_length=1) = "67ac62ddfaa3aee44d38f4a5"
     subscription_id: str = "default"
     model_name: str = "llama3.2"
     persona: str = "Document Assistant"
     session_id: Optional[str] = None
-    new_session: Optional[bool] = False  # Frontend sends flag here
+    new_session: bool = False  # Frontend sends flag here
+    agent_mode: Optional[bool] = None
+    debug: bool = False
+
+
+class AnswerPayload(BaseModel):
+    response: Any
+    sources: List[Any] = Field(default_factory=list)
+    grounded: bool = False
+    context_found: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AskResponse(BaseModel):
+    answer: AnswerPayload
+    current_session_id: Optional[str]
+    debug: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
+    """
+    Ensure we use a consistent session ID across the RAG pipeline and chat history.
+    - If frontend provides session_id, keep it.
+    - If a new session is requested but no ID was provided, generate one so history and
+      LLM memory share the same namespace from the very first turn.
+    """
+    if request.session_id:
+        return request.session_id
+    if request.new_session:
+        return str(uuid.uuid4())
+    return None
 
 
 def _normalize_answer(answer):
-    """Ensure API responses are structured consistently."""
-    if isinstance(answer, dict):
-        structured = {
-            "response": answer.get("response") or answer.get("answer"),
-            "sources": answer.get("sources", []),
-            "grounded": answer.get("grounded", False),
-            "context_found": answer.get("context_found", False),
-            "metadata": {k: v for k, v in answer.items() if k not in {"response", "answer", "sources"}},
-        }
-        return structured
+    """Backward-compatible wrapper around the shared normalizer."""
+    return normalize_answer(answer)
+
+
+def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
+    if not value:
+        return ""
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "…"
+
+
+def _resolve_output_root(path_str: str) -> Path:
+    """Resolve user-provided output_dir to an absolute path within APP_HOME when relative."""
+    root = Path(path_str)
+    if not root.is_absolute():
+        root = Path(Config.Path.APP_HOME) / root
+    return root
+
+
+def _training_runs_dir(output_dir: str) -> Path:
+    run_dir = _resolve_output_root(output_dir) / "training_runs"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _load_training_run_records(run_dir: Path) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not run_dir.exists():
+        return records
+    for path in run_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text())
+            records.append(data)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to read training run record %s: %s", path, exc)
+    return records
+
+
+def _persist_training_run_record(run_dir: Path, record: Dict[str, Any]) -> Path:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / f"{record['training_run_id']}.json"
+    try:
+        path.write_text(json.dumps(record, indent=2))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to persist training run record %s: %s", path, exc)
+    return path
+
+
+def _collection_config_hash(request: CollectionOnlyFinetuneRequest) -> str:
+    """
+    Compute a deterministic hash of the training configuration excluding volatile fields.
+    Excludes: output_dir, run_name, retrain, subscription_id(s)
+    """
+    config = {
+        "collection_name": request.collection_name,
+        "base_model": request.base_model,
+        "learning_rate": request.learning_rate,
+        "num_epochs": request.num_epochs,
+        "max_steps": request.max_steps,
+        "batch_size": request.batch_size,
+        "gradient_accumulation": request.gradient_accumulation,
+        "lora_r": request.lora_r,
+        "lora_alpha": request.lora_alpha,
+        "lora_dropout": request.lora_dropout,
+        "include_actual_data": request.include_actual_data,
+        "dataset_path": request.dataset_path,
+        "max_points": request.max_points,
+        "questions_per_chunk": request.questions_per_chunk,
+        "generation_model": request.generation_model,
+    }
+    encoded = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _map_status(status: Optional[str]) -> str:
+    if status == "completed":
+        return "succeeded"
+    if status == "failed":
+        return "failed"
+    if status == "running":
+        return "running"
+    return "scheduled"
+
+
+def _derive_overall_status(record: Dict[str, Any]) -> str:
+    profiles = record.get("profiles") or []
+    if not profiles:
+        return "pending"
+    statuses = {p.get("status") or "scheduled" for p in profiles}
+    if statuses == {"succeeded"}:
+        return "succeeded"
+    if "failed" in statuses:
+        if record.get("fail_fast"):
+            return "failed"
+        return "partial"
+    if statuses.issubset({"scheduled", "queued", "running"}):
+        return "in_progress"
+    return "partial"
+
+
+def _refresh_training_run_record(record: Dict[str, Any], manager) -> bool:
+    """Refresh per-profile statuses from the finetune manager when possible."""
+    updated = False
+    profiles = record.get("profiles") or []
+    for entry in profiles:
+        job_id = entry.get("job_id")
+        if not job_id or not manager:
+            continue
+        status_obj = manager.get_status(job_id)
+        if not status_obj:
+            continue
+        mapped = _map_status(status_obj.status)
+        message = getattr(status_obj, "message", "") or entry.get("message")
+        if mapped != entry.get("status") or message != entry.get("message"):
+            entry["status"] = mapped
+            entry["message"] = message
+            updated = True
+    record["profiles"] = profiles
+    overall_before = record.get("overall_status")
+    record["overall_status"] = _derive_overall_status(record)
+    if record["overall_status"] in {"succeeded", "failed", "partial"} and not record.get("finished_at"):
+        record["finished_at"] = time.time()
+        updated = True
+    if overall_before != record["overall_status"]:
+        updated = True
+    return updated
+
+
+def _find_successful_training_run(
+        run_dir: Path,
+        collection_name: str,
+        base_model: str,
+        run_name: str,
+        config_hash: str,
+        manager,
+) -> Optional[Dict[str, Any]]:
+    for record in _load_training_run_records(run_dir):
+        if record.get("collection_name") != collection_name:
+            continue
+        if record.get("base_model") != base_model:
+            continue
+        if str(record.get("run_name") or "") != run_name:
+            continue
+        if record.get("config_hash") != config_hash:
+            continue
+        if _refresh_training_run_record(record, manager):
+            _persist_training_run_record(run_dir, record)
+        profiles = record.get("profiles") or []
+        if record.get("overall_status") == "succeeded" and profiles and all(
+                (p.get("status") == "succeeded") for p in profiles
+        ):
+            return record
+    return None
+
+
+def _build_training_summary(
+        record: Dict[str, Any],
+        total_profiles_discovered: Optional[int] = None,
+        status: Optional[str] = None,
+) -> Dict[str, Any]:
+    profiles = record.get("profiles") or []
+    failures = [
+        {"profile_id": p.get("profile_id"), "error": p.get("error") or p.get("message")}
+        for p in profiles
+        if p.get("status") == "failed"
+    ]
+    processed = len(profiles)
+    failed = len(failures)
+    succeeded = len([p for p in profiles if p.get("status") == "succeeded"])
     return {
-        "response": str(answer),
-        "sources": [],
-        "grounded": False,
-        "context_found": False,
-        "metadata": {},
+        "status": status or record.get("overall_status"),
+        "collection_name": record.get("collection_name"),
+        "training_run_id": record.get("training_run_id"),
+        "run_name": record.get("run_name") or None,
+        "base_model": record.get("base_model"),
+        "config_hash": record.get("config_hash"),
+        "total_profiles_discovered": total_profiles_discovered or record.get("total_profiles_discovered") or len(profiles),
+        "profiles_processed": processed,
+        "profiles_succeeded": succeeded,
+        "profiles_failed": failed,
+        "fail_fast": record.get("fail_fast"),
+        "profiles": profiles,
+        "failures": failures,
     }
 
 
@@ -196,12 +412,11 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
     return activity, raw_body
 
 
-@app.post("/teams/messages")
+@api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
-    activity_payload, raw_body = await _parse_teams_activity(request)
-    if activity_payload is None:
-        # Return a Bot-style message so Teams sees a graceful response instead of 4xx
+    activity = await _parse_teams_activity(request)
+    if activity is None:
         return {
             "type": "message",
             "text": "I couldn't read that Teams message. Please try sending it again.",
@@ -259,91 +474,121 @@ async def handle_teams_messages(request: Request):
             raw_body=raw_body,
         )
     except teams_adapter.TeamsAuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_error("unauthorized", str(exc)))
 
 
-@app.post("/ask")
-def ask_question_api(request: QuestionRequest):
-    logging.info(f"[ASK] ========== START ==========")
-    logging.info(f"[ASK] User: {request.user_id}")
-    logging.info(f"[ASK] Query: {request.query}")
-    logging.info(f"[ASK] Session ID from frontend: {request.session_id}")
-    logging.info(f"[ASK] New session flag: {request.new_session}")
-
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    if not request.profile_id:
-        raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
-
-    # Generate answer
-    raw_answer = _get_dw_newron().answer_question(
-        request.query,
+@api_router.post("/ask", tags=["Default"], response_model=AskResponse)
+def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
+    logger.info(
+        "[ASK] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s query_snippet=%s",
         request.user_id,
-        request.profile_id,
-        request.subscription_id,
-        request.model_name,
-        request.persona
-    )
-    answer = _normalize_answer(raw_answer)
-
-    # Add to history - backend uses frontend's session_id
-    _history, active_session_id = add_message_to_history(
-        request.user_id,
-        request.query,
-        answer,
-        session_id=request.session_id,  # Use frontend's UUID
-        new_session=request.new_session  # Use frontend's flag
+        request.session_id,
+        request.new_session,
+        request.agent_mode,
+        agent_mode,
+        _safe_snippet(request.query),
     )
 
-    logging.info(f"[ASK] Answer generated")
-    logging.info(f"[ASK] < Active Session ID: {active_session_id}")
-    logging.info(f"[ASK] ========== END ==========\n")
+    session_id = _resolve_session_id(request)
+    request.session_id = session_id
+    if agent_mode is not None:
+        object.__setattr__(request, "agent_mode_query", agent_mode)
 
-    # Return session_id back to frontend
-    return {
-        "answer": answer,
-        "current_session_id": active_session_id
-    }
+    session_state = session_state_store.get(session_id)
+    mode = resolve_execution_mode(request, session_state)
+    ctx = RequestContext.build(
+        query=request.query,
+        session_id=session_id,
+        user_id=request.user_id,
+        mode=mode.value,
+        debug=bool(request.debug),
+        profile_id=request.profile_id,
+        subscription_id=request.subscription_id,
+        model_name=request.model_name,
+        persona=request.persona,
+    )
+    result = execute_request(request, session_state=session_state, ctx=ctx, stream=False, debug=bool(request.debug))
+
+    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
+    if explicit_toggle is not None:
+        session_state_store.set_preferred_mode(
+            session_id,
+            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
+        )
+
+    answer = AnswerPayload.model_validate(result.answer)
+
+    _, active_session_id = add_message_to_history(
+        request.user_id,
+        request.query,
+        answer.model_dump(),
+        session_id=session_id,
+        new_session=request.new_session,
+    )
+
+    logger.info("[ASK] completed session_id=%s mode=%s", active_session_id, result.mode.value)
+
+    enriched_debug = {**(result.debug or {}), "request_id": ctx.request_id}
+    return AskResponse(answer=answer, current_session_id=active_session_id, debug=enriched_debug)
 
 
-@app.post("/askStream")
-def ask_question_stream_api(request: QuestionRequest):
+@api_router.post("/askStream", tags=["Default"])
+def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
     """
-    Streams the LLM response for a query. Uses the same RAG pipeline as /ask but
-    streams the generated answer text to the client.
+    Streams the LLM response for a query. Uses the same execution router as /ask but
+    yields text progressively based on the selected mode.
     """
-    logging.info(f"[ASK_STREAM] User: {request.user_id} | Query: {request.query}")
+    logger.info(
+        "[ASK_STREAM] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s query_snippet=%s",
+        request.user_id,
+        request.session_id,
+        request.new_session,
+        request.agent_mode,
+        agent_mode,
+        _safe_snippet(request.query),
+    )
 
-    if not request.query:
-        raise HTTPException(status_code=400, detail="Query is required")
-    if not request.profile_id:
-        raise HTTPException(status_code=400, detail="profile_id is required for retrieval")
+    session_id = _resolve_session_id(request)
+    request.session_id = session_id
+    if agent_mode is not None:
+        object.__setattr__(request, "agent_mode_query", agent_mode)
+
+    session_state = session_state_store.get(session_id)
+    mode = resolve_execution_mode(request, session_state)
+    ctx = RequestContext.build(
+        query=request.query,
+        session_id=session_id,
+        user_id=request.user_id,
+        mode=mode.value,
+        debug=bool(request.debug),
+        profile_id=request.profile_id,
+        subscription_id=request.subscription_id,
+        model_name=request.model_name,
+        persona=request.persona,
+    )
+
+    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
+    if explicit_toggle is not None:
+        session_state_store.set_preferred_mode(
+            session_id,
+            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
+        )
 
     def _stream():
         try:
-            raw_answer = _get_dw_newron().answer_question(
-                request.query,
-                request.user_id,
-                request.profile_id,
-                request.subscription_id,
-                request.model_name,
-                request.persona
-            )
-            answer = _normalize_answer(raw_answer)
-            text = answer.get("response") or ""
-            if not text:
-                text = "No response generated."
-            chunk_size = 256
-            for i in range(0, len(text), chunk_size):
-                yield text[i:i + chunk_size]
+            result = execute_request(request, session_state=session_state, ctx=ctx, stream=True, debug=bool(request.debug))
+            stream_iterable = result.stream or chunk_text_stream(result.answer.get("response") or "")
+            logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
+            for chunk in stream_iterable:
+                yield chunk
         except Exception as exc:
-            logging.error(f"[ASK_STREAM] Streaming failed: {exc}")
-            yield f"[error] {exc}"
+            logger.error("[ASK_STREAM] Streaming failed for session=%s: %s", session_id, exc, exc_info=True)
+            yield "[error] Unable to stream response right now."
 
     return StreamingResponse(_stream(), media_type="text/plain")
 
 
-@app.post("/train/{doc_id}")
+@api_router.post("/train/{doc_id}", tags=["Default"])
 def trigger_single_training(doc_id: str, subscription_id: str = "default"):
     """API endpoint to train a single document by its document ID."""
     try:
@@ -355,7 +600,7 @@ def trigger_single_training(doc_id: str, subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Single document training failed")
 
 
-@app.get("/train")
+@api_router.get("/train", tags=["Default"])
 def trigger_training(subscription_id: str = "default"):
     """API endpoint to trigger document training."""
     try:
@@ -368,15 +613,153 @@ def trigger_training(subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Training process failed")
 
 
-@app.post("/finetune")
-def trigger_finetune(request: FinetuneRequest):
-    """Kick off an Unsloth fine-tune for a profile/domain."""
+@api_router.post("/finetune/by-profile", tags=["Finetuning"])
+def finetune_single_profile(request: FinetuneRequest):
+    """
+    Kick off a fine-tune job for a single profile using the provided dataset/training parameters.
+    """
     manager = get_finetune_manager()
-    status = manager.start_job(request)
-    return status.dict()
+    try:
+        status = manager.start_job(request)
+        return status.dict()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@api_router.post("/finetune", tags=["Finetuning"])
+@api_router.post("/finetune/by-collection", tags=["Finetuning"])
+def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
+    """
+    Fine-tune all profiles discovered inside a Qdrant collection (collection-only request).
+
+    Example request:
+    {
+      "collection_name": "my-collection",
+      "base_model": "llama3.2",
+      "learning_rate": 0.0002,
+      "num_epochs": 1,
+      "max_steps": 200,
+      "batch_size": 4,
+      "gradient_accumulation": 2,
+      "lora_r": 16,
+      "lora_alpha": 16,
+      "lora_dropout": 0.05,
+      "include_actual_data": false,
+      "dataset_path": "path/to/dataset.jsonl",
+      "training_examples": [{"instruction": "string", "output": "string", "input": ""}],
+      "output_dir": "finetune_artifacts",
+      "run_name": "my-run",
+      "retrain": false,
+      "subscription_id": "string",
+      "subscription_ids": ["string"],
+      "max_points": 120,
+      "questions_per_chunk": 2,
+      "generation_model": "string",
+      "fail_fast": false
+    }
+    """
+    manager = get_finetune_manager()
+    qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+
+    try:
+        discovered_profiles = discover_profile_ids_from_collection(
+            client=qdrant_client,
+            collection_name=request.collection_name,
+            max_points=request.max_points,
+        )
+    except ValueError as exc:
+        status_code = 404 if "does not exist" in str(exc).lower() else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to read collection {request.collection_name}: {exc}")
+
+    if not discovered_profiles:
+        raise HTTPException(status_code=404, detail=f"No profile_ids found in collection {request.collection_name}")
+
+    config_hash = _collection_config_hash(request)
+    run_name = request.run_name or ""
+    run_dir = _training_runs_dir(request.output_dir)
+
+    existing = None
+    if not request.retrain:
+        existing = _find_successful_training_run(
+            run_dir=run_dir,
+            collection_name=request.collection_name,
+            base_model=request.base_model,
+            run_name=run_name,
+            config_hash=config_hash,
+            manager=manager,
+        )
+    if existing and not request.retrain:
+        return _build_training_summary(existing, total_profiles_discovered=len(discovered_profiles), status="already_trained")
+
+    training_run_id = str(uuid.uuid4())
+    run_record: Dict[str, Any] = {
+        "training_run_id": training_run_id,
+        "collection_name": request.collection_name,
+        "base_model": request.base_model,
+        "run_name": run_name,
+        "config_hash": config_hash,
+        "fail_fast": request.fail_fast,
+        "retrain": request.retrain,
+        "started_at": time.time(),
+        "finished_at": None,
+        "overall_status": "scheduled",
+        "profiles": [],
+        "total_profiles_discovered": len(discovered_profiles),
+    }
+    _persist_training_run_record(run_dir, run_record)
+
+    for profile_id in discovered_profiles:
+        profile_entry: Dict[str, Any] = {"profile_id": profile_id}
+        try:
+            dataset_path = build_dataset_from_qdrant(
+                profile_id=profile_id,
+                subscription_id=request.collection_name,
+                collection_name=request.collection_name,
+                max_points=request.max_points,
+                questions_per_chunk=request.questions_per_chunk,
+                generation_model=request.generation_model,
+                client=qdrant_client,
+            )
+            payload = request.finetune_payload(profile_id=profile_id, dataset_path=str(dataset_path))
+            status = manager.start_job(FinetuneRequest(**payload))
+            profile_entry.update(
+                {
+                    "job_id": status.job_id,
+                    "dataset_path": str(dataset_path),
+                    "status": _map_status(status.status),
+                    "message": status.message,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            profile_entry.update({"status": "failed", "error": str(exc)})
+            run_record["profiles"].append(profile_entry)
+            if request.fail_fast:
+                run_record["overall_status"] = "failed"
+                break
+            continue
+
+        run_record["profiles"].append(profile_entry)
+
+        if request.fail_fast and profile_entry.get("status") == "failed":
+            run_record["overall_status"] = "failed"
+            break
+
+    if not run_record["profiles"]:
+        run_record["overall_status"] = "failed"
+        _persist_training_run_record(run_dir, run_record)
+        raise HTTPException(status_code=400, detail="No finetune jobs started")
+
+    _refresh_training_run_record(run_record, manager)
+    run_record["overall_status"] = _derive_overall_status(run_record)
+    if run_record["overall_status"] in {"failed", "partial", "succeeded"}:
+        run_record["finished_at"] = run_record.get("finished_at") or time.time()
+    _persist_training_run_record(run_dir, run_record)
+
+    return _build_training_summary(run_record, total_profiles_discovered=len(discovered_profiles))
 
 
-@app.get("/finetune/{job_id}")
+@api_router.get("/finetune/{job_id}", tags=["Finetuning"])
 def finetune_status(job_id: str):
     manager = get_finetune_manager()
     status = manager.get_status(job_id)
@@ -385,102 +768,54 @@ def finetune_status(job_id: str):
     return status.dict()
 
 
-@app.post("/finetune/auto")
-def auto_finetune(request: Optional[AutoFinetuneRequest] = None):
-    """
-    Connect to Qdrant, discover collections/profiles, build datasets automatically,
-    and kick off Unsloth fine-tunes for each discovered profile.
-    """
-    manager = get_finetune_manager()
-    params = request or AutoFinetuneRequest()
-    requested_subs = list(params.subscription_ids or [])
-    if params.subscription_id:
-        requested_subs.append(params.subscription_id)
-    if requested_subs:
-        seen = set()
-        requested_subs = [s for s in requested_subs if not (s in seen or seen.add(s))]
-    else:
-        requested_subs = None
-
-    qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+def _collect_available_models() -> List[ModelInfo]:
+    models: Dict[str, ModelInfo] = {}
     try:
-        discovered = discover_collections_and_profiles(
-            subscription_ids=requested_subs,
-            client=qdrant_client,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to discover Qdrant collections: {exc}")
-
-    if not discovered:
-        raise HTTPException(status_code=404, detail="No Qdrant collections with profile data found")
-
-    if params.profile_id:
-        filtered = {sub: [pid for pid in pids if pid == params.profile_id] for sub, pids in discovered.items()}
-        filtered = {sub: ids for sub, ids in filtered.items() if ids}
-        discovered = filtered
-        if not discovered:
-            raise HTTPException(status_code=404, detail=f"Profile {params.profile_id} not found in Qdrant payloads")
-
-    jobs = []
-    dataset_paths = []
-    failures = {}
-
-    for subscription_id, profile_ids in discovered.items():
-        for profile_id in profile_ids:
-            try:
-                dataset_path = build_dataset_from_qdrant(
-                    profile_id=profile_id,
-                    subscription_id=subscription_id,
-                    max_points=params.max_points,
-                    questions_per_chunk=params.questions_per_chunk,
-                    generation_model=params.generation_model,
-                    client=qdrant_client,
-                )
-            except Exception as exc:
-                failures[f"{subscription_id}:{profile_id}"] = f"dataset_error: {exc}"
+        for entry in list_models():
+            name = entry.get("name") or entry.get("model")
+            if not name:
                 continue
+            models[name] = ModelInfo(
+                model=name,
+                source=entry.get("backend") or "finetune",
+                backend=entry.get("backend"),
+                profile_id=entry.get("profile_id"),
+                path=entry.get("path") or entry.get("model_path"),
+                updated_at=entry.get("updated_at"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to list managed models: %s", exc)
 
-            try:
-                payload = params.finetune_payload(profile_id=profile_id, dataset_path=str(dataset_path))
-                status = manager.start_job(FinetuneRequest(**payload))
-                jobs.append(status.dict())
-                dataset_paths.append(str(dataset_path))
-            except Exception as exc:  # noqa: BLE001
-                failures[f"{subscription_id}:{profile_id}"] = f"finetune_error: {exc}"
+    try:
+        raw = ollama.list().model_dump()
+        for entry in raw.get("models", []):
+            name = entry.get("model") or entry.get("name")
+            if not name:
+                continue
+            models.setdefault(
+                name,
+                ModelInfo(
+                    model=name,
+                    source="ollama",
+                    backend="ollama",
+                    size=entry.get("size"),
+                    digest=entry.get("digest"),
+                    updated_at=entry.get("modified_at"),
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to list Ollama models: %s", exc)
 
-    if not jobs:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": "No finetune jobs started",
-                "errors": failures or "Unable to build datasets or schedule jobs",
-            },
-        )
-
-    response = {
-        "jobs": jobs,
-        "dataset_paths": dataset_paths,
-        "discovered_profiles": discovered,
-    }
-    if failures:
-        response["skipped"] = failures
-    return response
-
-
-@app.post("/finetune/auto/run")
-def run_auto_finetune(request: AutoFinetuneRunRequest):
-    orchestrator = get_auto_orchestrator()
-    results = orchestrator.run_for_all_collections(request)
-    return {"jobs": [status.dict() for status in results]}
-
-
-@app.get("/finetune/auto/status")
-def auto_finetune_status():
-    orchestrator = get_auto_orchestrator()
-    return {"jobs": [status.dict() for status in orchestrator.status()]}
+    models.setdefault("gemini-2.5-flash", ModelInfo(model="gemini-2.5-flash", source="gemini", backend="gemini"))
+    return list(models.values())
 
 
-@app.delete("/document/{doc_id}/embeddings")
+@api_router.get("/models", tags=["Default"], response_model=ModelsResponse)
+def list_available_models():
+    return ModelsResponse(models=_collect_available_models())
+
+
+@api_router.delete("/document/{doc_id}/embeddings", tags=["Default"])
 def delete_document_embeddings_api(
         doc_id: str,
         subscription_id: str = "default",
@@ -564,36 +899,40 @@ def delete_document_embeddings_api(
         )
 
 
-@app.get("/models")
-def list_available_models():
-    """API endpoint to list available models."""
-    try:
-        models = ollama.list().model_dump()
-        model_list = models['models']
-        gemini = {'model': 'gemini-2.5-flash'}
-        model_list.append(gemini)
-        return {"models": model_list}
-    except Exception as e:
-        logging.error(f"Failed to list models: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve available models")
-
-
-@app.get("/metrics")
+@api_router.get("/metrics", tags=["Default"])
 def get_metrics(days: int = 7):
     """API endpoint to retrieve model/retrieval performance statistics."""
     try:
         summary = _get_dw_newron().metrics_summary(days=days)
-        return {
+        response = {
             "status": "success",
             "window_days": days,
             "metrics": summary
         }
+        if METRICS_V2_ENABLED:
+            response["docwain_metrics_v2"] = telemetry_store().snapshot()
+        return response
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
- 
 
-@app.get("/chat-history/{user_id}")
+'''
+@api_router.get("/chat-history/{user_id}")
+def get_chat_history_api(user_id: str):
+    """API endpoint to retrieve full chat history for a user."""
+    try:
+        history = get_chat_history(user_id)
+        if history is None:
+            raise HTTPException(status_code=404, detail="Chat history not found")
+
+        logging.info(f"[CHAT HISTORY] User: {user_id}")
+        return {"user_id": user_id, "chat_history": history}
+    except Exception as e:
+        logging.error(f"Failed to retrieve chat history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
+'''
+
+@api_router.get("/chat-history/{user_id}", tags=["Default"])
 def get_chat_history_api(user_id: str, subscription_id: str = "default"):
     """
     Returns all chat sessions for a user in the structure expected by NestJS.
@@ -624,7 +963,7 @@ def get_chat_history_api(user_id: str, subscription_id: str = "default"):
         logging.error(f"Failed to retrieve chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")
 
-@app.get("/sessions/{user_id}")
+@api_router.get("/sessions/{user_id}", tags=["Default"])
 def get_sessions_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to get list of all sessions (for sidebar)."""
     try:
@@ -636,7 +975,7 @@ def get_sessions_api(user_id: str, subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
 
 
-@app.get("/session/{user_id}/{session_id}")
+@api_router.get("/session/{user_id}/{session_id}", tags=["Default"])
 def get_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to get a specific session's messages."""
     try:
@@ -650,7 +989,7 @@ def get_session_api(user_id: str, session_id: str, subscription_id: str = "defau
         raise HTTPException(status_code=500, detail="Failed to retrieve session")
 
 
-@app.delete("/chat-history/{user_id}")
+@api_router.delete("/chat-history/{user_id}", tags=["Default"])
 def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to delete all chat history for a user."""
     try:
@@ -661,7 +1000,7 @@ def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail="Failed to delete chat history")
 
 
-@app.delete("/session/{user_id}/{session_id}")
+@api_router.delete("/session/{user_id}/{session_id}", tags=["Default"])
 def delete_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to delete a specific session."""
     try:
@@ -671,11 +1010,30 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
         logging.error(f"Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
 
+'''
+@api_router.get("/pii/{doc_id}")
+def get_pii_info(doc_id: str, subscription_id: str = "default"):
+    """API endpoint to retrieve PII masking stats for a document."""
+    try:
+        stats = get_pii_stats(doc_id)
+        if not stats:
+            raise HTTPException(status_code=404, detail=f"Document not found for id {doc_id}")
+        return stats
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to retrieve PII stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve PII stats")
+'''
+
+'-------------added by maha/maria ------------------'
+'--------------for PII setting management ------------------'
+
 class PIISettingUpdate(BaseModel):
     pii_enabled: bool
 
 
-@app.get("/subscription/{subscription_id}/pii-setting")
+@api_router.get("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def get_pii_setting(subscription_id: str):
     """
     Get current PII masking setting for a subscription
@@ -692,7 +1050,7 @@ def get_pii_setting(subscription_id: str):
         raise HTTPException(status_code=500, detail="Failed to retrieve PII setting")
 
 
-@app.put("/subscription/{subscription_id}/pii-setting")
+@api_router.put("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
     """
     Update PII masking setting for a subscription
@@ -748,7 +1106,7 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
         raise HTTPException(status_code=500, detail="Failed to update PII setting")
 
 
-@app.post("/subscription/{subscription_id}/reprocess-documents")
+@api_router.post("/subscription/{subscription_id}/reprocess-documents", tags=["Subscriptions"])
 def reprocess_documents_with_new_pii_setting(subscription_id: str):
     """
     Reprocess all documents in a subscription with updated PII setting
@@ -788,6 +1146,11 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
     except Exception as e:
         logging.error(f"Failed to reprocess documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to reprocess documents")
+
+
+app.include_router(api_router)
+app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
+app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 
 
 if __name__ == "__main__":

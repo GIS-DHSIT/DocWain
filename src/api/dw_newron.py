@@ -5,7 +5,7 @@ import threading
 import logging
 import hashlib
 import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 from collections import deque, Counter
 from datetime import datetime, timedelta
@@ -26,6 +26,7 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
 from src.api.genai_client import generate_text, get_genai_client
 from src.finetune import resolve_model_for_profile
+from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 
 # Configure logging
 logging.basicConfig(
@@ -44,7 +45,8 @@ _METRICS_TRACKER = None
 REDIS_MEMORY_TTL = int(os.getenv("REDIS_MEMORY_TTL", "86400"))
 ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v3"
-ENABLE_ANSWER_CACHE = os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
+NO_ANSWER_CACHE = os.getenv("NO_ANSWER_CACHE", "true").strip().lower() in {"true", "1", "yes", "on"}
+ENABLE_ANSWER_CACHE = False if NO_ANSWER_CACHE else os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
 
 
 def _parse_redis_connection_string(conn_str: str):
@@ -131,18 +133,24 @@ def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
-def _build_namespace(subscription_id: str, profile_id: str, model_name: str = "") -> str:
+def _build_namespace(
+        subscription_id: str,
+        profile_id: str,
+        model_name: str = "",
+        session_id: Optional[str] = None
+) -> str:
     """
     Compose a stable namespace for Redis keys so history/feedback/cache
-    never bleed across tenants, profiles, or model choices.
+    never bleed across tenants, profiles, models, or chat sessions.
     """
-    return ":".join(
-        [
-            _slug(subscription_id),
-            _slug(profile_id),
-            _slug(model_name or "default"),
-        ]
-    )
+    parts = [
+        _slug(subscription_id),
+        _slug(profile_id),
+        _slug(model_name or "default"),
+    ]
+    if session_id:
+        parts.append(_slug(session_id))
+    return ":".join(parts)
 
 
 def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransformer:
@@ -379,6 +387,17 @@ class ChatFeedbackMemory:
         except Exception as exc:
             logger.warning(f"Failed to persist feedback memory to Redis: {exc}")
 
+    def clear(self, namespace: str, user_id: str):
+        """Remove cached feedback so new sessions start fresh."""
+        key = (namespace, user_id)
+        if key in self.memories:
+            self.memories[key].clear()
+        if self.redis:
+            try:
+                self.redis.delete(self._cache_key(namespace, user_id))
+            except Exception as exc:
+                logger.warning(f"Failed to clear feedback memory from Redis: {exc}")
+
     def add_feedback(self, namespace: str, user_id: str, query: str, answer: str, sources: List[Dict[str, Any]]):
         self._load_from_cache(namespace, user_id)
         key = (namespace, user_id)
@@ -534,7 +553,6 @@ class ConversationHistory:
 
         for turn in recent_turns:
             context_parts.append(f"User: {turn.user_message}")
-            context_parts.append(f"Assistant: {turn.assistant_response}")
 
         return "\n".join(context_parts)
 
@@ -610,7 +628,8 @@ class GreetingHandler:
         'hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening',
         'greetings', 'howdy', 'what\'s up', 'how are you', 'how do you do',
         'nice to meet you', 'good day', 'hiya', 'sup', 'yo', 'salutations',
-        'welcome', 'hola', 'bonjour', 'namaste', 'aloha','hii','Hii'   }
+        'welcome', 'hola', 'bonjour', 'namaste', 'aloha', 'hii'
+    }
 
     FAREWELLS = {
         'bye', 'goodbye', 'good bye', 'see you', 'see ya', 'farewell',
@@ -625,44 +644,100 @@ class GreetingHandler:
 
     POSITIVE_FEEDBACK = {
         'thanks', 'thank you', 'thanks a lot', 'thank you so much',
-        'appreciate it', 'much appreciated'
+        'appreciate it', 'much appreciated', 'thx', 'ty', 'tysm'
     }
+
+    QUESTION_CUES = {
+        'can you', 'could you', 'would you', 'should you', 'help me', 'help with', 'help',
+        'how', 'what', 'why', 'when', 'where', 'which', 'who', 'can u', 'could u',
+        'tell me', 'show me', 'explain', 'walk me through', 'guide me', 'need help'
+    }
+
+    FILLER_WORDS = {'there', 'team', 'docwain', 'assistant', 'bot', 'buddy', 'friend', 'please'}
+
+    @staticmethod
+    def _clean_message(message: str) -> str:
+        cleaned = re.sub(r"[^\w\s?.!]", " ", message.lower())
+        return re.sub(r"\s+", " ", cleaned).strip()
+
+    @classmethod
+    def _strip_phrases(cls, message: str, phrases: Set[str]) -> str:
+        cleaned = cls._clean_message(message)
+        for phrase in sorted(phrases, key=len, reverse=True):
+            cleaned = re.sub(rf"\b{re.escape(phrase)}\b", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @classmethod
+    def _has_question_cue(cls, message: str) -> bool:
+        if "?" in message:
+            return True
+        normalized = cls._clean_message(message)
+        return any(cue in normalized for cue in cls.QUESTION_CUES)
+
+    @classmethod
+    def _has_follow_on_content(cls, message: str, phrases: Set[str]) -> bool:
+        """
+        Check if there is meaningful content beyond the matched phrase.
+        Prevents treating greetings/thanks with real questions as small talk.
+        """
+        remainder = cls._strip_phrases(message, phrases)
+        if not remainder:
+            return False
+
+        if cls._has_question_cue(remainder):
+            return True
+
+        tokens = [t for t in remainder.split() if t not in cls.FILLER_WORDS]
+        return len(tokens) >= 2
 
     @classmethod
     def is_greeting(cls, message: str) -> bool:
         """Check if message is a greeting."""
-        message = message.lower().strip()
+        normalized = cls._clean_message(message)
+        if not normalized:
+            return False
 
-        if len(message) <= 60:
-            pattern = r'\b(' + '|'.join(re.escape(g) for g in cls.GREETINGS) + r')\b'
-            if re.search(pattern, message):
-                words = message.split()
-                if len(words) <= 5 or any(g in ' '.join(words[:5]) for g in cls.GREETINGS):
-                    return True
+        pattern = r'\b(' + '|'.join(re.escape(g) for g in cls.GREETINGS) + r')\b'
+        if not re.search(pattern, normalized):
+            return False
 
-        return False
+        if cls._has_follow_on_content(message, cls.GREETINGS):
+            return False
+
+        return True
 
     @classmethod
     def is_farewell(cls, message: str) -> bool:
         """Check if message is a farewell."""
-        message = message.lower().strip()
+        normalized = cls._clean_message(message)
+        if not normalized:
+            return False
 
-        if len(message) <= 50:
-            pattern = r'\b(' + '|'.join(re.escape(f) for f in cls.FAREWELLS) + r')\b'
-            return bool(re.search(pattern, message))
+        pattern = r'\b(' + '|'.join(re.escape(f) for f in cls.FAREWELLS) + r')\b'
+        if not re.search(pattern, normalized):
+            return False
 
-        return False
+        if cls._has_follow_on_content(message, cls.FAREWELLS):
+            return False
+
+        return True
 
     @classmethod
     def is_positive_feedback(cls, message: str) -> bool:
         """Check if message is positive feedback."""
-        message = message.lower().strip()
+        normalized = cls._clean_message(message)
+        if not normalized:
+            return False
 
-        if len(message) <= 40:
-            pattern = r'\b(' + '|'.join(re.escape(f) for f in cls.POSITIVE_FEEDBACK) + r')\b'
-            return bool(re.search(pattern, message))
+        pattern = r'\b(' + '|'.join(re.escape(f) for f in cls.POSITIVE_FEEDBACK) + r')\b'
+        if not re.search(pattern, normalized):
+            return False
 
-        return False
+        if cls._has_follow_on_content(message, cls.POSITIVE_FEEDBACK):
+            return False
+
+        return True
 
 
 class OllamaClient:
@@ -2160,17 +2235,33 @@ class EnterpriseRAGSystem:
             persona: str = "professional document analysis assistant",
             top_k_retrieval: int = 80,
             top_k_rerank: int = 25,
-            final_k: int = 12
+            final_k: int = 12,
+            session_id: Optional[str] = None,
+            new_session: bool = False,
+            disable_answer_cache: bool = False,
+            force_refresh: bool = False,
+            request_id: Optional[str] = None,
+            index_version: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
+        telemetry = telemetry_store() if METRICS_V2_ENABLED else None
 
         try:
             if not profile_id:
                 raise ValueError("profile_id is required for retrieval")
             collection_name = build_collection_name(subscription_id)
-            namespace = _build_namespace(subscription_id, profile_id, self.model_name)
+            namespace = _build_namespace(subscription_id, profile_id, self.model_name, session_id)
             metrics = get_metrics_tracker()
+
+            effective_new_session = new_session or force_refresh
+            if effective_new_session:
+                logger.info("Resetting conversation context for new session: %s", session_id or "default")
+                self.conversation_history.clear_history(namespace, user_id)
+                try:
+                    self.feedback_memory.clear(namespace, user_id)
+                except Exception as feedback_exc:
+                    logger.debug("Feedback memory clear failed: %s", feedback_exc)
 
             # Quick collection diagnostics to avoid silent empty searches
             try:
@@ -2184,17 +2275,22 @@ class EnterpriseRAGSystem:
 
             if self.greeting_handler.is_positive_feedback(query):
                 return {
-                    "response": "Glad I could help! If you have another question, just ask.",
+                    "response": "You're welcome! If you want me to dig into another document or topic, just let me know.",
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": True,
                     "query_type": "positive_feedback",
                     "grounded": True
                 }
 
             if self.greeting_handler.is_greeting(query):
-                greeting_response = "Hi! I'm your DocWain assistant. I can help you find specific information in your documents. What would you like to look up?"
+                greeting_response = (
+                    f"Hi! I'm your {persona}. I can search your documents and answer questions. "
+                    f"What would you like to explore?"
+                )
                 self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
                 return {
@@ -2202,6 +2298,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": True,
                     "query_type": "greeting",
                     "grounded": True
@@ -2216,6 +2314,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": True,
                     "query_type": "farewell",
                     "grounded": True
@@ -2223,6 +2323,7 @@ class EnterpriseRAGSystem:
 
             logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
 
+            retrieval_start = time.time()
             retrieval_plan = self.retrieve_with_priorities(
                 query=query,
                 user_id=user_id,
@@ -2241,14 +2342,35 @@ class EnterpriseRAGSystem:
             retrieval_attempts = retrieval_plan.get("attempts", [])
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
             profile_context_data = retrieval_plan.get("profile_context", {})
+            if telemetry:
+                retrieval_latency_ms = (time.time() - retrieval_start) * 1000
+                telemetry.increment("retrieval_requests_count")
+                telemetry.observe("retrieval_latency_ms", retrieval_latency_ms)
+                telemetry.observe("retrieval_topk", len(retrieved_chunks))
+                approx_tokens = 0
+                doc_ids = []
+                for chunk in retrieved_chunks:
+                    text = getattr(chunk, "text", "") or ""
+                    approx_tokens += len(str(text).split())
+                    meta = getattr(chunk, "metadata", {}) or {}
+                    doc_id = meta.get("document_id") or meta.get("doc_id") or meta.get("docId")
+                    if doc_id:
+                        doc_ids.append(str(doc_id))
+                telemetry.observe("retrieval_context_tokens", approx_tokens)
+                if retrieved_chunks:
+                    telemetry.increment("retrieval_hits")
+                telemetry.set_gauge("last_retrieval_time", time.time())
+                for doc_id in set(doc_ids):
+                    telemetry.record_doc_metric(doc_id, "last_retrieval_time", time.time())
 
             # Cache lookup (per subscription/profile/query + recent memory fingerprint)
-            cache = get_redis_client() if ENABLE_ANSWER_CACHE else None
+            cache = get_redis_client() if (ENABLE_ANSWER_CACHE and not disable_answer_cache) else None
             cache_key = None
             conversation_context_for_cache = self.conversation_history.get_context(namespace, user_id, max_turns=2)
             memory_fingerprint = "noctx"
             if conversation_context_for_cache:
                 memory_fingerprint = hashlib.md5(conversation_context_for_cache.encode("utf-8")).hexdigest()
+            session_fingerprint = _slug(session_id) if session_id else "default"
             profile_context_fingerprint = "noprof"
             try:
                 profile_context_fingerprint = hashlib.md5(
@@ -2263,6 +2385,7 @@ class EnterpriseRAGSystem:
                     f"col={_slug(collection_name)}:"
                     f"prof={_slug(profile_id)}:"
                     f"usr={hashlib.md5(user_id.encode('utf-8')).hexdigest()[:8]}:"  # ✅ Added user
+                    f"sess={session_fingerprint}:"
                     f"model={_slug(self.model_name)}:"
                     f"strat={selected_strategy}:"
                     f"mem={memory_fingerprint[:8]}:"  # ✅ Shortened to avoid key bloat
@@ -2274,29 +2397,7 @@ class EnterpriseRAGSystem:
                         cached_obj = json.loads(cached)
                         if cached_obj.get("cache_version") and cached_obj["cache_version"] != ANSWER_CACHE_VERSION:
                             raise ValueError("Cache version mismatch")
-                        logger.info("Cache hit for query; returning cached answer")
-                        cached_response = cached_obj.get("response", "")
-                        self.conversation_history.add_turn(namespace, user_id, query, cached_response)
-                        sources = cached_obj.get("sources") or []
-                        self.feedback_memory.add_feedback(namespace, user_id, query, cached_response, sources)
-                        doc_ids = cached_obj.get("source_doc_ids") or []
-                        if doc_ids:
-                            self.conversation_history.add_sources(namespace, user_id, [d for d in doc_ids if d])
-                        try:
-                            metrics.record(
-                                model_name=self.model_name,
-                                subscription_id=subscription_id,
-                                profile_id=profile_id,
-                                query_type=cached_obj.get("query_type", "cached"),
-                                context_found=bool(cached_obj.get("context_found", False)),
-                                grounded=bool(cached_obj.get("grounded", True)),
-                                cached=True,
-                                processing_time=float(cached_obj.get("processing_time", 0.0)),
-                                retrieval_stats=cached_obj.get("retrieval_stats") or {}
-                            )
-                        except Exception as metric_exc:
-                            logger.debug("Metrics record (cache hit) failed: %s", metric_exc)
-                        return cached_obj
+                        logger.info("Cache hit for query; ignoring because answer cache is disabled")
                     except Exception:
                         logger.warning("Failed to parse cached answer; ignoring")
             logger.info(f"Preprocessed query: {processed_query}")
@@ -2328,6 +2429,8 @@ class EnterpriseRAGSystem:
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": False,
                     "query_type": "no_results",
                     "preprocessing": preprocessing_metadata,
@@ -2445,6 +2548,8 @@ class EnterpriseRAGSystem:
                     "sources": [],  # ✅ Changed to empty (no sources)
                     "user_id": user_id,
                     "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
                     "context_found": False,  # ✅ Changed to False
                     "query_type": "not_answerable",
                     "answerability_reason": answerability_reason,
@@ -2505,6 +2610,8 @@ class EnterpriseRAGSystem:
                 "sources": sources,
                 "user_id": user_id,
                 "collection": collection_name,
+                "request_id": request_id,
+                "index_version": index_version,
                 "context_found": True,
                 "query_type": "document_qa",
                 "num_sources": len(sources),
@@ -2531,7 +2638,9 @@ class EnterpriseRAGSystem:
                     "initial_retrieved": len(retrieved_chunks),
                     "after_rerank": len(reranked_chunks),
                     "final_context": len(final_chunks)
-                }
+                },
+                "force_refresh": force_refresh,
+                "disable_answer_cache": disable_answer_cache,
             }
 
             try:
@@ -2562,6 +2671,11 @@ class EnterpriseRAGSystem:
 
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
+            try:
+                if telemetry:
+                    telemetry.increment("retrieval_failures_count")
+            except Exception:
+                pass
 
             error_response = "Sorry, something went wrong on my side. Please try again, and let me know if it keeps happening."
 
@@ -2586,6 +2700,8 @@ class EnterpriseRAGSystem:
                 "sources": [],
                 "user_id": user_id,
                 "collection": collection_name if 'collection_name' in locals() else profile_id,
+                "request_id": request_id,
+                "index_version": index_version,
                 "context_found": False,
                 "query_type": "error",
                 "error": str(e),
@@ -2706,7 +2822,13 @@ def answer_question(
         profile_id: str,
         subscription_id: str = "default",
         model_name: str = "llama3.2",
-        persona: str = "professional document analysis assistant"
+        persona: str = "professional document analysis assistant",
+        session_id: Optional[str] = None,
+        new_session: bool = False,
+        disable_answer_cache: bool = False,
+        force_refresh: bool = False,
+        request_id: Optional[str] = None,
+        index_version: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main entry point for answering questions with enhanced NLU.
@@ -2734,7 +2856,13 @@ def answer_question(
         profile_id=profile_id,
         subscription_id=subscription_id,
         user_id=user_id,
-        persona=persona
+        persona=persona,
+        session_id=session_id,
+        new_session=new_session,
+        disable_answer_cache=disable_answer_cache,
+        force_refresh=force_refresh,
+        request_id=request_id,
+        index_version=index_version,
     )
 
 
@@ -2804,7 +2932,13 @@ def add_domain_terms(terms: List[str]):
         logger.error(f"Error adding domain terms: {e}")
 
 
-def clear_conversation_history(user_id: str, subscription_id: str = "default", profile_id: str = "default", model_name: str = ""):
+def clear_conversation_history(
+        user_id: str,
+        subscription_id: str = "default",
+        profile_id: str = "default",
+        model_name: str = "",
+        session_id: Optional[str] = None
+):
     """
     Clear conversation history for a specific user.
 
@@ -2816,7 +2950,12 @@ def clear_conversation_history(user_id: str, subscription_id: str = "default", p
     """
     try:
         rag_system = get_rag_system()
-        ns = _build_namespace(subscription_id, profile_id, model_name or getattr(rag_system, "model_name", ""))
+        ns = _build_namespace(
+            subscription_id,
+            profile_id,
+            model_name or getattr(rag_system, "model_name", ""),
+            session_id=session_id
+        )
         rag_system.conversation_history.clear_history(ns, user_id)
         logger.info(f"Cleared conversation history for user {user_id}")
     except Exception as e:

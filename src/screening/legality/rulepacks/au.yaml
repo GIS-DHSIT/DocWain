@@ -1,0 +1,14 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      AU:
+        - "APP notice of collection"
+        - "Overseas disclosure notice"
+        - "Complaint handling steps"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "State applicable Australian state or territory law."
+region_notes:
+  AU:
+    - "Consider referencing APPs for privacy-facing commitments."

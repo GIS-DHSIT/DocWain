@@ -1,4 +1,4 @@
-from src.finetune.models import FinetuneRequest, FinetuneStatus, ResolvedModel
+from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest, FinetuneStatus, ResolvedModel
 
 
 def get_finetune_manager():

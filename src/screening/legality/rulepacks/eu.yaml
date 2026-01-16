@@ -1,0 +1,15 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      EU:
+        - "GDPR lawful basis"
+        - "Data Subject Rights"
+        - "DPO contact (if applicable)"
+        - "Cross-border transfer mechanism"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "Clarify EU member state governing law and forum."
+region_notes:
+  EU:
+    - "Ensure references to GDPR Articles are accurate and current."

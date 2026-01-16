@@ -42,6 +42,7 @@ pytesseract
 pillow
 openpyxl
 pytz
+pyyaml
 
 # --- Security & Encryption ---
 pycryptodome
@@ -59,3 +60,4 @@ ollama
 python-dotenv
 loguru
 gunicorn
+pytest

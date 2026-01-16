@@ -9,13 +9,14 @@ from src.api import docwain_api
 class TeamsMessagesRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(docwain_api.app)
+        self.path = "/api/teams/messages"
 
     def test_empty_body_returns_bot_message(self):
         with patch(
             "src.api.docwain_api.teams_adapter.handle_teams_activity",
             new_callable=AsyncMock,
         ) as mock_handle:
-            response = self.client.post("/teams/messages", data=b"")
+            response = self.client.post(self.path, data=b"")
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -28,7 +29,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
             new_callable=AsyncMock,
         ) as mock_handle:
             response = self.client.post(
-                "/teams/messages",
+                self.path,
                 data="not-json",
                 headers={"Content-Type": "application/json"},
             )
@@ -46,7 +47,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
             return_value=expected,
         ) as mock_handle:
             response = self.client.post(
-                "/teams/messages",
+                self.path,
                 data="hello",
                 headers={"Content-Type": "text/plain;charset=UTF-8"},
             )
@@ -65,7 +66,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
             new_callable=AsyncMock,
             return_value=expected,
         ) as mock_handle:
-            response = self.client.post("/teams/messages", json={"text": "hi"})
+            response = self.client.post(self.path, json={"text": "hi"})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), expected)
