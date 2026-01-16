@@ -26,6 +26,9 @@ class RequestContext:
     model_name: Optional[str] = None
     persona: Optional[str] = None
     filters: Dict[str, Any] | None = None
+    tools: Optional[list[str]] = None
+    use_tools: bool = False
+    tool_inputs: Optional[Dict[str, Any]] = None
 
     @classmethod
     def build(
@@ -42,6 +45,9 @@ class RequestContext:
         persona: Optional[str] = None,
         index_version: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
+        tools: Optional[list[str]] = None,
+        use_tools: bool = False,
+        tool_inputs: Optional[Dict[str, Any]] = None,
     ) -> "RequestContext":
         return cls(
             request_id=str(uuid.uuid4()),
@@ -57,4 +63,7 @@ class RequestContext:
             model_name=model_name,
             persona=persona,
             filters=filters or {},
+            tools=tools,
+            use_tools=use_tools,
+            tool_inputs=tool_inputs,
         )
