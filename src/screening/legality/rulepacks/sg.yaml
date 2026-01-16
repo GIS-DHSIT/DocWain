@@ -1,0 +1,14 @@
+document_types:
+  PRIVACY_NOTICE:
+    region_checks:
+      SG:
+        - "PDPA consent and purpose limitation"
+        - "Access/correction rights (PDPA)"
+        - "Data breach notification (if applicable)"
+  CONTRACT:
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "State Singapore law or justify alternative."
+region_notes:
+  SG:
+    - "Ensure data transfer language references PDPA safeguards."

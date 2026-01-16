@@ -19,6 +19,26 @@ class Config:
         IMAGES_DIR = APP_HOME / "images"
         DUCKDB_DIR = DATABASE_DIR / "duck-db"
 
+    class API:
+        # Allow explicit whitelist; fall back to localhost defaults when not provided.
+        ALLOW_ORIGINS = [
+            origin.strip()
+            for origin in os.getenv(
+                "API_ALLOWED_ORIGINS",
+                "http://localhost:3000,http://127.0.0.1:3000",
+            ).split(",")
+            if origin.strip()
+        ]
+        # Permit "*" only when explicitly enabled for local development.
+        ALLOW_ALL_ORIGINS = os.getenv("API_ALLOW_ALL_ORIGINS", "").lower() in {"1", "true", "yes"}
+
+    class Execution:
+        DEFAULT_AGENT_MODE = os.getenv("DEFAULT_AGENT_MODE", "false").lower() in {"1", "true", "yes", "on"}
+        ALLOW_AGENT_MODE = os.getenv("ALLOW_AGENT_MODE", "true").lower() in {"1", "true", "yes", "on"}
+        MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "10"))
+        MAX_AGENT_EVIDENCE = int(os.getenv("MAX_AGENT_EVIDENCE", "20"))
+        AGENT_MODEL_NAME = os.getenv("AGENT_MODEL_NAME", "nemotron-3-nano")
+
     class Qdrant:
         URL = os.getenv("QDRANT_URL", 'https://89f776c3-76fb-493f-8509-c583d9579329.europe-west3-0.gcp.cloud.qdrant.io')
         API = os.getenv("QDRANT_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.-cJ2HVTYcH3u5KNuZuxZRNJhhTFfZwqkoVacNCKBYkY")

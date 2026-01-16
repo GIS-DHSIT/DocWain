@@ -1,0 +1,90 @@
+document_types:
+  DEFAULT:
+    required_clauses:
+      - "Parties"
+      - "Term"
+      - "Governing Law"
+      - "Confidentiality"
+      - "Liability"
+    risky_clauses:
+      - name: "Unlimited liability"
+        pattern: "unlimited liability"
+        severity: "high"
+        note: "Open-ended liability increases exposure."
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "Must name the applicable jurisdiction."
+  NDA:
+    required_clauses:
+      - "Definition of Confidential Information"
+      - "Obligations of Recipient"
+      - "Exclusions"
+      - "Term & Survival"
+      - "Return/Destruction"
+      - "Governing Law"
+      - "Remedies/Equitable Relief"
+    risky_clauses:
+      - name: "Non-compete language"
+        pattern: "(non[-\\s]?compete|restraint of trade)"
+        severity: "high"
+        note: "Often restricted depending on jurisdiction."
+    region_overrides:
+      - clause: "Governing Law"
+        requirement: "Must match region or be explicitly justified"
+  CONTRACT:
+    required_clauses:
+      - "Parties"
+      - "Scope of Work"
+      - "Payment Terms"
+      - "Liability"
+      - "Indemnity"
+      - "Termination"
+      - "Governing Law"
+    risky_clauses:
+      - name: "Auto-renewal without notice"
+        pattern: "auto[-\\s]?renew"
+        severity: "medium"
+        note: "Auto-renewal should include notice and opt-out."
+  PRIVACY_NOTICE:
+    required_clauses:
+      - "Data Collected"
+      - "Purpose of Processing"
+      - "Data Subject Rights"
+      - "Retention"
+      - "Contact"
+    region_checks:
+      GLOBAL:
+        - "Data retention"
+        - "Data subject rights"
+  TERMS:
+    required_clauses:
+      - "Acceptance"
+      - "Use Restrictions"
+      - "Termination"
+      - "Disclaimer"
+      - "Limitation of Liability"
+      - "Governing Law"
+    risky_clauses:
+      - name: "Broad license grant"
+        pattern: "perpetual, worldwide, irrevocable"
+        severity: "medium"
+        note: "Consider narrowing the license scope."
+  EMPLOYMENT_OFFER:
+    required_clauses:
+      - "Position and Title"
+      - "Compensation"
+      - "Benefits"
+      - "At-will Statement"
+      - "Start Date"
+      - "Confidentiality"
+      - "IP Assignment"
+  INVOICE:
+    required_clauses:
+      - "Invoice Number"
+      - "Payment Due Date"
+      - "Currency"
+      - "Tax"
+      - "Governing Law"
+region_notes:
+  GLOBAL:
+    - "Use concise placeholders for missing clauses before counsel review."
