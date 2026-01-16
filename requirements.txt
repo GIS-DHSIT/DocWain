@@ -1,5 +1,6 @@
 # --- Core Web Framework ---
 fastapi
+httpx
 uvicorn[standard]
 python-multipart  # required for FastAPI file uploads
 
@@ -10,7 +11,7 @@ botbuilder-schema  # ensures Teams schemas (FileDownloadInfo) are available
 # --- Cloud SDKs ---
 boto3
 azure-storage-blob
-google-generativeai
+google-genai
 requests
 
 # --- Database & Vector Storage ---

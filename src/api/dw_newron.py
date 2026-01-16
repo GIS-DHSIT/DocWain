@@ -1,6 +1,7 @@
 import re
 import json
 import time
+import threading
 import logging
 import hashlib
 import numpy as np
@@ -15,7 +16,6 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 import ollama
 import os
 import redis
-import google.generativeai as genai
 from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -24,6 +24,7 @@ from src.api.enhanced_context_builder import IntelligentContextBuilder
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
+from src.api.genai_client import generate_text, get_genai_client
 from src.finetune import resolve_model_for_profile
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 
@@ -209,6 +210,9 @@ def get_cross_encoder():
     """Lazy load cross encoder model."""
     global _CROSS_ENCODER
     if _CROSS_ENCODER is None:
+        if not getattr(Config.Retrieval, "RERANKER_ENABLED", True):
+            logger.info("Cross-encoder reranker disabled via configuration")
+            return None
         model_name = getattr(Config.Model, "RERANKER_MODEL", "")
         if not model_name:
             logger.info("Cross-encoder reranker disabled via configuration")
@@ -304,8 +308,9 @@ def configure_gemini():
         api_key = getattr(Config.Model, "GEMINI_API_KEY", None) or getattr(Config.Gemini, "GEMINI_API_KEY", None)
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not set in configuration")
-        genai.configure(api_key=api_key)
+        get_genai_client(api_key)
         logger.info("Gemini API configured successfully")
+        return api_key
     except Exception as e:
         logger.error(f"Failed to configure Gemini API: {e}")
         raise
@@ -750,17 +755,21 @@ class OllamaClient:
         max_retries: int = 3,
         backoff: float = 1.0
     ) -> str:
+        temperature = getattr(Config.LLM, "TEMPERATURE", 0.2)
+        top_p = getattr(Config.LLM, "TOP_P", 0.85)
+        max_tokens = getattr(Config.LLM, "MAX_TOKENS", 2048)
         for attempt in range(1, max_retries + 1):
             try:
                 response = ollama.generate(
                     model=self.model_name,
                     prompt=prompt,
                     options={
-                        "temperature": 0.2,   #  LOWER = less hallucination
-                        "top_p": 0.85,
+                        "temperature": temperature,   #  LOWER = less hallucination
+                        "top_p": top_p,
                         "top_k": 40,
                         "repeat_penalty": 1.1,
-                        "num_ctx": 4096
+                        "num_ctx": 4096,
+                        "num_predict": max_tokens,
                     }
                 )
 
@@ -785,17 +794,16 @@ class OllamaClient:
 
 class GeminiClient:
     def __init__(self, model_name: Optional[str] = None):
-        configure_gemini()
+        self.api_key = configure_gemini()
         self.model_name = model_name or Config.Model.GEMINI_MODEL_NAME
         if not self.model_name:
             raise ValueError("Gemini model name is not configured")
-        self.model = genai.GenerativeModel(self.model_name)
-        self.generation_config = genai.GenerationConfig(
-            temperature=0.3,  # ✅ OPTIMAL: 0.3 balances accuracy + fluency
-            top_p=0.95,
-            top_k=40,
-            max_output_tokens=2048,
-        )
+        self.generation_config = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.3),
+            "top_p": getattr(Config.LLM, "TOP_P", 0.95),
+            "top_k": 40,
+            "max_output_tokens": getattr(Config.LLM, "MAX_TOKENS", 2048),
+        }
         logger.info(f"Initialized GeminiClient with model: {self.model_name}")
 
     def generate(
@@ -807,29 +815,16 @@ class GeminiClient:
         """Generate response with retry logic and robust parsing."""
         for attempt in range(1, max_retries + 1):
             try:
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config=self.generation_config
+                text, response = generate_text(
+                    api_key=self.api_key,
+                    model=self.model_name,
+                    prompt=prompt,
+                    generation_config=self.generation_config,
                 )
-
-                text = None
-
-                if hasattr(response, 'text') and response.text:
-                    text = response.text.strip()
-                elif hasattr(response, 'candidates') and response.candidates:
-                    candidate = response.candidates[0]
-                    if hasattr(candidate, 'content'):
-                        if hasattr(candidate.content, 'parts') and candidate.content.parts:
-                            text = candidate.content.parts[0].text.strip()
-                        elif hasattr(candidate.content, 'text'):
-                            text = candidate.content.text.strip()
-
                 if text:
                     return text
-                else:
-                    logger.warning(f"No text in response: {response}")
-                    return "I apologize, but I couldn't generate a proper response."
-
+                logger.warning(f"No text in response: {response}")
+                return "I apologize, but I couldn't generate a proper response."
             except Exception as e:
                 logger.warning(f"Gemini API attempt {attempt}/{max_retries} failed: {e}")
                 if attempt < max_retries:
@@ -855,8 +850,8 @@ class OpenAICompatibleClient:
             self.endpoint = self.endpoint.rstrip("/") + "/chat/completions"
         self.model_name = model_name or os.getenv("LOCAL_LLM_MODEL", "local-model")
         self.api_key = api_key or os.getenv("LOCAL_LLM_API_KEY", "")
-        self.temperature = float(os.getenv("LOCAL_LLM_TEMPERATURE", "0.0"))
-        self.max_tokens = int(os.getenv("LOCAL_LLM_MAX_TOKENS", "2048"))
+        self.temperature = float(os.getenv("LOCAL_LLM_TEMPERATURE", str(getattr(Config.LLM, "TEMPERATURE", 0.0))))
+        self.max_tokens = int(os.getenv("LOCAL_LLM_MAX_TOKENS", str(getattr(Config.LLM, "MAX_TOKENS", 2048))))
         self.timeout = float(os.getenv("LOCAL_LLM_TIMEOUT", "30"))
         logger.info("Initialized OpenAI-compatible client at %s with model %s", self.endpoint, self.model_name)
 
@@ -2721,6 +2716,23 @@ _RAG_MODEL = None
 _RAG_PROFILE = None
 _RAG_BACKEND = None
 _RAG_MODEL_PATH = None
+_LLM_CLIENTS: dict[tuple[str, str, str | None], Any] = {}
+_LLM_SEMAPHORE: Optional[threading.Semaphore] = None
+
+
+class _LLMClientWrapper:
+    """Wrap LLM clients to enforce concurrency limits without changing callers."""
+
+    def __init__(self, client, semaphore: threading.Semaphore):
+        self._client = client
+        self._semaphore = semaphore
+
+    def __getattr__(self, item):
+        return getattr(self._client, item)
+
+    def generate(self, *args, **kwargs):
+        with self._semaphore:
+            return self._client.generate(*args, **kwargs)
 
 
 def create_llm_client(
@@ -2729,18 +2741,35 @@ def create_llm_client(
         model_path: Optional[str] = None
 ):
     """Factory to select LLM backend based on requested model name or env."""
+    global _LLM_SEMAPHORE
+    if _LLM_SEMAPHORE is None:
+        _LLM_SEMAPHORE = threading.Semaphore(getattr(Config.LLM, "MAX_CONCURRENCY", 2))
     name = (model_name or "").lower()
     backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
-    if backend in {"openai", "openai_compatible", "local_http"}:
-        return OpenAICompatibleClient(model_name)
-    if backend == "gemini" or name.startswith("gemini"):
-        return GeminiClient(model_name)
-    if backend == "unsloth" or model_path:
+    resolved_backend = backend
+    if not resolved_backend:
+        resolved_backend = "gemini" if name.startswith("gemini") else "ollama"
+    cache_key = (resolved_backend, model_name or "", model_path)
+    if cache_key in _LLM_CLIENTS:
+        return _LLM_CLIENTS[cache_key]
+
+    if resolved_backend in {"openai", "openai_compatible", "local_http"}:
+        client = OpenAICompatibleClient(model_name)
+    elif resolved_backend == "gemini" or name.startswith("gemini"):
+        client = GeminiClient(model_name)
+    elif resolved_backend == "unsloth" or model_path:
         from src.finetune.llm_client import UnslothLLMClient
+
         target = model_path or model_name
-        return UnslothLLMClient(target)
-    if backend == "ollama":
-        return OllamaClient(model_name)
+        client = UnslothLLMClient(target)
+    elif resolved_backend == "ollama":
+        client = OllamaClient(model_name)
+    else:
+        client = OllamaClient(model_name)
+
+    wrapped = _LLMClientWrapper(client, _LLM_SEMAPHORE)
+    _LLM_CLIENTS[cache_key] = wrapped
+    return wrapped
     # default to local Ollama for plug-and-play usage
     return OllamaClient(model_name)
 

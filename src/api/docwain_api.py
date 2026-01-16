@@ -21,8 +21,7 @@ from src.api.dataHandler import (
     db,
     delete_embeddings,
     get_subscription_pii_setting,
-    mongoClient,
-    trainData,  # trainSingleDocument
+    trainData,
     train_single_document,
 )
 from src.api.dw_chat import (
@@ -337,6 +336,16 @@ def _build_training_summary(
     }
 
 
+def _is_botframework_jwt(auth_header: str) -> bool:
+    """Determine if the Authorization header contains a Bot Framework JWT."""
+    if not auth_header:
+        return False
+    if not auth_header.lower().startswith("bearer "):
+        return False
+    token = auth_header[7:].strip()
+    return token.count(".") == 2
+
+
 def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> Dict[str, Any] | None:
     """Construct a minimal Teams-like activity from a plain text payload."""
     try:
@@ -353,10 +362,15 @@ def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> D
     )
     user_id = headers.get("x-teams-user-id") or "teams_user"
 
-    return {"text": text, "conversation": {"id": convo_id}, "from": {"id": user_id}}
+    return {
+        "type": "message",
+        "text": text,
+        "conversation": {"id": convo_id},
+        "from": {"id": user_id},
+    }
 
 
-async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
+async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None, bytes]:
     """
     Parse Teams activity payload, tolerating empty/invalid bodies.
     Returns a dict on success; None when the body cannot be parsed.
@@ -368,7 +382,7 @@ async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
             "Teams payload missing/empty body; responding with friendly message | content_type=%s",
             content_type,
         )
-        return None
+        return None, raw_body
 
     try:
         activity = json.loads(raw_body)
@@ -382,20 +396,20 @@ async def _parse_teams_activity(request: Request) -> Dict[str, Any] | None:
                     content_type,
                     len(raw_body or b""),
                 )
-                return fallback
+                return fallback, raw_body
 
         logger.debug(
             "Invalid Teams payload: JSON decode failed; responding with friendly message | content_type=%s | body_len=%d",
             content_type,
             len(raw_body or b""),
         )
-        return None
+        return None, raw_body
 
     if not isinstance(activity, dict):
         logger.warning("Invalid Teams payload type: %s", type(activity))
-        return None
+        return None, raw_body
 
-    return activity
+    return activity, raw_body
 
 
 @api_router.post("/teams/messages", tags=["Teams"])
@@ -408,8 +422,57 @@ async def handle_teams_messages(request: Request):
             "text": "I couldn't read that Teams message. Please try sending it again.",
         }
 
+    headers = dict(request.headers)
+    auth_header = request.headers.get("Authorization", "")
+    use_bot_framework = _is_botframework_jwt(auth_header)
+
+    if use_bot_framework and not BOT_CREDENTIALS_CONFIGURED:
+        logger.error(
+            "Microsoft bot credentials are not configured; cannot validate Teams JWT. "
+            "Set MicrosoftAppId/MicrosoftAppPassword in the environment."
+        )
+        raise HTTPException(status_code=401, detail="Bot credentials are not configured")
+
+    if use_bot_framework:
+        try:
+            activity_obj = Activity.deserialize(activity_payload)
+        except Exception as exc:
+            logger.error("Failed to deserialize Teams activity: %s", exc)
+            raise HTTPException(status_code=400, detail="Invalid Teams activity payload")
+
+        async def bot_logic(turn_context: TurnContext):
+            response_payload = await teams_adapter.handle_teams_activity(
+                turn_context.activity.as_dict(),
+                headers=headers,
+                raw_body=raw_body,
+            )
+            if isinstance(response_payload, dict):
+                try:
+                    outgoing = Activity.deserialize(response_payload)
+                except Exception:
+                    outgoing = Activity(
+                        type=response_payload.get("type") or "message",
+                        text=response_payload.get("text"),
+                    )
+            else:
+                outgoing = response_payload
+            await turn_context.send_activity(outgoing)
+
+        try:
+            await teams_bot_adapter.process_activity(activity_obj, auth_header, bot_logic)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to process Teams activity via Bot Framework adapter: %s", exc, exc_info=True)
+            detail = "Unauthorized Teams request" if "auth" in str(exc).lower() or "unauthoriz" in str(exc).lower() else "Failed to process Teams activity"
+            status = 401 if "auth" in detail.lower() else 500
+            raise HTTPException(status_code=status, detail=detail)
+        return {}
+
     try:
-        return await teams_adapter.handle_teams_activity(activity, headers=dict(request.headers))
+        return await teams_adapter.handle_teams_activity(
+            activity_payload,
+            headers=headers,
+            raw_body=raw_body,
+        )
     except teams_adapter.TeamsAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_error("unauthorized", str(exc)))
 
@@ -802,7 +865,7 @@ def delete_document_embeddings_api(
         )
 
         if result["status"] == "success":
-            logging.info(f" [API] Successfully deleted embeddings for document {doc_id}")
+            logging.info(f"[API] Successfully deleted embeddings for document {doc_id}")
             return {
                 "status": "success",
                 "document_id": doc_id,
@@ -829,7 +892,7 @@ def delete_document_embeddings_api(
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"L [API] Failed to delete embeddings: {e}", exc_info=True)
+        logging.error(f"[API] Failed to delete embeddings: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to delete embeddings: {str(e)}"
@@ -895,7 +958,7 @@ def get_chat_history_api(user_id: str, subscription_id: str = "default"):
             formatted = history  # already correct format
 
         logging.info(f"[CHAT HISTORY] User: {user_id}, Sessions: {len(formatted['sessions'])}")
-        return formatted  #  Now returns {"sessions": [...]}
+        return formatted
     except Exception as e:
         logging.error(f"Failed to retrieve chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve chat history")

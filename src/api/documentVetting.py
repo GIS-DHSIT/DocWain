@@ -7,7 +7,6 @@ import os
 import pandas as pd
 from src.api.config import Config
 from azure.storage.blob import BlobServiceClient
-import google.generativeai as genai
 
 # Patterns for basic PII detection/masking
 PII_PATTERNS = [

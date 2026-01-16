@@ -1,35 +1,14 @@
+import hashlib
+import hmac
 import logging
-import os
 import re
 from typing import Any, Dict, List, Optional
 
-import requests
-
-try:
-    from azure.storage.blob import BlobServiceClient
-    _BLOB_AVAILABLE = True
-    _BLOB_WARNING_EMITTED = False
-    _BLOB_IMPORT_ERROR: Optional[Exception] = None
-except ImportError as exc:
-    BlobServiceClient = None  # type: ignore
-    _BLOB_AVAILABLE = False
-    _BLOB_WARNING_EMITTED = False
-    _BLOB_IMPORT_ERROR = exc
-
-try:
-    from botbuilder.core.teams import FileDownloadInfo  # type: ignore
-except ImportError:  # pragma: no cover - fallback for alternate package layout
-    try:
-        from botbuilder.schema.teams import FileDownloadInfo  # type: ignore
-    except ImportError as exc:  # pragma: no cover - explicit guidance when dependency missing
-        raise ImportError(
-            "botbuilder-core is required for Teams attachment handling"
-        ) from exc
-
 from src.api.config import Config
-from src.api.dataHandler import fileProcessor, train_on_document
 from src.api.dw_chat import add_message_to_history
+from src.teams.attachments import handle_attachments
 from src.teams.logic import TeamsAnswerResult, TeamsChatError, TeamsChatService
+from src.utils.logging_utils import get_correlation_id, get_logger
 
 logger = logging.getLogger(__name__)
 TEAMS_CHAT_SERVICE = TeamsChatService()
@@ -43,23 +22,50 @@ def _get_header(headers: Dict[str, str], key: str) -> str:
     return headers.get(key) or headers.get(key.lower()) or headers.get(key.upper()) or ""
 
 
-def verify_shared_secret(headers: Dict[str, str]) -> bool:
+def _is_botframework_jwt(headers: Optional[Dict[str, str]]) -> bool:
+    """Detect a Bot Framework bearer token (JWT) to bypass shared-secret auth."""
+    if not headers:
+        return False
+    auth_header = _get_header(headers, "authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return False
+    token = auth_header[7:].strip()
+    return token.count(".") == 2
+
+
+def verify_shared_secret(headers: Dict[str, str], raw_body: Optional[bytes] = None) -> None:
     """Check shared secret (simple header-based auth for Teams outbound calls)."""
+    if _is_botframework_jwt(headers):
+        # Bot Framework JWT present; rely on adapter validation instead.
+        return
+
     expected = Config.Teams.SHARED_SECRET
     if not expected:
         # No secret configured; allow for local/dev use.
-        return True
+        return
 
-    candidate = _get_header(headers, "x-teams-shared-secret") or _get_header(headers, "x-teams-signature")
+    candidate = _get_header(headers, "x-teams-shared-secret")
+    if not candidate and not Config.Teams.SIGNATURE_ENABLED:
+        candidate = _get_header(headers, "x-teams-signature")
     if not candidate:
         candidate = _get_header(headers, "authorization")
         if candidate.lower().startswith("bearer "):
             candidate = candidate[7:].strip()
 
-    if candidate != expected:
+    if not candidate:
+        raise TeamsAuthError("Missing Teams shared secret")
+    if not hmac.compare_digest(candidate, expected):
         logger.warning("Invalid Teams shared secret provided")
-        return False
-    return True
+        raise TeamsAuthError("Invalid Teams shared secret")
+
+    if Config.Teams.SIGNATURE_ENABLED:
+        signature = _get_header(headers, "x-teams-signature")
+        if not signature:
+            raise TeamsAuthError("Missing Teams signature")
+        signature = signature.replace("sha256=", "")
+        computed = hmac.new(expected.encode("utf-8"), raw_body or b"", hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, computed):
+            raise TeamsAuthError("Invalid Teams signature")
 
 
 def _strip_mentions(text: str) -> str:
@@ -88,7 +94,14 @@ def extract_user_id(activity: Dict[str, Any]) -> str:
 def extract_session_id(activity: Dict[str, Any]) -> str:
     """Use conversation id as a lightweight session key."""
     convo = activity.get("conversation") or {}
-    return convo.get("id") or "teams-session"
+    channel_data = activity.get("channelData") or {}
+    return (
+        convo.get("id")
+        or channel_data.get("team", {}).get("id")
+        or channel_data.get("channel", {}).get("id")
+        or channel_data.get("teamsChannelId")
+        or "teams-session"
+    )
 
 
 def format_sources(sources: List[Dict[str, Any]]) -> str:
@@ -132,152 +145,30 @@ def answer_question(*args, **kwargs):
     return _answer_question(*args, **kwargs)
 
 
-def _blob_uploads_enabled() -> bool:
-    """
-    Check whether blob uploads can run. This avoids crashes when the optional
-    azure-storage-blob dependency is not installed in environments that do not
-    need blob persistence.
-    """
-    if not _BLOB_AVAILABLE:
-        global _BLOB_WARNING_EMITTED
-        if not _BLOB_WARNING_EMITTED:
-            logger.warning(
-                "azure-storage-blob is not installed; Teams attachments will be processed "
-                "but not uploaded to blob storage. Install azure-storage-blob to enable uploads."
-            )
-            _BLOB_WARNING_EMITTED = True
-        return False
-    return True
-
-
-def _upload_to_blob(file_path: str, filename: str, subscription_id: str) -> None:
-    """Upload a processed attachment to Azure Blob Storage if configured."""
-    if not _blob_uploads_enabled():
-        return
-
-    connection_string = getattr(Config.Teams, "BLOB_CONNECTION_STRING", "")
-    container_name = getattr(Config.Teams, "BLOB_CONTAINER", "")
-    prefix = getattr(Config.Teams, "BLOB_PATH_PREFIX", "") or getattr(Config.Teams, "UPLOAD_DIR", "")
-
-    if not connection_string or not container_name:
-        logger.info("Teams blob storage is not configured; skipping upload.")
-        return
-
-    blob_name_parts = [prefix.strip("/"), subscription_id.strip("/"), filename]
-    blob_name = "/".join(part for part in blob_name_parts if part)
-
-    try:
-        service = BlobServiceClient.from_connection_string(connection_string)
-        container = service.get_container_client(container_name)
-        try:
-            container.create_container()
-        except Exception:
-            # Container likely already exists; safe to ignore
-            pass
-
-        with open(file_path, "rb") as data:
-            container.upload_blob(name=blob_name, data=data, overwrite=True)
-
-        logger.info("Uploaded Teams attachment to blob storage at %s/%s", container_name, blob_name)
-    except Exception as exc:
-        logger.error("Failed to upload Teams attachment to blob storage: %s", exc)
-
-
-async def handle_attachment_activity(activity: Dict[str, Any]) -> Dict[str, Any]:
+async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: str) -> Dict[str, Any]:
     """Handle Teams activities that include file attachments."""
-    attachments = activity.get("attachments") or []
-    if not attachments:
-        return {"type": "message", "text": "I did not find any attachments to process."}
-
-    upload_dir = os.environ.get("TEAMS_UPLOAD_DIR", getattr(Config.Teams, "UPLOAD_DIR", "/tmp"))
-    os.makedirs(upload_dir, exist_ok=True)
-
     session_id = extract_session_id(activity)
     user_id = extract_user_id(activity)
     context = TEAMS_CHAT_SERVICE.build_context(user_id=user_id, session_id=session_id)
     TEAMS_CHAT_SERVICE.ensure_collection(context.subscription_id)
-
-    processed = False
-
-    for attachment in attachments:
-        content_type = (attachment.get("contentType") or "").lower()
-        if "file.download.info" not in content_type:
-            continue
-
-        file_download = FileDownloadInfo.deserialize(attachment.get("content") or {})
-        download_url = getattr(file_download, "download_url", None)
-        if not download_url:
-            logger.warning("Attachment missing download_url; skipping.")
-            continue
-
-        filename = (
-            getattr(file_download, "name", None)
-            or getattr(file_download, "unique_id", None)
-            or getattr(file_download, "id", None)
-            or "teams-upload"
-        )
-        temp_file_path = os.path.join(upload_dir, filename)
-
-        try:
-            response = requests.get(download_url)
-            response.raise_for_status()
-
-            with open(temp_file_path, "wb") as temp_file:
-                temp_file.write(response.content)
-
-            with open(temp_file_path, "rb") as saved_file:
-                file_bytes = saved_file.read()
-
-            extracted_docs = fileProcessor(file_bytes, filename)
-            if not extracted_docs:
-                logger.warning("No extractable content found for attachment %s", filename)
-                continue
-
-            doc_tag = str(
-                getattr(file_download, "unique_id", None)
-                or getattr(file_download, "id", None)
-                or filename
-            )
-
-            for doc_name, doc_content in extracted_docs.items():
-                train_on_document(
-                    doc_content,
-                    subscription_id=context.subscription_id,
-                    profile_tag=context.profile_id,
-                    doc_tag=doc_tag,
-                    doc_name=doc_name,
-                )
-
-            _upload_to_blob(temp_file_path, filename, context.subscription_id)
-            processed = True
-        except Exception as exc:
-            logger.error("Failed to process Teams attachment %s: %s", filename, exc)
-        finally:
-            try:
-                os.remove(temp_file_path)
-            except FileNotFoundError:
-                pass
-            except Exception as cleanup_exc:
-                logger.warning("Could not remove temp file %s: %s", temp_file_path, cleanup_exc)
-
-    if processed:
-        return build_teams_message(
-            {"response": "File processed successfully. You can now ask questions about it."}
-        )
-
-    return {"type": "message", "text": "Unable to process the attachment. Please try again."}
+    return await handle_attachments(activity, context, correlation_id)
 
 
-async def handle_teams_activity(activity: Dict[str, Any], headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+async def handle_teams_activity(
+    activity: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    raw_body: Optional[bytes] = None,
+) -> Dict[str, Any]:
     """Entrypoint used by FastAPI route to serve Teams messages."""
+    correlation_id = get_correlation_id(activity=activity, headers=headers)
+    log = get_logger(__name__, correlation_id)
     if headers:
-        if not verify_shared_secret(headers):
-            raise TeamsAuthError("Unauthorized Teams request")
+        verify_shared_secret(headers, raw_body=raw_body)
     elif getattr(Config.Teams, "SHARED_SECRET", ""):
-        logger.warning("Teams shared secret configured but no headers provided; skipping verification.")
+        log.warning("Teams shared secret configured but no headers provided; skipping verification.")
 
     if activity.get("attachments"):
-        return await handle_attachment_activity(activity)
+        return await handle_attachment_activity(activity, correlation_id)
 
     question = extract_question(activity)
     if not question:
@@ -304,26 +195,26 @@ async def handle_teams_activity(activity: Dict[str, Any], headers: Optional[Dict
                 user_id=user_id,
                 query=question,
                 answer=answer,
-                session_id=session_id,
+                session_id=context.session_id,
                 new_session=False,
             )
         except Exception as history_exc:
-            logger.debug("Teams history persistence failed: %s", history_exc)
+            log.debug("Teams history persistence failed: %s", history_exc)
     except TeamsChatError as exc:
-        logger.error("Failed to answer Teams question: %s", exc)
+        log.error("Failed to answer Teams question: %s", exc, exc_info=True)
         return {
             "type": "message",
             "text": "I hit a snag answering your question. Please try again in a moment.",
         }
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to answer Teams question: %s", exc)
+        log.error("Failed to answer Teams question: %s", exc, exc_info=True)
         return {
             "type": "message",
             "text": "I hit a snag answering your question. Please try again in a moment.",
         }
 
     # Log session mapping to help debug multi-user chats.
-    logger.info(
+    log.info(
         "Teams message handled | user=%s session=%s subscription=%s profile=%s internet_fallback=%s",
         user_id,
         session_id,
