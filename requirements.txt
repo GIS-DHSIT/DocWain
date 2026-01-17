@@ -1,3 +1,4 @@
+botbuilder
 # --- Core Web Framework ---
 fastapi
 httpx

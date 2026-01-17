@@ -15,6 +15,22 @@ from src.finetune import qdrant_discovery
 logger = logging.getLogger(__name__)
 
 
+def _ensure_profile_indexes(client: QdrantClient, collection_name: str) -> None:
+    """Create keyword indexes for profile_id/profileId when missing to avoid Qdrant 400 errors."""
+    for field in ("profile_id", "profileId"):
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema="keyword",
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if "already exists" in msg or "index exists" in msg:
+                continue
+            logger.debug("Ensure payload index %s on %s failed: %s", field, collection_name, exc)
+
+
 def _get_llm_client(model_name: Optional[str] = None):
     # Lazy import to avoid circular dependencies
     from src.api.dw_newron import create_llm_client
@@ -46,20 +62,36 @@ def _sample_chunks(
             raise ValueError("collection_name or subscription_id is required to sample chunks")
         collection_name = build_collection_name(subscription_id)
     target_collection = collection_name
+    _ensure_profile_indexes(client, target_collection)
 
     def _scroll(filter_key: str):
         pts: List[Dict] = []
         scroll_filter = {"must": [{"key": filter_key, "match": {"value": str(profile_id)}}]}
         offset = None
         while len(pts) < limit:
-            res = client.scroll(
-                collection_name=target_collection,
-                scroll_filter=scroll_filter,
-                limit=min(64, limit - len(pts)),
-                with_vectors=False,
-                with_payload=True,
-                offset=offset,
-            )
+            try:
+                res = client.scroll(
+                    collection_name=target_collection,
+                    scroll_filter=scroll_filter,
+                    limit=min(64, limit - len(pts)),
+                    with_vectors=False,
+                    with_payload=True,
+                    offset=offset,
+                )
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "index required" in msg and "profileid" in msg:
+                    _ensure_profile_indexes(client, target_collection)
+                    res = client.scroll(
+                        collection_name=target_collection,
+                        scroll_filter=scroll_filter,
+                        limit=min(64, limit - len(pts)),
+                        with_vectors=False,
+                        with_payload=True,
+                        offset=offset,
+                    )
+                else:
+                    raise
             batch, offset = res
             if not batch:
                 break
@@ -90,6 +122,9 @@ def _sample_chunks(
         if identity in seen:
             continue
         seen.add(identity)
+        payload = dict(payload)
+        payload.setdefault("collection_name", target_collection)
+        payload.setdefault("profile_id", str(profile_id))
         entry = {"text": text, "metadata": payload}
         group_key = (str(payload.get("source_file") or ""), str(payload.get("document_id") or ""))
         groups.setdefault(group_key, []).append(entry)
@@ -103,6 +138,14 @@ def _sample_chunks(
             chunks.append(groups[key].pop(0))
             if len(chunks) >= limit:
                 break
+    chunks.sort(
+        key=lambda ch: (
+            str(ch["metadata"].get("source_file") or ""),
+            ch["metadata"].get("page") or ch["metadata"].get("page_number") or 0,
+            ch["metadata"].get("chunk_index") or 0,
+            str(ch["metadata"].get("chunk_id") or ""),
+        )
+    )
     return chunks
 
 
@@ -291,11 +334,20 @@ CHUNK:
     return []
 
 
+def _validate_records(records: List[Dict], profile_id: str, collection_name: Optional[str]) -> None:
+    if not records:
+        raise ValueError(
+            f"No training pairs generated for profile {profile_id} in collection "
+            f"{collection_name or 'unknown'}. Ensure chunks contain sufficient text."
+        )
+
+
 def _get_profile_snapshot(
     client: QdrantClient,
     collection: str,
     profile_id: str,
 ) -> Dict[str, int]:
+    _ensure_profile_indexes(client, collection)
     try:
         count = client.count(
             collection_name=collection,
@@ -392,13 +444,17 @@ def build_dataset_from_qdrant(
     root = Path(output_dir) if output_dir else Path(Config.Path.APP_HOME) / "finetune_artifacts" / profile_id / "auto_datasets"
     root.mkdir(parents=True, exist_ok=True)
     path = root / f"qa_{int(time.time())}.jsonl"
+    _validate_records(records, profile_id, collection_name or subscription_id)
     with path.open("w", encoding="utf-8") as f:
         for rec in records:
+            payload = rec.get("metadata") or {}
+            payload.setdefault("collection_name", collection_name or build_collection_name(subscription_id or "default"))
+            payload.setdefault("profile_id", profile_id)
+            payload.setdefault("chunk_id", payload.get("chunk_id") or payload.get("id"))
+            payload.setdefault("page", payload.get("page") or payload.get("page_number") or 0)
+            payload.setdefault("chunk_index", payload.get("chunk_index") or 0)
+            rec["metadata"] = payload
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-    if snapshot:
-        cache[cache_key] = {"dataset_path": str(path), "count": snapshot.get("count", 0)}
-        _save_dataset_cache(cache_path, cache)
 
     logger.info("Built auto dataset at %s with %d records", path, len(records))
     return path

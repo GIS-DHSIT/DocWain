@@ -2,9 +2,6 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment overrides from a .env file when present. This makes sure the
-# app picks up the deployment-specific connection strings instead of falling
-# back to the hard-coded defaults below.
 load_dotenv()
 
 DEFAULT_REDIS_CONNECTION_STRING = "docwain-rediscache.redis.cache.windows.net:6380,password=2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo=,ssl=True,abortConnect=False"
@@ -143,7 +140,9 @@ class Config:
         BOT_ACCESS_TOKEN = os.getenv("TEAMS_BOT_ACCESS_TOKEN", "")
         # Support common Azure Bot env var spellings; defaults intentionally blank to force explicit configuration
         BOT_APP_ID = os.getenv("MICROSOFT_APP_ID")
-        BOT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PWD")
+        BOT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MICROSOFT_APP_PWD")
+        WEB_APP_URL = os.getenv("DOCWAIN_WEB_URL", os.getenv("TEAMS_WEB_APP_URL", "https://www.docwain.ai"))
+        DIAG_MODE = os.getenv("TEAMS_DIAG_MODE", "").lower() in {"1", "true", "yes", "on"}
 
     class Retrieval:
         CHUNK_SIZE = int(os.getenv("RETRIEVAL_CHUNK_SIZE", "800"))
@@ -178,3 +177,9 @@ class Config:
         AUTO_MAX_PROFILES_PER_RUN = int(os.getenv("FINETUNE_AUTO_MAX_PROFILES_PER_RUN", "10"))
         CLEANUP_ENABLED = os.getenv("FINETUNE_CLEANUP_ENABLED", "false").lower() == "true"
         CLEANUP_KEEP_LAST = int(os.getenv("FINETUNE_CLEANUP_KEEP_LAST", "3"))
+        AGENTIC_ENABLED = os.getenv("FINETUNE_AGENTIC_ENABLED", "false").lower() == "true"
+        ORCHESTRATOR_MODEL = os.getenv("FINETUNE_ORCHESTRATOR_MODEL", "nemotron-3-nano")
+        AGENT_MAX_STEPS = int(os.getenv("FINETUNE_AGENT_MAX_STEPS", "12"))
+        AGENT_TIMEOUT_S = int(os.getenv("FINETUNE_AGENT_TIMEOUT_S", "900"))
+        AGENT_FALLBACK_TO_LEGACY = os.getenv("FINETUNE_AGENT_FALLBACK_TO_LEGACY", "true").lower() == "true"
+        OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
