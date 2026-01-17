@@ -183,3 +183,4 @@ class Config:
         AGENT_TIMEOUT_S = int(os.getenv("FINETUNE_AGENT_TIMEOUT_S", "900"))
         AGENT_FALLBACK_TO_LEGACY = os.getenv("FINETUNE_AGENT_FALLBACK_TO_LEGACY", "true").lower() == "true"
         OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        OLLAMA_API = os.getenv("OLLAMA_API", "455d65a864a84e3bba92c0faea74f027.t3cJBT6-bjULKiySSIZQx4Dg")
