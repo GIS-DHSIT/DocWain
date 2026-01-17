@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 PAYLOAD_INDEX_FIELDS = [
     "subscription_id",
     "profile_id",
+    "profileId",
     "document_id",
     "source_file",
     "page",

@@ -9,7 +9,7 @@ from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
 
 def execute_request(request: Any, session_state: Any, ctx: Any, *, stream: bool = False, debug: bool = False):
     """
-    Single entry point for /ask and /askStream. Dispatches to the appropriate runner.
+    Single entry point for /ask (streaming or JSON). Dispatches to the appropriate runner.
     """
     mode = resolve_execution_mode(request, session_state)
     if mode == ExecutionMode.NORMAL:

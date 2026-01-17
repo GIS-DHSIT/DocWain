@@ -1,0 +1,18 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "DocWain tools", "weight": "Bolder", "size": "Medium" },
+    { "type": "TextBlock", "text": "Run actions against the documents uploaded in this Teams chat.", "wrap": true }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Summarize recent", "data": { "action": "summarize_recent" } },
+    { "type": "Action.Submit", "title": "Extract invoice fields", "data": { "action": "extract_fields", "preset": "invoice" } },
+    { "type": "Action.Submit", "title": "Extract contract fields", "data": { "action": "extract_fields", "preset": "contract" } },
+    { "type": "Action.Submit", "title": "List docs", "data": { "action": "list_docs" } },
+    { "type": "Action.Submit", "title": "Switch model", "data": { "action": "set_model", "model": "{default_model}" } },
+    { "type": "Action.Submit", "title": "Switch persona", "data": { "action": "set_persona", "persona": "{default_persona}" } },
+    { "type": "Action.Submit", "title": "Open DocWain", "data": { "action": "open_ui", "url": "{open_url}" } }
+  ]
+}

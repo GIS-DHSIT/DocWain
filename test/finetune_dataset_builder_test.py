@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from src.finetune import dataset_builder
 
@@ -49,3 +50,19 @@ def test_generate_pairs_validates_grounding(monkeypatch):
     chunk_text = "This is a grounded answer inside the chunk."
     pairs = dataset_builder._generate_pairs_for_chunk(chunk_text, "profile", None, 1, retries=1)
     assert pairs[0]["output"] == "grounded answer"
+
+
+def test_build_dataset_raises_on_empty(monkeypatch, tmp_path):
+    # Force no records generated
+    monkeypatch.setattr(dataset_builder, "_sample_chunks", lambda *a, **k: [{"text": "abc" * 100, "metadata": {}}])
+    monkeypatch.setattr(dataset_builder, "_generate_pairs_for_chunk", lambda *a, **k: [])
+    with pytest.raises(ValueError):
+        dataset_builder.build_dataset_from_qdrant(
+            profile_id="p1",
+            subscription_id="sub",
+            max_points=1,
+            questions_per_chunk=1,
+            output_dir=tmp_path,
+            client=None,
+            collection_name="col",
+        )

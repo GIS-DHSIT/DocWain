@@ -1,0 +1,12 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "Something went wrong", "weight": "Bolder", "size": "Medium" },
+    { "type": "TextBlock", "text": "{message}", "wrap": true }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Try tools", "data": { "action": "show_tools" } }
+  ]
+}

@@ -4,13 +4,14 @@ import logging
 import mimetypes
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import httpx
 
 from src.api.config import Config
 from src.api.dataHandler import fileProcessor, train_on_document
 from src.teams.logic import TeamsChatContext
+from src.teams.state import TeamsStateStore
 from src.utils.logging_utils import get_logger
 
 try:
@@ -29,22 +30,22 @@ except ImportError as exc:
 logger = logging.getLogger(__name__)
 
 
+class AttachmentIngestError(Exception):
+    """Raised when a Teams attachment cannot be ingested."""
+
+
 @dataclass
 class AttachmentOutcome:
     filename: str
     documents_created: int
+    doc_tag: str
 
 
-def _get_download_info(attachment: Dict[str, Any]) -> Tuple[Optional[str], str]:
-    content = attachment.get("content") or {}
-    download_url = content.get("downloadUrl") or content.get("download_url")
-    filename = (
-        content.get("fileName")
-        or content.get("name")
-        or attachment.get("name")
-        or f"teams-upload-{uuid.uuid4()}"
-    )
-    return download_url, filename
+@dataclass
+class IngestionResult:
+    filenames: List[str]
+    documents_created: int
+    doc_tags: List[str]
 
 
 def _attachment_type(attachment: Dict[str, Any]) -> str:
@@ -102,13 +103,13 @@ def _upload_to_blob(file_bytes: bytes, filename: str, subscription_id: str, log:
             content_settings=ContentSettings(content_type=content_type) if ContentSettings else None,
         )
         log.info("Uploaded Teams attachment to blob storage at %s/%s", container_name, blob_name)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         log.error("Failed to upload Teams attachment to blob storage: %s", exc, exc_info=True)
 
 
 async def _download_bytes(
     url: str,
-    headers: Optional[Dict[str, str]],
+    headers: Dict[str, str],
     timeout: float,
     retries: int,
     max_bytes: int,
@@ -136,51 +137,85 @@ async def _download_bytes(
     raise RuntimeError("Download failed unexpectedly")
 
 
+async def _resolve_auth_token(turn_context, provided_token: Optional[str]) -> str:
+    if provided_token:
+        return provided_token
+    # Prefer adapter-issued connector token
+    if turn_context:
+        try:
+            token = await turn_context.adapter.get_access_token()  # type: ignore[attr-defined]
+            if token:
+                return token
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Unable to resolve connector token from adapter: %s", exc)
+    fallback = getattr(Config.Teams, "BOT_ACCESS_TOKEN", "") or ""
+    if fallback:
+        return fallback
+    raise AttachmentIngestError("Missing connector token for secure file download.")
+
+
+def _resolve_doc_tag(attachment: Dict[str, Any], filename: str) -> str:
+    content = attachment.get("content") or {}
+    return (
+        content.get("uniqueId")
+        or content.get("id")
+        or content.get("fileType")
+        or hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
+    )
+
+
 async def _process_file_download(
     attachment: Dict[str, Any],
     context: TeamsChatContext,
     log: logging.LoggerAdapter,
+    auth_token: str,
+    timeout: float,
+    retries: int,
+    max_bytes: int,
 ) -> Optional[AttachmentOutcome]:
-    download_url, filename = _get_download_info(attachment)
+    content = attachment.get("content") or {}
+    download_url = content.get("downloadUrl") or content.get("download_url")
+    filename = (
+        content.get("fileName")
+        or content.get("name")
+        or attachment.get("name")
+        or f"teams-upload-{uuid.uuid4()}"
+    )
     if not download_url:
-        log.warning("Attachment missing download URL: %s", attachment)
-        return None
+        raise AttachmentIngestError("Attachment missing a secure download URL.")
 
-    max_bytes = int(getattr(Config.Teams, "MAX_ATTACHMENT_MB", 50)) * 1024 * 1024
-    timeout = float(getattr(Config.Teams, "HTTP_TIMEOUT_SEC", 20))
-    retries = int(getattr(Config.Teams, "HTTP_RETRIES", 2))
-
-    file_bytes = await _download_bytes(download_url, headers=None, timeout=timeout, retries=retries, max_bytes=max_bytes)
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    file_bytes = await _download_bytes(download_url, headers=headers, timeout=timeout, retries=retries, max_bytes=max_bytes)
     extracted_docs = await asyncio.to_thread(fileProcessor, file_bytes, filename)
     if not extracted_docs:
         log.warning("No extractable content found for attachment %s", filename)
         return None
 
-    doc_tag = (
-        attachment.get("content", {}).get("uniqueId")
-        or attachment.get("content", {}).get("id")
-        or filename
-    )
+    doc_tag = _resolve_doc_tag(attachment, filename)
     documents_created = 0
     for doc_name, doc_content in extracted_docs.items():
         await asyncio.to_thread(
             train_on_document,
             doc_content,
             subscription_id=context.subscription_id,
-            profile_tag=context.profile_id,
+            profile_id=context.profile_id,
             doc_tag=str(doc_tag),
             doc_name=doc_name,
         )
         documents_created += 1
 
     _upload_to_blob(file_bytes, filename, context.subscription_id, log)
-    return AttachmentOutcome(filename=filename, documents_created=documents_created)
+    return AttachmentOutcome(filename=filename, documents_created=documents_created, doc_tag=str(doc_tag))
 
 
 async def _process_inline_image(
     attachment: Dict[str, Any],
     context: TeamsChatContext,
     log: logging.LoggerAdapter,
+    auth_token: str,
+    timeout: float,
+    retries: int,
+    max_bytes: int,
 ) -> Optional[AttachmentOutcome]:
     content_url = attachment.get("contentUrl")
     content_type = _attachment_type(attachment)
@@ -188,45 +223,48 @@ async def _process_inline_image(
         log.warning("Inline image missing contentUrl: %s", attachment)
         return None
 
-    headers = {}
-    if "/v3/attachments/" in content_url and getattr(Config.Teams, "BOT_ACCESS_TOKEN", ""):
-        headers["Authorization"] = f"Bearer {Config.Teams.BOT_ACCESS_TOKEN}"
-    elif "/v3/attachments/" in content_url:
-        log.warning("Bot Framework token missing for attachment download")
-        return None
-
-    max_bytes = int(getattr(Config.Teams, "MAX_ATTACHMENT_MB", 50)) * 1024 * 1024
-    timeout = float(getattr(Config.Teams, "HTTP_TIMEOUT_SEC", 20))
-    retries = int(getattr(Config.Teams, "HTTP_RETRIES", 2))
-
+    headers = {"Authorization": f"Bearer {auth_token}"}
     filename = attachment.get("name") or f"teams-image-{uuid.uuid4()}"
-    file_bytes = await _download_bytes(content_url, headers=headers or None, timeout=timeout, retries=retries, max_bytes=max_bytes)
+    file_bytes = await _download_bytes(content_url, headers=headers, timeout=timeout, retries=retries, max_bytes=max_bytes)
     extracted_docs = await asyncio.to_thread(fileProcessor, file_bytes, filename)
     if not extracted_docs:
         log.warning("No extractable content found for inline image %s", filename)
         return None
 
     documents_created = 0
+    doc_tag = hashlib.sha256(content_url.encode("utf-8")).hexdigest()
     for doc_name, doc_content in extracted_docs.items():
         await asyncio.to_thread(
             train_on_document,
             doc_content,
             subscription_id=context.subscription_id,
-            profile_tag=context.profile_id,
-            doc_tag=hashlib.sha256(content_url.encode("utf-8")).hexdigest(),
+            profile_id=context.profile_id,
+            doc_tag=doc_tag,
             doc_name=doc_name,
         )
         documents_created += 1
     _upload_to_blob(file_bytes, filename, context.subscription_id, log)
     log.info("Processed inline image %s (%s)", filename, content_type)
-    return AttachmentOutcome(filename=filename, documents_created=documents_created)
+    return AttachmentOutcome(filename=filename, documents_created=documents_created, doc_tag=doc_tag)
 
 
-async def handle_attachments(activity: Dict[str, Any], context: TeamsChatContext, correlation_id: str) -> Dict[str, Any]:
+async def ingest_attachments(
+    activity: Dict[str, Any],
+    turn_context,
+    context: TeamsChatContext,
+    correlation_id: str,
+    state_store: Optional[TeamsStateStore] = None,
+    connector_token: Optional[str] = None,
+) -> IngestionResult:
     attachments = activity.get("attachments") or []
     log = get_logger(__name__, correlation_id)
     if not attachments:
-        return {"type": "message", "text": "I did not find any attachments to process."}
+        raise AttachmentIngestError("No attachments found to ingest.")
+
+    timeout = float(getattr(Config.Teams, "HTTP_TIMEOUT_SEC", 20))
+    retries = int(getattr(Config.Teams, "HTTP_RETRIES", 2))
+    max_bytes = int(getattr(Config.Teams, "MAX_ATTACHMENT_MB", 50)) * 1024 * 1024
+    token = await _resolve_auth_token(turn_context, connector_token)
 
     outcomes: List[AttachmentOutcome] = []
     errors: List[str] = []
@@ -234,40 +272,54 @@ async def handle_attachments(activity: Dict[str, Any], context: TeamsChatContext
     for attachment in attachments:
         content_type = _attachment_type(attachment)
         try:
-            if "file.download.info" in content_type:
-                outcome = await _process_file_download(attachment, context, log)
-                if outcome:
-                    outcomes.append(outcome)
-                else:
-                    errors.append("File attachment could not be processed.")
-            elif content_type.startswith("image/"):
-                outcome = await _process_inline_image(attachment, context, log)
-                if outcome:
-                    outcomes.append(outcome)
-                else:
-                    errors.append(
-                        f"Received image attachment ({content_type}) but could not download it. "
-                        "Please upload the image as a file attachment."
-                    )
+            if "file.download.info" in content_type or (attachment.get("content") or {}).get("downloadUrl"):
+                outcome = await _process_file_download(
+                    attachment,
+                    context,
+                    log,
+                    auth_token=token,
+                    timeout=timeout,
+                    retries=retries,
+                    max_bytes=max_bytes,
+                )
+            elif content_type.startswith("image/") or attachment.get("contentUrl"):
+                outcome = await _process_inline_image(
+                    attachment,
+                    context,
+                    log,
+                    auth_token=token,
+                    timeout=timeout,
+                    retries=retries,
+                    max_bytes=max_bytes,
+                )
             else:
                 errors.append(f"Unsupported attachment type: {content_type or 'unknown'}.")
-        except Exception as exc:
+                continue
+
+            if outcome:
+                outcomes.append(outcome)
+                if state_store:
+                    state_store.record_upload(
+                        context.subscription_id,
+                        context.profile_id,
+                        outcome.filename,
+                        outcome.doc_tag,
+                        outcome.documents_created,
+                    )
+            else:
+                errors.append("Attachment had no extractable content.")
+        except AttachmentIngestError as exc:
+            errors.append(str(exc))
+        except Exception as exc:  # noqa: BLE001
             log.error("Attachment processing failed: %s", exc, exc_info=True)
             errors.append("An attachment failed to process. Please try again.")
 
     if outcomes:
-        filenames = ", ".join(sorted({out.filename for out in outcomes}))
-        doc_count = sum(out.documents_created for out in outcomes)
-        return {
-            "type": "message",
-            "text": (
-                f"Successfully processed file(s): {filenames}. "
-                f"Extracted {doc_count} document(s). "
-                "Ask a question now and I will use the new content!"
-            ),
-        }
+        return IngestionResult(
+            filenames=[out.filename for out in outcomes],
+            documents_created=sum(out.documents_created for out in outcomes),
+            doc_tags=[out.doc_tag for out in outcomes],
+        )
 
-    if errors:
-        return {"type": "message", "text": " ".join(errors)}
-
-    return {"type": "message", "text": "Unable to process the attachment. Please try again."}
+    message = " ".join(errors) if errors else "No attachments were ingested."
+    raise AttachmentIngestError(message)

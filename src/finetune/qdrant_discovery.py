@@ -8,6 +8,21 @@ from src.api.config import Config
 logger = logging.getLogger(__name__)
 
 
+def _ensure_profile_indexes(client: QdrantClient, collection_name: str) -> None:
+    for field in ("profile_id", "profileId"):
+        try:
+            client.create_payload_index(
+                collection_name=collection_name,
+                field_name=field,
+                field_schema="keyword",
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc).lower()
+            if "already exists" in msg or "index exists" in msg:
+                continue
+            logger.debug("Ensure payload index %s on %s failed: %s", field, collection_name, exc)
+
+
 def list_collections(client: Optional[QdrantClient] = None) -> List[str]:
     client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
     resp = client.get_collections()
@@ -21,6 +36,7 @@ def list_profile_ids(
     batch_size: int = 64,
 ) -> Dict[str, object]:
     client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
+    _ensure_profile_indexes(client, collection_name)
     profiles: Dict[str, int] = {}
     offset = None
     scanned = 0

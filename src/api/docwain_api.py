@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import re
 import time
 import uuid
 from pathlib import Path
@@ -35,6 +36,7 @@ from src.api.dw_chat import (
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
 from src.finetune import get_finetune_manager, list_models
+from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
 from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
@@ -43,7 +45,16 @@ from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
 from src.execution.common import normalize_answer, chunk_text_stream
 from src.screening.api import screening_router
+from botbuilder.schema import Activity
+
 from src.teams import adapter as teams_adapter
+from src.teams.bot_app import (
+    BOT_CREDENTIALS_CONFIGURED,
+    bot_adapter,
+    docwain_teams_bot,
+    MICROSOFT_APP_ID,
+    MICROSOFT_APP_PASSWORD,
+)
 from src.tools.router import tools_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
@@ -119,6 +130,7 @@ class QuestionRequest(BaseModel):
     session_id: Optional[str] = None
     new_session: bool = False  # Frontend sends flag here
     agent_mode: Optional[bool] = None
+    stream: bool = False  # When true, /ask returns a streaming response instead of JSON.
     debug: bool = False
     tools: Optional[List[str]] = None
     tool_inputs: Optional[Dict[str, Any]] = None
@@ -272,7 +284,20 @@ def _refresh_training_run_record(record: Dict[str, Any], manager) -> bool:
             entry["status"] = mapped
             entry["message"] = message
             updated = True
+        ollama_info = getattr(status_obj, "ollama", None)
+        if ollama_info is not None and ollama_info != entry.get("ollama"):
+            entry["ollama"] = ollama_info
+            updated = True
     record["profiles"] = profiles
+    ollama_map = {
+        p.get("profile_id"): p.get("ollama")
+        for p in profiles
+        if p.get("profile_id") and p.get("ollama") is not None
+    }
+    if ollama_map or record.get("ollama"):
+        if ollama_map != record.get("ollama"):
+            record["ollama"] = ollama_map
+            updated = True
     overall_before = record.get("overall_status")
     record["overall_status"] = _derive_overall_status(record)
     if record["overall_status"] in {"succeeded", "failed", "partial"} and not record.get("finished_at"):
@@ -337,6 +362,7 @@ def _build_training_summary(
         "profiles_failed": failed,
         "fail_fast": record.get("fail_fast"),
         "profiles": profiles,
+        "ollama": record.get("ollama"),
         "failures": failures,
     }
 
@@ -420,8 +446,8 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
 @api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
-    activity = await _parse_teams_activity(request)
-    if activity is None:
+    activity_payload, raw_body = await _parse_teams_activity(request)
+    if activity_payload is None:
         return {
             "type": "message",
             "text": "I couldn't read that Teams message. Please try sending it again.",
@@ -431,45 +457,93 @@ async def handle_teams_messages(request: Request):
     auth_header = request.headers.get("Authorization", "")
     use_bot_framework = _is_botframework_jwt(auth_header)
 
+    def _bot_credentials_valid() -> bool:
+        app_id = MICROSOFT_APP_ID or ""
+        pwd = MICROSOFT_APP_PASSWORD or getattr(Config.Teams, "BOT_APP_PASSWORD", None) or ""
+        guid_like = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", app_id))
+        if not guid_like or not pwd or len(pwd) < 10:
+            logger.error(
+                "Teams bot credentials invalid | app_id_guid_like=%s pwd_set=%s pwd_len=%s",
+                guid_like,
+                bool(pwd),
+                len(pwd or ""),
+            )
+            return False
+        return True
+
     if use_bot_framework and not BOT_CREDENTIALS_CONFIGURED:
         logger.error(
             "Microsoft bot credentials are not configured; cannot validate Teams JWT. "
             "Set MicrosoftAppId/MicrosoftAppPassword in the environment."
         )
         raise HTTPException(status_code=401, detail="Bot credentials are not configured")
+    if use_bot_framework and not _bot_credentials_valid():
+        raise HTTPException(status_code=500, detail="Bot credentials are invalid or incomplete. Check MICROSOFT_APP_ID/MICROSOFT_APP_PASSWORD.")
 
     if use_bot_framework:
         try:
-            activity_obj = Activity.deserialize(activity_payload)
+            activity_obj = Activity().deserialize(activity_payload)
         except Exception as exc:
             logger.error("Failed to deserialize Teams activity: %s", exc)
             raise HTTPException(status_code=400, detail="Invalid Teams activity payload")
 
-        async def bot_logic(turn_context: TurnContext):
-            response_payload = await teams_adapter.handle_teams_activity(
-                turn_context.activity.as_dict(),
-                headers=headers,
-                raw_body=raw_body,
+        turn_state = {"incoming_headers": headers, "raw_body": raw_body}
+
+        if getattr(Config.Teams, "DIAG_MODE", False):
+            logger.info(
+                "Teams BF diag: serviceUrl=%s channelId=%s conversationId=%s activityId=%s fromId=%s",
+                getattr(activity_obj, "service_url", None),
+                getattr(activity_obj, "channel_id", None),
+                getattr(getattr(activity_obj, "conversation", None), "id", None),
+                getattr(activity_obj, "id", None),
+                getattr(getattr(activity_obj, "from_property", None), "id", None),
             )
-            if isinstance(response_payload, dict):
-                try:
-                    outgoing = Activity.deserialize(response_payload)
-                except Exception:
-                    outgoing = Activity(
-                        type=response_payload.get("type") or "message",
-                        text=response_payload.get("text"),
-                    )
-            else:
-                outgoing = response_payload
-            await turn_context.send_activity(outgoing)
+            logger.info(
+                "Teams BF auth header length: %s | adapter_app_id=%s",
+                len(auth_header or ""),
+                MICROSOFT_APP_ID,
+            )
+
+        if not bot_adapter:
+            raise HTTPException(
+                status_code=401,
+                detail="Bot adapter is not initialized; check MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD.",
+            )
+
+        expected_app_id = MICROSOFT_APP_ID or "(unset)"
+        actual_app_id = (activity_obj.recipient and getattr(activity_obj.recipient, "id", None)) or ""
+
+        if actual_app_id and expected_app_id != actual_app_id:
+            logger.warning(
+                "Incoming activity AppId does not match configured bot AppId | expected=%s got=%s",
+                expected_app_id,
+                actual_app_id,
+            )
 
         try:
-            await teams_bot_adapter.process_activity(activity_obj, auth_header, bot_logic)
+            async def _run_bot(turn_context):
+                turn_context.turn_state.update(turn_state)
+                await docwain_teams_bot.on_turn(turn_context)
+
+            response = await bot_adapter.process_activity(activity_obj, auth_header, _run_bot)
+            if response:
+                return JSONResponse(status_code=response.status, content=response.body)
+        except PermissionError as exc:
+            logger.error(
+                "Failed Teams auth (likely AppId/secret mismatch). Expected AppId=%s | error=%s",
+                expected_app_id,
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized Teams request: verify MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD match the bot registration.",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to process Teams activity via Bot Framework adapter: %s", exc, exc_info=True)
             detail = "Unauthorized Teams request" if "auth" in str(exc).lower() or "unauthoriz" in str(exc).lower() else "Failed to process Teams activity"
-            status = 401 if "auth" in detail.lower() else 500
-            raise HTTPException(status_code=status, detail=detail)
+            status_code = 401 if "auth" in detail.lower() else 500
+            raise HTTPException(status_code=status_code, detail=detail)
         return {}
 
     try:
@@ -482,22 +556,14 @@ async def handle_teams_messages(request: Request):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_error("unauthorized", str(exc)))
 
 
-@api_router.post("/ask", tags=["Default"], response_model=AskResponse)
-def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
-    logger.info(
-        "[ASK] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s query_snippet=%s",
-        request.user_id,
-        request.session_id,
-        request.new_session,
-        request.agent_mode,
-        agent_mode,
-        _safe_snippet(request.query),
-    )
-
+def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool]):
+    """
+    Resolve session + mode and build a shared RequestContext for both streaming and JSON responses.
+    """
     session_id = _resolve_session_id(request)
     request.session_id = session_id
-    if agent_mode is not None:
-        object.__setattr__(request, "agent_mode_query", agent_mode)
+    if agent_mode_query is not None:
+        object.__setattr__(request, "agent_mode_query", agent_mode_query)
 
     session_state = session_state_store.get(session_id)
     mode = resolve_execution_mode(request, session_state)
@@ -515,7 +581,34 @@ def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Quer
         use_tools=bool(getattr(request, "use_tools", False)),
         tool_inputs=request.tool_inputs,
     )
-    result = execute_request(request, session_state=session_state, ctx=ctx, stream=False, debug=bool(request.debug))
+    return session_id, session_state, mode, ctx
+
+
+@api_router.post("/ask", tags=["Default"], response_model=AskResponse)
+def ask_question_api(
+    request: QuestionRequest,
+    agent_mode: Optional[bool] = Query(None),
+    stream: Optional[bool] = Query(None),
+):
+    """
+    Unified /ask handler. Toggle `stream=true` to receive a streamed response instead of JSON.
+    """
+    streaming = bool(stream if stream is not None else request.stream)
+    session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
+    logger.info(
+        "[ASK%s] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s stream(body)=%s stream(query)=%s query_snippet=%s",
+        "_STREAM" if streaming else "",
+        request.user_id,
+        session_id,
+        request.new_session,
+        request.agent_mode,
+        agent_mode,
+        request.stream,
+        stream,
+        _safe_snippet(request.query),
+    )
+
+    result = execute_request(request, session_state=session_state, ctx=ctx, stream=streaming, debug=bool(request.debug))
 
     explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
     if explicit_toggle is not None:
@@ -523,6 +616,20 @@ def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Quer
             session_id,
             ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
         )
+
+    if streaming:
+        def _stream():
+            try:
+                normalized_answer = _normalize_answer(result.answer)
+                stream_iterable = result.stream or chunk_text_stream(normalized_answer.get("response") or "")
+                logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
+                for chunk in stream_iterable:
+                    yield chunk
+            except Exception as exc:
+                logger.error("[ASK_STREAM] Streaming failed for session=%s: %s", session_id, exc, exc_info=True)
+                yield "[error] Unable to stream response right now."
+
+        return StreamingResponse(_stream(), media_type="text/plain")
 
     answer = AnswerPayload.model_validate(result.answer)
 
@@ -534,69 +641,19 @@ def ask_question_api(request: QuestionRequest, agent_mode: Optional[bool] = Quer
         new_session=request.new_session,
     )
 
-    logger.info("[ASK] completed session_id=%s mode=%s", active_session_id, result.mode.value)
+    logger.info("[ASK] completed session_id=%s mode=%s stream=%s", active_session_id, result.mode.value, streaming)
 
     enriched_debug = {**(result.debug or {}), "request_id": ctx.request_id}
     return AskResponse(answer=answer, current_session_id=active_session_id, debug=enriched_debug)
 
 
-@api_router.post("/askStream", tags=["Default"])
+@api_router.post("/askStream", tags=["Default"], deprecated=True)
 def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
     """
-    Streams the LLM response for a query. Uses the same execution router as /ask but
-    yields text progressively based on the selected mode.
+    Backward-compatible alias for streaming; prefer /ask with `stream=true`.
     """
-    logger.info(
-        "[ASK_STREAM] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s query_snippet=%s",
-        request.user_id,
-        request.session_id,
-        request.new_session,
-        request.agent_mode,
-        agent_mode,
-        _safe_snippet(request.query),
-    )
-
-    session_id = _resolve_session_id(request)
-    request.session_id = session_id
-    if agent_mode is not None:
-        object.__setattr__(request, "agent_mode_query", agent_mode)
-
-    session_state = session_state_store.get(session_id)
-    mode = resolve_execution_mode(request, session_state)
-    ctx = RequestContext.build(
-        query=request.query,
-        session_id=session_id,
-        user_id=request.user_id,
-        mode=mode.value,
-        debug=bool(request.debug),
-        profile_id=request.profile_id,
-        subscription_id=request.subscription_id,
-        model_name=request.model_name,
-        persona=request.persona,
-        tools=request.tools,
-        use_tools=bool(getattr(request, "use_tools", False)),
-        tool_inputs=request.tool_inputs,
-    )
-
-    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
-    if explicit_toggle is not None:
-        session_state_store.set_preferred_mode(
-            session_id,
-            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
-        )
-
-    def _stream():
-        try:
-            result = execute_request(request, session_state=session_state, ctx=ctx, stream=True, debug=bool(request.debug))
-            stream_iterable = result.stream or chunk_text_stream(result.answer.get("response") or "")
-            logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
-            for chunk in stream_iterable:
-                yield chunk
-        except Exception as exc:
-            logger.error("[ASK_STREAM] Streaming failed for session=%s: %s", session_id, exc, exc_info=True)
-            yield "[error] Unable to stream response right now."
-
-    return StreamingResponse(_stream(), media_type="text/plain")
+    object.__setattr__(request, "stream", True)
+    return ask_question_api(request, agent_mode=agent_mode, stream=True)
 
 
 @api_router.post("/train/{doc_id}", tags=["Default"])
@@ -671,6 +728,36 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
     manager = get_finetune_manager()
     qdrant_client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
 
+    agentic_requested = bool(request.agentic or getattr(Config.Finetune, "AGENTIC_ENABLED", False))
+    if agentic_requested and request.collection_name:
+        orchestrator = AgenticFinetuneOrchestrator(client=qdrant_client)
+        try:
+            agentic_result = orchestrator.run(request)
+            summary = _build_training_summary(
+                agentic_result,
+                total_profiles_discovered=agentic_result.get("total_profiles_discovered"),
+                status=agentic_result.get("overall_status"),
+            )
+            for key in ("plan_path", "snapshot_path", "dataset_stats_path"):
+                if agentic_result.get(key):
+                    summary[key] = agentic_result[key]
+            return summary
+        except OllamaModelMissing as exc:
+            if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
+                logger.warning("Agentic path missing model; falling back to legacy: %s", exc)
+            else:
+                raise HTTPException(status_code=400, detail=str(exc))
+        except OllamaUnavailable as exc:
+            if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
+                logger.warning("Agentic path Ollama unavailable; falling back to legacy: %s", exc)
+            else:
+                raise HTTPException(status_code=503, detail=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
+                logger.warning("Agentic finetune failed; using legacy flow: %s", exc, exc_info=True)
+            else:
+                raise HTTPException(status_code=400, detail=str(exc))
+
     try:
         discovered_profiles = discover_profile_ids_from_collection(
             client=qdrant_client,
@@ -716,6 +803,7 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
         "finished_at": None,
         "overall_status": "scheduled",
         "profiles": [],
+        "ollama": {},
         "total_profiles_discovered": len(discovered_profiles),
     }
     _persist_training_run_record(run_dir, run_record)
@@ -1162,6 +1250,7 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 app.include_router(api_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
+app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,13 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "DocWain for Teams", "weight": "Bolder", "size": "Medium" },
+    { "type": "TextBlock", "text": "Upload files and they are ingested automatically. Ask questions right away or pick a tool below.", "wrap": true },
+    { "type": "TextBlock", "text": "Tools: summarize latest uploads, extract fields, list documents, switch model/persona, or open the DocWain web app.", "wrap": true }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Show tools", "data": { "action": "show_tools" } }
+  ]
+}

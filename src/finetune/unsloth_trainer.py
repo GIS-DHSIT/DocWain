@@ -1,14 +1,16 @@
+import contextlib
 import hashlib
-import json
-import math
-import logging
 import inspect
+import json
+import logging
+import math
+import os
+import shutil
 import threading
 import time
-import uuid
-import os
 import traceback
-import contextlib
+import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +18,8 @@ from datasets import Dataset, load_dataset
 
 from src.api.config import Config
 from src.finetune.models import FinetuneRequest, FinetuneStatus, ResolvedModel, TrainingExample
+from src.ollama_publisher import DEFAULT_PARAMS as OLLAMA_DEFAULT_PARAMS
+from src.ollama_publisher import DEFAULT_SYSTEM_PROMPT, OllamaPublisher
 from transformers import __version__ as transformers_version
 
 logger = logging.getLogger(__name__)
@@ -178,13 +182,14 @@ class UnslothFinetuneManager:
                         profile_id=profile_id,
                         status=entry.get("status", "completed"),
                         message=entry.get("message", ""),
-                        output_model=entry.get("output_model"),
-                        started_at=entry.get("started_at", time.time()),
-                        finished_at=entry.get("finished_at"),
-                        params={},
-                        training_run_id=entry.get("run_id"),
-                        params_hash=entry.get("params_hash"),
-                    )
+                    output_model=entry.get("output_model"),
+                    started_at=entry.get("started_at", time.time()),
+                    finished_at=entry.get("finished_at"),
+                    params={},
+                    training_run_id=entry.get("run_id"),
+                    params_hash=entry.get("params_hash"),
+                    ollama=entry.get("ollama"),
+                )
             return None
 
     def list_models(self) -> List[Dict[str, str]]:
@@ -218,6 +223,7 @@ class UnslothFinetuneManager:
         """Execute fine-tune and activate the resulting model for the profile."""
         import torch
 
+        params_hash = self._params_hash(request)
         redis_lock = self._acquire_redis_lock(job_id)
         if redis_lock is False:
             self._update_status(job_id, status="failed", message="Unable to acquire training lock; try again later.")
@@ -239,17 +245,21 @@ class UnslothFinetuneManager:
             "status": "running",
             "error": None,
             "traceback": None,
+            "params_hash": params_hash,
             "config": {k: v for k, v in request.dict().items() if k != "training_examples"},
             "dataset": {},
+            "artifacts": {},
             "versions": {
                 "transformers": transformers_version,
             },
+            "ollama": None,
         }
         try:
             from unsloth import __version__ as unsloth_version
             manifest["versions"]["unsloth"] = unsloth_version
         except Exception:
             pass
+        eval_loss = None
         try:
             if torch.cuda.is_available():
                 self._ensure_gpu_headroom()
@@ -306,8 +316,9 @@ class UnslothFinetuneManager:
             )
             self._update_status(job_id, status="running", message="training with Unsloth SFTTrainer")
 
+            artifacts: Dict[str, Optional[Path]] = {"merged_dir": output_dir / "merged", "adapter_dir": None}
             try:
-                eval_metrics = self._train(model, tokenizer, train_ds, request, output_dir, eval_dataset=eval_ds)
+                eval_metrics, artifacts = self._train(model, tokenizer, train_ds, request, output_dir, eval_dataset=eval_ds)
             except torch.cuda.OutOfMemoryError as oom:
                 logger.error("OOM during training; retrying with memory-safe settings: %s", oom)
                 self._update_status(job_id, status="running", message="OOM hit; retrying with smaller batch")
@@ -325,14 +336,30 @@ class UnslothFinetuneManager:
                 load_notes = {}
                 model, tokenizer = self._load_model(model_id, request, load_notes)
                 manifest["load_retry_after_oom"] = load_notes
-                eval_metrics = self._train(model, tokenizer, train_ds, request, output_dir, eval_dataset=eval_ds)
+                eval_metrics, artifacts = self._train(model, tokenizer, train_ds, request, output_dir, eval_dataset=eval_ds)
             if eval_ds:
                 eval_loss = eval_metrics.get("eval_loss")
                 if eval_loss is None or math.isnan(eval_loss):
                     raise ValueError("Evaluation failed; not promoting model")
                 self._update_status(job_id, status="running", message=f"eval_loss={eval_loss:.4f}")
 
-            merged_dir = output_dir / "merged"
+            merged_dir = artifacts.get("merged_dir") or output_dir / "merged"
+            adapter_dir = artifacts.get("adapter_dir")
+            manifest["dataset"]["hash"] = dataset_hash
+            manifest["artifacts"] = {
+                "merged_dir": str(merged_dir),
+                "adapter_dir": str(adapter_dir) if adapter_dir else None,
+            }
+            publish_record = self._publish_to_ollama(
+                request=request,
+                job_id=job_id,
+                output_dir=output_dir,
+                merged_dir=merged_dir,
+                adapter_dir=adapter_dir,
+                dataset_hash=dataset_hash,
+                params_hash=params_hash,
+            )
+            manifest["ollama"] = publish_record
             self._activate_profile_model(
                 request.profile_id,
                 merged_dir,
@@ -340,6 +367,8 @@ class UnslothFinetuneManager:
                 dataset_hash=dataset_hash,
                 qdrant_snapshot=request.qdrant_snapshot,
                 eval_loss=eval_loss,
+                adapter_dir=adapter_dir,
+                ollama_record=publish_record,
             )
 
             self._update_status(
@@ -347,6 +376,7 @@ class UnslothFinetuneManager:
                 status="completed",
                 message="fine-tune finished",
                 output_model=str(merged_dir),
+                ollama=publish_record,
             )
             manifest["status"] = "completed"
             manifest["finished_at"] = time.time()
@@ -382,6 +412,13 @@ class UnslothFinetuneManager:
             examples.extend(self._load_profile_examples(request.profile_id))
 
         if request.dataset_path:
+            dataset_file = Path(request.dataset_path)
+            if not dataset_file.exists() or dataset_file.stat().st_size == 0:
+                raise ValueError(f"Dataset file is empty: {request.dataset_path}")
+            with dataset_file.open("r", encoding="utf-8") as f:
+                line_count = sum(1 for _ in f)
+            if line_count == 0:
+                raise ValueError(f"Dataset file has no records: {request.dataset_path}")
             ds = load_dataset("json", data_files=request.dataset_path, split="train")
             ds = ds.map(self._format_row, remove_columns=ds.column_names)
             return ds
@@ -599,7 +636,7 @@ class UnslothFinetuneManager:
 
         return model, tokenizer
 
-    def _train(self, model, tokenizer, dataset: Dataset, request: FinetuneRequest, output_dir: Path, eval_dataset: Optional[Dataset] = None):
+    def _train(self, model, tokenizer, dataset: Dataset, request: FinetuneRequest, output_dir: Path, eval_dataset: Optional[Dataset] = None) -> tuple[Dict[str, float], Dict[str, Optional[Path]]]:
         import torch
         from trl import SFTTrainer
         from unsloth import FastLanguageModel
@@ -642,11 +679,10 @@ class UnslothFinetuneManager:
             except Exception as eval_exc:
                 logger.warning("Evaluation failed to run; continuing without eval metrics: %s", eval_exc)
                 eval_metrics = {}
-        merged_dir = output_dir / "merged"
-        self._save_model(model, tokenizer, merged_dir)
-        return eval_metrics
+        artifacts = self._save_model(model, tokenizer, output_dir)
+        return eval_metrics, artifacts
 
-    def _save_model(self, model, tokenizer, output_dir: Path):
+    def _save_model(self, model, tokenizer, output_dir: Path) -> Dict[str, Optional[Path]]:
         """
         Save a trained model+tokenizer using the best available Unsloth/HF hook.
 
@@ -660,35 +696,126 @@ class UnslothFinetuneManager:
             FastLanguageModel = None  # noqa: N806
 
         output_dir.mkdir(parents=True, exist_ok=True)
+        merged_dir = output_dir / "merged"
+        adapter_dir = output_dir / "adapter"
+        merged_dir.mkdir(parents=True, exist_ok=True)
+
+        adapter_path: Optional[Path] = None
+        try:
+            adapter_dir.mkdir(parents=True, exist_ok=True)
+            if hasattr(model, "save_pretrained"):
+                model.save_pretrained(str(adapter_dir))
+                adapter_path = adapter_dir
+            if hasattr(tokenizer, "save_pretrained"):
+                tokenizer.save_pretrained(str(adapter_dir))
+                adapter_path = adapter_dir
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to save adapter weights to %s: %s", adapter_dir, exc)
 
         # Preferred: Unsloth merged save on the model instance
         if hasattr(model, "save_pretrained_merged"):
-            logger.info("Saving model via save_pretrained_merged to %s", output_dir)
-            model.save_pretrained_merged(str(output_dir), tokenizer=tokenizer, save_method="merged_16bit")
-            return
+            logger.info("Saving model via save_pretrained_merged to %s", merged_dir)
+            model.save_pretrained_merged(str(merged_dir), tokenizer=tokenizer, save_method="merged_16bit")
+            return {"merged_dir": merged_dir, "adapter_dir": adapter_path}
 
         # Secondary: class-level helper if the installed Unsloth exposes it
         if FastLanguageModel and hasattr(FastLanguageModel, "save_pretrained"):
-            logger.info("Saving model via FastLanguageModel.save_pretrained to %s", output_dir)
+            logger.info("Saving model via FastLanguageModel.save_pretrained to %s", merged_dir)
             FastLanguageModel.save_pretrained(
                 model,
                 tokenizer,
-                save_directory=str(output_dir),
+                save_directory=str(merged_dir),
                 save_method="merged_16bit",
             )
-            return
+            return {"merged_dir": merged_dir, "adapter_dir": adapter_path}
 
         # Fallback: plain HF save + tokenizer save
         logger.warning(
             "Unsloth merged save helper not available; falling back to model.save_pretrained/tokenizer.save_pretrained."
         )
         if hasattr(model, "save_pretrained"):
-            model.save_pretrained(str(output_dir))
+            model.save_pretrained(str(merged_dir))
         if hasattr(tokenizer, "save_pretrained"):
-            tokenizer.save_pretrained(str(output_dir))
+            tokenizer.save_pretrained(str(merged_dir))
+        return {"merged_dir": merged_dir, "adapter_dir": adapter_path if adapter_path and adapter_path.exists() else None}
 
-    def _activate_profile_model(self, profile_id: str, model_dir: Path):
-        entry = {
+    def _publish_to_ollama(
+        self,
+        request: FinetuneRequest,
+        job_id: str,
+        output_dir: Path,
+        merged_dir: Path,
+        adapter_dir: Optional[Path],
+        dataset_hash: str,
+        params_hash: str,
+    ) -> Dict[str, Any]:
+        tenant_segment = self._slug_for_name(
+            request.collection_name
+            or (request.qdrant_snapshot or {}).get("collection")
+            or os.getenv("DOCWAIN_TENANT", "docwain"),
+            max_len=28,
+        )
+        run_segment = self._slug_for_name(request.run_name or job_id, max_len=28)
+        profile_segment = self._slug_for_name(request.profile_id or "merged", max_len=24)
+        hash_part = self._short_hash(params_hash, dataset_hash)
+        model_name = f"{tenant_segment}-{run_segment}-{profile_segment}-{self._date_code()}-{hash_part}"
+        latest_alias = f"{tenant_segment}-{run_segment}-latest"
+
+        try:
+            publisher = OllamaPublisher(
+                base_model=request.base_model,
+                run_dir=str(output_dir),
+                model_name=model_name,
+                adapter_dir=str(adapter_dir) if adapter_dir else "",
+                system_prompt=self._ollama_system_prompt(),
+                params=OLLAMA_DEFAULT_PARAMS,
+                latest_alias=latest_alias,
+                config_hash=params_hash,
+                dataset_manifest_path=str(output_dir / "manifest.json"),
+                run_id=job_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unable to initialize OllamaPublisher: %s", exc)
+            return {
+                "status": "skipped",
+                "reason": f"OllamaPublisher init failed: {exc}",
+                "adapter_dir": str(adapter_dir) if adapter_dir else None,
+                "model_name": model_name,
+                "latest_alias": latest_alias,
+            }
+
+        artifact = publisher._resolve_artifact()
+        if not artifact:
+            notes = ["Adapter directory missing or empty; skipping Ollama publish."]
+            return publisher.write_publish_artifacts("skipped", notes)
+
+        smoke = os.getenv("OLLAMA_VERIFY_RUN", "").lower() in {"1", "true", "yes"}
+        try:
+            publish_record = publisher.publish(smoke_test=smoke)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Ollama publish failed for job %s: %s", job_id, exc, exc_info=True)
+            return publisher.write_publish_artifacts("failed", [str(exc)])
+
+        publish_record.setdefault("model_name", model_name)
+        publish_record.setdefault("adapter_dir", str(adapter_dir) if adapter_dir else None)
+        publish_record["merged_dir"] = str(merged_dir)
+        return publish_record
+
+    def _activate_profile_model(
+        self,
+        profile_id: str,
+        model_dir: Path,
+        *,
+        base_model: Optional[str] = None,
+        dataset_hash: Optional[str] = None,
+        qdrant_snapshot: Optional[Dict[str, Any]] = None,
+        eval_loss: Optional[float] = None,
+        adapter_dir: Optional[Path] = None,
+        ollama_record: Optional[Dict[str, Any]] = None,
+    ):
+        entry = self.state.get(profile_id, {})
+        runs = entry.get("runs", [])
+        run_record = {
             "profile_id": profile_id,
             "model_path": str(model_dir),
             "base_model": base_model,
@@ -696,6 +823,8 @@ class UnslothFinetuneManager:
             "qdrant_snapshot": qdrant_snapshot,
             "eval_loss": eval_loss,
             "created_at": time.time(),
+            "adapter_path": str(adapter_dir) if adapter_dir else None,
+            "ollama": ollama_record,
         }
         runs.append(run_record)
         entry.update(
@@ -706,10 +835,24 @@ class UnslothFinetuneManager:
                 "served_model_name": f"finetuned-{profile_id}",
                 "updated_at": time.time(),
                 "runs": runs,
+                "adapter_path": str(adapter_dir) if adapter_dir else None,
+                "ollama": ollama_record,
             }
         )
         self.state[profile_id] = entry
         self._persist_state()
+        self.run_index[profile_id] = {
+            **self.run_index.get(profile_id, {}),
+            "job_id": self.run_index.get(profile_id, {}).get("job_id"),
+            "run_id": self.run_index.get(profile_id, {}).get("run_id"),
+            "status": "completed",
+            "output_model": str(model_dir),
+            "model_path": str(model_dir),
+            "finished_at": time.time(),
+            "adapter_path": str(adapter_dir) if adapter_dir else None,
+            "ollama": ollama_record,
+        }
+        self._persist_runs()
         self._cleanup_old_runs(profile_id)
 
     def _cleanup_old_runs(self, profile_id: str) -> None:
@@ -734,7 +877,14 @@ class UnslothFinetuneManager:
         self.state[profile_id] = entry
         self._persist_state()
 
-    def _update_status(self, job_id: str, status: str, message: str = "", output_model: Optional[str] = None):
+    def _update_status(
+        self,
+        job_id: str,
+        status: str,
+        message: str = "",
+        output_model: Optional[str] = None,
+        ollama: Optional[Dict[str, Any]] = None,
+    ):
         with self.lock:
             if job_id not in self.jobs:
                 return
@@ -743,6 +893,8 @@ class UnslothFinetuneManager:
             status_obj.message = message
             if output_model:
                 status_obj.output_model = output_model
+            if ollama is not None:
+                status_obj.ollama = ollama
             if status in {"completed", "failed"}:
                 status_obj.finished_at = time.time()
             self.jobs[job_id] = status_obj
@@ -752,6 +904,8 @@ class UnslothFinetuneManager:
                 run_entry["message"] = message
                 run_entry["output_model"] = output_model or run_entry.get("output_model")
                 run_entry["finished_at"] = status_obj.finished_at
+                if ollama is not None:
+                    run_entry["ollama"] = ollama
                 self.run_index[status_obj.profile_id] = run_entry
                 self._persist_runs()
 
@@ -928,6 +1082,31 @@ class UnslothFinetuneManager:
                 )
 
     @staticmethod
+    def _slug_for_name(value: Optional[str], max_len: int = 48) -> str:
+        raw = str(value or "").strip()
+        cleaned = "".join(ch.lower() if ch.isalnum() else "-" for ch in raw)
+        cleaned = "-".join(filter(None, cleaned.split("-")))
+        cleaned = cleaned or "docwain"
+        return cleaned[:max_len].strip("-") or "docwain"
+
+    @staticmethod
+    def _date_code() -> str:
+        return datetime.utcnow().strftime("%Y%m%d")
+
+    @staticmethod
+    def _short_hash(*parts: str) -> str:
+        raw = "|".join([p for p in parts if p]) or str(time.time())
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+
+    @staticmethod
+    def _ollama_system_prompt() -> str:
+        return (
+            f"{DEFAULT_SYSTEM_PROMPT} "
+            "Blend multi-chunk bundles carefully, cite document or section identifiers in brackets, "
+            "and be explicit about missing context instead of guessing."
+        )
+
+    @staticmethod
     def _params_hash(request: FinetuneRequest) -> str:
         payload = request.dict()
         payload.pop("run_name", None)
@@ -955,5 +1134,6 @@ class UnslothFinetuneManager:
                     params={},
                     training_run_id=run_entry.get("run_id"),
                     params_hash=params_hash,
+                    ollama=run_entry.get("ollama"),
                 )
         return None

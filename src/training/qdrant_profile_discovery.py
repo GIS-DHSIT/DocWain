@@ -54,6 +54,14 @@ def discover_profile_ids_from_collection(
     if not collection_name:
         raise ValueError("collection_name is required for profile discovery")
 
+    # Ensure profile indexes exist to prevent Qdrant 400 errors during filtered operations elsewhere.
+    for field in ("profile_id", "profileId"):
+        try:
+            client.create_payload_index(collection_name=collection_name, field_name=field, field_schema="keyword")
+        except Exception as exc:  # noqa: BLE001
+            if "already exists" not in str(exc).lower():
+                logger.debug("Ensure index %s failed: %s", field, exc)
+
     if not client.collection_exists(collection_name):
         raise ValueError(f"Collection '{collection_name}' does not exist")
 
