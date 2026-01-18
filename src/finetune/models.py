@@ -37,6 +37,9 @@ class FinetuneRequest(BaseModel):
     collection_name: Optional[str] = Field(
         None, description="Optional collection name for agentic finetuning context enforcement"
     )
+    training_run_id: Optional[str] = Field(
+        None, description="Optional training run id for diagnostics/artifact paths"
+    )
 
 
 class FinetuneStatus(BaseModel):

@@ -199,7 +199,7 @@ class AgenticFinetuneOrchestrator:
             profile_dir = artifact_root / profile_id / job_id
             profile_dir.mkdir(parents=True, exist_ok=True)
             try:
-                dataset_path = build_dataset_from_qdrant(
+                dataset_result = build_dataset_from_qdrant(
                     profile_id=profile_id,
                     subscription_id=collection,
                     collection_name=collection,
@@ -207,25 +207,29 @@ class AgenticFinetuneOrchestrator:
                     questions_per_chunk=plan.dataset_plan.questions_per_chunk,
                     generation_model=request.generation_model,
                     client=self.client,
+                    run_id=job_id,
                 )
-                stats = self._validate_dataset(dataset_path, collection, profile_id, plan.acceptance_criteria)
+                if dataset_result.status != "success" or not dataset_result.dataset_path:
+                    raise ValueError(f"Dataset generation {dataset_result.status} for profile {profile_id}")
+                stats = self._validate_dataset(dataset_result.dataset_path, collection, profile_id, plan.acceptance_criteria)
                 dataset_stats.append(stats)
 
                 payload = self._build_finetune_payload(
                     request=request,
                     profile_id=profile_id,
-                    dataset_path=str(dataset_path),
+                    dataset_path=str(dataset_result.dataset_path),
                     plan=plan.training_plan,
                     snapshot=snapshot,
                     orchestrator_model=orchestrator_model,
                 )
+                payload["training_run_id"] = job_id
                 train_args_dump.append(payload)
                 status = self.manager.start_job(FinetuneRequest(**payload))
                 profiles.append(
                     {
                         "profile_id": profile_id,
                         "job_id": status.job_id,
-                        "dataset_path": str(dataset_path),
+                        "dataset_path": str(dataset_result.dataset_path),
                         "status": status.status if status.status != "completed" else "succeeded",
                         "message": status.message,
                     }

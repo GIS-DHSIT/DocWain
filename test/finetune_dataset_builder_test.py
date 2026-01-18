@@ -1,68 +1,72 @@
 import json
+from pathlib import Path
+
 import pytest
 
-from src.finetune import dataset_builder
+from src.finetune.dataset_builder import build_dataset_from_qdrant
+from src.finetune.pair_generator import ChunkRecord, MultiStrategyPairGenerator, merge_adjacent
+from src.api.config import Config
 
 
 class _FakePoint:
-    def __init__(self, payload):
+    def __init__(self, pid, payload):
+        self.id = pid
         self.payload = payload
+        self.vector = [0.1, 0.2, 0.3]
 
 
 class _FakeQdrantClient:
     def __init__(self, points):
         self.points = points
-        self.scroll_calls = []
 
-    def scroll(self, collection_name, scroll_filter, limit, with_vectors, with_payload, offset=None):
-        self.scroll_calls.append((collection_name, offset))
-        data = self.points
+    def scroll(self, collection_name, scroll_filter=None, limit=1, with_vectors=False, with_payload=True, offset=None):
         start = offset or 0
         end = start + limit
-        batch = [_FakePoint(payload) for payload in data[start:end]]
-        next_offset = end if end < len(data) else None
+        batch = self.points[start:end]
+        next_offset = end if end < len(self.points) else None
         return batch, next_offset
 
 
-def test_sample_chunks_deduplicates_by_metadata():
+def test_merge_adjacent_respects_min_tokens():
+    chunks = [
+        ChunkRecord(text="alpha beta", metadata={"document_id": "d1", "chunk_index": 0}),
+        ChunkRecord(text="gamma delta epsilon", metadata={"document_id": "d1", "chunk_index": 1}),
+        ChunkRecord(text="zeta eta theta iota", metadata={"document_id": "d1", "chunk_index": 2}),
+    ]
+    merged = merge_adjacent(chunks, min_tokens=6, merge_window=3)
+    assert len(merged) == 1
+    assert "alpha beta" in merged[0].text
+
+
+def test_multi_strategy_fallback_generates_pairs():
+    block = ChunkRecord(text="Step one: do X. Step two: do Y.", metadata={"document_id": "d1"})
+    gen = MultiStrategyPairGenerator(llm_client=None, min_pairs=1, max_pairs=5)
+    pairs, strategies = gen.generate([block])
+    assert len(pairs) >= 1
+    assert strategies["span_instruction"] >= 1 or strategies["extractive_qa"] >= 1
+
+
+def test_build_dataset_with_schema_probe_and_sparse_text(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(Config.Finetune, "MIN_CHUNK_CHARS", 1, raising=False)
+    monkeypatch.setattr(Config.Finetune, "MIN_MERGED_TOKENS", 1, raising=False)
+    monkeypatch.setattr(Config.Finetune, "MIN_PAIRS_PER_PROFILE", 1, raising=False)
+    monkeypatch.setattr(Config.Finetune, "MAX_PAIRS_PER_PROFILE", 5, raising=False)
+
     points = [
-        {"text": "Long chunk text A" * 10, "source_file": "a.pdf", "document_id": "doc1", "chunk_index": 1, "profile_id": "p1"},
-        {"text": "Long chunk text A" * 10, "source_file": "a.pdf", "document_id": "doc1", "chunk_index": 1, "profile_id": "p1"},
-        {"text": "Long chunk text B" * 10, "source_file": "b.pdf", "document_id": "doc2", "chunk_index": 2, "profile_id": "p1"},
+        _FakePoint("p1", {"content": "Short text one.", "profile_id": "p1", "document_id": "d1"}),
+        _FakePoint("p2", {"content": "Short text two.", "profile_id": "p1", "document_id": "d1"}),
     ]
     client = _FakeQdrantClient(points)
-    chunks = dataset_builder._sample_chunks("p1", "sub", limit=10, client=client)
-    assert len(chunks) == 2
-
-
-def test_generate_pairs_validates_grounding(monkeypatch):
-    class _FakeLLM:
-        def __init__(self):
-            self.calls = 0
-
-        def generate(self, prompt, max_retries=2):
-            self.calls += 1
-            if self.calls == 1:
-                return json.dumps([{"instruction": "Q", "output": "not in chunk"}])
-            return json.dumps([{"instruction": "Q", "output": "grounded answer"}])
-
-    monkeypatch.setattr(dataset_builder, "_get_llm_client", lambda model_name=None: _FakeLLM())
-    chunk_text = "This is a grounded answer inside the chunk."
-    pairs = dataset_builder._generate_pairs_for_chunk(chunk_text, "profile", None, 1, retries=1)
-    assert pairs[0]["output"] == "grounded answer"
-
-
-def test_build_dataset_raises_on_empty(monkeypatch, tmp_path):
-    # Force no records generated
-    monkeypatch.setattr(dataset_builder, "_sample_chunks", lambda *a, **k: [{"text": "abc" * 100, "metadata": {}}])
-    monkeypatch.setattr(dataset_builder, "_generate_pairs_for_chunk", lambda *a, **k: [])
-    with pytest.raises(ValueError):
-        dataset_builder.build_dataset_from_qdrant(
-            profile_id="p1",
-            subscription_id="sub",
-            max_points=1,
-            questions_per_chunk=1,
-            output_dir=tmp_path,
-            client=None,
-            collection_name="col",
-        )
+    result = build_dataset_from_qdrant(
+        profile_id="p1",
+        subscription_id="sub",
+        max_points=10,
+        output_dir=tmp_path,
+        client=client,
+        collection_name="col",
+        run_id="run-test",
+    )
+    assert result.status == "success"
+    assert result.dataset_path and result.dataset_path.exists()
+    lines = result.dataset_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) >= 1

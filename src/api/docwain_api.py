@@ -2,6 +2,8 @@
 import hashlib
 import json
 import logging
+import datetime as dt
+import os
 import re
 import time
 import uuid
@@ -39,7 +41,17 @@ from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
 from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
-from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
+from src.metrics.aggregation import (
+    aggregate_range,
+    build_metrics_payload,
+    compute_date_range,
+    daily_boundaries,
+    normalize_timezone,
+    normalize_week_start,
+    weekly_boundaries,
+)
+from src.metrics.ai_metrics import get_metrics_store
+from src.metrics.repository import MetricsRepository
 from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
 from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
@@ -693,7 +705,6 @@ def finetune_single_profile(request: FinetuneRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=str(exc))
 
-@api_router.post("/finetune", tags=["Finetuning"])
 @api_router.post("/finetune/by-collection", tags=["Finetuning"])
 def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
     """
@@ -811,7 +822,7 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
     for profile_id in discovered_profiles:
         profile_entry: Dict[str, Any] = {"profile_id": profile_id}
         try:
-            dataset_path = build_dataset_from_qdrant(
+            dataset_result = build_dataset_from_qdrant(
                 profile_id=profile_id,
                 subscription_id=request.collection_name,
                 collection_name=request.collection_name,
@@ -819,15 +830,34 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
                 questions_per_chunk=request.questions_per_chunk,
                 generation_model=request.generation_model,
                 client=qdrant_client,
+                run_id=training_run_id,
             )
-            payload = request.finetune_payload(profile_id=profile_id, dataset_path=str(dataset_path))
+            profile_entry["diagnostics_path"] = str(dataset_result.diagnostics_path)
+            if dataset_result.status != "success" or not dataset_result.dataset_path:
+                profile_entry.update(
+                    {
+                        "status": "skipped_insufficient_pairs",
+                        "message": f"Dataset generation {dataset_result.status}",
+                        "pairs_created": dataset_result.pair_count,
+                        "diagnostics": dataset_result.diagnostics,
+                    }
+                )
+                run_record["profiles"].append(profile_entry)
+                if request.fail_fast:
+                    run_record["overall_status"] = "failed"
+                    break
+                continue
+            payload = request.finetune_payload(profile_id=profile_id, dataset_path=str(dataset_result.dataset_path))
+            payload["training_run_id"] = training_run_id
             status = manager.start_job(FinetuneRequest(**payload))
             profile_entry.update(
                 {
                     "job_id": status.job_id,
-                    "dataset_path": str(dataset_path),
+                    "dataset_path": str(dataset_result.dataset_path),
                     "status": _map_status(status.status),
                     "message": status.message,
+                    "pairs_created": dataset_result.pair_count,
+                    "diagnostics": dataset_result.diagnostics,
                 }
             )
         except Exception as exc:  # noqa: BLE001
@@ -858,7 +888,7 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
     return _build_training_summary(run_record, total_profiles_discovered=len(discovered_profiles))
 
 
-@api_router.get("/finetune/{job_id}", tags=["Finetuning"])
+@api_router.get("/finetune/status/{job_id}", tags=["Finetuning"])
 def finetune_status(job_id: str):
     manager = get_finetune_manager()
     status = manager.get_status(job_id)
@@ -999,17 +1029,91 @@ def delete_document_embeddings_api(
 
 
 @api_router.get("/metrics", tags=["Default"])
-def get_metrics(days: int = 7):
+def get_metrics(
+    days: int = Query(..., gt=0),
+    tz: str = "UTC",
+    week_start: str = "MON",
+    document_id: Optional[str] = None,
+    model_id: Optional[str] = None,
+    agent: Optional[str] = None,
+    tool: Optional[str] = None,
+):
     """API endpoint to retrieve model/retrieval performance statistics."""
     try:
-        summary = _get_dw_newron().metrics_summary(days=days)
+        tzinfo = normalize_timezone(tz)
+        if tz and tzinfo == dt.timezone.utc and tz.upper() != "UTC":
+            raise HTTPException(status_code=400, detail="Invalid timezone")
+        week_start_norm = week_start.strip().upper()
+        if week_start_norm not in {"MON", "SUN"}:
+            raise HTTPException(status_code=400, detail="week_start must be MON or SUN")
+        week_start_idx = normalize_week_start(week_start_norm)
+
+        start_date, end_date, range_start, range_end = compute_date_range(days, tzinfo)
+        daily = daily_boundaries(start_date, days, tzinfo)
+        weekly = weekly_boundaries(daily, week_start_idx)
+
+        start_utc = daily[0][1]
+        end_utc = daily[-1][2]
+
+        store = get_metrics_store()
+        cache_ttl = int(os.getenv("METRICS_CACHE_TTL", "60"))
+        cache_key = None
+        if store.redis and cache_ttl > 0:
+            cache_key = (
+                "ai:metrics:snapshot:"
+                f"days={days}:tz={tz}:week_start={week_start_norm}:"
+                f"doc={document_id or 'all'}:model={model_id or 'all'}:"
+                f"agent={agent or 'all'}:tool={tool or 'all'}"
+            )
+            cached = store.redis.get(cache_key)
+            if cached:
+                try:
+                    return json.loads(cached)
+                except Exception:
+                    pass
+
+        repo = MetricsRepository(store)
+        hourly = repo.fetch_hourly(
+            start_utc,
+            end_utc,
+            document_id=document_id,
+            model_id=model_id,
+            agent=agent,
+            tool=tool,
+        )
+
+        daily_payload = []
+        for date_str, day_start, day_end in daily:
+            aggregate = aggregate_range(hourly, day_start, day_end)
+            payload = build_metrics_payload(aggregate, latency_buckets=store.latency_buckets_ms)
+            payload["date"] = date_str
+            daily_payload.append(payload)
+
+        weekly_payload = []
+        for week_start_date, week_end_date, week_start_utc, week_end_utc in weekly:
+            aggregate = aggregate_range(hourly, week_start_utc, week_end_utc)
+            payload = build_metrics_payload(aggregate, latency_buckets=store.latency_buckets_ms)
+            payload["week_start_date"] = week_start_date
+            payload["week_end_date"] = week_end_date
+            weekly_payload.append(payload)
+
         response = {
-            "status": "success",
-            "window_days": days,
-            "metrics": summary
+            "meta": {
+                "days": days,
+                "tz": tz,
+                "week_start": week_start_norm,
+                "range_start": range_start.isoformat(),
+                "range_end": range_end.isoformat(),
+                "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            },
+            "daily": daily_payload,
+            "weekly": weekly_payload,
         }
-        if METRICS_V2_ENABLED:
-            response["docwain_metrics_v2"] = telemetry_store().snapshot()
+        if cache_key and store.redis and cache_ttl > 0:
+            try:
+                store.redis.setex(cache_key, cache_ttl, json.dumps(response))
+            except Exception:
+                pass
         return response
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")

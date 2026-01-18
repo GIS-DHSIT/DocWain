@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 from datasets import Dataset, load_dataset
 
 from src.api.config import Config
+from src.finetune.config_resolver import apply_numeric_config_to_request
 from src.finetune.models import FinetuneRequest, FinetuneStatus, ResolvedModel, TrainingExample
 from src.ollama_publisher import DEFAULT_PARAMS as OLLAMA_DEFAULT_PARAMS
 from src.ollama_publisher import DEFAULT_SYSTEM_PROMPT, OllamaPublisher
@@ -136,6 +137,10 @@ class UnslothFinetuneManager:
 
     def start_job(self, request: FinetuneRequest) -> FinetuneStatus:
         """Start a fine-tune run asynchronously."""
+        try:
+            request, resolved_numeric = apply_numeric_config_to_request(request)
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
         params_hash = self._params_hash(request)
         if not request.retrain:
             existing = self._existing_active_run(request.profile_id, params_hash)
@@ -164,6 +169,7 @@ class UnslothFinetuneManager:
                 "params_hash": params_hash,
                 "status": "queued",
                 "started_at": status.started_at,
+                "config_types": {k: v.to_dict() for k, v in resolved_numeric.items()},
             }
             self._persist_runs()
 
@@ -229,9 +235,14 @@ class UnslothFinetuneManager:
             self._update_status(job_id, status="failed", message="Unable to acquire training lock; try again later.")
             return
 
-        acquired = self._concurrency_sem.acquire(blocking=False)
+        wait_sec = int(os.getenv("FINETUNE_QUEUE_WAIT_SEC", "300"))
+        acquired = self._concurrency_sem.acquire(timeout=wait_sec)
         if not acquired:
-            self._update_status(job_id, status="failed", message="Too many concurrent finetune jobs; please retry later.")
+            self._update_status(
+                job_id,
+                status="failed",
+                message=f"Too many concurrent finetune jobs; waited {wait_sec}s. Please retry later.",
+            )
             return
         self._update_status(job_id, status="running", message="initializing")
         manifest = {
@@ -386,8 +397,17 @@ class UnslothFinetuneManager:
             logger.error("Finetune job %s failed: %s", job_id, exc, exc_info=True)
             manifest["status"] = "failed"
             manifest["error"] = str(exc)
-            manifest["traceback"] = traceback.format_exc()
+            try:
+                tb = traceback.TracebackException.from_exception(exc, capture_locals=True)
+                trace_text = "".join(tb.format())
+            except Exception:
+                trace_text = traceback.format_exc()
+            manifest["traceback"] = trace_text
             manifest["finished_at"] = time.time()
+            try:
+                self._write_error_debug(request, job_id, manifest["traceback"])
+            except Exception:
+                pass
             try:
                 self._persist_manifest(output_dir if 'output_dir' in locals() else Path(Config.Path.APP_HOME) / "finetune_artifacts", manifest)
             except Exception:
@@ -855,6 +875,28 @@ class UnslothFinetuneManager:
         self._persist_runs()
         self._cleanup_old_runs(profile_id)
 
+    def _write_error_debug(self, request: FinetuneRequest, job_id: str, trace: str) -> None:
+        run_id = request.training_run_id or request.run_name or job_id
+        base = Path(Config.Path.APP_HOME) / "outputs" / "finetune" / str(run_id) / str(request.profile_id)
+        base.mkdir(parents=True, exist_ok=True)
+        trace_path = base / "error_traceback.txt"
+        trace_path.write_text(trace)
+        numeric_config = {}
+        try:
+            _, resolved = apply_numeric_config_to_request(request)
+            numeric_config = {k: v.to_dict() for k, v in resolved.items()}
+        except Exception as exc:
+            numeric_config = {"error": str(exc)}
+        debug_payload = {
+            "profile_id": request.profile_id,
+            "job_id": job_id,
+            "run_id": run_id,
+            "config_types": numeric_config,
+            "request_types": {k: type(v).__name__ for k, v in request.dict().items()},
+        }
+        debug_path = base / "debug_types.json"
+        debug_path.write_text(json.dumps(debug_payload, indent=2))
+
     def _cleanup_old_runs(self, profile_id: str) -> None:
         if not getattr(Config.Finetune, "CLEANUP_ENABLED", False):
             return
@@ -955,11 +997,9 @@ class UnslothFinetuneManager:
     def _memory_safe_request(request: FinetuneRequest) -> FinetuneRequest:
         safe = request.model_copy()
         safe.batch_size = 1
-        safe.gradient_accumulation = max(
-            request.gradient_accumulation * request.batch_size,
-            request.gradient_accumulation,
-            1,
-        )
+        grad = int(request.gradient_accumulation)
+        batch = int(request.batch_size)
+        safe.gradient_accumulation = max(grad * batch, grad, 1)
         safe.learning_rate = min(request.learning_rate, 2e-4)
         return safe
 
@@ -1113,6 +1153,22 @@ class UnslothFinetuneManager:
         payload.pop("retrain", None)
         encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _hash_dataset(dataset_path: Optional[str]) -> str:
+        if not dataset_path:
+            return ""
+        path = Path(dataset_path)
+        if not path.exists():
+            return ""
+        hasher = hashlib.sha256()
+        try:
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+        except Exception:
+            return ""
+        return hasher.hexdigest()
 
     def _existing_active_run(self, profile_id: str, params_hash: str) -> Optional[FinetuneStatus]:
         with self.lock:
