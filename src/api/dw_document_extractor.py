@@ -2,7 +2,7 @@ import hashlib
 import io
 import logging
 import re
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import docx
 import fitz
@@ -65,19 +65,40 @@ class DocumentExtractor:
         if easyocr and self._easyocr_reader is None:
             self._easyocr_reader = easyocr.Reader(["en"], gpu=False)
 
-    def _ocr_image(self, image: Image.Image) -> str:
+    def _ocr_image(self, image: Image.Image) -> Tuple[str, Optional[float]]:
         if self.ocr_engine == "easyocr" and easyocr:
             try:
                 self._ensure_easyocr()
-                result = self._easyocr_reader.readtext(np.array(image), detail=0)
-                return " ".join(result).strip()
+                result = self._easyocr_reader.readtext(np.array(image), detail=1)
+                texts = []
+                confidences = []
+                for _, text, conf in result:
+                    if text:
+                        texts.append(text)
+                    if conf is not None:
+                        confidences.append(float(conf) * 100.0)
+                text_value = " ".join(texts).strip()
+                avg_conf = sum(confidences) / len(confidences) if confidences else None
+                return text_value, avg_conf
             except Exception as exc:  # noqa: BLE001
                 logger.warning("EasyOCR failed, falling back to tesseract: %s", exc)
         try:
-            return pytesseract.image_to_string(image).strip()
+            data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+            words = [w.strip() for w in data.get("text", []) if w.strip()]
+            confidences = []
+            for conf in data.get("conf", []):
+                try:
+                    conf_val = float(conf)
+                except (TypeError, ValueError):
+                    continue
+                if conf_val >= 0:
+                    confidences.append(conf_val)
+            text_value = " ".join(words).strip()
+            avg_conf = sum(confidences) / len(confidences) if confidences else None
+            return text_value, avg_conf
         except Exception as exc:  # noqa: BLE001
             logger.error("OCR failed: %s", exc)
-            return ""
+            return "", None
 
     def _finalize_section(
         self,
@@ -132,6 +153,7 @@ class DocumentExtractor:
         chunk_candidates: List[ChunkCandidate] = []
         full_text_parts: List[str] = []
         errors: List[str] = []
+        ocr_confidences: List[float] = []
 
         current_title = "Introduction"
         current_section_id = self._make_section_id(current_title, 1)
@@ -187,7 +209,7 @@ class DocumentExtractor:
                                 try:
                                     base_image = doc.extract_image(img[0])
                                     image = Image.open(io.BytesIO(base_image["image"]))
-                                    ocr_text = self._ocr_image(image)
+                                    ocr_text, ocr_conf = self._ocr_image(image)
                                     if ocr_text:
                                         figures.append(Figure(page=page_index, caption=ocr_text))
                                         chunk_candidates.append(
@@ -200,6 +222,8 @@ class DocumentExtractor:
                                             )
                                         )
                                         page_text_parts.append(ocr_text)
+                                    if ocr_conf is not None:
+                                        ocr_confidences.append(float(ocr_conf))
                                 except Exception as exc:  # noqa: BLE001
                                     logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
                                     errors.append(f"image_extraction_failed: page={page_index} err={exc}")
@@ -282,6 +306,7 @@ class DocumentExtractor:
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=errors,
+            metrics={"ocr_confidences": ocr_confidences},
         )
 
     def extract_text_from_docx(self, doc_content: Union[bytes, bytearray, memoryview, str, io.IOBase], filename: Optional[str] = None) -> ExtractedDocument:

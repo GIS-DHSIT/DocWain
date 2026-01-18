@@ -4,6 +4,7 @@ import time
 import threading
 import logging
 import hashlib
+import random
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
 from src.api.genai_client import generate_text, get_genai_client
 from src.finetune import resolve_model_for_profile
+from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 
 # Configure logging
@@ -131,6 +133,49 @@ def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
+
+
+_METRICS_EMBED_SAMPLE_RATE = float(os.getenv("METRICS_EMBED_SAMPLE_RATE", "0.4"))
+_METRICS_EMBED_MAX_CHARS = int(os.getenv("METRICS_EMBED_MAX_CHARS", "1200"))
+_FIRST_METRICS_REQUEST = True
+
+
+def _approx_token_count(text: Optional[str]) -> int:
+    return len((text or "").split())
+
+
+def _token_overlap_score(left: str, right: str) -> float:
+    left_tokens = set(re.findall(r"[A-Za-z0-9]{3,}", (left or "").lower()))
+    right_tokens = set(re.findall(r"[A-Za-z0-9]{3,}", (right or "").lower()))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = left_tokens & right_tokens
+    union = left_tokens | right_tokens
+    return len(overlap) / max(len(union), 1)
+
+
+def _embedding_similarity_score(left: str, right: str) -> Optional[float]:
+    if not left or not right:
+        return None
+    sample_rate = max(0.0, min(1.0, _METRICS_EMBED_SAMPLE_RATE))
+    if sample_rate < 1.0 and random.random() > sample_rate:
+        return None
+    left_trimmed = (left or "")[:_METRICS_EMBED_MAX_CHARS]
+    right_trimmed = (right or "")[:_METRICS_EMBED_MAX_CHARS]
+    try:
+        model = get_model()
+        vectors = model.encode([left_trimmed, right_trimmed], normalize_embeddings=True)
+        sim = float(np.dot(vectors[0], vectors[1]))
+        return max(0.0, min(1.0, sim))
+    except Exception:
+        return None
+
+
+def _semantic_similarity(left: str, right: str) -> float:
+    sim = _embedding_similarity_score(left, right)
+    if sim is not None:
+        return sim
+    return _token_overlap_score(left, right)
 
 
 def _build_namespace(
@@ -755,6 +800,14 @@ class OllamaClient:
         max_retries: int = 3,
         backoff: float = 1.0
     ) -> str:
+        metrics_store = get_metrics_store()
+        request_started = time.time()
+        if metrics_store.available:
+            metrics_store.record(
+                counters={"llm_request_count": 1},
+                distributions={"model_usage": {self.model_name: 1}},
+                model_id=self.model_name,
+            )
         temperature = getattr(Config.LLM, "TEMPERATURE", 0.2)
         top_p = getattr(Config.LLM, "TOP_P", 0.85)
         max_tokens = getattr(Config.LLM, "MAX_TOKENS", 2048)
@@ -778,7 +831,18 @@ class OllamaClient:
                 if not text:
                     logger.warning(f"Ollama returned empty response: {response}")
                     return "I don’t have enough information in the documents to answer that."
-
+                if metrics_store.available:
+                    latency_ms = (time.time() - request_started) * 1000
+                    metrics_store.record(
+                        values={"llm_latency_ms": latency_ms},
+                        histograms={"llm_latency_ms": latency_ms},
+                        model_id=self.model_name,
+                    )
+                    if attempt > 1:
+                        metrics_store.record(
+                            counters={"llm_retry_count": attempt - 1},
+                            model_id=self.model_name,
+                        )
                 return text
 
             except Exception as e:
@@ -787,6 +851,14 @@ class OllamaClient:
                     time.sleep(backoff * attempt)
                 else:
                     logger.error(f"All Ollama retries failed")
+                    if metrics_store.available:
+                        latency_ms = (time.time() - request_started) * 1000
+                        metrics_store.record(
+                            counters={"llm_failure": 1},
+                            values={"llm_latency_ms": latency_ms},
+                            histograms={"llm_latency_ms": latency_ms},
+                            model_id=self.model_name,
+                        )
                     raise
 
         return "I’m unable to answer that based on the available information."
@@ -813,6 +885,14 @@ class GeminiClient:
             backoff: float = 1.0
     ) -> str:
         """Generate response with retry logic and robust parsing."""
+        metrics_store = get_metrics_store()
+        request_started = time.time()
+        if metrics_store.available:
+            metrics_store.record(
+                counters={"llm_request_count": 1},
+                distributions={"model_usage": {self.model_name: 1}},
+                model_id=self.model_name,
+            )
         for attempt in range(1, max_retries + 1):
             try:
                 text, response = generate_text(
@@ -822,6 +902,18 @@ class GeminiClient:
                     generation_config=self.generation_config,
                 )
                 if text:
+                    if metrics_store.available:
+                        latency_ms = (time.time() - request_started) * 1000
+                        metrics_store.record(
+                            values={"llm_latency_ms": latency_ms},
+                            histograms={"llm_latency_ms": latency_ms},
+                            model_id=self.model_name,
+                        )
+                        if attempt > 1:
+                            metrics_store.record(
+                                counters={"llm_retry_count": attempt - 1},
+                                model_id=self.model_name,
+                            )
                     return text
                 logger.warning(f"No text in response: {response}")
                 return "I apologize, but I couldn't generate a proper response."
@@ -831,6 +923,14 @@ class GeminiClient:
                     time.sleep(backoff * attempt)
                 else:
                     logger.error(f"All retry attempts failed: {e}")
+                    if metrics_store.available:
+                        latency_ms = (time.time() - request_started) * 1000
+                        metrics_store.record(
+                            counters={"llm_failure": 1},
+                            values={"llm_latency_ms": latency_ms},
+                            histograms={"llm_latency_ms": latency_ms},
+                            model_id=self.model_name,
+                        )
                     raise
 
         return "I apologize, but I encountered an error generating a response."
@@ -867,6 +967,14 @@ class OpenAICompatibleClient:
             max_retries: int = 3,
             backoff: float = 1.0
     ) -> str:
+        metrics_store = get_metrics_store()
+        request_started = time.time()
+        if metrics_store.available:
+            metrics_store.record(
+                counters={"llm_request_count": 1},
+                distributions={"model_usage": {self.model_name: 1}},
+                model_id=self.model_name,
+            )
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -889,6 +997,18 @@ class OpenAICompatibleClient:
                 text = message.get("content") or choice.get("text") or ""
                 text = text.strip()
                 if text:
+                    if metrics_store.available:
+                        latency_ms = (time.time() - request_started) * 1000
+                        metrics_store.record(
+                            values={"llm_latency_ms": latency_ms},
+                            histograms={"llm_latency_ms": latency_ms},
+                            model_id=self.model_name,
+                        )
+                        if attempt > 1:
+                            metrics_store.record(
+                                counters={"llm_retry_count": attempt - 1},
+                                model_id=self.model_name,
+                            )
                     return text
                 logger.warning("No text in local LLM response: %s", response)
                 return "I apologize, but I couldn't generate a proper response."
@@ -898,6 +1018,14 @@ class OpenAICompatibleClient:
                     time.sleep(backoff * attempt)
                 else:
                     logger.error("All local LLM retry attempts failed: %s", e)
+                    if metrics_store.available:
+                        latency_ms = (time.time() - request_started) * 1000
+                        metrics_store.record(
+                            counters={"llm_failure": 1},
+                            values={"llm_latency_ms": latency_ms},
+                            histograms={"llm_latency_ms": latency_ms},
+                            model_id=self.model_name,
+                        )
                     raise
 
         return "I apologize, but I encountered an error generating a response."
@@ -2249,8 +2377,14 @@ class EnterpriseRAGSystem:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
         telemetry = telemetry_store() if METRICS_V2_ENABLED else None
+        metrics_store = get_metrics_store()
         tool_list = tools or []
         use_tooling = bool(use_tools or tool_list)
+        global _FIRST_METRICS_REQUEST
+        is_cold_start = False
+        if _FIRST_METRICS_REQUEST:
+            is_cold_start = True
+            _FIRST_METRICS_REQUEST = False
 
         try:
             if not profile_id:
@@ -2347,6 +2481,103 @@ class EnterpriseRAGSystem:
             retrieval_attempts = retrieval_plan.get("attempts", [])
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
             profile_context_data = retrieval_plan.get("profile_context", {})
+            mrr_score = 0.0
+            target_doc_id = preprocessing_metadata.get("target_document_id")
+            if target_doc_id:
+                for rank, chunk in enumerate(retrieved_chunks, start=1):
+                    doc_id = (chunk.metadata or {}).get("document_id")
+                    if doc_id and str(doc_id) == str(target_doc_id):
+                        mrr_score = 1.0 / rank
+                        break
+            retrieval_hits = 1.0 if retrieved_chunks else 0.0
+
+            def _record_request_metrics(
+                *,
+                query_type: str,
+                answer_text: str,
+                context_text: str,
+                context_found: bool,
+                grounded: bool,
+                has_citations: bool,
+                processing_seconds: float,
+                prompt_text: Optional[str] = None,
+                tool_successes: int = 0,
+                document_ids: Optional[List[str]] = None,
+            ) -> None:
+                if not metrics_store.available:
+                    return
+                prompt_tokens = _approx_token_count(prompt_text or query)
+                completion_tokens = _approx_token_count(answer_text)
+                # Embedding similarity is sampled; token overlap is the low-cost fallback.
+                sentence_similarity = _semantic_similarity(query, processed_query or query)
+                semantic_preservation = _semantic_similarity(context_text, answer_text)
+                answer_relevance = _semantic_similarity(query, answer_text)
+                # Grounding blends retrieval context presence with citation signals.
+                context_grounding = 0.5 * float(bool(context_found)) + 0.5 * float(bool(has_citations))
+                # Hallucination risk inversely tracks preservation + grounding.
+                hallucination_risk = max(0.0, min(1.0, 1.0 - ((semantic_preservation + context_grounding) / 2.0)))
+                response_consistency = 1.0 if has_citations else (0.6 if grounded else 0.2)
+                temperature = float(getattr(Config.LLM, "TEMPERATURE", 0.2))
+                temperature_sensitivity = max(0.0, min(1.0, 1.0 - temperature))
+                latency_ms = processing_seconds * 1000
+
+                counters = {
+                    "requests_total": 1,
+                    "retrieval_total": 1,
+                    "retrieval_hits": retrieval_hits,
+                    "retrieval_grounded": 1 if grounded else 0,
+                }
+                if query_type != "error":
+                    counters["requests_success"] = 1
+                if use_tooling:
+                    counters["requests_with_tools"] = 1
+                    if tool_successes == 0:
+                        counters["llm_without_tool_fallback"] = 1
+
+                distributions = {}
+                if query_type in {"error", "no_results", "not_answerable"}:
+                    distributions["failure_type"] = {query_type: 1}
+
+                values = {
+                    "prompt_tokens": float(prompt_tokens),
+                    "completion_tokens": float(completion_tokens),
+                    "sentence_transformation_similarity_score": sentence_similarity,
+                    "semantic_preservation_score": semantic_preservation,
+                    "answer_faithfulness_score": semantic_preservation,
+                    "answer_relevance_score": answer_relevance,
+                    "context_grounding_score": context_grounding,
+                    "hallucination_risk_score": hallucination_risk,
+                    "response_consistency_score": response_consistency,
+                    "temperature_sensitivity_score": temperature_sensitivity,
+                    "mean_reciprocal_rank": mrr_score,
+                    "request_latency_ms": latency_ms,
+                }
+                if is_cold_start:
+                    values["cold_start_latency_ms"] = latency_ms
+                else:
+                    values["warm_start_latency_ms"] = latency_ms
+
+                metrics_store.record(
+                    counters=counters,
+                    values=values,
+                    distributions=distributions,
+                    histograms={
+                        "request_latency_ms": latency_ms,
+                        "cold_start_latency_ms": latency_ms if is_cold_start else None,
+                        "warm_start_latency_ms": latency_ms if not is_cold_start else None,
+                    },
+                    model_id=self.model_name,
+                )
+                if document_ids:
+                    for doc_id in set(document_ids):
+                        metrics_store.record(
+                            counters=counters,
+                            values=values,
+                            distributions=distributions,
+                            histograms={"request_latency_ms": latency_ms},
+                            document_id=str(doc_id),
+                            model_id=self.model_name,
+                        )
             if telemetry:
                 retrieval_latency_ms = (time.time() - retrieval_start) * 1000
                 telemetry.increment("retrieval_requests_count")
@@ -2429,6 +2660,17 @@ class EnterpriseRAGSystem:
                 except Exception as metric_exc:
                     logger.debug("Metrics record (no_results) failed: %s", metric_exc)
 
+                _record_request_metrics(
+                    query_type="no_results",
+                    answer_text=no_results_response,
+                    context_text="",
+                    context_found=False,
+                    grounded=False,
+                    has_citations=False,
+                    processing_seconds=time.time() - start_time,
+                    prompt_text=processed_query,
+                )
+
                 return {
                     "response": no_results_response,
                     "sources": [],
@@ -2505,6 +2747,8 @@ class EnterpriseRAGSystem:
 
             logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
 
+            tool_successes = 0
+            tool_failures = 0
             if use_tooling and tool_list:
                 try:
                     import asyncio
@@ -2524,11 +2768,13 @@ class EnterpriseRAGSystem:
                         payload["input"].update(extra_input)
                     elif extra_input is not None:
                         payload["input"]["value"] = extra_input
+                    tool_start = time.time()
                     try:
                         tool_resp = asyncio.run(
                             registry.invoke(tool_name, payload, correlation_id=request_id)
                         )
                         if tool_resp.get("status") == "success":
+                            tool_successes += 1
                             tool_result = tool_resp.get("result") or {}
                             snippet = json.dumps(tool_result, default=str)
                             tool_chunks.append(f"[{tool_name}] {snippet[:800]}")
@@ -2539,8 +2785,37 @@ class EnterpriseRAGSystem:
                                 context_sources.append(src)
                         else:
                             logger.warning("Tool %s returned status=%s", tool_name, tool_resp.get("status"))
+                            tool_failures += 1
+                        if metrics_store.available:
+                            tool_latency_ms = (time.time() - tool_start) * 1000
+                            metrics_store.record(
+                                counters={
+                                    "tool_calls": 1,
+                                    "tool_success": 1 if tool_resp.get("status") == "success" else 0,
+                                    "tool_failure": 0 if tool_resp.get("status") == "success" else 1,
+                                },
+                                values={"tool_latency_ms": tool_latency_ms},
+                                histograms={"tool_latency_ms": tool_latency_ms},
+                                distributions={"tool_usage": {tool_name: 1}},
+                                model_id=self.model_name,
+                                tool=tool_name,
+                            )
                     except Exception as tool_exc:  # noqa: BLE001
                         logger.warning("Tool %s failed: %s", tool_name, tool_exc)
+                        tool_failures += 1
+                        if metrics_store.available:
+                            tool_latency_ms = (time.time() - tool_start) * 1000
+                            metrics_store.record(
+                                counters={
+                                    "tool_calls": 1,
+                                    "tool_failure": 1,
+                                },
+                                values={"tool_latency_ms": tool_latency_ms},
+                                histograms={"tool_latency_ms": tool_latency_ms},
+                                distributions={"tool_usage": {tool_name: 1}},
+                                model_id=self.model_name,
+                                tool=tool_name,
+                            )
                 if tool_chunks:
                     context = (context or "") + "\n\n".join(tool_chunks)
 
@@ -2586,6 +2861,17 @@ class EnterpriseRAGSystem:
                     )
                 except Exception as metric_exc:
                     logger.debug("Metrics record (not_answerable) failed: %s", metric_exc)
+
+                _record_request_metrics(
+                    query_type="not_answerable",
+                    answer_text=not_answerable_response,
+                    context_text="",
+                    context_found=False,
+                    grounded=False,
+                    has_citations=False,
+                    processing_seconds=time.time() - start_time,
+                    prompt_text=processed_query,
+                )
 
                 return {
                     "response": not_answerable_response,
@@ -2702,6 +2988,19 @@ class EnterpriseRAGSystem:
             except Exception as metric_exc:
                 logger.debug("Metrics record (success) failed: %s", metric_exc)
 
+            _record_request_metrics(
+                query_type=response_obj.get("query_type", "document_qa"),
+                answer_text=answer,
+                context_text=context or "",
+                context_found=True,
+                grounded=bool(response_obj.get("grounded", True)),
+                has_citations=has_citations,
+                processing_seconds=processing_time,
+                prompt_text=prompt,
+                tool_successes=tool_successes,
+                document_ids=final_doc_ids,
+            )
+
             # Persist the response in Redis before returning. Only cache successful
             # answers (document_qa) to improve subsequent response accuracy.
             if cache and cache_key:
@@ -2738,6 +3037,18 @@ class EnterpriseRAGSystem:
                 )
             except Exception as metric_exc:
                 logger.debug("Metrics record (error) failed: %s", metric_exc)
+
+            if "_record_request_metrics" in locals():
+                _record_request_metrics(
+                    query_type="error",
+                    answer_text=error_response,
+                    context_text="",
+                    context_found=False,
+                    grounded=False,
+                    has_citations=False,
+                    processing_seconds=time.time() - start_time,
+                    prompt_text=processed_query if "processed_query" in locals() else query,
+                )
 
             return {
                 "response": error_response,

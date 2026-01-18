@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import time
 import uuid
@@ -28,6 +29,7 @@ from src.api.documentVetting import mask_document_content, vettingProcessor
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
+from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -1095,12 +1097,19 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
     """
     try:
         telemetry = telemetry_store() if METRICS_V2_ENABLED else None
+        metrics_store = get_metrics_store()
         logging.info(f"=" * 80)
         logging.info(f"Starting training for {doc_name}")
         logging.info(f"  Document ID: {doc_tag}")
         logging.info(f"  Subscription: {subscription_id}")
         logging.info(f"  Profile: {profile_id}")
         logging.info(f"=" * 80)
+
+        if metrics_store.available:
+            metrics_store.record(
+                counters={"documents_processed": 1},
+                document_id=doc_tag,
+            )
 
         if not profile_id:
             raise ValueError("profile_id is required for training")
@@ -1124,6 +1133,46 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             logging.info(f" Stored {result.get('points_saved', 0)} structured embeddings")
             return f"Stored {result.get('points_saved', 0)} embeddings"
         elif isinstance(text, ExtractedDocument):
+            if metrics_store.available:
+                candidates = text.chunk_candidates or []
+                total_candidates = max(len(candidates), 1)
+                short_chunks = sum(1 for cand in candidates if len((cand.text or "").strip()) < 20)
+                missing_ratio = short_chunks / total_candidates
+                text_accuracy = max(0.0, min(1.0, 1.0 - missing_ratio))
+                structured_types = {"table", "table_row", "table_header", "ocr_text"}
+                structured_chunks = sum(1 for cand in candidates if cand.chunk_type in structured_types)
+                structure_ratio = structured_chunks / total_candidates
+
+                error_pages = set()
+                for err in text.errors or []:
+                    match = re.search(r"page=(\d+)", str(err))
+                    if match:
+                        error_pages.add(int(match.group(1)))
+                page_numbers = [
+                    cand.page for cand in candidates if cand.page is not None
+                ]
+                total_pages = max(page_numbers, default=1)
+                corrupted_ratio = len(error_pages) / max(total_pages, 1)
+
+                # Heuristic: short/empty chunks signal missing extraction content.
+                metrics_store.record(
+                    values={
+                        "text_extraction_accuracy_pct": text_accuracy,
+                        "structure_extraction_accuracy_pct": structure_ratio,
+                        "missing_content_ratio": missing_ratio,
+                        "corrupted_page_ratio": corrupted_ratio,
+                    },
+                    document_id=doc_tag,
+                )
+
+                ocr_confidences = (text.metrics or {}).get("ocr_confidences", []) if text.metrics else []
+                for conf in ocr_confidences:
+                    metrics_store.record(
+                        values={"ocr_confidence": float(conf)},
+                        minmax={"ocr_confidence": float(conf)},
+                        document_id=doc_tag,
+                    )
+
             candidates: List[ChunkCandidate] = text.chunk_candidates or []
             if not candidates and text.full_text:
                 logging.info("No structured candidates found; falling back to raw text chunking")
@@ -1192,6 +1241,21 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 telemetry.observe("embedding_latency_ms", embed_latency_ms)
                 telemetry.record_doc_metric(doc_tag, "chunks_embedded", len(chunks))
                 telemetry.set_gauge("last_embedding_time", time.time())
+            if metrics_store.available and len(embeddings_array) > 0:
+                if len(embeddings_array) > 1:
+                    # Adjacent normalized chunk embeddings approximate coherence.
+                    sims = np.sum(embeddings_array[:-1] * embeddings_array[1:], axis=1)
+                    coherence = float(np.mean(sims))
+                else:
+                    coherence = 1.0
+                drift = max(0.0, min(1.0, 1.0 - coherence))
+                metrics_store.record(
+                    values={
+                        "embedding_coherence_score": coherence,
+                        "chunk_semantic_drift_score": drift,
+                    },
+                    document_id=doc_tag,
+                )
             sparse_vectors = build_sparse_vectors(chunks)
             summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
 

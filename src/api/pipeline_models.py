@@ -43,6 +43,7 @@ class ExtractedDocument:
     chunk_candidates: List[ChunkCandidate]
     doc_type: Optional[str] = None
     errors: List[str] = field(default_factory=list)
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
