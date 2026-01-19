@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from src.api.docwain_api import app
+from src.main import app
 from src.screening import api as screening_api
 from src.screening import storage_adapter
 

@@ -16,7 +16,7 @@ sys.modules["datasets"] = datasets_stub
 
 from fastapi.testclient import TestClient
 
-from src.api import docwain_api
+from src import main as docwain_api
 from src.teams.attachments import ingest_attachments
 from src.teams.logic import TeamsChatContext, TeamsChatService
 from src.teams.tools import TeamsToolRouter
@@ -29,7 +29,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
 
     def test_empty_body_returns_bot_message(self):
         with patch(
-            "src.api.docwain_api.teams_adapter.handle_teams_activity",
+            "src.main.teams_adapter.handle_teams_activity",
             new_callable=AsyncMock,
         ) as mock_handle:
             response = self.client.post(self.path, data=b"")
@@ -41,7 +41,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
 
     def test_invalid_json_returns_bot_message(self):
         with patch(
-            "src.api.docwain_api.teams_adapter.handle_teams_activity",
+            "src.main.teams_adapter.handle_teams_activity",
             new_callable=AsyncMock,
         ) as mock_handle:
             response = self.client.post(
@@ -58,7 +58,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
     def test_text_plain_fallback_routes(self):
         expected = {"type": "message", "text": "ok"}
         with patch(
-            "src.api.docwain_api.teams_adapter.handle_teams_activity",
+            "src.main.teams_adapter.handle_teams_activity",
             new_callable=AsyncMock,
             return_value=expected,
         ) as mock_handle:
@@ -78,7 +78,7 @@ class TeamsMessagesRouteTests(unittest.TestCase):
     def test_valid_activity_is_forwarded(self):
         expected = {"type": "message", "text": "ok"}
         with patch(
-            "src.api.docwain_api.teams_adapter.handle_teams_activity",
+            "src.main.teams_adapter.handle_teams_activity",
             new_callable=AsyncMock,
             return_value=expected,
         ) as mock_handle:

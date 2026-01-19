@@ -10,12 +10,12 @@ from typing import Dict, List
 
 from qdrant_client import QdrantClient
 
-from dataset_preflight import ProfileStats, gate_training, save_profile_stats
-from dataset_writer import DatasetWriter
-from embedding_aware_pairgen import Chunk, LineFrequencyCleaner, build_pairs_for_profile
-from finetune_runner import FinetuneConfig, FinetuneRunner
-from qdrant_retriever import QdrantRetriever
-from qdrant_schema_probe import run_probe
+from .dataset_preflight import ProfileStats, gate_training, save_profile_stats
+from .dataset_writer import DatasetWriter
+from .embedding_aware_pairgen import Chunk, LineFrequencyCleaner, build_pairs_for_profile
+from .finetune_runner import FinetuneConfig, FinetuneRunner
+from .qdrant_retriever import QdrantRetriever
+from .qdrant_schema_probe import run_probe
 
 
 def configure_logging(run_dir: Path):

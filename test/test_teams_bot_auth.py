@@ -15,7 +15,7 @@ datasets_stub.load_dataset = lambda *args, **kwargs: None
 datasets_stub.__spec__ = importlib.machinery.ModuleSpec("datasets", None)
 sys.modules["datasets"] = datasets_stub
 
-from src.api import docwain_api
+from src import main as docwain_api
 from src.teams import bot_app
 
 
