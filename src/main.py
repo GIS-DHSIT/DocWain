@@ -1,4 +1,3 @@
-
 import hashlib
 import json
 import logging
@@ -12,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 import ollama
 import uvicorn
-from bson.objectid import ObjectId  # added by maha/maria
+from bson.objectid import ObjectId
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse

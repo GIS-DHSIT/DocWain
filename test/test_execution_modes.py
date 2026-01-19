@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api import docwain_api
+from src import main as docwain_api
 from src.execution.common import ExecutionResult
 from src.mode.execution_mode import ExecutionMode
 

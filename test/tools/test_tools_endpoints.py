@@ -3,7 +3,7 @@ from typing import Any, Dict
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api import docwain_api
+from src import main as docwain_api
 
 
 @pytest.fixture

@@ -74,7 +74,7 @@ sys.modules["src.execution.common"] = types.SimpleNamespace(normalize_answer=lam
 sys.modules["src.mode.session_state"] = types.SimpleNamespace(SessionStateStore=object, __spec__=types.SimpleNamespace())
 sys.modules["src.runtime.request_context"] = types.SimpleNamespace(RequestContext=object, __spec__=types.SimpleNamespace())
 
-from src.api import docwain_api
+from src import main as docwain_api
 from src.finetune import agentic_orchestrator as ao
 from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneStatus
 

@@ -3,8 +3,8 @@ from pathlib import Path
 
 import numpy as np
 
-from embedding_aware_pairgen import Chunk, LineFrequencyCleaner, build_pairs_for_profile
-from qdrant_schema_probe import SchemaProbe, SchemaProbeResult, FieldStat
+from src.training.embedding_aware_pairgen import Chunk, LineFrequencyCleaner, build_pairs_for_profile
+from src.training.qdrant_schema_probe import SchemaProbe, SchemaProbeResult, FieldStat
 
 
 class _FakePoint:
