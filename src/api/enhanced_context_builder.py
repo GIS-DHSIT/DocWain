@@ -6,8 +6,10 @@ Replaces context building logic in dw_newron.py
 import re
 import time
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
+
+from src.api.config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,83 @@ class IntelligentContextBuilder:
             filtered.append(chunk)
         return filtered
 
+    @staticmethod
+    def _filter_low_confidence(chunks: List[Dict], min_confidence: Optional[float]) -> List[Dict]:
+        if min_confidence is None:
+            return chunks
+        filtered = []
+        for chunk in chunks:
+            meta = chunk.get("metadata") or {}
+            conf = meta.get("ocr_confidence")
+            if conf is None:
+                filtered.append(chunk)
+                continue
+            try:
+                conf_val = float(conf)
+            except Exception:
+                filtered.append(chunk)
+                continue
+            conf_norm = conf_val / 100.0 if conf_val > 1.0 else conf_val
+            if conf_norm >= min_confidence:
+                filtered.append(chunk)
+        return filtered
+
+    @staticmethod
+    def _score_chunk_quality(chunk: Dict) -> float:
+        base = float(chunk.get("score", 0.0))
+        meta = chunk.get("metadata") or {}
+        boost = 1.0
+        chunk_type = (meta.get("chunk_type") or "").lower()
+        if chunk_type in {"section", "table", "table_row", "table_header", "slide"}:
+            boost += 0.12
+        section_title = (meta.get("section_title") or "").strip().lower()
+        if section_title and section_title not in {"document", "introduction"}:
+            boost += 0.06
+        if meta.get("summary"):
+            boost += 0.05
+        conf = meta.get("ocr_confidence")
+        if conf is not None:
+            try:
+                conf_val = float(conf)
+                conf_norm = conf_val / 100.0 if conf_val > 1.0 else conf_val
+                boost *= max(0.6, min(1.15, conf_norm + 0.4))
+            except Exception:
+                pass
+        return base * boost
+
+    def _diversify_chunks(
+        self,
+        chunks: List[Dict],
+        max_chunks: int,
+        similarity_threshold: float,
+    ) -> List[Dict]:
+        selected: List[Dict] = []
+        ordered = sorted(
+            chunks,
+            key=lambda c: float(c.get("quality_score", c.get("score", 0.0))),
+            reverse=True,
+        )
+        for chunk in ordered:
+            if len(selected) >= max_chunks:
+                break
+            if not selected:
+                selected.append(chunk)
+                continue
+            if all(
+                self._calculate_text_similarity(chunk.get("text", ""), sel.get("text", ""))
+                < similarity_threshold
+                for sel in selected
+            ):
+                selected.append(chunk)
+        if len(selected) < max_chunks:
+            for chunk in ordered:
+                if chunk in selected:
+                    continue
+                selected.append(chunk)
+                if len(selected) >= max_chunks:
+                    break
+        return selected
+
     def _merge_adjacent_doc_chunks(self, doc_chunks: List[Dict]) -> List[Dict]:
         """Merge back-to-back chunks from the same document to keep context continuous."""
         merged: List[Dict] = []
@@ -204,7 +283,11 @@ class IntelligentContextBuilder:
             doc_chunks_sorted = sorted(
                 doc_chunks,
                 key=lambda x: (
-                    -(x['score'] * self._recency_factor(x.get("metadata", {})) + self._source_priority(x.get("metadata", {}))),
+                    -(
+                        float(x.get("quality_score", x.get("score", 0.0)))
+                        * self._recency_factor(x.get("metadata", {}))
+                        + self._source_priority(x.get("metadata", {}))
+                    ),
                     x['metadata'].get('chunk_index', 999)
                 )
             )
@@ -282,10 +365,16 @@ class IntelligentContextBuilder:
             return "", []
 
         # Deduplicate exact chunk ids before text-level dedup
-        dedup_by_id = self._deduplicate_by_chunk_id(self._filter_low_signal(chunks))
+        min_conf = getattr(Config.Retrieval, "MIN_OCR_CONFIDENCE", None)
+        min_conf = float(min_conf) / 100.0 if isinstance(min_conf, (int, float)) and min_conf > 1 else min_conf
+        filtered = self._filter_low_confidence(self._filter_low_signal(chunks), min_conf)
+        dedup_by_id = self._deduplicate_by_chunk_id(filtered)
 
         # Deduplicate similar chunks
         unique_chunks = self._deduplicate_chunks(dedup_by_id)
+
+        for chunk in unique_chunks:
+            chunk["quality_score"] = self._score_chunk_quality(chunk)
 
         # Ensure multi-document coverage by round-robin selection across docs
         def _doc_key(chunk: Dict) -> str:
@@ -297,7 +386,7 @@ class IntelligentContextBuilder:
             buckets.setdefault(_doc_key(c), []).append(c)
 
         for doc_chunks in buckets.values():
-            doc_chunks.sort(key=lambda x: float(x.get('score', 0.0)), reverse=True)
+            doc_chunks.sort(key=lambda x: float(x.get('quality_score', x.get("score", 0.0))), reverse=True)
 
         selected_chunks: List[Dict] = []
 
@@ -306,7 +395,8 @@ class IntelligentContextBuilder:
         if buckets:
             top_doc_id = max(
                 buckets.keys(),
-                key=lambda k: float(buckets[k][0].get('score', 0.0)) if buckets[k] else 0.0
+                key=lambda k: float(buckets[k][0].get('quality_score', buckets[k][0].get('score', 0.0)))
+                if buckets[k] else 0.0
             )
             top_doc = buckets[top_doc_id]
             max_from_top = min(len(top_doc), max(3, self.max_context_chunks // 2))
@@ -319,7 +409,8 @@ class IntelligentContextBuilder:
             # Order docs by best available score to favor stronger evidence
             doc_order = sorted(
                 buckets.items(),
-                key=lambda item: float(item[1][0].get('score', 0.0)) if item[1] else 0.0,
+                key=lambda item: float(item[1][0].get('quality_score', item[1][0].get('score', 0.0)))
+                if item[1] else 0.0,
                 reverse=True
             )
             progress = False
@@ -334,8 +425,11 @@ class IntelligentContextBuilder:
             if not progress:
                 break
 
+        diversity_threshold = float(getattr(Config.Retrieval, "DIVERSITY_THRESHOLD", 0.6))
+        diversified = self._diversify_chunks(selected_chunks, self.max_context_chunks, diversity_threshold)
+
         # Order logically
-        ordered_chunks = self._order_chunks_logically(selected_chunks)
+        ordered_chunks = self._order_chunks_logically(diversified)
 
         # Build context string
         context_parts = []

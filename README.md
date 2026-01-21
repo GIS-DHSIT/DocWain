@@ -15,6 +15,20 @@
 - Local development: `docker-compose up --build` now starts a Redis 7 container and wires the app to it with no auth and SSL disabled. Verify it is running with `docker compose exec redis redis-cli ping`.
 - If you point at your own Redis instance, update the env vars above and restart the service so the client reinitializes with the new settings.
 
+## Embedding Pickles from Blob Storage
+
+How to run:
+- Set `AZURE_STORAGE_CONNECTION_STRING` (preferred) or `DOCWAIN_BLOB_ACCOUNT_URL` for managed identity.
+- Set `DOCWAIN_BLOB_CONTAINER=document-content` and optionally `DOCWAIN_BLOB_PREFIX` to scope blobs (e.g. `pickles/`).
+- Start the API: `uvicorn src.main:app --reload`
+
+Example embed call (processes available pickle blobs):
+```bash
+curl -X POST http://localhost:8000/api/documents/embed \\
+  -H \"Content-Type: application/json\" \\
+  -d '{\"max_blobs\": 5}'
+```
+
 ### Fine-tuning with Unsloth (LLama 3.2) from a Qdrant collection
 
 1) Install deps: `pip install -r requirements.txt` (includes `unsloth`, `trl`, `datasets`, `transformers`, `bitsandbytes`).

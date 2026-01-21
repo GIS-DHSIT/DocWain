@@ -2,6 +2,11 @@ import datetime
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from bson.objectid import ObjectId
+except Exception:  # noqa: BLE001
+    ObjectId = None  # type: ignore[assignment]
+
 from src.api.config import Config
 from src.api.dataHandler import db
 
@@ -65,11 +70,33 @@ def _resolve_updated(doc: Dict[str, Any]) -> Optional[Any]:
     )
 
 
+def _resolve_profile_id(doc: Dict[str, Any]) -> Optional[str]:
+    value = doc.get("profile_id") or doc.get("profileId") or doc.get("profile") or doc.get("profileID")
+    if value is None:
+        return None
+    value_str = str(value)
+    return value_str if value_str else None
+
+
+def _resolve_subscription_id(doc: Dict[str, Any]) -> Optional[str]:
+    value = (
+        doc.get("subscription_id")
+        or doc.get("subscriptionId")
+        or doc.get("subscription")
+        or doc.get("subscriptionID")
+    )
+    if value is None:
+        return None
+    value_str = str(value)
+    return value_str if value_str else None
+
+
 def list_documents(
     limit: int = 50,
     offset: int = 0,
     q: Optional[str] = None,
     doc_type: Optional[str] = None,
+    profile_id: Optional[str] = None,
     created_after: Optional[str] = None,
     created_before: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], int]:
@@ -87,6 +114,19 @@ def list_documents(
 
     if doc_type:
         and_filters.append({"$or": [{"doc_type": doc_type}, {"document_type": doc_type}, {"type": doc_type}]})
+
+    if profile_id is not None and str(profile_id).strip():
+        profile_value = str(profile_id).strip()
+        profile_values: List[Any] = [profile_value]
+        if ObjectId is not None and ObjectId.is_valid(profile_value):
+            profile_values.append(ObjectId(profile_value))
+        profile_filters = []
+        for field in ("profile_id", "profileId", "profile", "profileID"):
+            if len(profile_values) == 1:
+                profile_filters.append({field: profile_values[0]})
+            else:
+                profile_filters.append({field: {"$in": profile_values}})
+        and_filters.append({"$or": profile_filters})
 
     created_after_dt = _parse_dt(created_after)
     if created_after_dt:
@@ -165,6 +205,14 @@ def list_documents(
         dtype = _resolve_type(doc)
         if dtype:
             item["doc_type"] = dtype
+
+        profile_value = _resolve_profile_id(doc)
+        if profile_value:
+            item["profile_id"] = profile_value
+
+        subscription_value = _resolve_subscription_id(doc)
+        if subscription_value:
+            item["subscription_id"] = subscription_value
 
         created_val = _resolve_created(doc)
         if created_val:

@@ -77,14 +77,6 @@ def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) ->
     return {"error": {"code": code, "message": message, "details": details or {}}}
 
 
-def _cors_origins() -> List[str]:
-    if getattr(Config.API, "ALLOW_ALL_ORIGINS", False):
-        return ["*"]
-    if getattr(Config.API, "ALLOW_ORIGINS", None):
-        return Config.API.ALLOW_ORIGINS
-    return ["http://localhost:3000", "http://127.0.0.1:3000"]
-
-
 def _get_dw_newron():
     """
     Lazy loader for RAG pipeline functions to avoid heavy imports on module load.
@@ -100,7 +92,7 @@ api_router = APIRouter(prefix="/api")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins(),
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -667,29 +659,41 @@ def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool]
     return ask_question_api(request, agent_mode=agent_mode, stream=True)
 
 
-@api_router.post("/train/{doc_id}", tags=["Default"])
-def trigger_single_training(doc_id: str, subscription_id: str = "default"):
-    """API endpoint to train a single document by its document ID."""
+@api_router.post("/extract/{doc_id}", tags=["Default"])
+def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
+    """API endpoint to extract a single document by its document ID."""
     try:
-        logging.info(f"Received single document training request for: {doc_id} (subscription: {subscription_id})")
+        logging.info(f"Received single document extraction request for: {doc_id} (subscription: {subscription_id})")
         result = train_single_document(doc_id)
         return {"status": "success", "message": result}
     except Exception as e:
-        logging.error(f"Single training API error: {e}")
-        raise HTTPException(status_code=500, detail="Single document training failed")
+        logging.error(f"Single extraction API error: {e}")
+        raise HTTPException(status_code=500, detail="Single document extraction failed")
 
 
-@api_router.get("/train", tags=["Default"])
-def trigger_training(subscription_id: str = "default"):
-    """API endpoint to trigger document training."""
+@api_router.post("/train/{doc_id}", tags=["Default"], deprecated=True)
+def trigger_single_training(doc_id: str, subscription_id: str = "default"):
+    """Deprecated alias for /extract/{doc_id}. Performs extraction only."""
+    return trigger_single_extraction(doc_id=doc_id, subscription_id=subscription_id)
+
+
+@api_router.get("/extract", tags=["Default"])
+def trigger_extraction(subscription_id: str = "default"):
+    """API endpoint to trigger document extraction."""
     try:
-        logging.info(f"Received training request (subscription: {subscription_id})")
+        logging.info(f"Received extraction request (subscription: {subscription_id})")
         status_response = trainData()
         logging.info(status_response)
         return {"status": "success", "message": status_response, "response": "Executed"}
     except Exception as e:
-        logging.error(f"Training API error: {e}")
-        raise HTTPException(status_code=500, detail="Training process failed")
+        logging.error(f"Extraction API error: {e}")
+        raise HTTPException(status_code=500, detail="Extraction process failed")
+
+
+@api_router.get("/train", tags=["Default"], deprecated=True)
+def trigger_training(subscription_id: str = "default"):
+    """Deprecated alias for /extract. Performs extraction only."""
+    return trigger_extraction(subscription_id=subscription_id)
 
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])
@@ -1312,7 +1316,7 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
 def reprocess_documents_with_new_pii_setting(subscription_id: str):
     """
     Reprocess all documents in a subscription with updated PII setting
-    This will retrain documents with new PII masking rules
+    This will re-extract documents with new PII masking rules
     """
     try:
         # Get all documents for this subscription
@@ -1337,13 +1341,13 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
             }
         )
         logging.info(f"Marked {result.modified_count} documents for reprocessing")
-        # Trigger training
+        # Trigger extraction
         training_result = trainData()
         return {
             "status": "success",
             "subscription_id": subscription_id,
             "documents_marked_for_reprocessing": result.modified_count,
-            "training_result": training_result
+            "extraction_result": training_result
         }
     except Exception as e:
         logging.error(f"Failed to reprocess documents: {e}")
