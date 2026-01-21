@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional
 from bson import ObjectId
 from qdrant_client import QdrantClient
 
+from src.api.content_store import load_extracted_pickle
 from src.api.config import Config
+from src.api.pipeline_models import ExtractedDocument
 from src.api.dataHandler import db, get_qdrant_client
 from src.api.vector_store import build_collection_name
 
@@ -21,15 +23,24 @@ def _get_document_collection():
         return None
 
 
-def _lookup_document(doc_id: str) -> Optional[Dict[str, Any]]:
+def _get_document_record(doc_id: str) -> Dict[str, Any]:
     collection = _get_document_collection()
     if collection is None:
-        return None
+        raise ValueError("Document store is not accessible")
 
     queries: List[Dict[str, Any]] = []
     if ObjectId.is_valid(doc_id):
         queries.append({"_id": ObjectId(doc_id)})
-    queries.extend([{"_id": doc_id}, {"document_id": doc_id}, {"documentId": doc_id}])
+
+    alt_filters = [
+        {"_id": doc_id},
+        {"document_id": doc_id},
+        {"doc_id": doc_id},
+        {"documentId": doc_id},
+        {"docId": doc_id},
+        {"id": doc_id},
+    ]
+    queries.append({"$or": alt_filters})
 
     for query in queries:
         try:
@@ -39,7 +50,8 @@ def _lookup_document(doc_id: str) -> Optional[Dict[str, Any]]:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Document lookup failed for %s with %s: %s", doc_id, query, exc)
             continue
-    return None
+
+    raise ValueError(f"Document not found for doc_id={doc_id}")
 
 
 def _extract_text_from_record(record: Dict[str, Any]) -> List[str]:
@@ -66,6 +78,47 @@ def _extract_text_from_record(record: Dict[str, Any]) -> List[str]:
     return texts
 
 
+def _extract_text_from_extracted(extracted: Any) -> List[str]:
+    texts: List[str] = []
+    if isinstance(extracted, ExtractedDocument):
+        if extracted.full_text:
+            texts.append(extracted.full_text)
+        else:
+            texts.extend([sec.text for sec in extracted.sections if sec.text])
+        return texts
+
+    if isinstance(extracted, dict):
+        for value in extracted.values():
+            if isinstance(value, ExtractedDocument):
+                if value.full_text:
+                    texts.append(value.full_text)
+                else:
+                    texts.extend([sec.text for sec in value.sections if sec.text])
+            elif isinstance(value, str):
+                if value.strip():
+                    texts.append(value.strip())
+            elif isinstance(value, dict):
+                inner_text = value.get("text") or value.get("content")
+                if isinstance(inner_text, str) and inner_text.strip():
+                    texts.append(inner_text.strip())
+                elif isinstance(inner_text, list):
+                    texts.append(" ".join(str(item) for item in inner_text if item))
+            elif isinstance(value, list):
+                texts.append(" ".join(str(item) for item in value if item))
+    return texts
+
+
+def get_extracted_document(document_id: str) -> ExtractedDocument:
+    extracted = load_extracted_pickle(document_id)
+    if isinstance(extracted, ExtractedDocument):
+        return extracted
+    if isinstance(extracted, dict):
+        for value in extracted.values():
+            if isinstance(value, ExtractedDocument):
+                return value
+    raise ValueError(f"Extracted content is not an ExtractedDocument for document_id={document_id}")
+
+
 def _fetch_chunks_from_qdrant(
     doc_id: str,
     subscription_id: str,
@@ -73,6 +126,9 @@ def _fetch_chunks_from_qdrant(
     client: Optional[QdrantClient] = None,
     limit: int = 256,
 ) -> List[Dict[str, Any]]:
+    if not subscription_id or str(subscription_id).strip().lower() == "default":
+        logger.warning("Qdrant lookup unavailable for doc_id=%s: subscription_id missing", doc_id)
+        return []
     client = client or get_qdrant_client()
     collection_name = build_collection_name(subscription_id)
     scroll_filter: Dict[str, Any] = {"must": [{"key": "document_id", "match": {"value": str(doc_id)}}]}
@@ -112,15 +168,40 @@ def _combine_payload_texts(payloads: List[Dict[str, Any]]) -> List[str]:
     return texts
 
 
+def get_document_subscription_id(doc_id: str) -> Optional[str]:
+    record = _get_document_record(doc_id)
+    candidates = [
+        record.get("subscriptionId"),
+        record.get("subscription_id"),
+        record.get("subscription"),
+        record.get("tenantId"),
+        record.get("collection_name"),
+    ]
+    metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    candidates.extend(
+        [
+            metadata.get("subscriptionId"),
+            metadata.get("subscription_id"),
+            metadata.get("subscription"),
+            metadata.get("tenantId"),
+            metadata.get("collection_name"),
+        ]
+    )
+    for value in candidates:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def get_document_metadata(doc_id: str) -> Dict[str, Any]:
-    record = _lookup_document(doc_id)
-    return record or {}
+    return _get_document_record(doc_id)
 
 
 def get_document_doc_type(doc_id: str) -> Optional[str]:
-    record = _lookup_document(doc_id)
-    if not record:
-        return None
+    record = _get_document_record(doc_id)
     for key in ("doc_type", "doctype", "document_type", "type"):
         value = record.get(key)
         if isinstance(value, str) and value.strip():
@@ -128,33 +209,60 @@ def get_document_doc_type(doc_id: str) -> Optional[str]:
     return None
 
 
-def get_document_text(doc_id: str) -> str:
-    record = _lookup_document(doc_id) or {}
+def extract_text_from_payload(extracted: Any) -> Optional[str]:
+    texts = _extract_text_from_extracted(extracted)
+    if texts:
+        return "\n\n".join(texts)
+    return None
+
+
+def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool = True) -> str:
+    if extracted is not None:
+        text = extract_text_from_payload(extracted)
+        if text:
+            return text
+        if not allow_fallback:
+            raise ValueError(f"Extracted payload had no text for doc_id={doc_id}")
+
+    try:
+        extracted = load_extracted_pickle(doc_id)
+        texts = _extract_text_from_extracted(extracted)
+        if texts:
+            return "\n\n".join(texts)
+        logger.warning("Extracted pickle for doc_id=%s had no text; falling back", doc_id)
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            logger.warning("Blob pickle unavailable for doc_id=%s: %s", doc_id, exc)
+        else:
+            raise
+
+    record = _get_document_record(doc_id)
     texts = _extract_text_from_record(record)
 
-    subscription_id = (
-        record.get("subscriptionId")
-        or record.get("subscription_id")
-        or record.get("subscription")
-        or "default"
-    )
+    subscription_id = get_document_subscription_id(doc_id)
     profile_id = record.get("profileId") or record.get("profile_id") or record.get("profile")
 
     if not texts:
-        payloads = _fetch_chunks_from_qdrant(
-            doc_id=doc_id,
-            subscription_id=str(subscription_id),
-            profile_id=str(profile_id) if profile_id else None,
-        )
-        texts = _combine_payload_texts(payloads)
+        if subscription_id:
+            payloads = _fetch_chunks_from_qdrant(
+                doc_id=doc_id,
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id) if profile_id else None,
+            )
+            texts = _combine_payload_texts(payloads)
+        else:
+            logger.warning(
+                "No subscription_id available for doc_id=%s; qdrant_unavailable=true",
+                doc_id,
+            )
 
     if not texts:
-        raise ValueError(f"Document text not found for doc_id={doc_id}")
+        raise ValueError(f"Document found but text missing for doc_id={doc_id}")
     return "\n\n".join(texts)
 
 
 def get_document_bytes(doc_id: str) -> Optional[bytes]:
-    record = _lookup_document(doc_id) or {}
+    record = _get_document_record(doc_id)
     raw_bytes = record.get("raw_bytes") or record.get("file_bytes")
     if isinstance(raw_bytes, (bytes, bytearray)):
         return bytes(raw_bytes)

@@ -88,6 +88,34 @@ class ScreeningReport:
         }
 
 
+@dataclass
+class SecurityFinding:
+    """Detailed finding for security screening output."""
+
+    finding_type: str
+    category: str
+    subcategory: Optional[str]
+    severity: str
+    confidence: float
+    location: Dict[str, Any]
+    snippet_masked: str
+    context_masked: str
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "type": self.finding_type,
+            "category": self.category,
+            "subcategory": self.subcategory,
+            "severity": self.severity,
+            "confidence": round(float(self.confidence), 3),
+            "location": self.location,
+            "snippet_masked": self.snippet_masked,
+            "context_masked": self.context_masked,
+            "evidence": self.evidence,
+        }
+
+
 def compute_config_hash(data: Dict[str, Any]) -> str:
     """Generate a stable hash for provenance tracking."""
     packed = json.dumps(data, sort_keys=True, default=str).encode("utf-8")

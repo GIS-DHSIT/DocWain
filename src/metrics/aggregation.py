@@ -281,6 +281,14 @@ def build_metrics_payload(
             if _avg(totals, "chunk_semantic_drift_score") is not None else None,
             "hallucination_risk_score": round(_avg(totals, "hallucination_risk_score"), 4)
             if _avg(totals, "hallucination_risk_score") is not None else None,
+            "answer_confidence_score": round(_avg(totals, "answer_confidence_score"), 4)
+            if _avg(totals, "answer_confidence_score") is not None else None,
+            "evidence_support_score": round(_avg(totals, "evidence_support_score"), 4)
+            if _avg(totals, "evidence_support_score") is not None else None,
+            "citation_coverage_score": round(_avg(totals, "citation_coverage_score"), 4)
+            if _avg(totals, "citation_coverage_score") is not None else None,
+            "numeric_support_rate": round(_avg(totals, "numeric_support_rate"), 4)
+            if _avg(totals, "numeric_support_rate") is not None else None,
             "note": "; ".join(notes["semantic_quality"]) if notes["semantic_quality"] else None,
         },
         "retrieval": {

@@ -148,12 +148,23 @@ class Config:
         CHUNK_SIZE = int(os.getenv("RETRIEVAL_CHUNK_SIZE", "800"))
         CHUNK_OVERLAP = int(os.getenv("RETRIEVAL_CHUNK_OVERLAP", "200"))
         MIN_CHUNK_SIZE = int(os.getenv("RETRIEVAL_MIN_CHUNK_SIZE", "150"))
+        CHUNK_COVERAGE_THRESHOLD = float(os.getenv("CHUNK_COVERAGE_THRESHOLD", "0.98"))
         MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
         SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
         USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
         USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"
         NEIGHBOR_WINDOW = int(os.getenv("RETRIEVAL_NEIGHBOR_WINDOW", "2"))
         NEIGHBOR_MAX_NEW = int(os.getenv("RETRIEVAL_NEIGHBOR_MAX_NEW", "10"))
+        BROAD_RECALL_MULTIPLIER = float(os.getenv("RETRIEVAL_BROAD_RECALL_MULTIPLIER", "1.5"))
+        BROAD_RECALL_THRESHOLD = float(os.getenv("RETRIEVAL_BROAD_RECALL_THRESHOLD", "0.02"))
+        DIVERSITY_THRESHOLD = float(os.getenv("RETRIEVAL_DIVERSITY_THRESHOLD", "0.6"))
+        MIN_OCR_CONFIDENCE = float(os.getenv("RETRIEVAL_MIN_OCR_CONFIDENCE", "60"))
+        CONFIDENCE_THRESHOLD = float(os.getenv("RETRIEVAL_CONFIDENCE_THRESHOLD", "0.55"))
+        HIGH_CONFIDENCE_THRESHOLD = float(os.getenv("RETRIEVAL_HIGH_CONFIDENCE_THRESHOLD", "0.75"))
+        QUERY_INTELLIGENCE_USE_LLM = os.getenv("RETRIEVAL_QUERY_INTELLIGENCE_LLM", "true").lower() == "true"
+        REASONING_LAYER_ENABLED = os.getenv("RETRIEVAL_REASONING_LAYER_ENABLED", "true").lower() == "true"
+        MIN_SUPPORT_SCORE = float(os.getenv("RETRIEVAL_MIN_SUPPORT_SCORE", "0.15"))
+        MIN_CITATION_COVERAGE = float(os.getenv("RETRIEVAL_MIN_CITATION_COVERAGE", "0.75"))
         HYBRID_WEIGHTS = {
             "dense": float(os.getenv("HYBRID_WEIGHT_DENSE", "0.6")),
             "sparse": float(os.getenv("HYBRID_WEIGHT_SPARSE", "0.4")),

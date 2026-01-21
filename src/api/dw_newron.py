@@ -12,7 +12,8 @@ from collections import deque, Counter
 from datetime import datetime, timedelta
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, SparseVector
+from fastapi import HTTPException, status
+from qdrant_client.models import Distance, PointStruct, SparseVector, Range
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import ollama
 import os
@@ -22,6 +23,9 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from src.api.config import Config
 from src.api.enhanced_context_builder import IntelligentContextBuilder
+from src.api.query_intelligence import QueryIntelligence
+from src.api.reasoning_layer import EvidencePlanner, AnswerVerifier, ConfidenceScorer
+from src.api.learning_signals import LearningSignalStore
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
@@ -36,6 +40,32 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class QdrantCollectionNotFoundError(ValueError):
+    def __init__(self, collection_name: str, available_collections: Optional[List[str]] = None):
+        available = available_collections or []
+        detail = f"qdrant_collection_not_found: collection '{collection_name}' not found"
+        if available:
+            detail = f"{detail}; available_collections={available}"
+        super().__init__(detail)
+        self.collection_name = collection_name
+        self.available_collections = available
+
+
+def _resolve_collection_name(
+    *,
+    collection_name: Optional[str] = None,
+    subscription_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> str:
+    if collection_name and str(collection_name).strip():
+        return str(collection_name).strip()
+    if subscription_id and str(subscription_id).strip():
+        return build_collection_name(str(subscription_id).strip())
+    if profile_id and str(profile_id).strip():
+        return str(profile_id).strip()
+    raise ValueError("collection_name could not be resolved; provide collection_name, subscription_id, or profile_id")
 
 # Initialize models and clients (lazy loading to avoid startup errors)
 _MODEL = None
@@ -1101,7 +1131,14 @@ class QdrantRetriever:
             raise ValueError("profile_id is required for retrieval to enforce isolation")
 
     def _build_filter(
-        self, profile_id: str, document_ids: Optional[List[str]] = None, source_files: Optional[List[str]] = None
+        self,
+        profile_id: str,
+        document_ids: Optional[List[str]] = None,
+        source_files: Optional[List[str]] = None,
+        doc_types: Optional[List[str]] = None,
+        section_titles: Optional[List[str]] = None,
+        page_numbers: Optional[List[int]] = None,
+        min_confidence: Optional[float] = None,
     ) -> Filter:
         self._ensure_profile(profile_id)
         conditions = [
@@ -1111,12 +1148,55 @@ class QdrantRetriever:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
             conditions.append(FieldCondition(key="source_file", match=MatchAny(any=[str(s) for s in source_files])))
+        if doc_types:
+            conditions.append(FieldCondition(key="doc_type", match=MatchAny(any=[str(d) for d in doc_types])))
+        if section_titles:
+            conditions.append(FieldCondition(key="section_title", match=MatchAny(any=[str(s) for s in section_titles])))
+        if page_numbers:
+            values = []
+            for page in page_numbers:
+                try:
+                    values.append(int(page))
+                except Exception:
+                    continue
+                values.append(str(page))
+            if values:
+                conditions.append(FieldCondition(key="page", match=MatchAny(any=values)))
+        if min_confidence is not None:
+            try:
+                min_conf = float(min_confidence)
+                conditions.append(FieldCondition(key="ocr_confidence", range=Range(gte=min_conf)))
+            except Exception:
+                pass
         return Filter(must=conditions)
 
     def _build_sparse_query(self, query: str) -> SparseVector:
         matrix = self._hash_vectorizer.transform([query])
         coo = matrix.tocoo()
         return SparseVector(indices=coo.col.tolist(), values=coo.data.astype(np.float32).tolist())
+
+    def _list_collection_names(self) -> List[str]:
+        try:
+            collections = self.client.get_collections().collections
+            return [col.name for col in collections]
+        except Exception as exc:
+            logger.warning("Could not list Qdrant collections: %s", exc)
+            return []
+
+    def _ensure_collection_exists(self, collection_name: str) -> None:
+        try:
+            self.client.get_collection(collection_name)
+            return
+        except Exception as exc:
+            available = self._list_collection_names()
+            if collection_name not in available:
+                logger.error("Qdrant collection not found: %s (available=%s)", collection_name, available)
+                raise QdrantCollectionNotFoundError(collection_name, available) from exc
+            logger.error("Qdrant collection lookup failed for '%s': %s", collection_name, exc)
+            raise ValueError(f"qdrant_collection_unavailable: collection '{collection_name}'") from exc
+
+    def ensure_collection_exists(self, collection_name: str) -> None:
+        self._ensure_collection_exists(collection_name)
 
     @staticmethod
     def _points_to_chunks(results, method: str) -> List[RetrievedChunk]:
@@ -1175,6 +1255,7 @@ class QdrantRetriever:
             score_threshold: Optional[float] = None
     ):
         """Execute a vector search against Qdrant using query_points."""
+        self._ensure_collection_exists(collection_name)
         try:
             kwargs = dict(
                 collection_name=collection_name,
@@ -1194,6 +1275,8 @@ class QdrantRetriever:
 
             results = self.client.query_points(**kwargs)
             return results
+        except QdrantCollectionNotFoundError:
+            raise
         except Exception as e:
             logger.error("Qdrant query_points error: %s", e, exc_info=True)
             return None
@@ -1203,6 +1286,7 @@ class QdrantRetriever:
         if collection_name in self.collection_dims:
             return self.collection_dims[collection_name]
         try:
+            self._ensure_collection_exists(collection_name)
             info = self.client.get_collection(collection_name)
             cfg = getattr(info, "config", None) or {}
             params = getattr(cfg, "params", None) or {}
@@ -1221,16 +1305,11 @@ class QdrantRetriever:
             self.collection_dims[collection_name] = dim
             logger.info(f"Collection '{collection_name}' expects dim={dim}")
             return dim
+        except QdrantCollectionNotFoundError:
+            raise
         except Exception as e:
-            fallback_dim = getattr(Config.Model, "EMBEDDING_DIM", None) or 768
-            logger.warning(
-                "Could not fetch vector dim for collection '%s': %s; using fallback dim=%s",
-                collection_name,
-                e,
-                fallback_dim,
-            )
-            self.collection_dims[collection_name] = int(fallback_dim)
-            return int(fallback_dim)
+            logger.error("Could not fetch vector dim for collection '%s': %s", collection_name, e, exc_info=True)
+            raise ValueError(f"qdrant_collection_unavailable: collection '{collection_name}'") from e
 
     def retrieve(
             self,
@@ -1238,7 +1317,13 @@ class QdrantRetriever:
             query: str,
             filter_profile: str = None,
             top_k: int = 50,
-            score_threshold: float = 0.10  # ✅ CHANGED FROM 0.15
+            score_threshold: float = 0.10,  # ✅ CHANGED FROM 0.15
+            document_ids: Optional[List[str]] = None,
+            source_files: Optional[List[str]] = None,
+            doc_types: Optional[List[str]] = None,
+            section_titles: Optional[List[str]] = None,
+            page_numbers: Optional[List[int]] = None,
+            min_confidence: Optional[float] = None,
     ) -> List[RetrievedChunk]:
         """Retrieve relevant chunks using Qdrant's native search."""
         try:
@@ -1255,13 +1340,23 @@ class QdrantRetriever:
             ).astype(np.float32).tolist()
             if target_dim and len(query_vector) != target_dim:
                 raise ValueError(f"Embedding dim {len(query_vector)} does not match collection dim {target_dim}")
+        except QdrantCollectionNotFoundError:
+            raise
         except Exception as err:
             logger.error(f"Failed to embed query for retrieval: {err}", exc_info=True)
             return []
 
         logger.info(f"Searching collection '{collection_name}' for query: {query[:100]}")
 
-        query_filter = self._build_filter(str(filter_profile))
+        query_filter = self._build_filter(
+            str(filter_profile),
+            document_ids=document_ids,
+            source_files=source_files,
+            doc_types=doc_types,
+            section_titles=section_titles,
+            page_numbers=page_numbers,
+            min_confidence=min_confidence,
+        )
 
         results = self.run_search(
             collection_name=collection_name,
@@ -1306,11 +1401,23 @@ class QdrantRetriever:
             top_k: int = 50,
             document_ids: Optional[List[str]] = None,
             source_files: Optional[List[str]] = None,
+            doc_types: Optional[List[str]] = None,
+            section_titles: Optional[List[str]] = None,
+            page_numbers: Optional[List[int]] = None,
+            min_confidence: Optional[float] = None,
             score_threshold: float = 0.05,
     ) -> List[RetrievedChunk]:
         """Hybrid dense + sparse retrieval with reciprocal rank fusion."""
         self._ensure_profile(profile_id)
-        query_filter = self._build_filter(profile_id, document_ids=document_ids, source_files=source_files)
+        query_filter = self._build_filter(
+            profile_id,
+            document_ids=document_ids,
+            source_files=source_files,
+            doc_types=doc_types,
+            section_titles=section_titles,
+            page_numbers=page_numbers,
+            min_confidence=min_confidence,
+        )
 
         target_dim = self.get_collection_vector_dim(collection_name)
         model = get_model(required_dim=target_dim)
@@ -1956,13 +2063,15 @@ class PromptBuilder:
             conversation_summary: str = "",
             domain_guidance: str = "",
             feedback_memory: str = "",
-            retrieval_brief: str = ""
+            retrieval_brief: str = "",
+            evidence_plan: str = "",
     ) -> str:
         """Build a structured QA prompt with grounding and citation requirements."""
         convo_block = f"\nPRIOR CONVERSATION SUMMARY:\n{conversation_summary}\n" if conversation_summary else ""
         domain_block = f"\nDOMAIN ADAPTER:\n{domain_guidance}\n" if domain_guidance else ""
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
+        evidence_block = f"\nINTERNAL EVIDENCE PLAN:\n{evidence_plan}\n" if evidence_plan else ""
 
         prompt = f"""You are a {persona}. Deliver a clear, reader-friendly answer that feels human and intentional, not robotic. Start with a tight summary, then unpack the best evidence.
 
@@ -1972,6 +2081,7 @@ DOCUMENT CONTEXT:
 {domain_block}
 {retrieval_block}
 {feedback_block}
+{evidence_block}
 
 USER QUESTION: {query}
 
@@ -2054,7 +2164,12 @@ class EnterpriseRAGSystem:
             self.prompt_builder = PromptBuilder()
             self.greeting_handler = GreetingHandler()
             self.query_reformulator = QueryReformulator(self.llm_client)
+            self.query_intelligence = QueryIntelligence(self.llm_client)
             self.answerability_detector = AnswerabilityDetector(self.llm_client)
+            self.evidence_planner = EvidencePlanner(self.llm_client)
+            self.answer_verifier = AnswerVerifier()
+            self.confidence_scorer = ConfidenceScorer()
+            self.learning_signals = LearningSignalStore()
             # Initialize Redis client for storing conversation history and feedback.
             redis_client = get_redis_client()
 
@@ -2130,12 +2245,18 @@ class EnterpriseRAGSystem:
     @staticmethod
     def _detect_intent(query: str) -> str:
         q = query.lower()
+        if any(word in q for word in ["summary", "summarize", "overview", "brief"]):
+            return "summary"
+        if any(word in q for word in ["compare", "difference", "vs", "versus", "comparison"]):
+            return "comparison"
+        if any(word in q for word in ["list", "extract", "identify", "show", "find"]):
+            return "extraction"
+        if any(word in q for word in ["why", "cause", "impact", "implication", "analyze", "evaluate", "reason"]):
+            return "reasoning"
         if any(word in q for word in ["how", "steps", "procedure", "configure", "setup"]):
             return "procedural"
         if any(word in q for word in ["error", "issue", "fail", "troubleshoot", "bug"]):
             return "troubleshooting"
-        if any(word in q for word in ["difference", "compare", "vs", "versus", "comparison"]):
-            return "comparison"
         return "factual"
 
     @staticmethod
@@ -2171,6 +2292,24 @@ class EnterpriseRAGSystem:
 
         contextual_query = " ; ".join([query] + extras)
         return contextual_query, {"profile_keywords_used": keywords, "profile_hints_used": hints}
+
+    @staticmethod
+    def _build_clarification_question(
+        query: str,
+        profile_context: Dict[str, Any],
+        metadata_filters: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        hints = profile_context.get("hints") or []
+        sections = (metadata_filters or {}).get("section_titles") or []
+        prompt_parts = ["I want to make sure I answer precisely."]
+        if sections:
+            prompt_parts.append(f"Which section should I focus on (e.g., {sections[0]})?")
+        elif hints:
+            prompt_parts.append(f"Which document or section should I focus on (e.g., {', '.join(hints[:2])})?")
+        else:
+            prompt_parts.append("Which document or section should I focus on?")
+        prompt_parts.append("If you want a comparison or summary, say which documents to include.")
+        return " ".join(prompt_parts)
 
 
     def extract_person_name_from_query(self, query: str) -> Optional[str]:
@@ -2209,6 +2348,7 @@ class EnterpriseRAGSystem:
             profile_id: str
     ) -> str | None:
         try:
+            self.retriever.ensure_collection_exists(collection_name)
             #  Encode name
             query_vector = self.model.encode(
                 person_name,
@@ -2253,6 +2393,8 @@ class EnterpriseRAGSystem:
 
             return None
 
+        except QdrantCollectionNotFoundError:
+            raise
         except Exception as e:
             logger.error(f"Error finding document by name '{person_name}': {e}")
             return None
@@ -2300,47 +2442,127 @@ class EnterpriseRAGSystem:
         primary_metadata["person_name"] = person_name
         primary_metadata["target_document_id"] = target_document_id
 
-        chunks = self.retriever.hybrid_retrieve(
-            collection_name=collection_name,
-            query=primary_query,
-            profile_id=profile_id,
-            top_k=top_k_retrieval,
-            document_ids=[target_document_id] if target_document_id else None,
-        )
-        attempt_records.append(
-            {
-                "label": "hybrid",
-                "query": primary_query,
-                "hits": len(chunks),
-                "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
-                "document_filter": target_document_id,
-            }
-        )
+        query_analysis = self.query_intelligence.analyze(primary_query, profile_context_data)
+        primary_metadata["intent"] = query_analysis.intent
+        primary_metadata["query_analysis"] = {
+            "sub_queries": query_analysis.sub_queries,
+            "expanded_query": query_analysis.expanded_query,
+            "expansion_terms": query_analysis.expansion_terms,
+            "metadata_filters": query_analysis.metadata_filters,
+            "used_llm": query_analysis.used_llm,
+        }
 
-        if not chunks and target_document_id:
-            chunks = self.retriever.hybrid_retrieve(
+        metadata_filters = query_analysis.metadata_filters or {}
+        doc_types = metadata_filters.get("doc_types")
+        section_titles = metadata_filters.get("section_titles")
+        page_numbers = metadata_filters.get("page_numbers")
+        min_confidence = metadata_filters.get("min_confidence")
+
+        broad_multiplier = float(getattr(Config.Retrieval, "BROAD_RECALL_MULTIPLIER", 1.5))
+        broad_threshold = float(getattr(Config.Retrieval, "BROAD_RECALL_THRESHOLD", 0.02))
+        broad_top_k = max(int(top_k_retrieval), int(top_k_retrieval * broad_multiplier))
+
+        def _annotate_chunks(chunks: List[RetrievedChunk], variant: str) -> None:
+            for chunk in chunks:
+                meta = chunk.metadata or {}
+                methods = set(meta.get("methods") or [])
+                if chunk.method:
+                    methods.add(chunk.method)
+                meta["methods"] = list(methods) if methods else meta.get("methods", [])
+                variants = meta.get("query_variants") or []
+                if variant and variant not in variants:
+                    variants.append(variant)
+                meta["query_variants"] = variants
+                chunk.metadata = meta
+
+        def _merge_chunks(chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+            merged: Dict[str, RetrievedChunk] = {}
+            for chunk in chunks:
+                meta = chunk.metadata or {}
+                key = meta.get("chunk_id") or chunk.id
+                if key in merged:
+                    existing = merged[key]
+                    existing_meta = existing.metadata or {}
+                    incoming_meta = meta
+                    methods = set(existing_meta.get("methods") or [])
+                    methods.update(incoming_meta.get("methods") or [])
+                    if chunk.method:
+                        methods.add(chunk.method)
+                    if methods:
+                        existing_meta["methods"] = list(methods)
+                    variants = set(existing_meta.get("query_variants") or [])
+                    variants.update(incoming_meta.get("query_variants") or [])
+                    if variants:
+                        existing_meta["query_variants"] = list(variants)
+                    existing.metadata = existing_meta
+                    if float(chunk.score) > float(existing.score):
+                        existing.score = chunk.score
+                        if chunk.text:
+                            existing.text = chunk.text
+                else:
+                    merged[key] = chunk
+            return list(merged.values())
+
+        all_chunks: List[RetrievedChunk] = []
+        query_variants = query_analysis.query_variants or [primary_query]
+        for variant in query_variants:
+            variant_chunks = self.retriever.hybrid_retrieve(
+                collection_name=collection_name,
+                query=variant,
+                profile_id=profile_id,
+                top_k=broad_top_k,
+                document_ids=[target_document_id] if target_document_id else None,
+                doc_types=doc_types,
+                section_titles=section_titles,
+                page_numbers=page_numbers,
+                min_confidence=min_confidence,
+                score_threshold=broad_threshold,
+            )
+            _annotate_chunks(variant_chunks, variant)
+            attempt_records.append(
+                {
+                    "label": "hybrid_variant",
+                    "query": variant,
+                    "hits": len(variant_chunks),
+                    "top_score": round(float(variant_chunks[0].score), 4) if variant_chunks else 0.0,
+                    "document_filter": target_document_id,
+                }
+            )
+            all_chunks.extend(variant_chunks)
+
+        chunks = _merge_chunks(all_chunks)
+
+        if not chunks and (target_document_id or doc_types or section_titles or page_numbers or min_confidence):
+            fallback_chunks = self.retriever.hybrid_retrieve(
                 collection_name=collection_name,
                 query=primary_query,
                 profile_id=profile_id,
-                top_k=top_k_retrieval,
+                top_k=broad_top_k,
                 document_ids=None,
+                doc_types=None,
+                section_titles=None,
+                page_numbers=None,
+                min_confidence=None,
+                score_threshold=broad_threshold,
             )
+            _annotate_chunks(fallback_chunks, primary_query)
             attempt_records.append(
                 {
-                    "label": "hybrid_no_doc_filter",
+                    "label": "hybrid_no_filters",
                     "query": primary_query,
-                    "hits": len(chunks),
-                    "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
+                    "hits": len(fallback_chunks),
+                    "top_score": round(float(fallback_chunks[0].score), 4) if fallback_chunks else 0.0,
                     "document_filter": None,
                 }
             )
+            chunks = _merge_chunks(fallback_chunks)
 
         return {
             "chunks": chunks,
             "query": primary_query,
             "metadata": primary_metadata,
             "attempts": attempt_records,
-            "selected_strategy": "hybrid",
+            "selected_strategy": "hybrid_multi_stage",
             "profile_context": profile_context_data,
         }
 
@@ -2389,7 +2611,27 @@ class EnterpriseRAGSystem:
         try:
             if not profile_id:
                 raise ValueError("profile_id is required for retrieval")
-            collection_name = build_collection_name(subscription_id)
+            try:
+                collection_name = _resolve_collection_name(
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={"error": {"code": "qdrant_collection_unresolved", "message": str(exc)}},
+                ) from exc
+            logger.info(
+                "Resolved Qdrant collection",
+                extra={
+                    "collection_name": collection_name,
+                    "profile_id": profile_id,
+                    "subscription_id": subscription_id,
+                    "request_id": request_id,
+                    "session_id": session_id,
+                },
+            )
+            self.retriever.ensure_collection_exists(collection_name)
             namespace = _build_namespace(subscription_id, profile_id, self.model_name, session_id)
             metrics = get_metrics_tracker()
 
@@ -2503,6 +2745,10 @@ class EnterpriseRAGSystem:
                 prompt_text: Optional[str] = None,
                 tool_successes: int = 0,
                 document_ids: Optional[List[str]] = None,
+                confidence: Optional[float] = None,
+                support_score: Optional[float] = None,
+                coverage_score: Optional[float] = None,
+                numeric_support_rate: Optional[float] = None,
             ) -> None:
                 if not metrics_store.available:
                     return
@@ -2552,6 +2798,14 @@ class EnterpriseRAGSystem:
                     "mean_reciprocal_rank": mrr_score,
                     "request_latency_ms": latency_ms,
                 }
+                if confidence is not None:
+                    values["answer_confidence_score"] = float(confidence)
+                if support_score is not None:
+                    values["evidence_support_score"] = float(support_score)
+                if coverage_score is not None:
+                    values["citation_coverage_score"] = float(coverage_score)
+                if numeric_support_rate is not None:
+                    values["numeric_support_rate"] = float(numeric_support_rate)
                 if is_cold_start:
                     values["cold_start_latency_ms"] = latency_ms
                 else:
@@ -2670,6 +2924,15 @@ class EnterpriseRAGSystem:
                     processing_seconds=time.time() - start_time,
                     prompt_text=processed_query,
                 )
+                self.learning_signals.record_failure(
+                    query=query,
+                    reason="no_results",
+                    metadata={
+                        "profile_id": profile_id,
+                        "subscription_id": subscription_id,
+                        "processed_query": processed_query,
+                    },
+                )
 
                 return {
                     "response": no_results_response,
@@ -2696,56 +2959,60 @@ class EnterpriseRAGSystem:
                     if doc_id and doc_id in recent_docs:
                         chunk.score = float(chunk.score) + 0.1
 
-            reranked_chunks = self.reranker.rerank(
-                chunks=retrieved_chunks,
-                query=processed_query,
-                top_k=top_k_rerank,
-                use_cross_encoder=True
-            )
-
-            if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
-                neighbor_window = getattr(Config.Retrieval, "NEIGHBOR_WINDOW", 2) or 2
-                neighbor_max_new = getattr(Config.Retrieval, "NEIGHBOR_MAX_NEW", 10) or 10
-                reranked_chunks = self.retriever.expand_with_neighbors(
-                    collection_name=collection_name,
-                    seed_chunks=reranked_chunks,
-                    profile_id=profile_id,
-                    window=int(neighbor_window),
-                    max_new=int(neighbor_max_new)
+            def _build_context_from_chunks(chunks: List[RetrievedChunk]) -> Tuple[List[RetrievedChunk], List[RetrievedChunk], str, List[Dict[str, Any]]]:
+                reranked = self.reranker.rerank(
+                    chunks=chunks,
+                    query=processed_query,
+                    top_k=top_k_rerank,
+                    use_cross_encoder=True
                 )
-                reranked_chunks = sorted(reranked_chunks, key=lambda c: float(c.score), reverse=True)
 
-            config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)  # ✅ default 7
-            context_chunk_limit = max(final_k or 7, config_context_limit)  # ✅ default 7
-            context_chunk_limit = min(context_chunk_limit, len(reranked_chunks))
-            final_chunks = reranked_chunks[:context_chunk_limit]
-
-            context_sources: List[Dict[str, Any]] = []
-            context = ""
-            if final_chunks:
-                try:
-                    chunk_dicts = [
-                        {
-                            "text": chunk.text,
-                            "score": float(chunk.score),
-                            "metadata": chunk.metadata or {}
-                        }
-                        for chunk in final_chunks
-                    ]
-                    context, context_sources = self.intelligent_context_builder.build_context(
-                        chunks=chunk_dicts,
-                        query=processed_query,
-                        include_metadata=True
+                if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
+                    neighbor_window = getattr(Config.Retrieval, "NEIGHBOR_WINDOW", 2) or 2
+                    neighbor_max_new = getattr(Config.Retrieval, "NEIGHBOR_MAX_NEW", 10) or 10
+                    reranked = self.retriever.expand_with_neighbors(
+                        collection_name=collection_name,
+                        seed_chunks=reranked,
+                        profile_id=profile_id,
+                        window=int(neighbor_window),
+                        max_new=int(neighbor_max_new)
                     )
-                except Exception as ctx_exc:
-                    logger.warning(f"Enhanced context builder failed; falling back: {ctx_exc}")
-                    context = self.context_builder.build_context(
-                        chunks=final_chunks,
-                        max_chunks=context_chunk_limit
-                    )
-                    context_sources = self.context_builder.extract_sources(final_chunks)
+                    reranked = sorted(reranked, key=lambda c: float(c.score), reverse=True)
 
-            logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
+                config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)
+                context_chunk_limit = max(final_k or 7, config_context_limit)
+                context_chunk_limit = min(context_chunk_limit, len(reranked))
+                finals = reranked[:context_chunk_limit]
+
+                ctx_sources: List[Dict[str, Any]] = []
+                ctx_text = ""
+                if finals:
+                    try:
+                        chunk_dicts = [
+                            {
+                                "text": chunk.text,
+                                "score": float(chunk.score),
+                                "metadata": chunk.metadata or {}
+                            }
+                            for chunk in finals
+                        ]
+                        ctx_text, ctx_sources = self.intelligent_context_builder.build_context(
+                            chunks=chunk_dicts,
+                            query=processed_query,
+                            include_metadata=True
+                        )
+                    except Exception as ctx_exc:
+                        logger.warning(f"Enhanced context builder failed; falling back: {ctx_exc}")
+                        ctx_text = self.context_builder.build_context(
+                            chunks=finals,
+                            max_chunks=context_chunk_limit
+                        )
+                        ctx_sources = self.context_builder.extract_sources(finals)
+
+                logger.info(f"Built context with {len(finals)} chunks, {len(ctx_text)} chars")
+                return reranked, finals, ctx_text, ctx_sources
+
+            reranked_chunks, final_chunks, context, context_sources = _build_context_from_chunks(retrieved_chunks)
 
             tool_successes = 0
             tool_failures = 0
@@ -2872,6 +3139,15 @@ class EnterpriseRAGSystem:
                     processing_seconds=time.time() - start_time,
                     prompt_text=processed_query,
                 )
+                self.learning_signals.record_failure(
+                    query=query,
+                    reason="not_answerable",
+                    metadata={
+                        "profile_id": profile_id,
+                        "subscription_id": subscription_id,
+                        "processed_query": processed_query,
+                    },
+                )
 
                 return {
                     "response": not_answerable_response,
@@ -2903,23 +3179,184 @@ class EnterpriseRAGSystem:
                 if conversation_summary:
                     retrieval_brief += "; convo_summary=on"
 
-            prompt = self.prompt_builder.build_qa_prompt(
-                query=query,
-                context=context,
-                persona=persona,
-                conversation_summary=conversation_summary,
-                domain_guidance=adapter_text,
-                feedback_memory=feedback_text,
-                retrieval_brief=retrieval_brief
-            )
-
-            answer = self.llm_client.generate(prompt)
-            if answer and answer.strip().lower().startswith(query.strip().lower()):
-                trimmed = answer[len(query):].lstrip(" :.-\n\t")
-                if trimmed:
-                    answer = trimmed
+            def _generate_answer(
+                ctx_text: str,
+                ctx_sources: List[Dict[str, Any]],
+                ctx_chunks: List[RetrievedChunk],
+            ) -> Tuple[str, str, str, Dict[str, Any]]:
+                evidence_plan = self.evidence_planner.plan(processed_query, ctx_text)
+                evidence_plan_text = json.dumps(evidence_plan, ensure_ascii=True) if evidence_plan else ""
+                prompt_text = self.prompt_builder.build_qa_prompt(
+                    query=query,
+                    context=ctx_text,
+                    persona=persona,
+                    conversation_summary=conversation_summary,
+                    domain_guidance=adapter_text,
+                    feedback_memory=feedback_text,
+                    retrieval_brief=retrieval_brief,
+                    evidence_plan=evidence_plan_text,
+                )
+                response = self.llm_client.generate(prompt_text)
+                if response and response.strip().lower().startswith(query.strip().lower()):
+                    trimmed = response[len(query):].lstrip(" :.-\n\t")
+                    if trimmed:
+                        response = trimmed
+                verification = self.answer_verifier.verify(response, ctx_sources)
+                confidence, breakdown = self.confidence_scorer.score(ctx_chunks, ctx_sources, verification)
+                return response, prompt_text, evidence_plan_text, {
+                    "verification": verification,
+                    "confidence": confidence,
+                    "confidence_breakdown": breakdown,
+                }
 
             sources = context_sources or self.context_builder.extract_sources(final_chunks)
+
+            def _build_verification_sources(
+                ctx_sources: List[Dict[str, Any]],
+                ctx_chunks: List[RetrievedChunk],
+            ) -> List[Dict[str, Any]]:
+                if not ctx_sources:
+                    return []
+                text_by_id = {}
+                for chunk in ctx_chunks:
+                    meta = chunk.metadata or {}
+                    chunk_id = meta.get("chunk_id")
+                    if chunk_id:
+                        text_by_id[str(chunk_id)] = chunk.text or ""
+                verification_sources = []
+                for idx, src in enumerate(ctx_sources):
+                    src_copy = dict(src)
+                    chunk_id = src.get("chunk_id")
+                    full_text = text_by_id.get(str(chunk_id)) if chunk_id else None
+                    if not full_text and idx < len(ctx_chunks):
+                        full_text = ctx_chunks[idx].text or ""
+                    if full_text:
+                        src_copy["excerpt"] = full_text
+                    verification_sources.append(src_copy)
+                return verification_sources
+
+            verification_sources = _build_verification_sources(sources, final_chunks)
+            answer, prompt, evidence_plan_text, scoring = _generate_answer(context, verification_sources, final_chunks)
+            verification = scoring["verification"]
+            confidence = scoring["confidence"]
+            confidence_breakdown = scoring["confidence_breakdown"]
+
+            confidence_threshold = float(getattr(Config.Retrieval, "CONFIDENCE_THRESHOLD", 0.55))
+            low_confidence_retry = False
+            if confidence < confidence_threshold and not use_tooling:
+                fallback_top_k = max(top_k_retrieval * 2, len(retrieved_chunks) + 5)
+                fallback_chunks = self.retriever.hybrid_retrieve(
+                    collection_name=collection_name,
+                    query=processed_query,
+                    profile_id=profile_id,
+                    top_k=fallback_top_k,
+                    document_ids=None,
+                    doc_types=None,
+                    section_titles=None,
+                    page_numbers=None,
+                    min_confidence=None,
+                    score_threshold=None,
+                )
+                if fallback_chunks:
+                    retrieval_attempts.append(
+                        {
+                            "label": "low_confidence_broad_retry",
+                            "query": processed_query,
+                            "hits": len(fallback_chunks),
+                            "top_score": round(float(fallback_chunks[0].score), 4) if fallback_chunks else 0.0,
+                            "document_filter": None,
+                        }
+                    )
+                    retrieved_chunks = fallback_chunks
+                    reranked_chunks, final_chunks, context, context_sources = _build_context_from_chunks(
+                        fallback_chunks
+                    )
+                    sources = context_sources or self.context_builder.extract_sources(final_chunks)
+                    verification_sources = _build_verification_sources(sources, final_chunks)
+                    answer, prompt, evidence_plan_text, scoring = _generate_answer(context, verification_sources, final_chunks)
+                    verification = scoring["verification"]
+                    confidence = scoring["confidence"]
+                    confidence_breakdown = scoring["confidence_breakdown"]
+                    low_confidence_retry = True
+
+            if confidence < confidence_threshold and not verification.overall_grounded:
+                metadata_filters = (preprocessing_metadata.get("query_analysis") or {}).get("metadata_filters") or {}
+                clarification = self._build_clarification_question(query, profile_context_data, metadata_filters)
+                self.conversation_history.add_turn(namespace, user_id, query, clarification)
+                self.learning_signals.record_low_confidence(
+                    query=query,
+                    context=context or "",
+                    answer=answer,
+                    reason="low_confidence_clarification",
+                    metadata={
+                        "profile_id": profile_id,
+                        "subscription_id": subscription_id,
+                        "confidence": confidence,
+                        "confidence_breakdown": confidence_breakdown,
+                        "query_type": "clarification_needed",
+                    },
+                )
+                processing_time = time.time() - start_time
+                _record_request_metrics(
+                    query_type="clarification_needed",
+                    answer_text=clarification,
+                    context_text=context or "",
+                    context_found=bool(final_chunks),
+                    grounded=False,
+                    has_citations=False,
+                    processing_seconds=processing_time,
+                    prompt_text=prompt,
+                    confidence=confidence,
+                    support_score=verification.support_score,
+                    coverage_score=verification.coverage_score,
+                    numeric_support_rate=verification.numeric_support_rate,
+                )
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="clarification_needed",
+                        context_found=bool(final_chunks),
+                        grounded=False,
+                        cached=False,
+                        processing_time=processing_time,
+                        retrieval_stats={
+                            "initial_retrieved": len(retrieved_chunks),
+                            "after_rerank": len(reranked_chunks),
+                            "final_context": len(final_chunks),
+                        },
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (clarification_needed) failed: %s", metric_exc)
+                return {
+                    "response": clarification,
+                    "sources": sources,
+                    "user_id": user_id,
+                    "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
+                    "context_found": bool(final_chunks),
+                    "query_type": "clarification_needed",
+                    "preprocessing": preprocessing_metadata,
+                    "retrieval_attempts": retrieval_attempts,
+                    "selected_strategy": selected_strategy,
+                    "profile_context": profile_context_data,
+                    "grounded": False,
+                    "confidence": round(confidence, 3),
+                    "confidence_breakdown": confidence_breakdown,
+                    "verification": {
+                        "citations_valid": verification.citations_valid,
+                        "invalid_citations": verification.invalid_citations,
+                        "missing_citations": verification.missing_citations,
+                        "unsupported_sentences": verification.unsupported_sentences,
+                        "support_score": verification.support_score,
+                        "coverage_score": verification.coverage_score,
+                        "numeric_support_rate": verification.numeric_support_rate,
+                        "overall_grounded": verification.overall_grounded,
+                    },
+                    "processing_time": round(processing_time, 2),
+                }
 
             self.conversation_history.add_turn(namespace, user_id, query, answer)
             final_doc_ids = [
@@ -2952,8 +3389,21 @@ class EnterpriseRAGSystem:
                     "is_answerable": is_answerable,
                     "reason": answerability_reason
                 },
-                "grounded": True,
+                "grounded": bool(verification.overall_grounded),
                 "has_citations": has_citations,
+                "confidence": round(confidence, 3),
+                "confidence_breakdown": confidence_breakdown,
+                "verification": {
+                    "citations_valid": verification.citations_valid,
+                    "invalid_citations": verification.invalid_citations,
+                    "missing_citations": verification.missing_citations,
+                    "unsupported_sentences": verification.unsupported_sentences,
+                    "support_score": verification.support_score,
+                    "coverage_score": verification.coverage_score,
+                    "numeric_support_rate": verification.numeric_support_rate,
+                    "overall_grounded": verification.overall_grounded,
+                },
+                "evidence_plan_used": bool(evidence_plan_text),
                 "retrieval_attempts": retrieval_attempts,
                 "selected_strategy": selected_strategy,
                 "profile_context": profile_context_data,
@@ -2969,9 +3419,42 @@ class EnterpriseRAGSystem:
                     "after_rerank": len(reranked_chunks),
                     "final_context": len(final_chunks)
                 },
+                "low_confidence_retry": low_confidence_retry,
                 "force_refresh": force_refresh,
                 "disable_answer_cache": disable_answer_cache,
             }
+
+            high_conf_threshold = float(getattr(Config.Retrieval, "HIGH_CONFIDENCE_THRESHOLD", 0.75))
+            if confidence >= high_conf_threshold and verification.overall_grounded and has_citations:
+                self.learning_signals.record_high_quality(
+                    query=query,
+                    context=context or "",
+                    answer=answer,
+                    sources=sources,
+                    metadata={
+                        "profile_id": profile_id,
+                        "subscription_id": subscription_id,
+                        "document_ids": final_doc_ids,
+                        "confidence": confidence,
+                    },
+                )
+            elif confidence < confidence_threshold:
+                self.learning_signals.record_low_confidence(
+                    query=query,
+                    context=context or "",
+                    answer=answer,
+                    reason="low_confidence",
+                    metadata={
+                        "profile_id": profile_id,
+                        "subscription_id": subscription_id,
+                        "confidence": confidence,
+                        "confidence_breakdown": confidence_breakdown,
+                        "verification": {
+                            "citations_valid": verification.citations_valid,
+                            "missing_citations": verification.missing_citations,
+                        },
+                    },
+                )
 
             try:
                 metrics.record(
@@ -2999,6 +3482,10 @@ class EnterpriseRAGSystem:
                 prompt_text=prompt,
                 tool_successes=tool_successes,
                 document_ids=final_doc_ids,
+                confidence=confidence,
+                support_score=verification.support_score,
+                coverage_score=verification.coverage_score,
+                numeric_support_rate=verification.numeric_support_rate,
             )
 
             # Persist the response in Redis before returning. Only cache successful
@@ -3012,6 +3499,20 @@ class EnterpriseRAGSystem:
             # Return the constructed response
             return response_obj
 
+        except HTTPException:
+            raise
+        except QdrantCollectionNotFoundError as exc:
+            detail = {
+                "error": {
+                    "code": "qdrant_collection_not_found",
+                    "message": str(exc),
+                    "details": {
+                        "collection_name": exc.collection_name,
+                        "available_collections": exc.available_collections,
+                    },
+                }
+            }
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail) from exc
         except Exception as e:
             logger.error(f"Error in answer_question: {e}", exc_info=True)
             try:
@@ -3049,6 +3550,19 @@ class EnterpriseRAGSystem:
                     processing_seconds=time.time() - start_time,
                     prompt_text=processed_query if "processed_query" in locals() else query,
                 )
+            if "self" in locals():
+                try:
+                    self.learning_signals.record_failure(
+                        query=query,
+                        reason="error",
+                        metadata={
+                            "profile_id": profile_id if "profile_id" in locals() else None,
+                            "subscription_id": subscription_id if "subscription_id" in locals() else None,
+                            "error": str(e),
+                        },
+                    )
+                except Exception:
+                    pass
 
             return {
                 "response": error_response,

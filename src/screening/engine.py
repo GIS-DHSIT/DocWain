@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from . import storage_adapter
 from .config import ScreeningConfig
 from .models import ScreeningContext, ScreeningReport, ToolResult
+from src.api.pipeline_models import ExtractedDocument
 from .resume import run_resume_analysis
 from .search import NullSearchClient, SearchClient, SimpleHttpSearchClient
 from .tools import (
@@ -186,6 +187,19 @@ class ScreeningEngine:
                 break
         return findings
 
+    def _doc_type_from_payload(self, extracted_payload: Any) -> Optional[str]:
+        if isinstance(extracted_payload, ExtractedDocument):
+            return extracted_payload.doc_type
+        if isinstance(extracted_payload, dict):
+            for value in extracted_payload.values():
+                if isinstance(value, ExtractedDocument) and value.doc_type:
+                    return value.doc_type
+                if isinstance(value, dict):
+                    doc_type = value.get("doc_type")
+                    if isinstance(doc_type, str) and doc_type.strip():
+                        return doc_type
+        return None
+
     def _build_context_from_doc(
         self,
         doc_id: str,
@@ -194,12 +208,24 @@ class ScreeningEngine:
         internet_enabled_override: Optional[bool] = None,
         region_override: Optional[str] = None,
         jurisdiction_override: Optional[str] = None,
+        allow_region_jurisdiction: bool = False,
+        extracted_payload: Optional[Any] = None,
     ) -> ScreeningContext:
         cfg = self._with_config_override(internet_enabled_override)
         metadata = storage_adapter.get_document_metadata(doc_id)
-        text = storage_adapter.get_document_text(doc_id)
+        subscription_id = storage_adapter.get_document_subscription_id(doc_id)
+        text = storage_adapter.get_document_text(doc_id, extracted=extracted_payload, allow_fallback=extracted_payload is None)
         raw_bytes = storage_adapter.get_document_bytes(doc_id)
-        doc_type = doc_type_override or storage_adapter.get_document_doc_type(doc_id) or metadata.get("doc_type")
+        doc_type = (
+            doc_type_override
+            or self._doc_type_from_payload(extracted_payload)
+            or storage_adapter.get_document_doc_type(doc_id)
+            or metadata.get("doc_type")
+        )
+
+        warnings: List[str] = []
+        if not subscription_id:
+            warnings.append("subscription_id_unavailable_for_document")
 
         ctx = ScreeningContext(
             doc_id=doc_id,
@@ -207,12 +233,18 @@ class ScreeningEngine:
             text=text,
             metadata=metadata or {},
             raw_bytes=raw_bytes,
-            region=self._infer_region(metadata or {}, region_override),
-            jurisdiction=jurisdiction_override or (metadata or {}).get("jurisdiction"),
+            region=self._infer_region(metadata or {}, region_override) if allow_region_jurisdiction else None,
+            jurisdiction=(jurisdiction_override or (metadata or {}).get("jurisdiction"))
+            if allow_region_jurisdiction
+            else None,
             config=cfg,
             search_client=self._build_search_client(cfg),
         )
         ctx.metadata.setdefault("doc_id", doc_id)
+        if subscription_id:
+            ctx.metadata.setdefault("subscription_id", subscription_id)
+        if warnings:
+            ctx.metadata.setdefault("warnings", warnings)
         return ctx
 
     def _resolve_tools_for_category(
@@ -302,12 +334,43 @@ class ScreeningEngine:
         region: Optional[str] = None,
         jurisdiction: Optional[str] = None,
     ) -> List[ToolResult]:
+        normalized = category.lower().replace("_", "-")
+        allow_region = normalized == "legality"
         ctx = self._build_context_from_doc(
             doc_id,
             doc_type_override=doc_type,
             internet_enabled_override=internet_enabled_override,
             region_override=region,
             jurisdiction_override=jurisdiction,
+            allow_region_jurisdiction=allow_region,
+        )
+        cfg = ctx.config or self.config
+        tools = self._resolve_tools_for_category(category, ctx.doc_type, cfg)
+        if not tools:
+            raise ValueError(f"No screening tools found for category '{category}'")
+        return self._run_tools(ctx, tools)
+
+    def run_category_from_payload(
+        self,
+        category: str,
+        doc_id: str,
+        extracted_payload: Any,
+        *,
+        doc_type: Optional[str] = None,
+        internet_enabled_override: Optional[bool] = None,
+        region: Optional[str] = None,
+        jurisdiction: Optional[str] = None,
+    ) -> List[ToolResult]:
+        normalized = category.lower().replace("_", "-")
+        allow_region = normalized == "legality"
+        ctx = self._build_context_from_doc(
+            doc_id,
+            doc_type_override=doc_type,
+            internet_enabled_override=internet_enabled_override,
+            region_override=region,
+            jurisdiction_override=jurisdiction,
+            allow_region_jurisdiction=allow_region,
+            extracted_payload=extracted_payload,
         )
         cfg = ctx.config or self.config
         tools = self._resolve_tools_for_category(category, ctx.doc_type, cfg)
@@ -321,15 +384,12 @@ class ScreeningEngine:
         *,
         doc_type: Optional[str] = None,
         internet_enabled_override: Optional[bool] = None,
-        region: Optional[str] = None,
-        jurisdiction: Optional[str] = None,
     ) -> ScreeningReport:
         ctx = self._build_context_from_doc(
             doc_id,
             doc_type_override=doc_type,
             internet_enabled_override=internet_enabled_override,
-            region_override=region,
-            jurisdiction_override=jurisdiction,
+            allow_region_jurisdiction=False,
         )
         return self.screen(ctx, cfg=ctx.config)
 

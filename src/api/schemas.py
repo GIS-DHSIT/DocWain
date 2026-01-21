@@ -34,6 +34,8 @@ class DocumentSummary(BaseModel):
     doc_id: str
     document_name: str
     doc_type: Optional[str] = None
+    profile_id: Optional[str] = None
+    subscription_id: Optional[str] = None
     created_at: Optional[Any] = None
     updated_at: Optional[Any] = None
 

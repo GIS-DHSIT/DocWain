@@ -3,11 +3,13 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import time
 import uuid
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import boto3 as b3
@@ -27,6 +29,7 @@ from src.api.config import Config
 from src.api.context_understanding import ContextUnderstanding
 from src.api.documentVetting import mask_document_content, vettingProcessor
 from src.api.dw_document_extractor import DocumentExtractor
+from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
 from src.metrics.ai_metrics import get_metrics_store
@@ -432,6 +435,110 @@ def update_training_status(document_id, status, error_msg=None):
         return {"status": "error", "message": str(e)}
 
 
+def update_extraction_metadata(
+    document_id: str,
+    subscription_id: Optional[str],
+    pickle_path: Optional[str],
+    extracted_hash: Optional[str],
+) -> None:
+    """Persist extraction metadata without storing full text."""
+    try:
+        if ObjectId.is_valid(str(document_id)):
+            filter_criteria = {"_id": ObjectId(str(document_id))}
+        else:
+            filter_criteria = {"_id": str(document_id)}
+
+        update_data = {
+            "document_id": str(document_id),
+            "subscription_id": str(subscription_id) if subscription_id else None,
+            "extracted_pickle_path": pickle_path,
+            "extraction_status": "completed",
+            "extracted_hash": extracted_hash,
+            "extracted_at": time.time(),
+            "updated_at": time.time(),
+        }
+        if pickle_path:
+            from src.api.blob_store import blob_storage_configured
+
+            container_name = (
+                os.getenv("DOCWAIN_BLOB_CONTAINER")
+                if blob_storage_configured()
+                else os.getenv("DOCUMENT_CONTENT_DIR", "document-content")
+            )
+            update_data["blob_reference"] = {
+                "container": container_name,
+                "blob_name": Path(pickle_path).name,
+            }
+        collection = db[Config.MongoDB.DOCUMENTS]
+        collection.update_one(filter_criteria, {"$set": update_data})
+    except Exception as exc:  # noqa: BLE001
+        logging.error(f"Error updating extraction metadata for {document_id}: {exc}")
+
+
+def update_security_screening(document_id: str, report: Dict[str, Any], status: str) -> None:
+    """Persist security screening results for audit/debugging."""
+    try:
+        if ObjectId.is_valid(str(document_id)):
+            filter_criteria = {"_id": ObjectId(str(document_id))}
+        else:
+            filter_criteria = {"_id": str(document_id)}
+
+        update_data = {
+            "security_screening": report,
+            "security_screening_status": status,
+            "security_screened_at": time.time(),
+            "updated_at": time.time(),
+        }
+        collection = db[Config.MongoDB.DOCUMENTS]
+        collection.update_one(filter_criteria, {"$set": update_data})
+    except Exception as exc:  # noqa: BLE001
+        logging.error(f"Error updating security screening for {document_id}: {exc}")
+
+
+def run_security_screening(document_id: str, extracted_payload: Optional[Any] = None) -> Dict[str, Any]:
+    """Run mandatory security screening using extracted payload when provided."""
+    from src.screening.security_service import SecurityScreeningService
+
+    service = SecurityScreeningService()
+    return service.screen_document(
+        document_id,
+        extracted_payload=extracted_payload,
+        include_overall_score=True,
+    )
+
+
+def resolve_subscription_id(document_id: str, provided: Optional[str] = None) -> str:
+    if provided and str(provided).strip().lower() != "default":
+        return str(provided).strip()
+    try:
+        from src.screening import storage_adapter
+        resolved = storage_adapter.get_document_subscription_id(document_id)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"subscription_id lookup failed for document_id={document_id}: {exc}") from exc
+    if not resolved or str(resolved).strip().lower() == "default":
+        raise ValueError(f"subscription_id missing for document_id={document_id}")
+    return str(resolved).strip()
+
+
+def resolve_profile_id(document_id: str, provided: Optional[str] = None) -> str:
+    if provided and str(provided).strip():
+        return str(provided).strip()
+    try:
+        collection = db[Config.MongoDB.DOCUMENTS]
+        record = None
+        if ObjectId.is_valid(str(document_id)):
+            record = collection.find_one({"_id": ObjectId(str(document_id))})
+        if not record:
+            record = collection.find_one({"_id": str(document_id)})
+        if record:
+            value = record.get("profileId") or record.get("profile_id") or record.get("profile")
+            if value:
+                return str(value)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"profile_id lookup failed for document_id={document_id}: {exc}") from exc
+    raise ValueError(f"profile_id missing for document_id={document_id}")
+
+
 def update_pii_stats(document_id, masked_count, high_confidential, pii_items=None):
     """Persist PII masking stats for a document."""
     try:
@@ -530,14 +637,19 @@ def connectData(documentConnection):
         docId = str(docData['_id'])
         telemetry = telemetry_store() if METRICS_V2_ENABLED else None
 
-        subscriptionId = str(
+        subscription_candidate = (
             docData.get('subscriptionId')
             or docData.get('subscription_id')
             or docData.get('subscription')
             or (connData.get('subscriptionId') if isinstance(connData, dict) else None)
             or (connData.get('subscription') if isinstance(connData, dict) else None)
-            or "default"
         )
+        try:
+            subscriptionId = resolve_subscription_id(docId, subscription_candidate)
+        except Exception as exc:
+            logging.error(f"Subscription resolution failed for document {docId}: {exc}")
+            update_training_status(docId, 'TRAINING_FAILED', 'subscription_id missing')
+            continue
 
         # Check PII setting for this subscription
         pii_masking_enabled = get_subscription_pii_setting(subscriptionId)
@@ -685,6 +797,37 @@ def connectData(documentConnection):
 
                 # Apply PII masking and vetting
                 if all_extracted_docs:
+                    try:
+                        save_info = save_extracted_pickle(docId, all_extracted_docs)
+                        update_extraction_metadata(
+                            docId,
+                            subscriptionId,
+                            save_info.get("path"),
+                            save_info.get("sha256"),
+                        )
+                    except Exception as exc:
+                        logging.error(f"Failed to persist extracted pickle for {docId}: {exc}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Failed to persist extracted content')
+                        continue
+
+                    try:
+                        security_report = run_security_screening(docId)
+                        security_status = "passed"
+                        risk_level = str(
+                            security_report.get("overall_risk_level") or security_report.get("risk_level") or ""
+                        ).upper()
+                        if risk_level in {"HIGH", "CRITICAL"}:
+                            security_status = "failed"
+                        update_security_screening(docId, security_report, security_status)
+                        if security_status != "passed":
+                            logging.error(f"Security screening failed for document {docId}; blocking training")
+                            update_training_status(docId, 'TRAINING_BLOCKED_SECURITY', 'Security screening failed')
+                            continue
+                    except Exception as exc:
+                        logging.error(f"Security screening failed for {docId}: {exc}")
+                        update_training_status(docId, 'TRAINING_FAILED', 'Security screening failed')
+                        continue
+
                     if pii_masking_enabled:
                         masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
                         update_pii_stats(docId, pii_count, high_conf, pii_items)
@@ -721,7 +864,9 @@ def connectData(documentConnection):
                         'profileId': profileId,
                         'documentId': docId,  #  Explicit document_id
                         'extractedDoc': masked_docs,
-                        'docName': docData.get('name', 'Unknown')
+                        'docName': docData.get('name', 'Unknown'),
+                        'security': security_report,
+                        'security_status': security_status,
                     }
 
                     logging.info(
@@ -877,6 +1022,8 @@ def save_embeddings_to_qdrant(
 ):
     """Persist embeddings with deterministic chunk IDs and strict scoping."""
     try:
+        if not subscription_id or str(subscription_id).strip().lower() == "default":
+            raise ValueError("subscription_id is required and cannot be 'default' for embedding")
         if not profile_id:
             raise ValueError("profile_id is required for saving embeddings")
 
@@ -906,6 +1053,8 @@ def save_embeddings_to_qdrant(
         pages = embeddings.get("pages") or []
         sections = embeddings.get("sections") or []
         summaries = embeddings.get("summaries") or []
+        doc_type = embeddings.get("doc_type")
+        ocr_confidence = embeddings.get("ocr_confidence")
         sparse_vectors = embeddings.get("sparse_vectors") or []
 
         if not texts:
@@ -965,6 +1114,8 @@ def save_embeddings_to_qdrant(
                 "page": page_val,
                 "section_title": section_val or chunk_meta.get("section"),
                 "summary": summary_val,
+                "doc_type": chunk_meta.get("doc_type") or doc_type,
+                "ocr_confidence": chunk_meta.get("ocr_confidence") or ocr_confidence,
                 "chunk_id": chunk_id,
                 "prev_chunk_id": chunk_meta.get("prev_chunk_id"),
                 "next_chunk_id": chunk_meta.get("next_chunk_id"),
@@ -1111,6 +1262,9 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 document_id=doc_tag,
             )
 
+        if not subscription_id or str(subscription_id).strip().lower() == "default":
+            raise ValueError("subscription_id is required and cannot be 'default' for embedding")
+
         if not profile_id:
             raise ValueError("profile_id is required for training")
 
@@ -1127,12 +1281,37 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     for meta in text['chunk_metadata']:
                         meta['document_id'] = doc_tag
 
+            expected_points = 0
+            if isinstance(text.get("texts"), list):
+                expected_points = len(text.get("texts") or [])
+            elif isinstance(text.get("embeddings"), (list, tuple)):
+                expected_points = len(text.get("embeddings") or [])
             result = save_embeddings_to_qdrant(
                 text, subscription_id, profile_id, doc_tag, doc_name
             )
-            logging.info(f" Stored {result.get('points_saved', 0)} structured embeddings")
-            return f"Stored {result.get('points_saved', 0)} embeddings"
+            saved = result.get("points_saved", 0)
+            if expected_points and saved != expected_points:
+                raise ValueError(
+                    f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
+                )
+            logging.info(f" Stored {saved} structured embeddings")
+            return {
+                "status": "success",
+                "points_saved": saved,
+                "chunks": expected_points,
+                "dropped_chunks": 0,
+                "coverage_ratio": None,
+            }
         elif isinstance(text, ExtractedDocument):
+            doc_type = text.doc_type
+            ocr_confidences = (text.metrics or {}).get("ocr_confidences", []) if text.metrics else []
+            doc_ocr_confidence = None
+            if ocr_confidences:
+                try:
+                    doc_ocr_confidence = float(sum(ocr_confidences) / len(ocr_confidences))
+                except Exception:
+                    doc_ocr_confidence = None
+
             if metrics_store.available:
                 candidates = text.chunk_candidates or []
                 total_candidates = max(len(candidates), 1)
@@ -1165,7 +1344,6 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     document_id=doc_tag,
                 )
 
-                ocr_confidences = (text.metrics or {}).get("ocr_confidences", []) if text.metrics else []
                 for conf in ocr_confidences:
                     metrics_store.record(
                         values={"ocr_confidence": float(conf)},
@@ -1174,19 +1352,25 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     )
 
             candidates: List[ChunkCandidate] = text.chunk_candidates or []
-            if not candidates and text.full_text:
-                logging.info("No structured candidates found; falling back to raw text chunking")
-                candidates = [
-                    ChunkCandidate(
-                        text=text.full_text,
-                        page=None,
-                        section_title="Document",
-                        section_id=None,
-                        chunk_type="text",
-                    )
-                ]
 
-            def _merge_candidates(input_candidates: List[ChunkCandidate], min_len: int = 200):
+            def _split_text_preserve(input_text: str) -> List[str]:
+                if not input_text:
+                    return []
+                chunk_size = max(1, int(getattr(Config.Retrieval, "CHUNK_SIZE", 800)))
+                overlap = max(0, int(getattr(Config.Retrieval, "CHUNK_OVERLAP", 200)))
+                if overlap >= chunk_size:
+                    overlap = max(0, chunk_size // 4)
+                step = max(1, chunk_size - overlap)
+                chunks_out = []
+                text_len = len(input_text)
+                for start in range(0, text_len, step):
+                    end = min(text_len, start + chunk_size)
+                    chunks_out.append(input_text[start:end])
+                    if end >= text_len:
+                        break
+                return chunks_out
+
+            def _merge_candidates(input_candidates: List[ChunkCandidate], min_len: int):
                 merged = []
                 buffer_text = ""
                 buffer_meta: Optional[ChunkCandidate] = None
@@ -1194,40 +1378,128 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     if not cand.text:
                         continue
                     if buffer_meta is None:
-                        buffer_text = cand.text.strip()
+                        buffer_text = cand.text
                         buffer_meta = cand
                         continue
 
                     if len(buffer_text) < min_len and cand.section_id == buffer_meta.section_id:
-                        buffer_text = f"{buffer_text}\n{cand.text.strip()}"
+                        buffer_text = f"{buffer_text}\n{cand.text}"
                     else:
                         merged.append((buffer_text, buffer_meta))
-                        buffer_text = cand.text.strip()
+                        buffer_text = cand.text
                         buffer_meta = cand
 
                 if buffer_meta and buffer_text:
                     merged.append((buffer_text, buffer_meta))
                 return merged
 
-            merged_candidates = _merge_candidates(candidates)
-            if not merged_candidates:
+            chunks: List[str] = []
+            chunk_metadata: List[Dict[str, Any]] = []
+
+            if candidates:
+                min_len = int(getattr(Config.Retrieval, "MIN_CHUNK_SIZE", 200))
+                merged_candidates = _merge_candidates(candidates, min_len)
+                for chunk_text, cand_meta in merged_candidates:
+                    chunks.append(chunk_text)
+                    chunk_metadata.append(
+                        {
+                            "document_id": doc_tag,
+                            "section_title": cand_meta.section_title or "Document",
+                            "section_id": cand_meta.section_id
+                            or hashlib.sha1(
+                                f"{doc_tag}|{cand_meta.section_title or 'Document'}".encode("utf-8")
+                            ).hexdigest()[:12],
+                            "chunk_type": cand_meta.chunk_type,
+                            "page_number": cand_meta.page,
+                            "doc_type": doc_type,
+                            "ocr_confidence": doc_ocr_confidence,
+                        }
+                    )
+            else:
+                for section in text.sections or []:
+                    section_text = section.text or ""
+                    if not section_text.strip():
+                        continue
+                    for chunk_text in _split_text_preserve(section_text):
+                        chunks.append(chunk_text)
+                        chunk_metadata.append(
+                        {
+                            "document_id": doc_tag,
+                            "section_title": section.title or "Section",
+                            "section_id": section.section_id
+                            or hashlib.sha1(f"{doc_tag}|{section.title or 'Section'}".encode("utf-8")).hexdigest()[:12],
+                            "chunk_type": "section",
+                            "page_number": section.start_page,
+                            "doc_type": doc_type,
+                            "ocr_confidence": doc_ocr_confidence,
+                        }
+                    )
+
+                if not chunks and text.full_text:
+                    for chunk_text in _split_text_preserve(text.full_text):
+                        chunks.append(chunk_text)
+                        chunk_metadata.append(
+                        {
+                            "document_id": doc_tag,
+                            "section_title": "Document",
+                            "section_id": hashlib.sha1(f"{doc_tag}|Document".encode("utf-8")).hexdigest()[:12],
+                            "chunk_type": "text",
+                            "page_number": None,
+                            "doc_type": doc_type,
+                            "ocr_confidence": doc_ocr_confidence,
+                        }
+                    )
+
+            if not chunks:
                 raise ValueError(f"No chunk candidates extracted for {doc_name}")
 
-            chunks = []
-            chunk_metadata = []
-            for idx, (chunk_text, cand_meta) in enumerate(merged_candidates):
-                chunks.append(chunk_text)
-                chunk_metadata.append(
+            full_text = text.full_text or ""
+            coverage_threshold = float(getattr(Config.Retrieval, "CHUNK_COVERAGE_THRESHOLD", 0.98))
+            coverage_ratio = None
+            if full_text:
+                coverage_ratio = len("".join(chunks)) / max(1, len(full_text))
+                if coverage_ratio < coverage_threshold:
+                    logging.error(
+                        "Chunk coverage %.3f below threshold %.3f for %s; falling back to full_text chunking",
+                        coverage_ratio,
+                        coverage_threshold,
+                        doc_name,
+                    )
+                    chunks = _split_text_preserve(full_text)
+                    chunk_metadata = [
                     {
                         "document_id": doc_tag,
-                        "section_title": cand_meta.section_title,
-                        "section_id": cand_meta.section_id
-                        or hashlib.sha1(f"{doc_tag}|{cand_meta.section_title}".encode("utf-8")).hexdigest()[:12],
-                        "chunk_index": idx,
-                        "chunk_type": cand_meta.chunk_type,
-                        "page_number": cand_meta.page,
+                        "section_title": "Document",
+                        "section_id": hashlib.sha1(f"{doc_tag}|Document".encode("utf-8")).hexdigest()[:12],
+                        "chunk_type": "text",
+                        "page_number": None,
+                        "doc_type": doc_type,
+                        "ocr_confidence": doc_ocr_confidence,
                     }
-                )
+                    for _ in chunks
+                ]
+                    coverage_ratio = len("".join(chunks)) / max(1, len(full_text))
+
+            filtered_chunks: List[str] = []
+            filtered_meta: List[Dict[str, Any]] = []
+            dropped = 0
+            for chunk_text, meta in zip(chunks, chunk_metadata):
+                if not (chunk_text or "").strip():
+                    dropped += 1
+                    continue
+                filtered_chunks.append(chunk_text)
+                filtered_meta.append(meta)
+
+            if dropped:
+                logging.warning("Dropped %d blank chunks for %s", dropped, doc_name)
+
+            chunks = filtered_chunks
+            chunk_metadata = filtered_meta
+            if not chunks:
+                raise ValueError(f"No valid chunks extracted for {doc_name}")
+
+            if full_text:
+                coverage_ratio = len("".join(chunks)) / max(1, len(full_text))
 
             logging.info(f"Generated {len(chunks)} chunks from structured extraction for {doc_name}")
 
@@ -1281,13 +1553,27 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 "chunk_metadata": chunk_metadata,
                 "pages": [m.get("page_number") for m in chunk_metadata],
                 "sections": [m.get("section_title") for m in chunk_metadata],
+                "doc_type": doc_type,
+                "ocr_confidence": doc_ocr_confidence,
             }
 
             result = save_embeddings_to_qdrant(
                 embeddings_payload, subscription_id, profile_id, doc_tag, doc_name
             )
-            logging.info(f" Stored {result.get('points_saved', 0)} structured extraction embeddings")
-            return f"Stored {result.get('points_saved', 0)} embeddings"
+            saved = result.get("points_saved", 0)
+            expected_points = len(chunks)
+            if saved != expected_points:
+                raise ValueError(
+                    f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
+                )
+            logging.info(f" Stored {saved} structured extraction embeddings")
+            return {
+                "status": "success",
+                "points_saved": saved,
+                "chunks": expected_points,
+                "dropped_chunks": dropped,
+                "coverage_ratio": coverage_ratio,
+            }
 
         elif isinstance(text, str):
             if not text.strip():
@@ -1312,8 +1598,22 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             #  VERIFICATION STEP 1: Check chunks have correct document_id
             logging.info(f"Verifying {len(chunks_with_meta)} chunks for document_id={doc_tag}")
 
-            chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
-            chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
+            filtered_chunks: List[str] = []
+            filtered_meta: List[dict] = []
+            dropped = 0
+            for chunk_text, meta in chunks_with_meta:
+                if not (chunk_text or "").strip():
+                    dropped += 1
+                    continue
+                filtered_chunks.append(chunk_text)
+                filtered_meta.append(meta)
+            if dropped:
+                logging.warning("Dropped %d blank chunks for %s", dropped, doc_name)
+            chunks = filtered_chunks
+            chunk_metadata = filtered_meta
+
+            if not chunks:
+                raise ValueError(f"No valid chunks in {doc_name}")
 
             # Verify all chunks have the EXACT document_id
             doc_ids_in_chunks = set(meta.get('document_id') for meta in chunk_metadata)
@@ -1407,12 +1707,24 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             )
 
             logging.info(f"=" * 80)
-            logging.info(f" SUCCESS: Stored {result.get('points_saved', 0)} embeddings")
+            saved = result.get("points_saved", 0)
+            expected_points = len(chunks)
+            if saved != expected_points:
+                raise ValueError(
+                    f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
+                )
+            logging.info(f" SUCCESS: Stored {saved} embeddings")
             logging.info(f"  Document ID: {doc_tag}")
             logging.info(f"  File: {doc_name}")
             logging.info(f"=" * 80)
 
-            return f"Stored {result.get('points_saved', 0)} embeddings"
+            return {
+                "status": "success",
+                "points_saved": saved,
+                "chunks": expected_points,
+                "dropped_chunks": dropped,
+                "coverage_ratio": None,
+            }
 
         else:
             raise ValueError(f"Unsupported format: {type(text)}")
@@ -1431,267 +1743,192 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
         raise
 
 
-def trainData():
-    """Main training function that processes all UNDER_REVIEW documents."""
+def process_document_pipeline(
+    document_id: str,
+    file_bytes: bytes,
+    filename: str,
+    subscription_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """End-to-end ingestion pipeline for a single document."""
+    errors: List[str] = []
+    extraction_info: Dict[str, Any] = {"status": "failed"}
+    security_info: Dict[str, Any] = {"status": "failed"}
+    embedding_info: Dict[str, Any] = {"status": "skipped", "chunks": 0, "upserted": 0}
+    cleanup_info: Dict[str, Any] = {"pickle_deleted": False, "cleanup_pending": True}
+    save_info: Dict[str, Any] = {}
+
     try:
-        logging.info("=" * 80)
-        logging.info("Starting training process")
-        logging.info("=" * 80)
-
-        # Extract document information
-        docColl = extract_document_info()
-
-        if not docColl:
-            logging.warning("No documents found to train")
-            return {"status": "no_documents", "message": "No documents found for training"}
-
-        logging.info(f"Found {len(docColl)} documents in total")
-
-        # Filter documents eligible for training (exclude completed or deleted)
-        under_review_docs = {
-            doc_id: doc_info
-            for doc_id, doc_info in docColl.items()
-            if doc_info['dataDict'].get('status') not in {'DELETED', 'TRAINING_COMPLETED'}
-        }
-
-        # Also compute exact count for explicitly UNDER_REVIEW status for clarity
-        explicitly_under_review = {
-            doc_id: doc_info
-            for doc_id, doc_info in docColl.items()
-            if doc_info['dataDict'].get('status') == 'UNDER_REVIEW'
-        }
-
-        logging.info(
-            f"Found {len(under_review_docs)} documents eligible for processing (excluding DELETED/TRAINING_COMPLETED)")
-        logging.info(f"Found {len(explicitly_under_review)} documents with status == UNDER_REVIEW")
-
-        if not under_review_docs:
-            logging.warning("No documents eligible for training (excluding DELETED/TRAINING_COMPLETED)")
-            return {"status": "no_documents", "message": "No documents pending training"}
-
-        # Process documents and extract data
-        resData = connectData(under_review_docs)
-
-        if not resData:
-            logging.error("No documents were successfully processed")
-            return {"status": "processing_failed", "message": "All documents failed during processing"}
-
-        logging.info(f"Successfully processed {len(resData)} documents")
-
-        # Train each document individually
-        training_results = {
-            "successful": [],
-            "failed": [],
-            "total": len(resData)
-        }
-
-        for doc_id, doc_data in resData.items():
-            try:
-                profile_id = doc_data['profileId']
-                subscription_id = doc_data.get('subscriptionId', 'default')
-                extracted_doc = doc_data['extractedDoc']
-                doc_name = doc_data.get('docName', 'Unknown')
-
-                if not profile_id:
-                    raise ValueError(f"profile_id is required for training document {doc_id}")
-
-                logging.info("-" * 80)
-                logging.info(f"Training document: {doc_name} (ID: {doc_id})")
-                logging.info(f"Profile: {profile_id}")
-                logging.info(f"Number of files in document: {len(extracted_doc)}")
-
-                file_results = []
-                file_errors = []
-
-                # Train each file within the document
-                for file_name, file_content in extracted_doc.items():
-                    try:
-                        logging.info(f"Training file: {file_name}")
-                        result = train_on_document(
-                            file_content,
-                            subscription_id,
-                            profile_id,
-                            doc_id,
-                            file_name
-                        )
-                        logging.info(result)
-                        file_results.append({
-                            "file_name": file_name,
-                            "result": result
-                        })
-                    except Exception as file_error:
-                        logging.error(f"Failed to train file {file_name}: {file_error}")
-                        file_errors.append({
-                            "file_name": file_name,
-                            "error": str(file_error)
-                        })
-
-                # Update document status based on results
-                if file_results and not file_errors:
-                    # All files trained successfully
-                    update_training_status(doc_id, 'TRAINING_COMPLETED')
-                    training_results["successful"].append({
-                        "doc_id": doc_id,
-                        "doc_name": doc_name,
-                        "files_trained": len(file_results),
-                        "results": file_results
-                    })
-                elif file_results and file_errors:
-                    # Partial success
-                    error_msg = f"Partial training: {len(file_results)} succeeded, {len(file_errors)} failed"
-                    update_training_status(doc_id, 'TRAINING_PARTIALLY_COMPLETED', error_msg)
-                    training_results["successful"].append({
-                        "doc_id": doc_id,
-                        "doc_name": doc_name,
-                        "files_trained": len(file_results),
-                        "files_failed": len(file_errors),
-                        "results": file_results,
-                        "errors": file_errors,
-                        "status": "partial"
-                    })
-                else:
-                    # All files failed
-                    error_msg = f"All {len(file_errors)} files failed to train"
-                    update_training_status(doc_id, 'TRAINING_FAILED', error_msg)
-                    training_results["failed"].append({
-                        "doc_id": doc_id,
-                        "doc_name": doc_name,
-                        "errors": file_errors
-                    })
-
-            except Exception as doc_error:
-                logging.error(f"Failed to train document {doc_id}: {doc_error}")
-                update_training_status(doc_id, 'TRAINING_FAILED', str(doc_error))
-                training_results["failed"].append({
-                    "doc_id": doc_id,
-                    "error": str(doc_error)
-                })
-
-        logging.info("=" * 80)
-        logging.info("Training process completed")
-        logging.info(f"Successful: {len(training_results['successful'])}")
-        logging.info(f"Failed: {len(training_results['failed'])}")
-        logging.info("=" * 80)
-
+        extracted_doc = fileProcessor(file_bytes, filename)
+        if not extracted_doc:
+            raise ValueError("No content extracted from file")
+        save_info = save_extracted_pickle(document_id, extracted_doc)
+        update_extraction_metadata(
+            document_id,
+            subscription_id,
+            save_info.get("path"),
+            save_info.get("sha256"),
+        )
+        extraction_info = {"status": "ok", "blob": save_info.get("blob_name")}
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
         return {
-            "status": "completed",
-            "results": training_results,
-            "summary": {
-                "total": training_results["total"],
-                "successful": len(training_results["successful"]),
-                "failed": len(training_results["failed"])
-            }
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
         }
 
+    try:
+        subscription_id = resolve_subscription_id(document_id, subscription_id)
+        profile_id = resolve_profile_id(document_id, profile_id)
+        if save_info:
+            update_extraction_metadata(
+                document_id,
+                subscription_id,
+                save_info.get("path"),
+                save_info.get("sha256"),
+            )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
+        return {
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
+        }
+
+    try:
+        security_report = run_security_screening(document_id)
+        risk_level = str(security_report.get("overall_risk_level") or security_report.get("risk_level") or "").upper()
+        security_status = "passed" if risk_level not in {"HIGH", "CRITICAL"} else "failed"
+        security_info = {
+            "status": security_status,
+            "risk_level": security_report.get("risk_level"),
+            "overall_risk_level": security_report.get("overall_risk_level"),
+        }
+        update_security_screening(document_id, security_report, security_status)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
+        security_info = {"status": "failed", "risk_level": "UNKNOWN"}
+        return {
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
+        }
+
+    if security_info.get("status") != "passed":
+        embedding_info = {"status": "skipped", "chunks": 0, "upserted": 0}
+        return {
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
+        }
+
+    try:
+        pii_masking_enabled = get_subscription_pii_setting(subscription_id)
+        if pii_masking_enabled:
+            masked_docs, pii_count, high_conf, pii_items = mask_document_content(extracted_doc)
+            update_pii_stats(document_id, pii_count, high_conf, pii_items)
+            if high_conf:
+                raise ValueError("High confidentiality content detected")
+        else:
+            masked_docs = extracted_doc
+            update_pii_stats(document_id, 0, False, [])
+
+        vettingPoints = vettingProcessor(masked_docs)
+        updateVetting(document_id, vettingPoints)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
+        embedding_info = {"status": "failed", "chunks": 0, "upserted": 0}
+        return {
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
+        }
+
+    try:
+        total_chunks = 0
+        total_upserted = 0
+        for file_name, file_content in masked_docs.items():
+            result = train_on_document(
+                file_content,
+                subscription_id,
+                profile_id,
+                document_id,
+                file_name,
+            )
+            total_chunks += result.get("chunks", 0)
+            total_upserted += result.get("points_saved", 0)
+        if total_chunks != total_upserted:
+            raise ValueError(f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}")
+        embedding_info = {"status": "completed", "chunks": total_chunks, "upserted": total_upserted}
+    except Exception as exc:  # noqa: BLE001
+        errors.append(str(exc))
+        embedding_info = {"status": "failed", "chunks": 0, "upserted": 0}
+        return {
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
+        }
+
+    try:
+        cleanup_info["pickle_deleted"] = delete_extracted_pickle(document_id)
+        cleanup_info["cleanup_pending"] = not cleanup_info["pickle_deleted"]
+    except Exception as exc:  # noqa: BLE001
+        logging.warning(f"Cleanup failed for {document_id}: {exc}")
+        cleanup_info["pickle_deleted"] = False
+        cleanup_info["cleanup_pending"] = True
+
+    return {
+        "document_id": document_id,
+        "extraction": extraction_info,
+        "security": security_info,
+        "embedding": embedding_info,
+        "cleanup": cleanup_info,
+        "errors": errors,
+    }
+
+
+def trainData():
+    """Extraction-only pipeline for documents eligible for processing."""
+    try:
+        from src.api.extraction_service import extract_documents
+
+        logging.info("=" * 80)
+        logging.info("Starting extraction process")
+        logging.info("=" * 80)
+        return extract_documents()
     except Exception as e:
-        logging.error(f"Critical error in training data: {e}", exc_info=True)
-        return {
-            "status": "error",
-            "message": str(e),
-            "results": None
-        }
+        logging.error(f"Critical error in extraction data: {e}", exc_info=True)
+        return {"status": "error", "message": str(e), "results": None}
 
 
 # New function: train_single_document
 def train_single_document(doc_id: str):
-    """Train a single document identified by its string ID.
-
-    This function will process the specific document (perform extraction and vetting)
-    and then train embeddings for its files. If the document exists but is not in
-    UNDER_REVIEW status, it will still be processed for training (useful for manual triggers).
-    """
+    """Extract a single document identified by its string ID."""
     try:
-        logging.info(f"Starting single-document training for ID: {doc_id}")
+        from src.api.extraction_service import extract_single_document
 
-        # Fetch all document/connector info and locate requested doc
-        docColl = extract_document_info()
-        if not docColl or doc_id not in docColl:
-            logging.warning(f"Document {doc_id} not found in connector information")
-            return {"status": "not_found", "message": f"Document {doc_id} not found"}
-
-        # Prepare a single-document mapping for connectData. Force status to UNDER_REVIEW
-        # so that the existing processing path runs.
-        single_doc_info = copy.deepcopy(docColl[doc_id])
-        # Ensure dataDict exists and set status to UNDER_REVIEW to force processing
-        single_doc_info.setdefault('dataDict', {})
-        single_doc_info['dataDict']['status'] = 'UNDER_REVIEW'
-
-        # connectData expects a mapping of docId -> {dataDict, connDict}
-        resData = connectData({doc_id: single_doc_info})
-
-        if not resData:
-            logging.error(f"Processing failed or no content extracted for document {doc_id}")
-            update_training_status(doc_id, 'TRAINING_FAILED', 'Processing or extraction failed')
-            return {"status": "processing_failed", "message": f"Failed to process document {doc_id}"}
-
-        # Use same training flow as trainData but only for this document
-        training_results = {"successful": [], "failed": [], "total": len(resData)}
-
-        for d_id, doc_data in resData.items():
-            try:
-                profile_id = doc_data['profileId']
-                subscription_id = doc_data.get('subscriptionId', 'default')
-                extracted_doc = doc_data['extractedDoc']
-                doc_name = doc_data.get('docName', 'Unknown')
-
-                if not profile_id:
-                    raise ValueError(f"profile_id is required for training document {d_id}")
-
-                logging.info(f"Training document: {doc_name} (ID: {d_id})")
-
-                file_results = []
-                file_errors = []
-
-                for file_name, file_content in extracted_doc.items():
-                    try:
-                        logging.info(f"Training file: {file_name}")
-                        result = train_on_document(
-                            file_content,
-                            subscription_id,
-                            profile_id,
-                            d_id,
-                            file_name
-                        )
-                        logging.info(result)
-                        file_results.append({"file_name": file_name, "result": result})
-                    except Exception as file_error:
-                        logging.error(f"Failed to train file {file_name}: {file_error}")
-                        file_errors.append({"file_name": file_name, "error": str(file_error)})
-
-                if file_results and not file_errors:
-                    update_training_status(d_id, 'TRAINING_COMPLETED')
-                    training_results['successful'].append({
-                        'doc_id': d_id,
-                        'doc_name': doc_name,
-                        'files_trained': len(file_results),
-                        'results': file_results
-                    })
-                elif file_results and file_errors:
-                    error_msg = f"Partial training: {len(file_results)} succeeded, {len(file_errors)} failed"
-                    update_training_status(d_id, 'TRAINING_PARTIALLY_COMPLETED', error_msg)
-                    training_results['successful'].append({
-                        'doc_id': d_id,
-                        'doc_name': doc_name,
-                        'files_trained': len(file_results),
-                        'files_failed': len(file_errors),
-                        'results': file_results,
-                        'errors': file_errors,
-                        'status': 'partial'
-                    })
-                else:
-                    error_msg = f"All {len(file_errors)} files failed to train"
-                    update_training_status(d_id, 'TRAINING_FAILED', error_msg)
-                    training_results['failed'].append({'doc_id': d_id, 'doc_name': doc_name, 'errors': file_errors})
-
-            except Exception as doc_error:
-                logging.error(f"Failed to train document {d_id}: {doc_error}")
-                update_training_status(d_id, 'TRAINING_FAILED', str(doc_error))
-                training_results['failed'].append({'doc_id': d_id, 'error': str(doc_error)})
-
-        logging.info(f"Single-document training completed for {doc_id}")
-        return {"status": "completed", "results": training_results}
-
+        logging.info(f"Starting single-document extraction for ID: {doc_id}")
+        return extract_single_document(doc_id)
     except Exception as e:
-        logging.error(f"Critical error during single-document training for {doc_id}: {e}", exc_info=True)
+        logging.error(f"Critical error during single-document extraction for {doc_id}: {e}", exc_info=True)
         update_training_status(doc_id, 'TRAINING_FAILED', str(e))
         return {"status": "error", "message": str(e)}
