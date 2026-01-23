@@ -1,0 +1,22 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "Upload completed", "weight": "Bolder", "size": "Medium" },
+    { "type": "TextBlock", "text": "{message}", "wrap": true },
+    {
+      "type": "FactSet",
+      "facts": [
+        { "title": "Files", "value": "{filenames}" },
+        { "title": "Documents", "value": "{documents_created}" }
+      ]
+    }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Summarize upload", "data": { "action": "summarize_recent" } },
+    { "type": "Action.Submit", "title": "Extract fields", "data": { "action": "extract_fields" } },
+    { "type": "Action.Submit", "title": "List docs", "data": { "action": "list_docs" } },
+    { "type": "Action.Submit", "title": "Tools", "data": { "action": "show_tools" } }
+  ]
+}

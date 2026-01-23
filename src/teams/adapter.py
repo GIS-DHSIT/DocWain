@@ -6,12 +6,14 @@ from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
 from src.api.dw_chat import add_message_to_history
-from src.teams.attachments import handle_attachments
+from src.teams.attachments import AttachmentIngestError, IngestionResult, ingest_attachments
 from src.teams.logic import TeamsAnswerResult, TeamsChatError, TeamsChatService
+from src.teams.state import TeamsStateStore
 from src.utils.logging_utils import get_correlation_id, get_logger
 
 logger = logging.getLogger(__name__)
 TEAMS_CHAT_SERVICE = TeamsChatService()
+STATE_STORE = TeamsStateStore()
 
 
 class TeamsAuthError(Exception):
@@ -151,7 +153,22 @@ async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: s
     user_id = extract_user_id(activity)
     context = TEAMS_CHAT_SERVICE.build_context(user_id=user_id, session_id=session_id)
     TEAMS_CHAT_SERVICE.ensure_collection(context.subscription_id)
-    return await handle_attachments(activity, context, correlation_id)
+    result: IngestionResult = await ingest_attachments(
+        activity,
+        turn_context=None,
+        context=context,
+        correlation_id=correlation_id,
+        state_store=STATE_STORE,
+    )
+    filenames = ", ".join(result.filenames)
+    return {
+        "type": "message",
+        "text": (
+            f"Processed file(s): {filenames}. "
+            f"Ingested {result.documents_created} document(s). "
+            "You can start chatting now."
+        ),
+    }
 
 
 async def handle_teams_activity(
@@ -168,7 +185,14 @@ async def handle_teams_activity(
         log.warning("Teams shared secret configured but no headers provided; skipping verification.")
 
     if activity.get("attachments"):
-        return await handle_attachment_activity(activity, correlation_id)
+        try:
+            return await handle_attachment_activity(activity, correlation_id)
+        except AttachmentIngestError as exc:
+            log.error("Teams attachment ingest error: %s", exc)
+            return {"type": "message", "text": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            log.error("Unexpected attachment ingest error: %s", exc, exc_info=True)
+            return {"type": "message", "text": "Unable to ingest the attachment securely. Please try again."}
 
     question = extract_question(activity)
     if not question:
@@ -176,11 +200,14 @@ async def handle_teams_activity(
 
     user_id = extract_user_id(activity)
     session_id = extract_session_id(activity)
+    pref_subscription = session_id if Config.Teams.SESSION_AS_SUBSCRIPTION else Config.Teams.DEFAULT_SUBSCRIPTION
+    pref_profile = user_id if Config.Teams.PROFILE_PER_USER else Config.Teams.DEFAULT_PROFILE
+    prefs = STATE_STORE.get_preferences(pref_subscription, pref_profile)
     context = TEAMS_CHAT_SERVICE.build_context(
         user_id=user_id,
         session_id=session_id,
-        model_name=Config.Teams.DEFAULT_MODEL,
-        persona=Config.Teams.DEFAULT_PERSONA,
+        model_name=prefs.get("model_name") or Config.Teams.DEFAULT_MODEL,
+        persona=prefs.get("persona") or Config.Teams.DEFAULT_PERSONA,
     )
 
     try:

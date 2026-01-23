@@ -123,26 +123,27 @@ class AutoFinetuneOrchestrator:
             self.last_runs[f"{subscription_id}:{profile_id}"] = status
             return status
 
-        dataset_path = build_dataset_from_qdrant(
+        dataset_result = build_dataset_from_qdrant(
             profile_id=profile_id,
             subscription_id=subscription_id,
             max_points=request.max_points,
             questions_per_chunk=request.questions_per_chunk,
             generation_model=request.generation_model,
             client=self.client,
+            run_id=correlation_id,
         )
-        if not dataset_path.exists():
+        if dataset_result.status != "success" or not dataset_result.dataset_path:
             status = FinetuneStatus(
                 job_id="skipped",
                 profile_id=profile_id,
                 status="skipped",
-                message="Dataset generation failed",
+                message=f"Dataset generation {dataset_result.status}",
                 params=request.model_dump(),
             )
             self.last_runs[f"{subscription_id}:{profile_id}"] = status
             return status
 
-        with dataset_path.open("r", encoding="utf-8") as dataset_file:
+        with dataset_result.dataset_path.open("r", encoding="utf-8") as dataset_file:
             record_count = sum(1 for _ in dataset_file)
         if record_count < self.policy.min_records:
             status = FinetuneStatus(
@@ -157,12 +158,13 @@ class AutoFinetuneOrchestrator:
 
         finetune_request = FinetuneRequest(
             profile_id=profile_id,
-            dataset_path=str(dataset_path),
+            dataset_path=str(dataset_result.dataset_path),
             include_actual_data=False,
             qdrant_snapshot={
                 "collection": build_collection_name(subscription_id),
                 "points": profile_point_count,
             },
+            training_run_id=correlation_id,
         )
         status = manager.start_job(finetune_request)
         log.info("Auto finetune scheduled for %s/%s", subscription_id, profile_id)

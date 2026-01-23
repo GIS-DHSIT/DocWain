@@ -15,6 +15,21 @@
 - Local development: `docker-compose up --build` now starts a Redis 7 container and wires the app to it with no auth and SSL disabled. Verify it is running with `docker compose exec redis redis-cli ping`.
 - If you point at your own Redis instance, update the env vars above and restart the service so the client reinitializes with the new settings.
 
+## Embedding Pickles from Blob Storage
+
+How to run:
+- Set `AZURE_STORAGE_CONNECTION_STRING` (raw or base64-encoded). `AZURE_BLOB_CONNECTION_STRING` is ignored.
+- Set `DOCWAIN_BLOB_CONTAINER=document-content` or `AZURE_BLOB_CONTAINER_NAME=document-content`, and optionally `DOCWAIN_BLOB_PREFIX` to scope blobs (e.g. `pickles/`).
+- Chat history uses `AZURE_CHAT_CONTAINER_NAME` (defaults to `chat-history`); document pickles use `DOCWAIN_BLOB_CONTAINER`/`AZURE_BLOB_CONTAINER_NAME`.
+- Start the API: `uvicorn src.main:app --reload`
+
+Example embed call (processes available pickle blobs):
+```bash
+curl -X POST http://localhost:8000/api/documents/embed \\
+  -H \"Content-Type: application/json\" \\
+  -d '{\"max_blobs\": 5}'
+```
+
 ### Fine-tuning with Unsloth (LLama 3.2) from a Qdrant collection
 
 1) Install deps: `pip install -r requirements.txt` (includes `unsloth`, `trl`, `datasets`, `transformers`, `bitsandbytes`).
@@ -46,3 +61,16 @@ curl -X POST http://localhost:8000/finetune -H "Content-Type: application/json" 
    - Swap `generation_model` to a stronger generator if available.
    - Increase `num_epochs`/`max_steps` and adjust `learning_rate`, `batch_size`, and `gradient_accumulation` for tougher domains.
    - Tune LoRA knobs: `lora_r`, `lora_alpha`, `lora_dropout`.
+
+## Tools Framework (API)
+
+- All tools live under `/api/tools/*` with a standard response shape and correlation id. Use `/api/tools/run` for generic invocation:  
+  `curl -X POST http://localhost:8000/api/tools/run -H "Content-Type: application/json" -d '{"tool_name":"translator","input":{"text":"hello","target_lang":"fr"}}'`
+- Speech-to-Text: `curl -X POST http://localhost:8000/api/tools/stt/transcribe -F "audio_file=@sample.wav"` (returns transcript + segments; requires Whisper installed).
+- Text-to-Speech: `curl -X POST http://localhost:8000/api/tools/tts/speak -H "Content-Type: application/json" -d '{"text":"hello docwain"}'` (streams WAV audio).
+- Translator: `curl -X POST http://localhost:8000/api/tools/translator/translate -H "Content-Type: application/json" -d '{"text":"hola","target_lang":"en"}'`
+- Creator/Tutor/Email draft examples:  
+  `curl -X POST http://localhost:8000/api/tools/creator/generate -H "Content-Type: application/json" -d '{"content_type":"summary","text":"Safety checklist"}'`  
+  `curl -X POST http://localhost:8000/api/tools/tutor/lesson -H "Content-Type: application/json" -d '{"topic":"network security","learning_level":"beginner"}'`  
+  `curl -X POST http://localhost:8000/api/tools/email/draft -H "Content-Type: application/json" -d '{"intent":"follow up","recipient_role":"customer","tone":"concise"}'`
+- Connectors and analysis: `/api/tools/db/query`, `/api/tools/code/docs`, `/api/tools/web/analyze`, `/api/tools/jira_confluence/summarize`, `/api/tools/resumes/analyze`, `/api/tools/medical/summarize`, `/api/tools/lawhere/analyze`.

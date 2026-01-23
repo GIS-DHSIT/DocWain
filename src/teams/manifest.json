@@ -10,7 +10,7 @@
   },
   "description": {
     "short": "Ask DocWain questions from Microsoft Teams.",
-    "full": "DocWain lets you ask questions against your documents directly from Teams. Configure the messaging endpoint to point at /teams/messages."
+    "full": "Upload files in Teams, DocWain ingests them automatically, and you can chat or run tools (summaries, extraction, model/persona switch) right away. Configure the messaging endpoint to point at /teams/messages."
   },
   "accentColor": "#004578",
   "icons": {
@@ -38,10 +38,23 @@
             {
               "title": "Help",
               "description": "Get usage tips"
+            },
+            {
+              "title": "Tools",
+              "description": "Show DocWain tools for this chat"
             }
           ]
         }
       ]
+    }
+  ],
+  "staticTabs": [
+    {
+      "entityId": "docwain-web",
+      "name": "DocWain",
+      "contentUrl": "https://www.docwain.ai",
+      "websiteUrl": "https://www.docwain.ai",
+      "scopes": ["personal"]
     }
   ],
   "webApplicationInfo": {

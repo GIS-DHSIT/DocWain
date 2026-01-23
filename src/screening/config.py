@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .models import compute_config_hash
+
+logger = logging.getLogger(__name__)
+_LEGACY_VETTING_NOTICE_LOGGED = False
 
 DEFAULT_WEIGHTS = {
     "integrity_hash": 0.07,
@@ -59,6 +63,22 @@ def _parse_bool(value: str | bool | None, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _log_legacy_vetting_notice() -> None:
+    global _LEGACY_VETTING_NOTICE_LOGGED
+    if _LEGACY_VETTING_NOTICE_LOGGED:
+        return
+    _LEGACY_VETTING_NOTICE_LOGGED = True
+    logger.info("Legacy vetting config not found — proceeding with screening defaults")
+
+
+def log_legacy_vetting_notice_if_missing(path: Optional[str] = None) -> None:
+    config_path = Path(path) if path else Path(
+        os.getenv("SCREENING_CONFIG_PATH", "") or Path.cwd() / "screening_config.json"
+    )
+    if not config_path.exists():
+        _log_legacy_vetting_notice()
+
+
 @dataclass
 class ScreeningConfig:
     """Configuration holder for the screening subsystem."""
@@ -86,8 +106,7 @@ class ScreeningConfig:
         """Load configuration from JSON + environment overrides."""
         default_path = Path(
             os.getenv("SCREENING_CONFIG_PATH", "")
-            or os.getenv("VETTING_CONFIG_PATH", "")
-            or Path.cwd() / "vetting_config.json"
+            or Path.cwd() / "screening_config.json"
         )
         config_path = Path(path) if path else default_path
         data: Dict[str, Any] = {}
@@ -99,12 +118,11 @@ class ScreeningConfig:
                 source = str(config_path)
             except Exception:
                 data = {}
+        else:
+            _log_legacy_vetting_notice()
 
         weights = dict(DEFAULT_WEIGHTS)
         weights.update(data.get("weights", {}) if isinstance(data.get("weights"), dict) else {})
-        legacy_resume_weight = weights.pop("resume_vetting", None)
-        if legacy_resume_weight is not None:
-            weights["resume_screening"] = legacy_resume_weight
 
         enabled_tools = data.get("enabled_tools") if isinstance(data.get("enabled_tools"), list) else list(weights.keys())
         sigmoid = data.get("sigmoid", {}) if isinstance(data.get("sigmoid"), dict) else {}
@@ -114,19 +132,14 @@ class ScreeningConfig:
         sensitive_keywords = data.get("sensitive_keywords", DEFAULT_POLICY_RULES.get("sensitive_keywords", []))
         search_provider = data.get("search_provider", {}) if isinstance(data.get("search_provider"), dict) else {}
 
-        env_tools = os.getenv("SCREENING_ENABLED_TOOLS") or os.getenv("VETTING_ENABLED_TOOLS")
+        env_tools = os.getenv("SCREENING_ENABLED_TOOLS")
         if env_tools:
             enabled_tools = [tool.strip() for tool in env_tools.split(",") if tool.strip()]
-        enabled_tools = [
-            "resume_screening" if tool == "resume_vetting" else tool for tool in (enabled_tools or [])
-        ]
         if "legality_agent" not in enabled_tools:
             enabled_tools.append("legality_agent")
 
         for tool_name in list(weights.keys()):
-            env_weight = os.getenv(f"SCREENING_WEIGHT_{tool_name.upper()}") or os.getenv(
-                f"VETTING_WEIGHT_{tool_name.upper()}"
-            )
+            env_weight = os.getenv(f"SCREENING_WEIGHT_{tool_name.upper()}")
             if env_weight:
                 try:
                     weights[tool_name] = float(env_weight)
@@ -135,56 +148,56 @@ class ScreeningConfig:
 
         internet_from_file = _parse_bool(data.get("internet_enabled"), default=False)
         internet_enabled = _parse_bool(
-            os.getenv("SCREENING_INTERNET_ENABLED") or os.getenv("VETTING_INTERNET_ENABLED"),
+            os.getenv("SCREENING_INTERNET_ENABLED"),
             default=internet_from_file,
         )
         auto_attach_default = _parse_bool(data.get("auto_attach_on_ingest"), default=False)
         auto_attach = _parse_bool(
-            os.getenv("SCREENING_AUTO_ATTACH_ON_INGEST") or os.getenv("VETTING_AUTO_ATTACH_ON_INGEST"),
+            os.getenv("SCREENING_AUTO_ATTACH_ON_INGEST"),
             default=auto_attach_default,
         )
         block_default = _parse_bool(data.get("block_high_risk"), default=False)
         block_high_risk = _parse_bool(
-            os.getenv("SCREENING_BLOCK_HIGH_RISK") or os.getenv("VETTING_BLOCK_HIGH_RISK"),
+            os.getenv("SCREENING_BLOCK_HIGH_RISK"),
             default=block_default,
         )
 
-        if os.getenv("SCREENING_SIGMOID_A") or os.getenv("VETTING_SIGMOID_A"):
+        if os.getenv("SCREENING_SIGMOID_A"):
             try:
                 sigmoid["a"] = float(
-                    os.getenv("SCREENING_SIGMOID_A") or os.getenv("VETTING_SIGMOID_A") or sigmoid.get("a", 6.0)
+                    os.getenv("SCREENING_SIGMOID_A") or sigmoid.get("a", 6.0)
                 )
             except ValueError:
                 pass
-        if os.getenv("SCREENING_SIGMOID_B") or os.getenv("VETTING_SIGMOID_B"):
+        if os.getenv("SCREENING_SIGMOID_B"):
             try:
                 sigmoid["b"] = float(
-                    os.getenv("SCREENING_SIGMOID_B") or os.getenv("VETTING_SIGMOID_B") or sigmoid.get("b", 0.50)
+                    os.getenv("SCREENING_SIGMOID_B") or sigmoid.get("b", 0.50)
                 )
             except ValueError:
                 pass
 
-        if os.getenv("SCREENING_RISK_HIGH") or os.getenv("VETTING_RISK_HIGH"):
+        if os.getenv("SCREENING_RISK_HIGH"):
             try:
                 risk_thresholds["high"] = float(
-                    os.getenv("SCREENING_RISK_HIGH") or os.getenv("VETTING_RISK_HIGH") or "75"
+                    os.getenv("SCREENING_RISK_HIGH") or "75"
                 )
             except ValueError:
                 pass
-        if os.getenv("SCREENING_RISK_MEDIUM") or os.getenv("VETTING_RISK_MEDIUM"):
+        if os.getenv("SCREENING_RISK_MEDIUM"):
             try:
                 risk_thresholds["medium"] = float(
-                    os.getenv("SCREENING_RISK_MEDIUM") or os.getenv("VETTING_RISK_MEDIUM") or "45"
+                    os.getenv("SCREENING_RISK_MEDIUM") or "45"
                 )
             except ValueError:
                 pass
 
-        if os.getenv("SCREENING_SEARCH_PROVIDER") or os.getenv("VETTING_SEARCH_PROVIDER"):
-            search_provider["provider"] = os.getenv("SCREENING_SEARCH_PROVIDER") or os.getenv("VETTING_SEARCH_PROVIDER")
-        if os.getenv("SCREENING_SEARCH_API_KEY") or os.getenv("VETTING_SEARCH_API_KEY"):
-            search_provider["api_key"] = os.getenv("SCREENING_SEARCH_API_KEY") or os.getenv("VETTING_SEARCH_API_KEY")
-        if os.getenv("SCREENING_SEARCH_ENDPOINT") or os.getenv("VETTING_SEARCH_ENDPOINT"):
-            search_provider["endpoint"] = os.getenv("SCREENING_SEARCH_ENDPOINT") or os.getenv("VETTING_SEARCH_ENDPOINT")
+        if os.getenv("SCREENING_SEARCH_PROVIDER"):
+            search_provider["provider"] = os.getenv("SCREENING_SEARCH_PROVIDER")
+        if os.getenv("SCREENING_SEARCH_API_KEY"):
+            search_provider["api_key"] = os.getenv("SCREENING_SEARCH_API_KEY")
+        if os.getenv("SCREENING_SEARCH_ENDPOINT"):
+            search_provider["endpoint"] = os.getenv("SCREENING_SEARCH_ENDPOINT")
 
         config = cls(
             enabled_tools=enabled_tools,

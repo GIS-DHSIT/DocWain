@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from src.execution.common import ExecutionResult, chunk_text_stream
+from src.metrics.ai_metrics import get_metrics_store
 from src.mode.execution_mode import ExecutionMode
 from src.runtime.chain_factory import build_chain
 from src.runtime.freshness_guard import FreshnessGuard
@@ -49,6 +50,13 @@ def run_normal_mode(
         "evidence_ids": evidence_ids,
     }
     _ensure_debug_metadata(answer, debug_info)
+    metrics_store = get_metrics_store()
+    if metrics_store.available:
+        metrics_store.record(
+            distributions={"agent_execution": {ExecutionMode.NORMAL.value: 1}},
+            agent=ExecutionMode.NORMAL.value,
+            model_id=ctx.model_name,
+        )
 
     stream_iterable = None
     if stream:
