@@ -159,8 +159,6 @@ def test_process_pipeline_deletes_on_success(monkeypatch):
     monkeypatch.setattr(dataHandler, "get_subscription_pii_setting", lambda sub: False)
     monkeypatch.setattr(dataHandler, "mask_document_content", lambda docs: (docs, 0, False, []))
     monkeypatch.setattr(dataHandler, "update_pii_stats", lambda *a, **k: None)
-    monkeypatch.setattr(dataHandler, "vettingProcessor", lambda docs: {})
-    monkeypatch.setattr(dataHandler, "updateVetting", lambda *a, **k: None)
 
     monkeypatch.setattr(
         dataHandler,

@@ -18,8 +18,9 @@
 ## Embedding Pickles from Blob Storage
 
 How to run:
-- Set `AZURE_STORAGE_CONNECTION_STRING` (preferred) or `DOCWAIN_BLOB_ACCOUNT_URL` for managed identity.
-- Set `DOCWAIN_BLOB_CONTAINER=document-content` and optionally `DOCWAIN_BLOB_PREFIX` to scope blobs (e.g. `pickles/`).
+- Set `AZURE_STORAGE_CONNECTION_STRING` (raw or base64-encoded). `AZURE_BLOB_CONNECTION_STRING` is ignored.
+- Set `DOCWAIN_BLOB_CONTAINER=document-content` or `AZURE_BLOB_CONTAINER_NAME=document-content`, and optionally `DOCWAIN_BLOB_PREFIX` to scope blobs (e.g. `pickles/`).
+- Chat history uses `AZURE_CHAT_CONTAINER_NAME` (defaults to `chat-history`); document pickles use `DOCWAIN_BLOB_CONTAINER`/`AZURE_BLOB_CONTAINER_NAME`.
 - Start the API: `uvicorn src.main:app --reload`
 
 Example embed call (processes available pickle blobs):

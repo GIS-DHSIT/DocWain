@@ -94,23 +94,19 @@ class Config:
         BUCKET_NAME = 'docwain-chat-history'
 
     class AzureBlob:
-        CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=dwchathistory;AccountKey=1qh9meNrD3PJIbSpfOSC8uMhhg23rMrxBQ0PhL0+QRnE+RUNt1GFx7PCZILc6/XVL5GCrfiZvoQl+ASt3jNtPQ==;EndpointSuffix=core.windows.net"
-        CONTAINER_NAME = "chat-history"
-        BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=your_account_name;AccountKey=your_account_key;EndpointSuffix=core.windows.net"
-        blob_key = "1qh9meNrD3PJIbSpfOSC8uMhhg23rMrxBQ0PhL0+QRnE+RUNt1GFx7PCZILc6/XVL5GCrfiZvoQl+ASt3jNtPQ=="
-
-    class DocAzureBlob:
-        AZURE_BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=docwainuploads;AccountKey=+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA==;EndpointSuffix=core.windows.net"
-        AZURE_BLOB_CONTAINER_NAME = "local-uploads"
+        CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=docwainuploads;AccountKey=+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA==;EndpointSuffix=core.windows.net"
         AZURE_BLOB_KEY = "+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA=="
         AZURE_BLOB_ACCOUNT_NAME = "docwainuploads"
+        CONTAINER_NAME = "chat-history"
+        DOCUMENT_CONTAINER_NAME = "document-content"
 
-    class VettingAzureBlob:
-        AZURE_BLOB_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=docwainvetting;AccountKey=CM3patdUte0Fm82aFbNBffxtBVHS2i0CzC5JWPy/uQ0C/JtJwGrvHqZ2FO1C/7KH3iduWuCyA/pQ+AStRQkRiQ==;EndpointSuffix=core.windows.net"
-        AZURE_BLOB_CONTAINER_NAME = "configuration"
-        AZURE_BLOB_KEY = "CM3patdUte0Fm82aFbNBffxtBVHS2i0CzC5JWPy/uQ0C/JtJwGrvHqZ2FO1C/7KH3iduWuCyA/pQ+AStRQkRiQ=="
-        AZURE_BLOB_ACCOUNT_NAME = "docwainvetting"
-        AZURE_BLOB_FILE_NAME = "default/Vetting conditions_3words.xlsx"
+        @classmethod
+        def validate(cls) -> None:
+            if not cls.CONNECTION_STRING:
+                raise ValueError(
+                    "AzureBlob.CONNECTION_STRING is missing or empty. Set AZURE_STORAGE_CONNECTION_STRING."
+                )
+
 
     class Redis:
         CONNECTION_STRING = DEFAULT_REDIS_CONNECTION_STRING

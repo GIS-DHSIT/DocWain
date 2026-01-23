@@ -26,17 +26,14 @@ from typing import Any, Dict, Iterable, List, Optional
 from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
+from src.api.config import Config
+from src.storage.azure_blob_client import get_blob_service_client, get_document_container_client, has_blob_credentials
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CONTAINER = "document-content"
 _DEFAULT_PREFIX = ""
 _TRUSTED_TYPE = "extracted_doc"
-
-
-try:  # Optional dependency for managed identity auth
-    from azure.identity import DefaultAzureCredential  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    DefaultAzureCredential = None
 
 
 class BlobConfigurationError(ValueError):
@@ -54,7 +51,7 @@ class BlobInfo:
 
 
 def blob_storage_configured() -> bool:
-    return bool(os.getenv("AZURE_STORAGE_CONNECTION_STRING") or os.getenv("DOCWAIN_BLOB_ACCOUNT_URL"))
+    return has_blob_credentials()
 
 
 def _normalize_prefix(prefix: Optional[str]) -> str:
@@ -64,21 +61,10 @@ def _normalize_prefix(prefix: Optional[str]) -> str:
 
 
 def _build_service_client() -> BlobServiceClient:
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    if connection_string:
-        return BlobServiceClient.from_connection_string(connection_string)
-
-    account_url = os.getenv("DOCWAIN_BLOB_ACCOUNT_URL")
-    if not account_url:
-        raise BlobConfigurationError(
-            "DOCWAIN_BLOB_ACCOUNT_URL is not set and AZURE_STORAGE_CONNECTION_STRING is missing."
-        )
-
-    if DefaultAzureCredential is None:
-        raise BlobConfigurationError("azure-identity is required for DefaultAzureCredential auth.")
-
-    credential = DefaultAzureCredential()
-    return BlobServiceClient(account_url=account_url, credential=credential)
+    try:
+        return get_blob_service_client()
+    except Exception as exc:  # noqa: BLE001
+        raise BlobConfigurationError(str(exc)) from exc
 
 
 class BlobStore:
@@ -89,10 +75,15 @@ class BlobStore:
         prefix: Optional[str] = None,
         service_client: Optional[BlobServiceClient] = None,
     ) -> None:
-        self.container = container or os.getenv("DOCWAIN_BLOB_CONTAINER", _DEFAULT_CONTAINER)
+        default_container = getattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", _DEFAULT_CONTAINER)
+        self.container = container or default_container
         self.prefix = _normalize_prefix(prefix if prefix is not None else os.getenv("DOCWAIN_BLOB_PREFIX", _DEFAULT_PREFIX))
-        self._service_client = service_client or _build_service_client()
-        self._container_client = self._service_client.get_container_client(self.container)
+        if service_client is not None or container is not None:
+            self._service_client = service_client or _build_service_client()
+            self._container_client = self._service_client.get_container_client(self.container)
+        else:
+            self._service_client = None
+            self._container_client = get_document_container_client()
 
     @property
     def container_client(self):
