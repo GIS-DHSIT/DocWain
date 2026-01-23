@@ -21,6 +21,7 @@ from qdrant_client import QdrantClient
 from src.api.config import Config
 from src.api.dataHandler import (
     db,
+    clear_legacy_vetting_metadata,
     delete_embeddings,
     get_subscription_pii_setting,
     trainData,
@@ -56,6 +57,8 @@ from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
 from src.execution.common import normalize_answer, chunk_text_stream
 from src.screening.api import screening_router
+from src.screening.config import log_legacy_vetting_notice_if_missing
+from src.storage.azure_blob_client import validate_containers_once
 from botbuilder.schema import Activity
 
 from src.teams import adapter as teams_adapter
@@ -103,6 +106,22 @@ api_router.include_router(documents_router, tags=["Documents"])
 api_router.include_router(tools_router, tags=["Tools"])
 
 session_state_store = SessionStateStore()
+
+
+@app.on_event("startup")
+async def _startup_checks() -> None:
+    try:
+        validate_containers_once()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Azure blob container validation skipped: %s", exc)
+    try:
+        clear_legacy_vetting_metadata()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Legacy metadata cleanup skipped: %s", exc)
+    try:
+        log_legacy_vetting_notice_if_missing()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Legacy config notice skipped: %s", exc)
 
 
 @app.exception_handler(HTTPException)

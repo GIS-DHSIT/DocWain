@@ -16,7 +16,6 @@ import boto3 as b3
 import numpy as np
 import pandas as pd
 from Crypto.Cipher import AES
-from azure.storage.blob import BlobServiceClient
 from bson.objectid import ObjectId
 from pymongo import MongoClient, errors
 from qdrant_client import QdrantClient
@@ -27,13 +26,23 @@ from urllib.parse import urlparse
 
 from src.api.config import Config
 from src.api.context_understanding import ContextUnderstanding
-from src.api.documentVetting import mask_document_content, vettingProcessor
+from src.api.pii_masking import mask_document_content
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
+from azure.core.exceptions import ResourceNotFoundError
+
+from src.storage.azure_blob_client import (
+    classify_blob_error,
+    get_container_client,
+    get_document_container_client,
+    iter_blob_name_candidates,
+    normalize_blob_name,
+    sanitize_blob_url,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -93,7 +102,10 @@ def get_subscription_pii_setting(subscription_id: str) -> bool:
                 logging.warning(f"Subscription {subscription_id}: PII setting not found, defaulting to ENABLED")
                 return True  # Safe default - enable PII masking if not specified
         else:
-            logging.warning(f"Subscription {subscription_id} not found in database, defaulting to PII ENABLED")
+            logging.warning(
+                "PII masking defaulted to enabled because subscription not found (subscription_id=%s)",
+                subscription_id,
+            )
             return True  # Safe default
 
     except Exception as e:
@@ -388,24 +400,6 @@ def get_s3_document_info(s3_uri):
         return {"Error": str(e)}
 
 
-def updateVetting(document_id, new_value):
-    """Updates vetting points in MongoDB."""
-    try:
-        filter_criteria = {"_id": ObjectId(document_id)}
-        update_operation = {"$set": {'vettingPoints': new_value}}
-        collection = db[Config.MongoDB.DOCUMENTS]
-        result = collection.update_one(filter_criteria, update_operation)
-        if result.matched_count > 0:
-            logging.info(f"Document with ID {document_id} updated successfully.")
-            return {"status": "success", "matched_count": result.matched_count, "modified_count": result.modified_count}
-        else:
-            logging.warning(f"No document found with ID {document_id}.")
-            return {"status": "not_found", "matched_count": 0, "modified_count": 0}
-    except Exception as e:
-        logging.error(f"Error updating document: {e}")
-        return {"status": "error", "message": str(e)}
-
-
 def update_training_status(document_id, status, error_msg=None):
     """Updates training status in MongoDB for a specific document."""
     try:
@@ -561,6 +555,19 @@ def update_pii_stats(document_id, masked_count, high_confidential, pii_items=Non
         logging.error(f"Error updating PII stats for {document_id}: {e}")
 
 
+def clear_legacy_vetting_metadata() -> None:
+    """Remove deprecated vetting metadata from all documents."""
+    try:
+        collection = db[Config.MongoDB.DOCUMENTS]
+        result = collection.update_many({"vettingPoints": {"$exists": True}}, {"$unset": {"vettingPoints": ""}})
+        if result.modified_count:
+            logging.info("Cleared legacy vetting metadata from %s documents.", result.modified_count)
+        else:
+            logging.info("Legacy vetting metadata not present; no cleanup needed.")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Legacy vetting metadata cleanup skipped: %s", exc)
+
+
 def get_pii_stats(document_id):
     """Retrieve PII masking stats for a document."""
     try:
@@ -605,17 +612,78 @@ def get_pii_stats(document_id):
         return None
 
 
-def get_azure_docs(files):
-    """Fetches documents from Azure Blob Storage."""
+def get_azure_docs(files, *, document_id: Optional[str] = None):
+    """Fetch documents from Azure Blob Storage."""
+    container_name = getattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", "document-content")
+    blob_name = normalize_blob_name(files, container_name=container_name)
+    container_candidates = []
+
+    if isinstance(files, str) and files.startswith("az://"):
+        parsed = urlparse(files)
+        raw_path = parsed.path.lstrip("/")
+        path_parts = raw_path.split("/", 1) if raw_path else []
+        if parsed.netloc and parsed.netloc != container_name:
+            container_candidates.append(parsed.netloc)
+        elif path_parts and path_parts[0] and path_parts[0] != container_name:
+            container_candidates.append(path_parts[0])
+
+    teams_container = getattr(Config.Teams, "BLOB_CONTAINER", "")
+    local_prefixed_blob = None
+    if teams_container and teams_container != container_name:
+        if blob_name.startswith("local/"):
+            container_candidates.append(teams_container)
+        else:
+            local_prefixed_blob = f"local/{blob_name}"
+            container_candidates.append(teams_container)
+
+    container_candidates.append(container_name)
+    seen_containers = set()
     try:
-        blob_service_client = BlobServiceClient.from_connection_string(Config.DocAzureBlob.AZURE_BLOB_CONNECTION_STRING)
-        container_client = blob_service_client.get_container_client(Config.DocAzureBlob.AZURE_BLOB_CONTAINER_NAME)
-        blob_client = container_client.get_blob_client('local/' + files)
-        blob_data = blob_client.download_blob().readall()
-        return blob_data
-    except Exception as e:
-        logging.error(f"Error fetching Azure documents: {e}")
-        return None
+        last_exc = None
+        for candidate_container in container_candidates:
+            if candidate_container in seen_containers:
+                continue
+            seen_containers.add(candidate_container)
+            container_client = (
+                get_document_container_client()
+                if candidate_container == container_name
+                else get_container_client(candidate_container)
+            )
+            name_variants = [blob_name]
+            if candidate_container == teams_container and local_prefixed_blob:
+                name_variants.insert(0, local_prefixed_blob)
+            for name_variant in name_variants:
+                for candidate in iter_blob_name_candidates(name_variant):
+                    blob_client = container_client.get_blob_client(blob=candidate)
+                    blob_url = sanitize_blob_url(getattr(blob_client, "url", ""))
+                    if blob_url:
+                        logging.info("Downloading blob for document_id=%s url=%s", document_id, blob_url)
+                    else:
+                        logging.info(
+                            "Downloading blob for document_id=%s container=%s blob=%s",
+                            document_id,
+                            candidate_container,
+                            candidate,
+                        )
+                    try:
+                        return blob_client.download_blob().readall()
+                    except ResourceNotFoundError as exc:
+                        last_exc = exc
+                        continue
+        if last_exc:
+            raise last_exc
+        raise ResourceNotFoundError(message="Blob name candidates empty", response=None)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001
+        error = classify_blob_error(exc, document_id=document_id, blob_name=blob_name)
+        logging.error(
+            "Blob download failed document_id=%s blob=%s error_type=%s message=%s request_id=%s",
+            document_id,
+            blob_name,
+            error.__class__.__name__,
+            exc,
+            error.request_id,
+        )
+        raise error from exc
 
 
 '-------------------------------modified by maha/maria-----------------------'
@@ -763,11 +831,13 @@ def connectData(documentConnection):
 
                     # Process ONLY this document's specific file
                     try:
-                        # Extract the path after 'az://' prefix
-                        file_key = file_path.split('/', 4)[-1] if file_path.startswith('az://') else file_path
+                        # Extract the blob name after 'az://' prefix while preserving nested paths
+                        file_key = normalize_blob_name(
+                            file_path, container_name=Config.AzureBlob.DOCUMENT_CONTAINER_NAME
+                        )
                         logging.info(f"Reading file: {file_key} for document {docId}")
 
-                        docContent = get_azure_docs(file_key)
+                        docContent = get_azure_docs(file_key, document_id=docId)
                         if docContent is None:
                             logging.error(f"Failed to read Azure file {file_key} for document {docId}")
                             update_training_status(docId, 'TRAINING_FAILED', f'Failed to read file {file_key}')
@@ -795,7 +865,7 @@ def connectData(documentConnection):
                         update_training_status(docId, 'TRAINING_FAILED', str(file_error))
                         continue
 
-                # Apply PII masking and vetting
+                # Apply PII masking
                 if all_extracted_docs:
                     try:
                         save_info = save_extracted_pickle(docId, all_extracted_docs)
@@ -829,15 +899,8 @@ def connectData(documentConnection):
                         continue
 
                     if pii_masking_enabled:
-                        masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
-                        update_pii_stats(docId, pii_count, high_conf, pii_items)
-
-                        if high_conf:
-                            logging.error(
-                                f"High confidentiality content detected in document {docId}; blocking training")
-                            update_training_status(docId, 'TRAINING_BLOCKED_CONFIDENTIAL',
-                                                   'High confidentiality content detected')
-                            continue
+                        masked_docs, pii_count, _high_conf, pii_items = mask_document_content(all_extracted_docs)
+                        update_pii_stats(docId, pii_count, False, pii_items)
 
                         # Recompute embeddings for structured data after masking
                         for fname, content in masked_docs.items():
@@ -851,12 +914,8 @@ def connectData(documentConnection):
                         logging.info(f"PII masking disabled for subscription {subscriptionId}")
                         masked_docs = all_extracted_docs
                         pii_count = 0
-                        high_conf = False
                         pii_items = []
                         update_pii_stats(docId, 0, False, [])
-
-                    vettingPoints = vettingProcessor(masked_docs)
-                    updateVetting(docId, vettingPoints)
 
                     #  Store with explicit documentId
                     dataDict[docId] = {
@@ -1838,16 +1897,11 @@ def process_document_pipeline(
     try:
         pii_masking_enabled = get_subscription_pii_setting(subscription_id)
         if pii_masking_enabled:
-            masked_docs, pii_count, high_conf, pii_items = mask_document_content(extracted_doc)
-            update_pii_stats(document_id, pii_count, high_conf, pii_items)
-            if high_conf:
-                raise ValueError("High confidentiality content detected")
+            masked_docs, pii_count, _high_conf, pii_items = mask_document_content(extracted_doc)
+            update_pii_stats(document_id, pii_count, False, pii_items)
         else:
             masked_docs = extracted_doc
             update_pii_stats(document_id, 0, False, [])
-
-        vettingPoints = vettingProcessor(masked_docs)
-        updateVetting(document_id, vettingPoints)
     except Exception as exc:  # noqa: BLE001
         errors.append(str(exc))
         embedding_info = {"status": "failed", "chunks": 0, "upserted": 0}

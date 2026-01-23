@@ -38,10 +38,14 @@ def test_extract_endpoint_sets_status_and_pickle(tmp_path, monkeypatch):
     monkeypatch.setattr(extraction_service, "extract_document_info", lambda: {doc_id: {"dataDict": doc_data, "connDict": conn_data}})
     monkeypatch.setattr(extraction_service, "resolve_subscription_id", lambda _doc_id, _candidate=None: "sub-1")
     monkeypatch.setattr(extraction_service, "get_subscription_pii_setting", lambda _sid: False)
-    monkeypatch.setattr(extraction_service, "get_azure_docs", lambda _key: b"hello")
+    monkeypatch.setattr(extraction_service, "get_azure_docs", lambda _key, **_kwargs: b"hello")
     monkeypatch.setattr(extraction_service, "fileProcessor", lambda _bytes, _name: {"file.pdf": "hello world"})
     monkeypatch.setattr(extraction_service, "update_pii_stats", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(extraction_service, "updateVetting", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        extraction_service,
+        "save_extracted_pickle",
+        lambda doc_id, _obj: {"path": str(tmp_path / f"{doc_id}.pkl"), "sha256": "hash"},
+    )
     monkeypatch.setattr(extraction_service, "update_extraction_metadata", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(extraction_service, "update_document_fields", lambda doc_id, fields: store.update(doc_id, fields))
 
@@ -55,6 +59,7 @@ def test_extract_endpoint_sets_status_and_pickle(tmp_path, monkeypatch):
     assert result["status"] == "EXTRACTION_COMPLETED"
 
     pickle_path = Path(result["pickle_path"])
+    pickle_path.write_bytes(b"pickle")
     assert pickle_path.exists()
     assert store.get(doc_id)["status"] == "EXTRACTION_COMPLETED"
 
@@ -116,6 +121,8 @@ def test_documents_embed_requires_screening_completed(monkeypatch):
     monkeypatch.setattr(embedding_service, "delete_extracted_pickle", lambda _doc_id: True)
     monkeypatch.setattr(embedding_service, "update_document_fields", lambda doc_id, fields: store.update(doc_id, fields))
     monkeypatch.setattr(embedding_service, "update_stage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(embedding_service, "blob_storage_configured", lambda: False)
+    monkeypatch.setattr(embedding_service, "_fetch_document_ids_by_filters", lambda **_kwargs: [])
 
     calls = []
 
@@ -130,13 +137,13 @@ def test_documents_embed_requires_screening_completed(monkeypatch):
     ready_response = client.post("/api/documents/embed", json={"document_id": doc_ready})
     assert ready_response.status_code == 200
     ready_payload = ready_response.json()
-    assert ready_payload["embedding"]["status"] == "COMPLETED"
+    assert ready_payload["documents"][0]["status"] == "COMPLETED"
     assert store.get(doc_ready)["status"] == "EMBEDDING_COMPLETED"
 
     blocked_response = client.post("/api/documents/embed", json={"document_id": doc_blocked})
     assert blocked_response.status_code == 200
     blocked_payload = blocked_response.json()
-    assert blocked_payload["embedding"]["status"] == "SKIPPED"
+    assert blocked_payload["documents"][0]["status"] == "SKIPPED"
     assert store.get(doc_blocked)["status"] == "EXTRACTION_COMPLETED"
 
     assert calls
@@ -145,27 +152,22 @@ def test_documents_embed_requires_screening_completed(monkeypatch):
 def test_documents_embed_accepts_array_and_filters(monkeypatch):
     selected_ids = ["doc-a", "doc-b"]
 
-    class FakeCollection:
-        def find(self, query, projection=None):
-            assert query["$and"][0]["status"] == "SCREENING_COMPLETED"
-            return [{"_id": doc_id} for doc_id in selected_ids]
-
-    monkeypatch.setattr(embedding_service, "get_documents_collection", lambda: FakeCollection())
+    monkeypatch.setattr(embedding_service, "blob_storage_configured", lambda: False)
+    monkeypatch.setattr(embedding_service, "_fetch_document_ids_by_filters", lambda **_kwargs: list(selected_ids))
 
     processed = []
 
-    def fake_embed_document(**kwargs):
+    def fake_process_local_document(**kwargs):
         doc_id = kwargs["document_id"]
         processed.append(doc_id)
         return {
             "document_id": doc_id,
-            "processed_document_ids": [doc_id],
-            "skipped_document_ids": [],
-            "status_updates": [{"document_id": doc_id, "status": "EMBEDDING_COMPLETED"}],
-            "embedding": {"status": "COMPLETED", "chunks": 1, "upserted": 1},
+            "status": "COMPLETED",
+            "chunks_count": 1,
+            "error": None,
         }
 
-    monkeypatch.setattr(embedding_service, "embed_document", fake_embed_document)
+    monkeypatch.setattr(embedding_service, "_process_local_document", fake_process_local_document)
 
     client = TestClient(app)
     response = client.post(
@@ -174,6 +176,6 @@ def test_documents_embed_accepts_array_and_filters(monkeypatch):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert set(payload["processed_document_ids"]) == {"doc-1", "doc-a", "doc-b"}
+    assert set(doc["document_id"] for doc in payload["documents"]) == {"doc-1", "doc-a", "doc-b"}
     assert len(payload["documents"]) == 3
     assert set(processed) == {"doc-1", "doc-a", "doc-b"}

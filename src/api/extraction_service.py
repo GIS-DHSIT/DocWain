@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.api.config import Config
 from src.api.content_store import save_extracted_pickle
 from src.api.dataHandler import (
     extract_document_info,
@@ -16,19 +17,17 @@ from src.api.dataHandler import (
     resolve_subscription_id,
     update_extraction_metadata,
     update_pii_stats,
-    updateVetting,
-    vettingProcessor,
 )
 from src.api.document_status import init_document_record, set_error, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
 from src.api.statuses import (
     STATUS_DELETED,
     STATUS_EXTRACTION_COMPLETED,
-    STATUS_FAILED,
-    STATUS_TRAINING_BLOCKED_CONFIDENTIAL,
+    STATUS_EXTRACTION_FAILED,
     STATUS_TRAINING_FAILED,
     STATUS_UNDER_REVIEW,
 )
+from src.storage.azure_blob_client import BlobDownloadError, CredentialError, normalize_blob_name
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +105,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
     try:
         subscription_id = resolve_subscription_id(doc_id, subscription_candidate)
     except Exception as exc:  # noqa: BLE001
-        _set_document_status(doc_id, STATUS_FAILED, str(exc))
-        return {"document_id": doc_id, "status": STATUS_FAILED, "error": str(exc)}
+        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
+        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
     pii_masking_enabled = get_subscription_pii_setting(subscription_id)
     logger.info("Document %s (subscription %s): PII masking=%s", doc_id, subscription_id, pii_masking_enabled)
@@ -156,8 +155,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                 raise ValueError("Multiple file matches")
 
             file_path = matching_files[0]
-            file_key = file_path.split("/", 4)[-1] if file_path.startswith("az://") else file_path
-            doc_content = get_azure_docs(file_key)
+            file_key = normalize_blob_name(file_path, container_name=Config.AzureBlob.DOCUMENT_CONTAINER_NAME)
+            doc_content = get_azure_docs(file_key, document_id=doc_id)
             if doc_content is None:
                 raise ValueError(f"Failed to read file {file_key}")
 
@@ -168,21 +167,30 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             all_extracted_docs.update(extracted_doc)
         else:
             raise ValueError(f"Unsupported connector type: {doc_data.get('type')}")
+    except CredentialError as exc:
+        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"CredentialError: {exc}")
+        raise
+    except BlobDownloadError as exc:
+        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"{exc.__class__.__name__}: {exc}")
+        return {
+            "document_id": doc_id,
+            "status": STATUS_EXTRACTION_FAILED,
+            "error": f"{exc.__class__.__name__}: {exc}",
+        }
     except Exception as exc:  # noqa: BLE001
-        _set_document_status(doc_id, STATUS_FAILED, str(exc))
-        return {"document_id": doc_id, "status": STATUS_FAILED, "error": str(exc)}
+        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
+        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
     if not all_extracted_docs:
-        _set_document_status(doc_id, STATUS_FAILED, "No content extracted")
-        return {"document_id": doc_id, "status": STATUS_FAILED, "error": "No content extracted"}
+        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, "No content extracted")
+        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": "No content extracted"}
 
     masked_docs = all_extracted_docs
     pii_count = 0
-    high_conf = False
     pii_items: List[Any] = []
     if pii_masking_enabled:
-        masked_docs, pii_count, high_conf, pii_items = mask_document_content(all_extracted_docs)
-        update_pii_stats(doc_id, pii_count, high_conf, pii_items)
+        masked_docs, pii_count, _high_conf, pii_items = mask_document_content(all_extracted_docs)
+        update_pii_stats(doc_id, pii_count, False, pii_items)
     else:
         update_pii_stats(doc_id, 0, False, [])
 
@@ -198,17 +206,11 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                 masked_docs[fname] = content
 
     try:
-        vetting_points = vettingProcessor(masked_docs)
-        updateVetting(doc_id, vetting_points)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Vetting failed for %s: %s", doc_id, exc)
-
-    try:
         save_info = save_extracted_pickle(doc_id, masked_docs)
         update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
     except Exception as exc:  # noqa: BLE001
-        _set_document_status(doc_id, STATUS_FAILED, f"Failed to persist extracted content: {exc}")
-        return {"document_id": doc_id, "status": STATUS_FAILED, "error": str(exc)}
+        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
+        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
     extra_fields = {
         "subscription_id": subscription_id,
@@ -216,19 +218,12 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         "extracted_pickle_path": save_info.get("path"),
         "extracted_hash": save_info.get("sha256"),
     }
-
-    if high_conf:
-        result_status = STATUS_TRAINING_BLOCKED_CONFIDENTIAL
-        error_msg = "High confidentiality content detected"
-    else:
-        result_status = STATUS_EXTRACTION_COMPLETED
-        error_msg = None
-    _set_document_status(doc_id, result_status, error_msg=error_msg, extra_fields=extra_fields)
+    _set_document_status(doc_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
 
     summary = _build_extraction_summary(masked_docs)
     return {
         "document_id": doc_id,
-        "status": result_status,
+        "status": STATUS_EXTRACTION_COMPLETED,
         "pickle_path": save_info.get("path"),
         "summary": summary,
         "doc_name": doc_data.get("name", "Unknown"),
@@ -241,7 +236,7 @@ def extract_documents() -> Dict[str, Any]:
         if not doc_coll:
             return {"status": "no_documents", "message": "No documents found for extraction"}
 
-        allowed_statuses = {STATUS_UNDER_REVIEW, STATUS_TRAINING_FAILED}
+        allowed_statuses = {STATUS_UNDER_REVIEW, STATUS_TRAINING_FAILED, STATUS_EXTRACTION_FAILED}
         eligible_docs = {
             doc_id: doc_info
             for doc_id, doc_info in doc_coll.items()
@@ -255,7 +250,11 @@ def extract_documents() -> Dict[str, Any]:
         for doc_id, doc_info in eligible_docs.items():
             if doc_info.get("dataDict", {}).get("status") == STATUS_DELETED:
                 continue
-            res = _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
+            try:
+                res = _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
+            except CredentialError as exc:
+                logger.error("Credential error during extraction; failing batch: %s", exc)
+                return {"status": "error", "message": f"CredentialError: {exc}", "results": None}
             if res.get("status") == STATUS_EXTRACTION_COMPLETED:
                 results["successful"].append(res)
             else:
@@ -304,7 +303,7 @@ def extract_uploaded_document(
             raise ValueError("No content extracted from file")
     except Exception as exc:  # noqa: BLE001
         set_error(document_id, "extraction", exc)
-        _set_document_status(document_id, STATUS_FAILED, str(exc))
+        _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
         raise
 
     try:
@@ -312,7 +311,7 @@ def extract_uploaded_document(
         update_extraction_metadata(document_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
     except Exception as exc:  # noqa: BLE001
         set_error(document_id, "extraction", exc)
-        _set_document_status(document_id, STATUS_FAILED, str(exc))
+        _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
         raise
 
     stats = _build_extraction_summary(extracted)

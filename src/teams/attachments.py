@@ -15,13 +15,12 @@ from src.teams.state import TeamsStateStore
 from src.utils.logging_utils import get_logger
 
 try:
-    from azure.storage.blob import BlobServiceClient, ContentSettings
+    from azure.storage.blob import ContentSettings
 
     _BLOB_AVAILABLE = True
     _BLOB_WARNING_EMITTED = False
     _BLOB_IMPORT_ERROR: Optional[Exception] = None
 except ImportError as exc:
-    BlobServiceClient = None  # type: ignore
     ContentSettings = None  # type: ignore
     _BLOB_AVAILABLE = False
     _BLOB_WARNING_EMITTED = False
@@ -66,9 +65,7 @@ def _blob_uploads_enabled(log: logging.LoggerAdapter) -> bool:
 
 
 def _blob_configured() -> bool:
-    return bool(getattr(Config.Teams, "BLOB_CONNECTION_STRING", "")) and bool(
-        getattr(Config.Teams, "BLOB_CONTAINER", "")
-    )
+    return bool(getattr(Config.AzureBlob, "CONNECTION_STRING", "")) and bool(getattr(Config.Teams, "BLOB_CONTAINER", ""))
 
 
 def _build_blob_name(filename: str, subscription_id: str) -> str:
@@ -84,13 +81,14 @@ def _upload_to_blob(file_bytes: bytes, filename: str, subscription_id: str, log:
         log.info("Teams blob storage is not configured; skipping upload.")
         return
 
-    connection_string = getattr(Config.Teams, "BLOB_CONNECTION_STRING", "")
     container_name = getattr(Config.Teams, "BLOB_CONTAINER", "")
     blob_name = _build_blob_name(filename, subscription_id)
     content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
     try:
-        service = BlobServiceClient.from_connection_string(connection_string)
+        from src.storage.azure_blob_client import get_blob_service_client
+
+        service = get_blob_service_client()
         container = service.get_container_client(container_name)
         try:
             container.create_container()

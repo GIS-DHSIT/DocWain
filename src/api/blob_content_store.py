@@ -1,49 +1,31 @@
 import hashlib
 import logging
-import os
 import pickle
 from typing import Any, Dict
 
 from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import ContentSettings
 
 from src.api.config import Config
+from src.storage.azure_blob_client import get_document_container_client
 
 logger = logging.getLogger(__name__)
 
-_CONTAINER_NAME = "document-content"
 _EXTRACTED_DOC_TYPE = "extracted_doc"
 
 
-def _build_service_client() -> BlobServiceClient:
-    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    if connection_string:
-        return BlobServiceClient.from_connection_string(connection_string)
-
-    account_url = os.getenv("AZURE_STORAGE_ACCOUNT_URL")
-    credential = os.getenv("AZURE_STORAGE_CREDENTIAL") or os.getenv("AZURE_STORAGE_KEY")
-    if account_url and credential:
-        return BlobServiceClient(account_url=account_url, credential=credential)
-
-    fallback_conn = getattr(Config.DocAzureBlob, "AZURE_BLOB_CONNECTION_STRING", None)
-    if fallback_conn:
-        return BlobServiceClient.from_connection_string(fallback_conn)
-
-    raise ValueError(
-        "Azure Blob connection settings missing: "
-        "set AZURE_STORAGE_CONNECTION_STRING or AZURE_STORAGE_ACCOUNT_URL/AZURE_STORAGE_CREDENTIAL"
-    )
-
-
 def get_blob_client():
-    service_client = _build_service_client()
-    container_client = service_client.get_container_client(_CONTAINER_NAME)
+    container_client = get_document_container_client()
     try:
         container_client.create_container()
     except ResourceExistsError:
         pass
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not ensure blob container %s exists: %s", _CONTAINER_NAME, exc)
+        logger.warning(
+            "Could not ensure document blob container %s exists: %s",
+            getattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", ""),
+            exc,
+        )
     return container_client
 
 
