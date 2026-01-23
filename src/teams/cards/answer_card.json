@@ -1,0 +1,12 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "{title}", "size": "Medium", "weight": "Bolder", "wrap": true },
+    { "type": "TextBlock", "text": "{text}", "wrap": true }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Tools", "data": { "action": "show_tools" } }
+  ]
+}

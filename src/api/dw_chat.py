@@ -4,23 +4,16 @@ from datetime import datetime
 from io import BytesIO
 from typing import Dict, List, Tuple
 
-from azure.storage.blob import BlobServiceClient, ContentSettings
-
-from src.api.config import Config
+from src.storage.azure_blob_client import get_chat_container_client, upload_chat_history
 from src.api.genai_client import generate_text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-connection_string = Config.AzureBlob.CONNECTION_STRING
-blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-container_name = Config.AzureBlob.CONTAINER_NAME
-container_client = blob_service_client.get_container_client(container_name)
-
 
 def get_chat_history(user_id: str) -> Dict:
     """Retrieve chat history with sessions from Azure Blob Storage."""
     try:
         blob_name = f"chat_history/{user_id}.json"
+        container_client = get_chat_container_client()
         blob_client = container_client.get_blob_client(blob_name)
         blob_data = blob_client.download_blob().readall()
         chat_history = json.loads(blob_data.decode("utf-8"))
@@ -52,10 +45,8 @@ def save_chat_history(user_id: str, chat_history: Dict) -> None:
     """Save chat history to Azure Blob Storage."""
     try:
         blob_name = f"chat_history/{user_id}.json"
-        blob_client = container_client.get_blob_client(blob_name)
-        content_settings = ContentSettings(content_type="application/json")
         chat_data_stream = BytesIO(json.dumps(chat_history, ensure_ascii=False, indent=2).encode("utf-8"))
-        blob_client.upload_blob(chat_data_stream, overwrite=True, content_settings=content_settings)
+        upload_chat_history(blob_name, chat_data_stream.getvalue())
         logging.info(f"Chat history saved for user {user_id}")
     except Exception as e:
         logging.error(f"Error saving chat history: {e}")

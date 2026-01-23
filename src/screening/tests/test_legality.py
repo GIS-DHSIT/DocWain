@@ -30,7 +30,7 @@ def test_legality_route_registered_once():
     paths = [route.path for route in screening_router.routes if "legality" in route.path]
     assert paths, "Legality endpoint not registered"
     assert len(paths) == len(set(paths)), "Duplicate legality endpoints detected"
-    assert "/screening/{doc_id}/legality" in paths
+    assert "/screening/legality" in paths
 
 
 def test_legality_category_returns_structured_payload(monkeypatch):

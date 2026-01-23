@@ -1,9 +1,23 @@
-from fastapi import APIRouter, HTTPException, Query
+from typing import List, Optional
+
+from fastapi import APIRouter, Body, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from src.api.schemas import DocumentListResponse
 from src.documents.document_store_adapter import list_documents
+from src.api.blob_store import BlobConfigurationError
+from src.api.embedding_service import embed_documents
 
 documents_router = APIRouter()
+
+
+class DocumentEmbedRequest(BaseModel):
+    document_id: Optional[str] = Field(None, description="Document identifier")
+    document_ids: Optional[List[str]] = Field(None, description="Multiple document identifiers")
+    subscription_id: Optional[str] = Field(None, description="Optional subscription id override")
+    profile_id: Optional[str] = Field(None, description="Optional profile id override")
+    doc_type: Optional[str] = Field(None, description="Optional document type override")
+    max_blobs: Optional[int] = Field(None, description="Optional max blobs to process per request")
 
 
 @documents_router.get("/documents", response_model=DocumentListResponse)
@@ -12,12 +26,13 @@ def get_documents(
     offset: int = Query(0, ge=0),
     q: str | None = Query(None, description="Optional name search query"),
     doc_type: str | None = Query(None, description="Optional document type filter"),
+    profile_id: str | None = Query(None, description="Optional profile id filter"),
     created_after: str | None = Query(None, description="ISO timestamp filter"),
     created_before: str | None = Query(None, description="ISO timestamp filter"),
 ):
     """
     List documents with stable pagination and optional filters.
-    Returns doc_id, document_name, doc_type, created_at, updated_at when available.
+    Returns doc_id, document_name, doc_type, profile_id, subscription_id, created_at, updated_at when available.
     """
     try:
         items, total = list_documents(
@@ -25,6 +40,7 @@ def get_documents(
             offset=offset,
             q=q,
             doc_type=doc_type,
+            profile_id=profile_id,
             created_after=created_after,
             created_before=created_before,
         )
@@ -39,3 +55,20 @@ def get_documents(
             status_code=500,
             detail={"error": {"code": "documents_list_failed", "message": str(exc)}},
         )
+
+
+@documents_router.post("/documents/embed")
+def embed_document(request: DocumentEmbedRequest = Body(...)):
+    try:
+        return embed_documents(
+            document_id=request.document_id,
+            document_ids=request.document_ids,
+            subscription_id=request.subscription_id,
+            profile_id=request.profile_id,
+            doc_type=request.doc_type,
+            max_blobs=request.max_blobs,
+        )
+    except BlobConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))

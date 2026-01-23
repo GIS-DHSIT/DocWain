@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api import docwain_api
+from src import main as docwain_api
 from src.execution.common import ExecutionResult
 from src.mode.execution_mode import ExecutionMode
 
@@ -30,7 +30,7 @@ def test_default_ask_routes_to_normal(monkeypatch, client):
 
     calls = {"normal": 0}
 
-    def fake_normal(request, stream=False, debug=False):
+    def fake_normal(request, ctx=None, session_state=None, stream=False, debug=False):
         calls["normal"] += 1
         return ExecutionResult(
             answer=_build_answer(ExecutionMode.NORMAL),
@@ -60,7 +60,7 @@ def test_agent_mode_body_toggle(monkeypatch, client):
     def fake_normal(*args, **kwargs):  # pragma: no cover - not expected
         raise AssertionError("Normal runner should not be called when agent_mode=true")
 
-    def fake_agent(request, stream=False, debug=False):
+    def fake_agent(request, ctx=None, session_state=None, stream=False, debug=False):
         calls["agent"] += 1
         return ExecutionResult(
             answer=_build_answer(ExecutionMode.AGENT),
@@ -84,7 +84,7 @@ def test_mode_isolation_per_request(monkeypatch, client):
 
     calls = {"agent": 0, "normal": 0}
 
-    def fake_normal(request, stream=False, debug=False):
+    def fake_normal(request, ctx=None, session_state=None, stream=False, debug=False):
         calls["normal"] += 1
         return ExecutionResult(
             answer=_build_answer(ExecutionMode.NORMAL),
@@ -92,7 +92,7 @@ def test_mode_isolation_per_request(monkeypatch, client):
             debug={"execution_mode": ExecutionMode.NORMAL.value},
         )
 
-    def fake_agent(request, stream=False, debug=False):
+    def fake_agent(request, ctx=None, session_state=None, stream=False, debug=False):
         calls["agent"] += 1
         return ExecutionResult(
             answer=_build_answer(ExecutionMode.AGENT),
@@ -117,11 +117,30 @@ def test_agent_mode_requires_evidence(monkeypatch):
     from src.agentic import orchestrator
     from src.api import dw_newron
 
-    monkeypatch.setattr(
-        dw_newron,
-        "answer_question",
-        lambda **kwargs: {"response": "speculative", "sources": []},
-    )
+    monkeypatch.setattr(dw_newron, "answer_question", lambda **kwargs: {"response": "speculative", "sources": []})
+
+    class DummyChain:
+        def run(self, stream=False, debug=False, force_refresh=False):
+            return (
+                {
+                    "response": "speculative",
+                    "sources": [],
+                    "grounded": True,
+                    "context_found": True,
+                    "metadata": {},
+                },
+                ["e1"],
+            )
+
+    class DummyGuard:
+        def __init__(self, session_state):
+            self.session_state = session_state
+
+        def enforce(self, ctx, answer, evidence_ids, regenerate):
+            return answer, evidence_ids
+
+    monkeypatch.setattr(orchestrator, "build_chain", lambda *args, **kwargs: DummyChain())
+    monkeypatch.setattr(orchestrator, "FreshnessGuard", DummyGuard)
 
     fake_request = SimpleNamespace(
         query="q",
@@ -136,7 +155,10 @@ def test_agent_mode_requires_evidence(monkeypatch):
         debug=True,
     )
 
-    result = orchestrator.run_agent_mode(fake_request, stream=False, debug=True)
+    ctx = SimpleNamespace(request_id="req-agent", model_name=None)
+    session_state = SimpleNamespace()
+
+    result = orchestrator.run_agent_mode(fake_request, ctx=ctx, session_state=session_state, stream=False, debug=True)
     assert result.mode == ExecutionMode.AGENT
     assert result.answer["grounded"] is False
     assert "limitations" in result.answer["metadata"].get("agent", {})
@@ -160,12 +182,35 @@ def test_agent_mode_uses_default_agent_model(monkeypatch):
 
     monkeypatch.setattr(dw_newron, "answer_question", fake_answer_question)
 
+    class DummyChain:
+        def run(self, stream=False, debug=False, force_refresh=False):
+            return (
+                {
+                    "response": "agent response",
+                    "sources": [{"id": "s1"}],
+                    "grounded": True,
+                    "context_found": True,
+                    "metadata": {},
+                },
+                ["s1"],
+            )
+
+    class DummyGuard:
+        def __init__(self, session_state):
+            self.session_state = session_state
+
+        def enforce(self, ctx, answer, evidence_ids, regenerate):
+            return answer, evidence_ids
+
+    monkeypatch.setattr(orchestrator, "build_chain", lambda *args, **kwargs: DummyChain())
+    monkeypatch.setattr(orchestrator, "FreshnessGuard", DummyGuard)
+
     fake_request = SimpleNamespace(
         query="agent",
         user_id="u",
         profile_id="p",
         subscription_id="s",
-        model_name="llama3.2",  # default should be overridden
+        model_name=None,  # default should be applied when not explicitly provided
         persona="doc",
         session_id=None,
         new_session=False,
@@ -173,8 +218,11 @@ def test_agent_mode_uses_default_agent_model(monkeypatch):
         debug=False,
     )
 
-    orchestrator.run_agent_mode(fake_request, stream=False, debug=False)
-    assert captured["model_name"] == Config.Execution.AGENT_MODEL_NAME
+    ctx = SimpleNamespace(request_id="req-agent-default", model_name=None)
+    session_state = SimpleNamespace()
+
+    orchestrator.run_agent_mode(fake_request, ctx=ctx, session_state=session_state, stream=False, debug=False)
+    assert ctx.model_name == Config.Execution.AGENT_MODEL_NAME
 
 
 def test_ask_stream_defaults_to_normal(monkeypatch, client):
@@ -182,7 +230,7 @@ def test_ask_stream_defaults_to_normal(monkeypatch, client):
 
     calls = {"normal": 0}
 
-    def fake_normal(request, stream=False, debug=False):
+    def fake_normal(request, ctx=None, session_state=None, stream=False, debug=False):
         calls["normal"] += 1
         return ExecutionResult(
             answer=_build_answer(ExecutionMode.NORMAL),
@@ -197,7 +245,7 @@ def test_ask_stream_defaults_to_normal(monkeypatch, client):
     monkeypatch.setattr(router, "run_normal_mode", fake_normal)
     monkeypatch.setattr(router, "run_agent_mode", fake_agent)
 
-    with client.stream("POST", "/api/askStream", json={"query": "stream default"}) as response:
+    with client.stream("POST", "/api/ask", json={"query": "stream default", "stream": True}) as response:
         body = "".join(response.iter_text())
 
     assert response.status_code == 200
@@ -211,7 +259,7 @@ def test_ask_stream_uses_mode_router(monkeypatch, client):
     def fake_normal(*args, **kwargs):  # pragma: no cover
         raise AssertionError("Normal runner should not stream when agent_mode=true")
 
-    def fake_agent(request, stream=False, debug=False):
+    def fake_agent(request, ctx=None, session_state=None, stream=False, debug=False):
         return ExecutionResult(
             answer=_build_answer(ExecutionMode.AGENT),
             mode=ExecutionMode.AGENT,
@@ -222,7 +270,7 @@ def test_ask_stream_uses_mode_router(monkeypatch, client):
     monkeypatch.setattr(router, "run_normal_mode", fake_normal)
     monkeypatch.setattr(router, "run_agent_mode", fake_agent)
 
-    with client.stream("POST", "/api/askStream?agent_mode=true", json={"query": "stream it"}) as response:
+    with client.stream("POST", "/api/ask?agent_mode=true", json={"query": "stream it", "stream": True}) as response:
         body = "".join(response.iter_text())
 
     assert response.status_code == 200

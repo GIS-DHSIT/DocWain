@@ -1,12 +1,8 @@
-from azure.storage.blob import BlobServiceClient
-from src.api.config import Config
-
-connection_string = Config.AzureBlob.CONNECTION_STRING
-blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-container_name = "chat-history"
+from src.storage.azure_blob_client import get_chat_container_client
 
 # Get the container client
-container_client = blob_service_client.get_container_client(container_name)
+container_client = get_chat_container_client()
+container_name = container_client.container_name
 
 # Check if the container exists
 if container_client.exists():

@@ -1,5 +1,5 @@
 import time
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -29,6 +29,17 @@ class FinetuneRequest(BaseModel):
     allow_offload: bool = Field(True, description="Permit CPU offload when GPU memory is insufficient")
     device_map: Optional[object] = Field(None, description="Optional device_map override for model loading")
     max_memory: Optional[object] = Field(None, description="Optional max_memory override for device_map dispatch")
+    agentic: bool = Field(False, description="Enable agentic finetune orchestration when supported")
+    orchestrator_model: Optional[str] = Field(None, description="Optional override for orchestrator LLM")
+    qdrant_snapshot: Optional[Dict[str, object]] = Field(
+        None, description="Optional snapshot metadata for the Qdrant collection"
+    )
+    collection_name: Optional[str] = Field(
+        None, description="Optional collection name for agentic finetuning context enforcement"
+    )
+    training_run_id: Optional[str] = Field(
+        None, description="Optional training run id for diagnostics/artifact paths"
+    )
 
 
 class FinetuneStatus(BaseModel):
@@ -42,6 +53,7 @@ class FinetuneStatus(BaseModel):
     params: dict = Field(default_factory=dict)
     training_run_id: Optional[str] = None
     params_hash: Optional[str] = None
+    ollama: Optional[Dict[str, Any]] = None
 
 
 class ResolvedModel(BaseModel):
@@ -158,12 +170,15 @@ class CollectionOnlyFinetuneRequest(BaseModel):
     output_dir: str = Field("finetune_artifacts", description="Root directory for finetune outputs")
     run_name: Optional[str] = Field(None, description="Optional identifier for the run")
     retrain: bool = Field(False, description="Force a new run even if the same parameters already completed")
+    profile_ids: Optional[List[str]] = Field(None, description="Optional list of profile ids to target")
     subscription_id: Optional[str] = Field(None, description="Optional subscription identifier for auditing")
     subscription_ids: Optional[List[str]] = Field(None, description="Optional subscription identifiers for auditing")
     max_points: int = Field(120, ge=1, description="Max chunks to sample from Qdrant")
     questions_per_chunk: int = Field(2, ge=1, le=5, description="QA pairs per chunk")
     generation_model: Optional[str] = Field(None, description="Model used to generate synthetic QA")
     fail_fast: bool = Field(False, description="Abort processing on first failure instead of continuing")
+    agentic: bool = Field(False, description="Enable agentic finetune orchestration when supported")
+    orchestrator_model: Optional[str] = Field(None, description="Optional override for orchestrator LLM")
 
     def finetune_payload(self, profile_id: str, dataset_path: str) -> dict:
         """
