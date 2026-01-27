@@ -28,7 +28,14 @@ def _doc_id_value(document_id: str):
 
 
 def _doc_filter(document_id: str) -> Dict[str, Any]:
-    candidates = [{"_id": str(document_id)}, {"document_id": str(document_id)}]
+    doc_id_str = str(document_id)
+    candidates = [
+        {"_id": doc_id_str},
+        {"document_id": doc_id_str},
+        {"documentId": doc_id_str},
+        {"doc_id": doc_id_str},
+        {"id": doc_id_str},
+    ]
     if ObjectId.is_valid(str(document_id)):
         candidates.insert(0, {"_id": ObjectId(str(document_id))})
     return {"$or": candidates}

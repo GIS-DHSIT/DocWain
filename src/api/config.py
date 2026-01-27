@@ -63,7 +63,12 @@ class Config:
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
         GEMINI_MODEL_NAME = "gemini-2.5-flash"
 
-
+    class Azure:
+        AZURE_SUBSCRIPTION_ID = "249bb11f-9b6e-4c0e-a844-500d627b80b3"
+        AZURE_RESOURCE_GROUP = "rg-docwain-dev"
+        AZURE_PROJECT_NAME = "dhs-ai-competency"
+        AZURE_AI_ENDPOINT = "https://dhs-ai-competency-resource.services.ai.azure.com/api/projects/dhs-ai-competency"
+        AZURE_AI_KEY = "CpQaDiSSIBQBXcIysi5DpdoalYW8ghtDLwU8nGOsagVlkulbKvCsJQQJ99CAAC77bzfXJ3w3AAAAACOGG3Yu"
     class AzureGpt4o:
         AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
         AZUREGPT4O_DEPLOYMENT = "dw-dev1-gpt-4o"

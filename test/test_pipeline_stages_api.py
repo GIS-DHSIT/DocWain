@@ -117,7 +117,11 @@ def test_documents_embed_requires_screening_completed(monkeypatch):
     monkeypatch.setattr(embedding_service, "get_document_record", lambda doc_id: store.get(doc_id))
     monkeypatch.setattr(embedding_service, "resolve_subscription_id", lambda _doc_id, _candidate=None: "sub-1")
     monkeypatch.setattr(embedding_service, "resolve_profile_id", lambda _doc_id, _candidate=None: "prof-1")
-    monkeypatch.setattr(embedding_service, "load_extracted_pickle", lambda _doc_id: {"file.pdf": "text"})
+    monkeypatch.setattr(
+        embedding_service,
+        "load_extracted_pickle",
+        lambda _doc_id: {"file.pdf": "This is a complete sentence. " * 5},
+    )
     monkeypatch.setattr(embedding_service, "delete_extracted_pickle", lambda _doc_id: True)
     monkeypatch.setattr(embedding_service, "update_document_fields", lambda doc_id, fields: store.update(doc_id, fields))
     monkeypatch.setattr(embedding_service, "update_stage", lambda *_args, **_kwargs: None)
@@ -137,16 +141,57 @@ def test_documents_embed_requires_screening_completed(monkeypatch):
     ready_response = client.post("/api/documents/embed", json={"document_id": doc_ready})
     assert ready_response.status_code == 200
     ready_payload = ready_response.json()
-    assert ready_payload["documents"][0]["status"] == "COMPLETED"
-    assert store.get(doc_ready)["status"] == "EMBEDDING_COMPLETED"
+    assert ready_payload["documents_processed"] == 1
+    assert ready_payload["documents_succeeded"] == 1
+    assert ready_payload["documents_failed"] == 0
+    assert ready_payload["total_chunks"] == 1
+    assert ready_payload["total_points_upserted"] == 1
+    assert store.get(doc_ready)["status"] == "TRAINING_COMPLETED"
 
     blocked_response = client.post("/api/documents/embed", json={"document_id": doc_blocked})
     assert blocked_response.status_code == 200
     blocked_payload = blocked_response.json()
-    assert blocked_payload["documents"][0]["status"] == "SKIPPED"
+    assert blocked_payload["documents_processed"] == 0
+    assert blocked_payload["documents_succeeded"] == 0
+    assert blocked_payload["documents_failed"] == 0
     assert store.get(doc_blocked)["status"] == "EXTRACTION_COMPLETED"
 
     assert calls
+
+
+def test_documents_embed_empty_extraction_sets_training_failed(monkeypatch):
+    store = StatusStore()
+    doc_ready = "doc-empty"
+    store.update(doc_ready, {"status": "SCREENING_COMPLETED", "subscription_id": "sub-1", "profile_id": "prof-1"})
+
+    monkeypatch.setattr(embedding_service, "get_document_record", lambda doc_id: store.get(doc_id))
+    monkeypatch.setattr(embedding_service, "resolve_subscription_id", lambda _doc_id, _candidate=None: "sub-1")
+    monkeypatch.setattr(embedding_service, "resolve_profile_id", lambda _doc_id, _candidate=None: "prof-1")
+    monkeypatch.setattr(embedding_service, "load_extracted_pickle", lambda _doc_id: {"file.pdf": ""})
+    monkeypatch.setattr(embedding_service, "delete_extracted_pickle", lambda _doc_id: True)
+    monkeypatch.setattr(embedding_service, "update_document_fields", lambda doc_id, fields: store.update(doc_id, fields))
+    monkeypatch.setattr(embedding_service, "update_stage", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(embedding_service, "blob_storage_configured", lambda: False)
+    monkeypatch.setattr(embedding_service, "_fetch_document_ids_by_filters", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        embedding_service,
+        "_prepare_extracted_docs",
+        lambda **_kwargs: (None, None, [], "empty_extraction"),
+    )
+
+    client = TestClient(app)
+    response = client.post("/api/documents/embed", json={"document_id": doc_ready})
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["documents_processed"] == 1
+    assert payload["documents_succeeded"] == 0
+    assert payload["documents_failed"] == 1
+    assert payload["failure_reasons"].get("empty_extraction") == 1
+
+    latest = store.get(doc_ready)
+    assert latest["status"] == "TRAINING_FAILED"
+    assert latest.get("error_summary") == "empty_extraction"
 
 
 def test_documents_embed_accepts_array_and_filters(monkeypatch):
@@ -164,6 +209,7 @@ def test_documents_embed_accepts_array_and_filters(monkeypatch):
             "document_id": doc_id,
             "status": "COMPLETED",
             "chunks_count": 1,
+            "points_upserted": 1,
             "error": None,
         }
 
@@ -176,6 +222,9 @@ def test_documents_embed_accepts_array_and_filters(monkeypatch):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert set(doc["document_id"] for doc in payload["documents"]) == {"doc-1", "doc-a", "doc-b"}
-    assert len(payload["documents"]) == 3
+    assert payload["documents_processed"] == 3
+    assert payload["documents_succeeded"] == 3
+    assert payload["documents_failed"] == 0
+    assert payload["total_chunks"] == 3
+    assert payload["total_points_upserted"] == 3
     assert set(processed) == {"doc-1", "doc-a", "doc-b"}

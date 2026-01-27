@@ -25,14 +25,21 @@ PAYLOAD_INDEX_FIELDS = [
     "profileId",
     "document_id",
     "source_file",
+    "filename",
     "section_title",
+    "section_path",
     "chunk_id",
     "chunk_type",
     "doc_type",
+    "document_type",
+    "chunk_hash",
 ]
 
 PAYLOAD_INDEX_SCHEMAS = {
     "page": "integer",
+    "page_start": "integer",
+    "page_end": "integer",
+    "chunk_char_len": "integer",
     "ocr_confidence": "float",
 }
 
