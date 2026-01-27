@@ -28,11 +28,17 @@ from src.api.reasoning_layer import EvidencePlanner, AnswerVerifier, ConfidenceS
 from src.api.learning_signals import LearningSignalStore
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 from sklearn.feature_extraction.text import HashingVectorizer
-from src.api.vector_store import build_collection_name
+from src.api.vector_store import build_collection_name, PAYLOAD_INDEX_FIELDS, PAYLOAD_INDEX_SCHEMAS
 from src.api.genai_client import generate_text, get_genai_client
 from src.finetune import resolve_model_for_profile
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
+from src.security.response_sanitizer import sanitize_user_payload
+
+try:
+    import torch
+except Exception:  # noqa: BLE001
+    torch = None
 
 # Configure logging
 logging.basicConfig(
@@ -79,6 +85,46 @@ ANSWER_CACHE_TTL = int(os.getenv("RAG_ANSWER_CACHE_TTL", "1800"))
 ANSWER_CACHE_VERSION = "v3"
 NO_ANSWER_CACHE = os.getenv("NO_ANSWER_CACHE", "true").strip().lower() in {"true", "1", "yes", "on"}
 ENABLE_ANSWER_CACHE = False if NO_ANSWER_CACHE else os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
+
+
+def _torch_cuda_available() -> bool:
+    try:
+        return bool(torch) and bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _embedding_device() -> str:
+    env_device = (os.getenv("EMBEDDING_DEVICE") or "").strip().lower()
+    if env_device:
+        return env_device
+    return "cuda" if _torch_cuda_available() else "cpu"
+
+
+def _is_meta_tensor_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "meta tensor" in msg or "cannot copy out of meta tensor" in msg
+
+
+def _resolve_torch_dtype():
+    if not torch:
+        return None
+    raw = (os.getenv("EMBEDDING_TORCH_DTYPE") or "").strip().lower()
+    if raw in {"fp16", "float16", "half"}:
+        return torch.float16
+    if raw in {"bf16", "bfloat16"}:
+        return torch.bfloat16
+    if raw in {"fp32", "float32", "full"}:
+        return torch.float32
+    return torch.float32
+
+
+def _model_kwargs_for_device(device: str) -> Dict[str, Any]:
+    kwargs: Dict[str, Any] = {"device_map": None, "low_cpu_mem_usage": False}
+    dtype = _resolve_torch_dtype()
+    if dtype is not None:
+        kwargs["torch_dtype"] = dtype
+    return kwargs
 
 
 def _parse_redis_connection_string(conn_str: str):
@@ -239,8 +285,22 @@ def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransf
     last_error = None
     for name in candidates:
         try:
-            logger.info(f"Loading sentence transformer model: {name}")
-            model = SentenceTransformer(name)
+            device = _embedding_device()
+            logger.info("Loading sentence transformer model: %s (device=%s)", name, device)
+            model_kwargs = _model_kwargs_for_device(device)
+            try:
+                model = SentenceTransformer(name, device=device, model_kwargs=model_kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if device != "cpu" and _is_meta_tensor_error(exc):
+                    logger.warning(
+                        "Model load on %s failed (%s); retrying on cpu for stability",
+                        device,
+                        exc,
+                    )
+                    cpu_kwargs = _model_kwargs_for_device("cpu")
+                    model = SentenceTransformer(name, device="cpu", model_kwargs=cpu_kwargs)
+                else:
+                    raise
             dim = model.get_sentence_embedding_dimension()
             logger.info(f"Loaded model '{name}' with dim={dim}")
             if required_dim is None or dim == required_dim:
@@ -1116,6 +1176,7 @@ class QdrantRetriever:
         self.preprocessor = TextPreprocessor()
         self.profile_context_cache: Dict[Tuple[str, str], ProfileContextSnapshot] = {}
         self.collection_dims: Dict[str, int] = {}
+        self._payload_index_cache: Dict[str, Set[str]] = {}
         self._hash_vectorizer = HashingVectorizer(
             n_features=4096,
             alternate_sign=False,
@@ -1182,6 +1243,71 @@ class QdrantRetriever:
         except Exception as exc:
             logger.warning("Could not list Qdrant collections: %s", exc)
             return []
+
+    @staticmethod
+    def _iter_filter_conditions(query_filter: Any):
+        if query_filter is None:
+            return
+        if isinstance(query_filter, Filter):
+            for attr in ("must", "should", "must_not"):
+                for cond in getattr(query_filter, attr, []) or []:
+                    yield from QdrantRetriever._iter_filter_conditions(cond)
+            return
+        if isinstance(query_filter, FieldCondition):
+            yield query_filter
+            return
+        if isinstance(query_filter, dict):
+            key = query_filter.get("key")
+            if key:
+                yield query_filter
+            for attr in ("must", "should", "must_not"):
+                for cond in query_filter.get(attr, []) or []:
+                    yield from QdrantRetriever._iter_filter_conditions(cond)
+            nested_filter = query_filter.get("filter")
+            if nested_filter:
+                yield from QdrantRetriever._iter_filter_conditions(nested_filter)
+
+    def _extract_filter_keys(self, query_filter: Any) -> Set[str]:
+        keys: Set[str] = set()
+        for cond in self._iter_filter_conditions(query_filter):
+            key = getattr(cond, "key", None)
+            if key is None and isinstance(cond, dict):
+                key = cond.get("key")
+            if key:
+                keys.add(str(key))
+        return keys
+
+    def _ensure_filter_indexes(self, collection_name: str, query_filter: Any) -> None:
+        keys = self._extract_filter_keys(query_filter)
+        if not keys:
+            return
+        fields_to_index = {
+            key for key in keys if key in PAYLOAD_INDEX_FIELDS or key in PAYLOAD_INDEX_SCHEMAS
+        }
+        if not fields_to_index:
+            return
+
+        cached = self._payload_index_cache.setdefault(collection_name, set())
+        for field in sorted(fields_to_index):
+            if field in cached:
+                continue
+            schema = PAYLOAD_INDEX_SCHEMAS.get(field, "keyword")
+            try:
+                self.client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc).lower()
+                if "already exists" in msg or "index exists" in msg:
+                    cached.add(field)
+                    continue
+                logger.warning(
+                    "Payload index ensure failed for %s on %s: %s", field, collection_name, exc
+                )
+                continue
+            cached.add(field)
 
     def _ensure_collection_exists(self, collection_name: str) -> None:
         try:
@@ -1268,6 +1394,7 @@ class QdrantRetriever:
 
             # Add query_filter only if provided (not as 'filter')
             if query_filter is not None:
+                self._ensure_filter_indexes(collection_name, query_filter)
                 kwargs["query_filter"] = query_filter
 
             if score_threshold is not None:
@@ -2092,6 +2219,13 @@ GROUNDING & CITATION RULES (MANDATORY):
 4) If sources disagree, briefly note the discrepancy with citations.
 5) Do not invent, pad, or generalize beyond the provided text.
 
+DOCUMENT FOCUS DECISION FLOW (MANDATORY):
+- If the question names a document, ID, or section, anchor the answer there.
+- Otherwise infer the most relevant document/section from the context and source map.
+- If multiple documents are relevant, default to the single most relevant document.
+- Include multiple documents only when comparison or aggregation is clearly requested.
+- Ask a clarification question only when ambiguity across unrelated documents would change the answer, and list concrete options.
+
 ANSWER STYLE (MANDATORY):
 - Format: 1-2 sentence overview, then 3-6 concise bullet points with citations, then a one-line takeaway.
 - Tone: warm, confident colleague; vary sentence openings; avoid filler and repetition.
@@ -2294,22 +2428,286 @@ class EnterpriseRAGSystem:
         return contextual_query, {"profile_keywords_used": keywords, "profile_hints_used": hints}
 
     @staticmethod
-    def _build_clarification_question(
+    def _clean_label(value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        base = os.path.basename(text)
+        base = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", base)
+        base = re.sub(r"[_\-]+", " ", base)
+        base = re.sub(r"\s+", " ", base).strip()
+        return base or text
+
+    @staticmethod
+    def _tokenize(text: str) -> Set[str]:
+        return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2}
+
+    @classmethod
+    def _source_label_from_chunk(cls, chunk: RetrievedChunk) -> str:
+        meta = chunk.metadata or {}
+        raw = (
+            chunk.source
+            or meta.get("source_file")
+            or meta.get("document_name")
+            or meta.get("document_title")
+            or meta.get("document_id")
+        )
+        label = cls._clean_label(raw)
+        if label:
+            return label
+        return f"Document {chunk.id[:8]}"
+
+    @classmethod
+    def _section_label_from_chunk(cls, chunk: RetrievedChunk) -> str:
+        meta = chunk.metadata or {}
+        raw = meta.get("section_title") or meta.get("section")
+        return cls._clean_label(raw)
+
+    @classmethod
+    def _collect_focus_options(
+        cls,
+        chunks: List[RetrievedChunk],
+        profile_context: Optional[Dict[str, Any]] = None,
+        *,
+        limit: int = 4,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        doc_map: Dict[str, Dict[str, Any]] = {}
+        for chunk in (chunks or [])[:25]:
+            label = cls._source_label_from_chunk(chunk)
+            entry = doc_map.setdefault(
+                label,
+                {
+                    "label": label,
+                    "max_score": 0.0,
+                    "total_score": 0.0,
+                    "sections": set(),
+                },
+            )
+            score = max(float(getattr(chunk, "score", 0.0) or 0.0), 0.0)
+            entry["max_score"] = max(entry["max_score"], score)
+            entry["total_score"] += score
+            section = cls._section_label_from_chunk(chunk)
+            if section:
+                entry["sections"].add(section)
+
+        if not doc_map and profile_context:
+            for hint in (profile_context.get("hints") or [])[:limit]:
+                label = cls._clean_label(hint)
+                if not label:
+                    continue
+                doc_map.setdefault(
+                    label,
+                    {
+                        "label": label,
+                        "max_score": 0.0,
+                        "total_score": 0.0,
+                        "sections": set(),
+                    },
+                )
+
+        doc_options = sorted(
+            doc_map.values(),
+            key=lambda d: (float(d.get("max_score", 0.0)), float(d.get("total_score", 0.0)), d.get("label", "")),
+            reverse=True,
+        )[:limit]
+
+        section_set: Set[str] = set()
+        for option in doc_options:
+            sections = sorted(option.get("sections") or [])[:4]
+            option["sections"] = sections
+            section_set.update(sections)
+
+        section_options = sorted(section_set)[:6]
+        return doc_options, section_options
+
+    @classmethod
+    def _query_mentions_focus(
+        cls,
         query: str,
-        profile_context: Dict[str, Any],
+        doc_options: List[Dict[str, Any]],
+        section_options: List[str],
+        metadata_filters: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        filters = metadata_filters or {}
+        if filters.get("section_titles"):
+            return True
+        q_lower = (query or "").lower()
+        q_tokens = cls._tokenize(query)
+
+        for option in doc_options[:4]:
+            label = option.get("label") or ""
+            if label and label.lower() in q_lower:
+                return True
+            if cls._tokenize(label) & q_tokens:
+                return True
+
+        for section in section_options[:4]:
+            if section.lower() in q_lower:
+                return True
+            if cls._tokenize(section) & q_tokens:
+                return True
+
+        return False
+
+    @classmethod
+    def _doc_relatedness(cls, left: str, right: str) -> float:
+        left_tokens = cls._tokenize(left)
+        right_tokens = cls._tokenize(right)
+        if not left_tokens or not right_tokens:
+            return 0.0
+        overlap = left_tokens & right_tokens
+        union = left_tokens | right_tokens
+        return len(overlap) / max(len(union), 1)
+
+    @classmethod
+    def _should_request_clarification(
+        cls,
+        *,
+        query: str,
+        doc_options: List[Dict[str, Any]],
+        section_options: List[str],
+        metadata_filters: Optional[Dict[str, Any]],
+        preprocessing_metadata: Optional[Dict[str, Any]],
+    ) -> bool:
+        if not doc_options or len(doc_options) < 2:
+            return False
+
+        pre = preprocessing_metadata or {}
+        if pre.get("target_document_id"):
+            return False
+
+        if cls._query_mentions_focus(query, doc_options, section_options, metadata_filters):
+            return False
+
+        intent = (
+            (pre.get("query_analysis") or {}).get("intent")
+            or pre.get("intent")
+            or ""
+        ).lower()
+        if intent == "comparison":
+            return False
+
+        top = float(doc_options[0].get("max_score", 0.0) or 0.0)
+        second = float(doc_options[1].get("max_score", 0.0) or 0.0)
+        close_scores = False
+        if top <= 0 and second <= 0:
+            close_scores = True
+        else:
+            ratio = second / max(top, 1e-6)
+            close_scores = ratio >= 0.88 or abs(top - second) <= 0.02
+
+        unrelated = cls._doc_relatedness(doc_options[0].get("label", ""), doc_options[1].get("label", "")) < 0.25
+        generic = cls._is_query_vague(query) or len((query or "").split()) <= 6
+
+        return bool(close_scores and unrelated and generic)
+
+    @staticmethod
+    def _format_options(options: List[str], limit: int = 3) -> str:
+        cleaned = [opt for opt in (options or []) if opt][:limit]
+        return ", ".join(cleaned)
+
+    @staticmethod
+    def _truncate_excerpt(text: str, max_len: int = 220) -> str:
+        cleaned = " ".join((text or "").split())
+        if len(cleaned) <= max_len:
+            return cleaned
+        trimmed = cleaned[:max_len].rsplit(" ", 1)[0]
+        return (trimmed or cleaned[:max_len]).rstrip() + "..."
+
+    @classmethod
+    def _build_evidence_response(
+        cls,
+        *,
+        query: str,
+        sources: List[Dict[str, Any]],
+        doc_options: Optional[List[Dict[str, Any]]] = None,
+        section_options: Optional[List[str]] = None,
+        max_items: int = 3,
+    ) -> str:
+        if not sources:
+            return (
+                "I couldn't find anything relevant to that question in the indexed documents."
+            )
+
+        lines = [
+            "Here are the most relevant passages I found in the indexed documents:",
+        ]
+        items = 0
+        for src in sources:
+            if items >= max_items:
+                break
+            excerpt = cls._truncate_excerpt(src.get("excerpt") or "")
+            if not excerpt:
+                continue
+            section = src.get("section")
+            page = src.get("page")
+            detail_parts = []
+            if section:
+                detail_parts.append(f"Section: {section}")
+            if page:
+                detail_parts.append(f"Page: {page}")
+            details = f" ({'; '.join(detail_parts)})" if detail_parts else ""
+            source_id = src.get("source_id")
+            if not source_id:
+                continue
+            lines.append(f"- \"{excerpt}\"{details} [SOURCE-{source_id}]")
+            items += 1
+
+        doc_labels = [opt.get("label") for opt in (doc_options or []) if opt.get("label")]
+        doc_list = cls._format_options(doc_labels)
+        section_list = cls._format_options(section_options or [])
+        if doc_list and section_list:
+            lines.append(
+                f"If you want a direct answer, specify a document like {doc_list} "
+                f"or a section like {section_list}."
+            )
+        elif doc_list:
+            lines.append(f"If you want a direct answer, specify a document like {doc_list}.")
+        elif section_list:
+            lines.append(f"If you want a direct answer, specify a section like {section_list}.")
+
+        return "\n".join(lines)
+
+    @classmethod
+    def _build_clarification_question(
+        cls,
+        *,
+        query: str,
+        doc_options: List[Dict[str, Any]],
+        section_options: List[str],
+        profile_context: Optional[Dict[str, Any]] = None,
         metadata_filters: Optional[Dict[str, Any]] = None,
     ) -> str:
-        hints = profile_context.get("hints") or []
-        sections = (metadata_filters or {}).get("section_titles") or []
-        prompt_parts = ["I want to make sure I answer precisely."]
-        if sections:
-            prompt_parts.append(f"Which section should I focus on (e.g., {sections[0]})?")
-        elif hints:
-            prompt_parts.append(f"Which document or section should I focus on (e.g., {', '.join(hints[:2])})?")
-        else:
-            prompt_parts.append("Which document or section should I focus on?")
-        prompt_parts.append("If you want a comparison or summary, say which documents to include.")
-        return " ".join(prompt_parts)
+        filters = metadata_filters or {}
+        explicit_sections = filters.get("section_titles") or []
+        if explicit_sections:
+            section_name = cls._clean_label(explicit_sections[0])
+            section_list = cls._format_options(section_options)
+            if section_list:
+                return (
+                    f"I can focus on the '{section_name}' section. "
+                    f"If you meant a different section, choose one: {section_list}."
+                )
+            return f"I can focus on the '{section_name}' section."
+
+        doc_labels = [opt.get("label") for opt in (doc_options or []) if opt.get("label")]
+        if not doc_labels and profile_context:
+            doc_labels = [cls._clean_label(h) for h in (profile_context.get("hints") or []) if cls._clean_label(h)]
+
+        doc_list = cls._format_options(doc_labels)
+        section_list = cls._format_options(section_options)
+        if doc_list and section_list:
+            return (
+                f"This could refer to multiple documents: {doc_list}. "
+                f"Which one should I use? You can also name a section like: {section_list}."
+            )
+        if doc_list:
+            return f"This could refer to multiple documents: {doc_list}. Which one should I use?"
+        if section_list:
+            return f"Which section should I use: {section_list}?"
+        return "I couldn't find a supported answer in the indexed documents."
 
 
     def extract_person_name_from_query(self, query: str) -> Optional[str]:
@@ -2445,6 +2843,7 @@ class EnterpriseRAGSystem:
         query_analysis = self.query_intelligence.analyze(primary_query, profile_context_data)
         primary_metadata["intent"] = query_analysis.intent
         primary_metadata["query_analysis"] = {
+            "intent": query_analysis.intent,
             "sub_queries": query_analysis.sub_queries,
             "expanded_query": query_analysis.expanded_query,
             "expansion_terms": query_analysis.expansion_terms,
@@ -2608,6 +3007,12 @@ class EnterpriseRAGSystem:
             is_cold_start = True
             _FIRST_METRICS_REQUEST = False
 
+        def _sanitize_response(payload: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                return sanitize_user_payload(payload)
+            except Exception:
+                return payload
+
         try:
             if not profile_id:
                 raise ValueError("profile_id is required for retrieval")
@@ -2655,7 +3060,7 @@ class EnterpriseRAGSystem:
                 logger.warning(f"Could not count collection '{collection_name}': {diag_exc}")
 
             if self.greeting_handler.is_positive_feedback(query):
-                return {
+                return _sanitize_response({
                     "response": "You're welcome! If you want me to dig into another document or topic, just let me know.",
                     "sources": [],
                     "user_id": user_id,
@@ -2665,7 +3070,7 @@ class EnterpriseRAGSystem:
                     "context_found": True,
                     "query_type": "positive_feedback",
                     "grounded": True
-                }
+                })
 
             if self.greeting_handler.is_greeting(query):
                 greeting_response = (
@@ -2674,7 +3079,7 @@ class EnterpriseRAGSystem:
                 )
                 self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
-                return {
+                return _sanitize_response({
                     "response": greeting_response,
                     "sources": [],
                     "user_id": user_id,
@@ -2684,13 +3089,13 @@ class EnterpriseRAGSystem:
                     "context_found": True,
                     "query_type": "greeting",
                     "grounded": True
-                }
+                })
 
             if self.greeting_handler.is_farewell(query):
                 farewell_response = "Thanks for chatting. If you need anything else, come back anytime."
                 self.conversation_history.clear_history(namespace, user_id)
 
-                return {
+                return _sanitize_response({
                     "response": farewell_response,
                     "sources": [],
                     "user_id": user_id,
@@ -2700,7 +3105,7 @@ class EnterpriseRAGSystem:
                     "context_found": True,
                     "query_type": "farewell",
                     "grounded": True
-                }
+                })
 
             logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
 
@@ -2893,10 +3298,24 @@ class EnterpriseRAGSystem:
             logger.info(f"Preprocessed query: {processed_query}")
 
             if not retrieved_chunks and not use_tooling:
-                no_results_response = (
-                    f"I couldn't find anything in your documents that answers: '{query}'. "
-                    "Try rephrasing or tell me which document or section to focus on."
-                )
+                doc_options, section_options = self._collect_focus_options([], profile_context_data)
+                doc_labels = [opt.get("label") for opt in doc_options if opt.get("label")]
+                doc_list = self._format_options(doc_labels)
+                section_list = self._format_options(section_options)
+                if doc_list and section_list:
+                    no_results_response = (
+                        f"I couldn't find anything in the indexed documents that answers: '{query}'. "
+                        f"If it helps, I can focus on: {doc_list}, or a section like: {section_list}."
+                    )
+                elif doc_list:
+                    no_results_response = (
+                        f"I couldn't find anything in the indexed documents that answers: '{query}'. "
+                        f"I can check a specific document such as: {doc_list}."
+                    )
+                else:
+                    no_results_response = (
+                        f"I couldn't find anything in the indexed documents that answers: '{query}'."
+                    )
                 self.conversation_history.add_turn(namespace, user_id, query, no_results_response)
 
                 try:
@@ -2934,7 +3353,7 @@ class EnterpriseRAGSystem:
                     },
                 )
 
-                return {
+                return _sanitize_response({
                     "response": no_results_response,
                     "sources": [],
                     "user_id": user_id,
@@ -2949,7 +3368,7 @@ class EnterpriseRAGSystem:
                     "profile_context": profile_context_data,
                     "grounded": True,
                     "processing_time": time.time() - start_time
-                }
+                })
 
             # Boost relevance for recently cited documents to honor session context
             recent_docs = set(self.conversation_history.get_recent_doc_ids(namespace, user_id))
@@ -3105,10 +3524,24 @@ class EnterpriseRAGSystem:
 
             # ✅ FIXED: Only block if we truly have NO context at all
             if not is_answerable and not final_chunks:
-                not_answerable_response = (
-                    f"I don't have enough detail in the documents to answer that. "
-                    "If you can point me to a specific document or section, I can check again."
-                )
+                doc_options, section_options = self._collect_focus_options([], profile_context_data)
+                doc_labels = [opt.get("label") for opt in doc_options if opt.get("label")]
+                doc_list = self._format_options(doc_labels)
+                section_list = self._format_options(section_options)
+                if doc_list and section_list:
+                    not_answerable_response = (
+                        "I don't have enough detail in the indexed documents to answer that. "
+                        f"You can point me to a document like {doc_list} or a section like {section_list}."
+                    )
+                elif doc_list:
+                    not_answerable_response = (
+                        "I don't have enough detail in the indexed documents to answer that. "
+                        f"You can point me to a document like {doc_list}."
+                    )
+                else:
+                    not_answerable_response = (
+                        "I don't have enough detail in the indexed documents to answer that."
+                    )
                 self.conversation_history.add_turn(namespace, user_id, query, not_answerable_response)
 
                 try:
@@ -3149,7 +3582,7 @@ class EnterpriseRAGSystem:
                     },
                 )
 
-                return {
+                return _sanitize_response({
                     "response": not_answerable_response,
                     "sources": [],  # ✅ Changed to empty (no sources)
                     "user_id": user_id,
@@ -3165,7 +3598,7 @@ class EnterpriseRAGSystem:
                     "profile_context": profile_context_data,
                     "grounded": False,  # ✅ Changed to False (couldn't answer)
                     "processing_time": time.time() - start_time
-                }
+                })
 
             retrieval_brief = (
                 f"strategy={selected_strategy}; processed_query=\"{processed_query}\"; "
@@ -3243,6 +3676,8 @@ class EnterpriseRAGSystem:
 
             confidence_threshold = float(getattr(Config.Retrieval, "CONFIDENCE_THRESHOLD", 0.55))
             low_confidence_retry = False
+            doc_focus_retry = False
+            doc_focus_document: Optional[str] = None
             if confidence < confidence_threshold and not use_tooling:
                 fallback_top_k = max(top_k_retrieval * 2, len(retrieved_chunks) + 5)
                 fallback_chunks = self.retriever.hybrid_retrieve(
@@ -3279,9 +3714,73 @@ class EnterpriseRAGSystem:
                     confidence_breakdown = scoring["confidence_breakdown"]
                     low_confidence_retry = True
 
-            if confidence < confidence_threshold and not verification.overall_grounded:
-                metadata_filters = (preprocessing_metadata.get("query_analysis") or {}).get("metadata_filters") or {}
-                clarification = self._build_clarification_question(query, profile_context_data, metadata_filters)
+            metadata_filters = (preprocessing_metadata.get("query_analysis") or {}).get("metadata_filters") or {}
+            doc_options, section_options = self._collect_focus_options(
+                final_chunks or retrieved_chunks,
+                profile_context_data,
+            )
+
+            if (
+                confidence < confidence_threshold
+                and not verification.overall_grounded
+                and doc_options
+                and len(doc_options) > 1
+            ):
+                focus_label = doc_options[0].get("label")
+                focused_chunks = [
+                    chunk for chunk in retrieved_chunks
+                    if self._source_label_from_chunk(chunk) == focus_label
+                ] if focus_label else []
+                if focused_chunks and len(focused_chunks) < len(retrieved_chunks):
+                    retrieval_attempts.append(
+                        {
+                            "label": "low_confidence_doc_focus_retry",
+                            "query": processed_query,
+                            "hits": len(focused_chunks),
+                            "top_score": round(float(focused_chunks[0].score), 4) if focused_chunks else 0.0,
+                            "document_filter": focus_label,
+                        }
+                    )
+                    doc_focus_retry = True
+                    doc_focus_document = focus_label
+                    if focus_label and f"doc_focus={focus_label}" not in retrieval_brief:
+                        retrieval_brief += f"; doc_focus={focus_label}"
+                    reranked_chunks, final_chunks, context, context_sources = _build_context_from_chunks(
+                        focused_chunks
+                    )
+                    sources = context_sources or self.context_builder.extract_sources(final_chunks)
+                    verification_sources = _build_verification_sources(sources, final_chunks)
+                    answer, prompt, evidence_plan_text, scoring = _generate_answer(
+                        context, verification_sources, final_chunks
+                    )
+                    verification = scoring["verification"]
+                    confidence = scoring["confidence"]
+                    confidence_breakdown = scoring["confidence_breakdown"]
+                    doc_options, section_options = self._collect_focus_options(
+                        final_chunks or focused_chunks,
+                        profile_context_data,
+                    )
+
+            needs_clarification = (
+                confidence < confidence_threshold
+                and not verification.overall_grounded
+                and self._should_request_clarification(
+                    query=query,
+                    doc_options=doc_options,
+                    section_options=section_options,
+                    metadata_filters=metadata_filters,
+                    preprocessing_metadata=preprocessing_metadata,
+                )
+            )
+
+            if needs_clarification:
+                clarification = self._build_clarification_question(
+                    query=query,
+                    doc_options=doc_options,
+                    section_options=section_options,
+                    profile_context=profile_context_data,
+                    metadata_filters=metadata_filters,
+                )
                 self.conversation_history.add_turn(namespace, user_id, query, clarification)
                 self.learning_signals.record_low_confidence(
                     query=query,
@@ -3293,6 +3792,7 @@ class EnterpriseRAGSystem:
                         "subscription_id": subscription_id,
                         "confidence": confidence,
                         "confidence_breakdown": confidence_breakdown,
+                        "doc_focus_document": doc_focus_document,
                         "query_type": "clarification_needed",
                     },
                 )
@@ -3329,7 +3829,7 @@ class EnterpriseRAGSystem:
                     )
                 except Exception as metric_exc:
                     logger.debug("Metrics record (clarification_needed) failed: %s", metric_exc)
-                return {
+                return _sanitize_response({
                     "response": clarification,
                     "sources": sources,
                     "user_id": user_id,
@@ -3356,7 +3856,97 @@ class EnterpriseRAGSystem:
                         "overall_grounded": verification.overall_grounded,
                     },
                     "processing_time": round(processing_time, 2),
-                }
+                    "retrieval_notes": retrieval_brief,
+                    "doc_focus_retry": doc_focus_retry,
+                    "doc_focus_document": doc_focus_document,
+                })
+
+            if confidence < confidence_threshold and not verification.overall_grounded:
+                evidence_response = self._build_evidence_response(
+                    query=query,
+                    sources=sources,
+                    doc_options=doc_options,
+                    section_options=section_options,
+                )
+                self.conversation_history.add_turn(namespace, user_id, query, evidence_response)
+                self.learning_signals.record_low_confidence(
+                    query=query,
+                    context=context or "",
+                    answer=answer,
+                    reason="evidence_only_response",
+                    metadata={
+                        "profile_id": profile_id,
+                        "subscription_id": subscription_id,
+                        "confidence": confidence,
+                        "confidence_breakdown": confidence_breakdown,
+                        "doc_focus_document": doc_focus_document,
+                        "query_type": "evidence_only",
+                    },
+                )
+                processing_time = time.time() - start_time
+                _record_request_metrics(
+                    query_type="evidence_only",
+                    answer_text=evidence_response,
+                    context_text=context or "",
+                    context_found=bool(final_chunks),
+                    grounded=False,
+                    has_citations=bool(re.search(r'\[SOURCE-\d+\]', evidence_response)),
+                    processing_seconds=processing_time,
+                    prompt_text=prompt,
+                    confidence=confidence,
+                    support_score=verification.support_score,
+                    coverage_score=verification.coverage_score,
+                    numeric_support_rate=verification.numeric_support_rate,
+                )
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="evidence_only",
+                        context_found=bool(final_chunks),
+                        grounded=False,
+                        cached=False,
+                        processing_time=processing_time,
+                        retrieval_stats={
+                            "initial_retrieved": len(retrieved_chunks),
+                            "after_rerank": len(reranked_chunks),
+                            "final_context": len(final_chunks),
+                        },
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (evidence_only) failed: %s", metric_exc)
+                return _sanitize_response({
+                    "response": evidence_response,
+                    "sources": sources,
+                    "user_id": user_id,
+                    "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
+                    "context_found": bool(final_chunks),
+                    "query_type": "evidence_only",
+                    "preprocessing": preprocessing_metadata,
+                    "retrieval_attempts": retrieval_attempts,
+                    "selected_strategy": selected_strategy,
+                    "profile_context": profile_context_data,
+                    "grounded": False,
+                    "confidence": round(confidence, 3),
+                    "confidence_breakdown": confidence_breakdown,
+                    "verification": {
+                        "citations_valid": verification.citations_valid,
+                        "invalid_citations": verification.invalid_citations,
+                        "missing_citations": verification.missing_citations,
+                        "unsupported_sentences": verification.unsupported_sentences,
+                        "support_score": verification.support_score,
+                        "coverage_score": verification.coverage_score,
+                        "numeric_support_rate": verification.numeric_support_rate,
+                        "overall_grounded": verification.overall_grounded,
+                    },
+                    "processing_time": round(processing_time, 2),
+                    "retrieval_notes": retrieval_brief,
+                    "doc_focus_retry": doc_focus_retry,
+                    "doc_focus_document": doc_focus_document,
+                })
 
             self.conversation_history.add_turn(namespace, user_id, query, answer)
             final_doc_ids = [
@@ -3420,6 +4010,8 @@ class EnterpriseRAGSystem:
                     "final_context": len(final_chunks)
                 },
                 "low_confidence_retry": low_confidence_retry,
+                "doc_focus_retry": doc_focus_retry,
+                "doc_focus_document": doc_focus_document,
                 "force_refresh": force_refresh,
                 "disable_answer_cache": disable_answer_cache,
             }
@@ -3490,14 +4082,15 @@ class EnterpriseRAGSystem:
 
             # Persist the response in Redis before returning. Only cache successful
             # answers (document_qa) to improve subsequent response accuracy.
+            sanitized_response = _sanitize_response(response_obj)
             if cache and cache_key:
                 try:
-                    cache.setex(cache_key, ANSWER_CACHE_TTL, json.dumps(response_obj))
+                    cache.setex(cache_key, ANSWER_CACHE_TTL, json.dumps(sanitized_response))
                 except Exception as cache_exc:
                     logger.warning(f"Failed to cache answer: {cache_exc}")
 
             # Return the constructed response
-            return response_obj
+            return sanitized_response
 
         except HTTPException:
             raise
@@ -3564,7 +4157,7 @@ class EnterpriseRAGSystem:
                 except Exception:
                     pass
 
-            return {
+            return _sanitize_response({
                 "response": error_response,
                 "sources": [],
                 "user_id": user_id,
@@ -3576,7 +4169,7 @@ class EnterpriseRAGSystem:
                 "error": str(e),
                 "grounded": False,
                 "processing_time": time.time() - start_time
-            }
+            })
 
 
 # Global RAG system instance (lazy initialization)

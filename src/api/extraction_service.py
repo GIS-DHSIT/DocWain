@@ -199,10 +199,13 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             if isinstance(content, dict) and "texts" in content:
                 texts = content.get("texts") or []
                 if texts:
-                    from src.api.dataHandler import get_model
+                    from src.api.dataHandler import encode_with_fallback
 
-                    model = get_model()
-                    content["embeddings"] = model.encode(texts, convert_to_numpy=True)
+                    content["embeddings"] = encode_with_fallback(
+                        texts,
+                        convert_to_numpy=True,
+                        normalize_embeddings=False,
+                    )
                 masked_docs[fname] = content
 
     try:

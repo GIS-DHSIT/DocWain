@@ -6,7 +6,8 @@ from pydantic import BaseModel, Field
 from src.api.schemas import DocumentListResponse
 from src.documents.document_store_adapter import list_documents
 from src.api.blob_store import BlobConfigurationError
-from src.api.embedding_service import embed_documents
+from src.api.embedding_service import embed_documents, embedding_integrity_report
+from src.security.response_sanitizer import sanitize_user_payload
 
 documents_router = APIRouter()
 
@@ -18,6 +19,14 @@ class DocumentEmbedRequest(BaseModel):
     profile_id: Optional[str] = Field(None, description="Optional profile id override")
     doc_type: Optional[str] = Field(None, description="Optional document type override")
     max_blobs: Optional[int] = Field(None, description="Optional max blobs to process per request")
+
+
+class DocumentIntegrityRequest(BaseModel):
+    document_id: Optional[str] = Field(None, description="Document identifier")
+    document_ids: Optional[List[str]] = Field(None, description="Multiple document identifiers")
+    subscription_id: Optional[str] = Field(None, description="Optional subscription id override")
+    profile_id: Optional[str] = Field(None, description="Optional profile id override")
+    limit: Optional[int] = Field(None, description="Max documents to inspect when ids are not provided")
 
 
 @documents_router.get("/documents", response_model=DocumentListResponse)
@@ -60,7 +69,7 @@ def get_documents(
 @documents_router.post("/documents/embed")
 def embed_document(request: DocumentEmbedRequest = Body(...)):
     try:
-        return embed_documents(
+        result = embed_documents(
             document_id=request.document_id,
             document_ids=request.document_ids,
             subscription_id=request.subscription_id,
@@ -68,6 +77,24 @@ def embed_document(request: DocumentEmbedRequest = Body(...)):
             doc_type=request.doc_type,
             max_blobs=request.max_blobs,
         )
+        return sanitize_user_payload(result)
+    except BlobConfigurationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@documents_router.post("/documents/embed/report")
+def embed_report(request: DocumentIntegrityRequest = Body(...)):
+    try:
+        result = embedding_integrity_report(
+            document_id=request.document_id,
+            document_ids=request.document_ids,
+            subscription_id=request.subscription_id,
+            profile_id=request.profile_id,
+            limit=request.limit,
+        )
+        return sanitize_user_payload(result)
     except BlobConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
