@@ -170,12 +170,25 @@ class BlobStore:
         if metadata:
             meta.update({str(k): str(v) for k, v in metadata.items() if v is not None})
 
-        blob_client.upload_blob(
-            payload,
-            overwrite=True,
-            metadata=meta,
-            content_settings=ContentSettings(content_type="application/octet-stream"),
-        )
+        try:
+            blob_client.upload_blob(
+                payload,
+                overwrite=True,
+                metadata=meta,
+                content_settings=ContentSettings(content_type="application/octet-stream"),
+            )
+        except HttpResponseError as exc:
+            error_code = str(getattr(exc, "error_code", "")).lower()
+            if error_code == "leaseidmissing":
+                logger.warning("Blob %s is leased; skipping overwrite.", blob_name)
+                return {
+                    "blob_name": blob_name,
+                    "etag": None,
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "leased": True,
+                }
+            raise
         try:
             props = blob_client.get_blob_properties()
             etag = getattr(props, "etag", None)

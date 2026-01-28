@@ -1104,6 +1104,22 @@ def _process_blob(
             record=record,
             subscription_id=subscription_id,
         )
+        if prep_error == "empty_extraction":
+            reextracted = _reextract_from_source(
+                document_id=doc_id,
+                record=record,
+                subscription_id=subscription_id,
+            )
+            if reextracted:
+                extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
+                    document_id=doc_id,
+                    extracted=reextracted,
+                    record=record,
+                    subscription_id=subscription_id,
+                )
+                if not prep_error:
+                    extracted = reextracted
+
         if prep_error or extracted_docs is None or expected_chunks is None:
             if telemetry:
                 telemetry.increment("embed_screening_fail_total")

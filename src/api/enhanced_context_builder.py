@@ -678,7 +678,7 @@ def generate_accurate_answer(
 
     if not context:
         return {
-            'answer': "I couldn't find relevant information in the documents to answer your question.",
+            'answer': "Please specify the document or section you want me to use so I can answer precisely.",
             'sources': [],
             'verified': True  # Absence acknowledgment is valid
         }
