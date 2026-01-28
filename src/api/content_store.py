@@ -54,7 +54,7 @@ def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any
             raise
         except Exception as exc:  # noqa: BLE001
             logger.error("Failed to persist extracted pickle to blob: %s", exc)
-            raise
+            logger.warning("Falling back to local pickle storage for %s", document_id)
 
     logger.warning("Blob storage not configured; falling back to local pickle storage.")
     payload = pickle.dumps(extracted_obj, protocol=pickle.HIGHEST_PROTOCOL)

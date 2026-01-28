@@ -37,6 +37,7 @@ from src.api.dw_chat import (
 )
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
+from src.api.knowledge_graph import knowledge_graph_router
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
@@ -1374,6 +1375,7 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 
 
 app.include_router(api_router)
+app.include_router(knowledge_graph_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)

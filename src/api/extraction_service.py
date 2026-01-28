@@ -24,7 +24,6 @@ from src.api.statuses import (
     STATUS_DELETED,
     STATUS_EXTRACTION_COMPLETED,
     STATUS_EXTRACTION_FAILED,
-    STATUS_TRAINING_FAILED,
     STATUS_UNDER_REVIEW,
 )
 from src.storage.azure_blob_client import BlobDownloadError, CredentialError, normalize_blob_name
@@ -239,7 +238,7 @@ def extract_documents() -> Dict[str, Any]:
         if not doc_coll:
             return {"status": "no_documents", "message": "No documents found for extraction"}
 
-        allowed_statuses = {STATUS_UNDER_REVIEW, STATUS_TRAINING_FAILED, STATUS_EXTRACTION_FAILED}
+        allowed_statuses = {STATUS_UNDER_REVIEW, STATUS_EXTRACTION_FAILED}
         eligible_docs = {
             doc_id: doc_info
             for doc_id, doc_info in doc_coll.items()

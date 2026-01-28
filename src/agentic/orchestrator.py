@@ -5,11 +5,15 @@ import time
 from typing import Any, Dict, Iterable, List
 
 from src.api.config import Config
+from src.api.query_intelligence import QueryIntelligence
+from src.agentic.budgets import compute_agent_budgets
 from src.execution.common import ExecutionResult, chunk_text_stream
 from src.metrics.ai_metrics import get_metrics_store
 from src.mode.execution_mode import ExecutionMode
 from src.runtime.chain_factory import build_chain
 from src.runtime.freshness_guard import FreshnessGuard
+from src.chat.companion_classifier import CompanionClassifier
+from src.api.dw_newron import get_redis_client
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +48,31 @@ def run_agent_mode(
     This wrapper defers heavy lifting to the existing retrieval pipeline while
     enforcing explicit agent safeguards (step budget, evidence requirement).
     """
-    max_steps = int(getattr(Config.Execution, "MAX_AGENT_STEPS", 10))
-    max_evidence = int(getattr(Config.Execution, "MAX_AGENT_EVIDENCE", 20))
+    base_steps = int(getattr(Config.Execution, "MAX_AGENT_STEPS", 10))
+    base_evidence = int(getattr(Config.Execution, "MAX_AGENT_EVIDENCE", 20))
+    max_steps = base_steps
+    max_evidence = base_evidence
+
+    query_text = getattr(request, "query", None) or getattr(request, "question", None) or ""
+    try:
+        analysis = QueryIntelligence().analyze(str(query_text))
+        budgets = compute_agent_budgets(str(query_text), analysis.__dict__, base_steps=base_steps, base_evidence=base_evidence)
+        max_steps = budgets.get("max_steps", base_steps)
+        max_evidence = budgets.get("max_evidence", base_evidence)
+    except Exception:
+        pass
+
+    companion_payload = None
+    try:
+        companion_classifier = CompanionClassifier(get_redis_client())
+        companion_payload = companion_classifier.classify(
+            user_query=str(query_text),
+            last_turns_summary="",
+            intent_from_query_intelligence=getattr(analysis, "intent", "") if "analysis" in locals() else "",
+            session_id=getattr(request, "session_id", None),
+        ).as_dict()
+    except Exception:
+        companion_payload = None
 
     trace: List[Dict[str, Any]] = _bounded_trace(max_steps)
     trace.append({"phase": "planning", "detail": "Decomposing request and goals", "timestamp": time.time()})
@@ -104,6 +131,7 @@ def run_agent_mode(
         "model_name": model_name,
         "request_id": ctx.request_id,
         "evidence_ids": evidence_ids,
+        "companion": companion_payload,
     }
     metadata = answer.get("metadata") or {}
     metadata["debug"] = {**debug_info, **metadata.get("debug", {})}

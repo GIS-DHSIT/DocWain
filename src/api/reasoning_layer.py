@@ -91,7 +91,7 @@ class AnswerVerifier:
         numeric_total = 0
 
         for sentence in sentences:
-            cited = self._extract_citations(sentence)
+            cited = self._extract_citations(sentence, sources)
             if not cited:
                 if not self._is_meta_statement(sentence):
                     missing_citations += 1
@@ -144,9 +144,49 @@ class AnswerVerifier:
         return [s.strip() for s in raw if s.strip()]
 
     @staticmethod
-    def _extract_citations(text: str) -> List[int]:
-        cites = re.findall(r"\[SOURCE-(\d+)\]", text)
-        return [int(c) for c in cites if c.isdigit()]
+    def _extract_citations(text: str, sources: List[Dict[str, Any]]) -> List[int]:
+        numeric = [int(c) for c in re.findall(r"\[SOURCE-(\d+)\]", text) if c.isdigit()]
+        if numeric:
+            return numeric
+
+        # Match doc/section style citations
+        labels = re.findall(r"\[(?:Doc|Document):([^\]]+)\]", text, flags=re.IGNORECASE)
+        if not labels:
+            return []
+
+        indices: List[int] = []
+        for label in labels:
+            idx = AnswerVerifier._match_label_to_source(label, sources)
+            if idx is not None:
+                indices.append(idx + 1)
+        return indices
+
+    @staticmethod
+    def _match_label_to_source(label: str, sources: List[Dict[str, Any]]) -> Optional[int]:
+        cleaned = re.sub(r"[\|\:]", " ", label or "").lower()
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned:
+            return None
+        label_tokens = set(re.findall(r"[a-z0-9]{3,}", cleaned))
+        if not label_tokens:
+            return None
+        best_idx = None
+        best_score = 0.0
+        for idx, src in enumerate(sources):
+            name = str(src.get("source_name") or "")
+            section = str(src.get("section") or "")
+            page = str(src.get("page") or "")
+            text = f"{name} {section} {page}".lower()
+            tokens = set(re.findall(r"[a-z0-9]{3,}", text))
+            if not tokens:
+                continue
+            overlap = len(label_tokens & tokens) / max(len(label_tokens), 1)
+            if overlap > best_score:
+                best_score = overlap
+                best_idx = idx
+        if best_score >= 0.15:
+            return best_idx
+        return None
 
     @staticmethod
     def _is_meta_statement(sentence: str) -> bool:

@@ -1,3 +1,3 @@
-"""Agentic orchestration entrypoints."""
+"""Agentic utilities."""
 
-from .orchestrator import run_agent_mode  # noqa: F401
+__all__ = []

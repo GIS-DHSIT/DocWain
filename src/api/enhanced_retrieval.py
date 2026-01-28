@@ -7,6 +7,7 @@ Key Fixes:
 """
 
 import logging
+import time
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
 from src.api.vector_store import compute_chunk_id
+from src.kg.entity_extractor import EntityExtractor
+from src.kg.neo4j_store import Neo4jStore
+from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +439,168 @@ class AdaptiveRetriever:
                 chunk['keyword_boost'] = match_ratio
 
         chunks.sort(key=lambda x: x['score'], reverse=True)
+        return chunks
+
+
+@dataclass
+class KGProbeResult:
+    document_ids: List[str]
+    section_paths: List[str]
+    hits: Dict[str, int]
+    source: str = "neo4j"
+
+
+class GraphGuidedRetriever:
+    """Lightweight KG probe + score boost layer for retrieval."""
+
+    def __init__(
+        self,
+        *,
+        neo4j_store: Optional[Neo4jStore],
+        cache: Optional[RedisJsonCache],
+        entity_extractor: Optional[EntityExtractor] = None,
+        probe_limit: int = 20,
+        probe_timeout_ms: int = 80,
+        cache_ttl_seconds: int = 1200,
+    ) -> None:
+        self.neo4j_store = neo4j_store
+        self.cache = cache
+        self.entity_extractor = entity_extractor or EntityExtractor()
+        self.probe_limit = int(probe_limit)
+        self.probe_timeout_ms = int(probe_timeout_ms)
+        self.cache_ttl_seconds = int(cache_ttl_seconds)
+
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        return " ".join((query or "").strip().lower().split())
+
+    def _cache_key(self, tenant: str, collection: str, normalized_query: str) -> str:
+        return f"kgprobe:{tenant}:{collection}:{hash_query(normalized_query)}"
+
+    def _entity_cache_key(self, tenant: str, normalized_query: str) -> str:
+        return f"kgentities:{tenant}:{hash_query(normalized_query)}"
+
+    def get_cached_probe(self, *, tenant: str, collection: str, query: str) -> Optional[KGProbeResult]:
+        if not self.cache:
+            return None
+        normalized = self._normalize_query(query)
+        cached = self.cache.get_json(self._cache_key(tenant, collection, normalized), feature="kgprobe")
+        if not cached:
+            return None
+        return KGProbeResult(
+            document_ids=cached.get("document_ids") or [],
+            section_paths=cached.get("section_paths") or [],
+            hits=cached.get("hits") or {},
+            source="cache",
+        )
+
+    def _extract_entities(self, *, tenant: str, query: str) -> List[str]:
+        normalized = self._normalize_query(query)
+        if self.cache:
+            cached = self.cache.get_json(self._entity_cache_key(tenant, normalized), feature="kgprobe")
+            if cached:
+                return cached.get("entity_ids") or []
+        entities = self.entity_extractor.extract(query)
+        entity_ids = [ent.entity_id for ent in entities]
+        if self.cache:
+            self.cache.set_json(
+                self._entity_cache_key(tenant, normalized),
+                stamp_cache_payload({"entity_ids": entity_ids}),
+                feature="kgprobe",
+                ttl=max(300, self.cache_ttl_seconds // 2),
+            )
+        return entity_ids
+
+    def probe(self, *, tenant: str, collection: str, query: str) -> KGProbeResult:
+        normalized = self._normalize_query(query)
+        if self.cache:
+            cached = self.cache.get_json(self._cache_key(tenant, collection, normalized), feature="kgprobe")
+            if cached:
+                return KGProbeResult(
+                    document_ids=cached.get("document_ids") or [],
+                    section_paths=cached.get("section_paths") or [],
+                    hits=cached.get("hits") or {},
+                    source="cache",
+                )
+
+        entity_ids = self._extract_entities(tenant=tenant, query=normalized)
+        if not entity_ids or not self.neo4j_store:
+            result = KGProbeResult(document_ids=[], section_paths=[], hits={}, source="empty")
+            if self.cache:
+                self.cache.set_json(
+                    self._cache_key(tenant, collection, normalized),
+                    stamp_cache_payload(result.__dict__),
+                    feature="kgprobe",
+                    ttl=self.cache_ttl_seconds,
+                )
+            return result
+
+        start = time.time()
+        try:
+            hits = self.neo4j_store.probe_entities(
+                entity_ids=entity_ids,
+                limit=self.probe_limit,
+                timeout_ms=self.probe_timeout_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("KG probe failed: %s", exc)
+            hits = []
+
+        doc_hits: Dict[str, int] = {}
+        section_paths: List[str] = []
+        for row in hits:
+            doc_id = str(row.get("document_id") or "")
+            section_path = row.get("section_path")
+            hit_count = int(row.get("hits") or 0)
+            if doc_id:
+                doc_hits[doc_id] = doc_hits.get(doc_id, 0) + hit_count
+            if section_path:
+                section_paths.append(str(section_path))
+
+        ranked_docs = [doc for doc, _ in sorted(doc_hits.items(), key=lambda item: item[1], reverse=True)]
+        unique_sections = list(dict.fromkeys(section_paths))
+        result = KGProbeResult(
+            document_ids=ranked_docs,
+            section_paths=unique_sections,
+            hits=doc_hits,
+            source="neo4j",
+        )
+        if self.cache:
+            self.cache.set_json(
+                self._cache_key(tenant, collection, normalized),
+                stamp_cache_payload(result.__dict__),
+                feature="kgprobe",
+                ttl=self.cache_ttl_seconds,
+            )
+        elapsed_ms = (time.time() - start) * 1000
+        if elapsed_ms > self.probe_timeout_ms:
+            logger.debug("KG probe exceeded budget: %.1fms", elapsed_ms)
+        return result
+
+    @staticmethod
+    def apply_boosts(
+        chunks: List[Dict[str, Any]],
+        probe: KGProbeResult,
+        *,
+        doc_boost: float = 0.12,
+        section_boost: float = 0.08,
+    ) -> List[Dict[str, Any]]:
+        if not chunks or not probe.document_ids:
+            return chunks
+        doc_set = set(probe.document_ids)
+        section_set = set([s.lower() for s in (probe.section_paths or [])])
+        for chunk in chunks:
+            meta = chunk.get("metadata") or {}
+            doc_id = str(meta.get("document_id") or "")
+            if doc_id and doc_id in doc_set:
+                chunk["score"] = float(chunk.get("score", 0.0)) + doc_boost
+                meta["kg_boost"] = True
+            section_path = (meta.get("section_path") or meta.get("section_title") or "").strip().lower()
+            if section_path and section_path in section_set:
+                chunk["score"] = float(chunk.get("score", 0.0)) + section_boost
+                meta["kg_section_boost"] = True
+            chunk["metadata"] = meta
+        chunks.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
         return chunks
 
     def _expand_with_adjacent_chunks(
