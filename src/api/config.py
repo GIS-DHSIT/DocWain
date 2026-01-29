@@ -76,9 +76,9 @@ class Config:
         HF_HUB_READ_TIMEOUT = int(os.getenv("HF_HUB_READ_TIMEOUT", "30"))
         HF_HUB_CONNECT_TIMEOUT = int(os.getenv("HF_HUB_CONNECT_TIMEOUT", "10"))
         HF_HUB_MAX_RETRIES = int(os.getenv("HF_HUB_MAX_RETRIES", "3"))
-        HF_DISABLE_TELEMETRY = os.getenv("HF_HUB_DISABLE_TELEMETRY", "true").lower() in {"1", "true", "yes", "on"}
-        TRANSFORMERS_OFFLINE = os.getenv("TRANSFORMERS_OFFLINE", "true").lower() in {"1", "true", "yes", "on"}
-        DISABLE_HF = os.getenv("DISABLE_HF", "true").lower() in {"1", "true", "yes", "on"}
+        HF_DISABLE_TELEMETRY = os.getenv("HF_HUB_DISABLE_TELEMETRY", "false").lower() in {"1", "true", "yes", "on"}
+        TRANSFORMERS_OFFLINE = os.getenv("TRANSFORMERS_OFFLINE", "false").lower() in {"1", "true", "yes", "on"}
+        DISABLE_HF = os.getenv("DISABLE_HF", "false").lower() in {"1", "true", "yes", "on"}
 
     class Azure:
         AZURE_SUBSCRIPTION_ID = "249bb11f-9b6e-4c0e-a844-500d627b80b3"
@@ -245,7 +245,7 @@ class Config:
         MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
 
     class ModelArbitration:
-        ENABLED = os.getenv("MODEL_ARBITRATION_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        ENABLED = os.getenv("MODEL_ARBITRATION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
         MAX_PARALLEL = int(os.getenv("MODEL_ARBITRATION_MAX_PARALLEL", "3"))
         MODELS_RAW = os.getenv("MODEL_ARBITRATION_MODELS", "").strip()
         MODELS = []

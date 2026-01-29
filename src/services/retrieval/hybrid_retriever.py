@@ -48,6 +48,146 @@ class HybridRetriever:
         self.client = client
         self.embedder = embedder
         self.config = config or HybridRetrieverConfig()
+        self._profile_key_cache: Dict[tuple[str, str], Optional[str]] = {}
+        self._profile_identity_cache: Dict[tuple[str, str], Optional[Tuple[str, List[Any]]]] = {}
+        self._inferred_profile_cache: Dict[str, Optional[Tuple[str, str]]] = {}
+
+    @staticmethod
+    def _profile_value_variants(profile_id: str) -> List[Any]:
+        variants: List[Any] = [str(profile_id)]
+        try:
+            if isinstance(profile_id, str) and profile_id.isdigit():
+                variants.append(int(profile_id))
+            elif isinstance(profile_id, (int, float)):
+                variants.append(str(profile_id))
+        except Exception:
+            pass
+        return variants
+
+    def _resolve_profile_key(self, collection_name: Optional[str], profile_id: str) -> Optional[str]:
+        if not collection_name:
+            return None
+        cache_key = (collection_name, str(profile_id))
+        if cache_key in self._profile_key_cache:
+            return self._profile_key_cache[cache_key]
+        candidates = ("profile_id", "profileId", "profile")
+        values = self._profile_value_variants(profile_id)
+        for key in candidates:
+            try:
+                count = self.client.count(
+                    collection_name=collection_name,
+                    exact=False,
+                    count_filter=Filter(must=[FieldCondition(key=key, match=MatchAny(any=values))]),
+                )
+                if getattr(count, "count", 0) > 0:
+                    self._profile_key_cache[cache_key] = key
+                    logger.info("Resolved profile key '%s' for collection '%s'", key, collection_name)
+                    return key
+            except Exception:
+                continue
+        logger.warning(
+            "No profile key matched for collection '%s' and profile_id '%s'",
+            collection_name,
+            profile_id,
+        )
+        self._profile_key_cache[cache_key] = None
+        return None
+
+    def _infer_single_profile(self, collection_name: str, max_points: int = 200) -> Optional[Tuple[str, str]]:
+        if not collection_name:
+            return None
+        if collection_name in self._inferred_profile_cache:
+            return self._inferred_profile_cache[collection_name]
+        try:
+            scroll = self.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=None,
+                with_payload=True,
+                with_vectors=False,
+                limit=max_points,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Profile inference scroll failed for %s: %s", collection_name, exc)
+            self._inferred_profile_cache[collection_name] = None
+            return None
+
+        points = []
+        if hasattr(scroll, "points"):
+            points = scroll.points or []
+        elif isinstance(scroll, tuple) and scroll:
+            points = scroll[0] or []
+        if not points:
+            self._inferred_profile_cache[collection_name] = None
+            return None
+
+        value_counts: Dict[str, int] = {}
+        key_counts: Dict[Tuple[str, str], int] = {}
+        for pt in points:
+            payload = getattr(pt, "payload", {}) or {}
+            for key in ("profile_id", "profileId", "profile"):
+                value = payload.get(key)
+                if value is None:
+                    continue
+                value_str = str(value)
+                value_counts[value_str] = value_counts.get(value_str, 0) + 1
+                key_counts[(key, value_str)] = key_counts.get((key, value_str), 0) + 1
+
+        if len(value_counts) != 1:
+            self._inferred_profile_cache[collection_name] = None
+            return None
+
+        inferred_value = next(iter(value_counts.keys()))
+        best_key = None
+        best_count = 0
+        for (key, val), count in key_counts.items():
+            if val != inferred_value:
+                continue
+            if count > best_count:
+                best_key = key
+                best_count = count
+
+        if not best_key:
+            self._inferred_profile_cache[collection_name] = None
+            return None
+
+        inferred = (best_key, inferred_value)
+        self._inferred_profile_cache[collection_name] = inferred
+        logger.warning(
+            "Inferred single profile for collection '%s' using key '%s'",
+            collection_name,
+            best_key,
+        )
+        return inferred
+
+    def _resolve_profile_identity(
+        self, collection_name: Optional[str], profile_id: str
+    ) -> Optional[Tuple[str, List[Any]]]:
+        if not collection_name:
+            return None
+        cache_key = (collection_name, str(profile_id))
+        if cache_key in self._profile_identity_cache:
+            return self._profile_identity_cache[cache_key]
+
+        key = self._resolve_profile_key(collection_name, profile_id)
+        if key:
+            identity = (key, self._profile_value_variants(profile_id))
+            self._profile_identity_cache[cache_key] = identity
+            return identity
+
+        inferred = self._infer_single_profile(collection_name)
+        if inferred:
+            inferred_key, inferred_value = inferred
+            logger.warning(
+                "Profile id '%s' not found in collection '%s'; using sole profile value",
+                profile_id,
+                collection_name,
+            )
+            identity = (inferred_key, [inferred_value])
+            self._profile_identity_cache[cache_key] = identity
+            return identity
+
+        self._profile_identity_cache[cache_key] = None
+        return None
 
     @staticmethod
     def _normalize_scores(values: List[float]) -> List[float]:
@@ -86,6 +226,7 @@ class HybridRetriever:
     def _build_filter(
         self,
         profile_id: str,
+        collection_name: Optional[str] = None,
         document_ids: Optional[List[str]] = None,
         source_files: Optional[List[str]] = None,
         doc_types: Optional[List[str]] = None,
@@ -95,7 +236,14 @@ class HybridRetriever:
     ) -> Filter:
         if not profile_id:
             raise ValueError("profile_id is required for retrieval")
-        conditions = [FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id)))]
+        profile_value = str(profile_id)
+        conditions: List[FieldCondition] = []
+        identity = self._resolve_profile_identity(collection_name, profile_value)
+        if identity:
+            profile_key, profile_values = identity
+            conditions.append(FieldCondition(key=profile_key, match=MatchAny(any=profile_values)))
+        else:
+            conditions.append(FieldCondition(key="profile_id", match=MatchValue(value=profile_value)))
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
@@ -167,17 +315,6 @@ class HybridRetriever:
         filters = filters or {}
         explicit_hints = explicit_hints or {}
         top_k = int(top_k or self.config.topk_dense)
-        try:
-            query_vector = self.embedder.encode(query, convert_to_numpy=True, normalize_embeddings=True)
-            if hasattr(query_vector, "astype"):
-                query_vector = query_vector.astype(np.float32).tolist()
-            elif isinstance(query_vector, (list, tuple)):
-                query_vector = [float(v) for v in query_vector]
-            else:
-                query_vector = [float(v) for v in list(query_vector)]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Hybrid retrieval skipped (embedder unavailable): %s", exc)
-            return []
 
         strict_filters = {
             key: filters.get(key)
@@ -188,6 +325,7 @@ class HybridRetriever:
 
         query_filter = self._build_filter(
             profile_id,
+            collection_name=collection_name,
             document_ids=strict_filters.get("document_ids") if use_strict else None,
             source_files=strict_filters.get("source_files") if use_strict else None,
             doc_types=strict_filters.get("doc_types") if use_strict else None,
@@ -195,6 +333,27 @@ class HybridRetriever:
             page_numbers=strict_filters.get("page_numbers") if use_strict else None,
             min_confidence=strict_filters.get("min_confidence") if use_strict else None,
         )
+
+        try:
+            query_vector = self.embedder.encode(query, convert_to_numpy=True, normalize_embeddings=True)
+            if hasattr(query_vector, "astype"):
+                query_vector = query_vector.astype(np.float32).tolist()
+            elif isinstance(query_vector, (list, tuple)):
+                query_vector = [float(v) for v in query_vector]
+            else:
+                query_vector = [float(v) for v in list(query_vector)]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Hybrid retrieval skipped (embedder unavailable): %s", exc)
+            return self._lexical_fallback(
+                collection_name=collection_name,
+                query=query,
+                query_filter=query_filter,
+                filters=filters,
+                top_k=top_k,
+                use_strict=use_strict,
+                query_id=query_id,
+                start=start,
+            )
 
         kwargs = dict(
             collection_name=collection_name,
@@ -267,3 +426,85 @@ class HybridRetriever:
             },
         )
         return candidates
+
+    def _lexical_fallback(
+        self,
+        *,
+        collection_name: str,
+        query: str,
+        query_filter: Filter,
+        filters: Dict[str, Any],
+        top_k: int,
+        use_strict: bool,
+        query_id: Optional[str],
+        start: float,
+    ) -> List[RetrievalCandidate]:
+        try:
+            scroll = self.client.scroll(
+                collection_name=collection_name,
+                scroll_filter=query_filter,
+                with_payload=True,
+                with_vectors=False,
+                limit=max(50, int(top_k * 5)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Hybrid lexical fallback failed: %s", exc)
+            return []
+
+        points = []
+        if hasattr(scroll, "points"):
+            points = scroll.points or []
+        elif isinstance(scroll, tuple) and scroll:
+            points = scroll[0] or []
+
+        if not points:
+            return []
+
+        payloads = [getattr(pt, "payload", {}) or {} for pt in points]
+        texts = [payload.get("text", "") for payload in payloads]
+        lexical_scores = self._lexical_scores(query, texts)
+        if any(score > 0 for score in lexical_scores):
+            lexical_norm = self._normalize_scores(lexical_scores)
+        else:
+            lexical_norm = [0.0 for _ in lexical_scores]
+
+        candidates: List[RetrievalCandidate] = []
+        for idx, pt in enumerate(points):
+            payload = getattr(pt, "payload", {}) or {}
+            text = payload.get("text", "") or ""
+            if not text.strip():
+                continue
+            lexical_score = lexical_norm[idx] if idx < len(lexical_norm) else 0.0
+            boosts = self._metadata_boost(query, payload, filters)
+            boost_value = sum(boosts.values())
+            if use_strict and boost_value > 0:
+                boost_value += self.config.strict_filter_boost
+            score = lexical_score + boost_value
+            candidates.append(
+                RetrievalCandidate(
+                    id=str(getattr(pt, "id", "")),
+                    text=text,
+                    score=float(score),
+                    vector_score=0.0,
+                    lexical_score=float(lexical_score),
+                    metadata=payload,
+                    source=payload.get("source_file") or payload.get("source"),
+                    method="lexical_fallback",
+                    boosts=boosts,
+                )
+            )
+
+        candidates.sort(key=lambda c: float(c.score), reverse=True)
+
+        elapsed_ms = (time.time() - start) * 1000
+        logger.info(
+            "Hybrid lexical fallback completed",
+            extra={
+                "query_id": query_id,
+                "candidates": len(candidates),
+                "top_k": top_k,
+                "use_strict_filters": use_strict,
+                "latency_ms": round(elapsed_ms, 2),
+            },
+        )
+        return candidates[:top_k]
