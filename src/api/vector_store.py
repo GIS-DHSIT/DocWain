@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import uuid
 from typing import Iterable, List, Optional
@@ -25,23 +26,11 @@ PAYLOAD_INDEX_FIELDS = [
     "profileId",
     "document_id",
     "source_file",
-    "filename",
+    "page",
     "section_title",
-    "section_path",
     "chunk_id",
     "chunk_type",
-    "doc_type",
-    "document_type",
-    "chunk_hash",
 ]
-
-PAYLOAD_INDEX_SCHEMAS = {
-    "page": "integer",
-    "page_start": "integer",
-    "page_end": "integer",
-    "chunk_char_len": "integer",
-    "ocr_confidence": "float",
-}
 
 
 def build_collection_name(subscription_id: str, profile_id: Optional[str] = None) -> str:
@@ -65,9 +54,20 @@ def compute_chunk_id(
 ) -> str:
     """
     Deterministic chunk id to prevent duplicates across retraining.
-    Uses document_id and chunk_index for stable point ids.
+    sha1(subscription|profile|document|file|index|text_prefix)
     """
-    return f"{document_id}:{chunk_index}"
+    base = "|".join(
+        [
+            str(subscription_id),
+            str(profile_id),
+            str(document_id),
+            str(source_file),
+            str(chunk_index),
+            (chunk_text or "")[:text_prefix_len],
+        ]
+    )
+    digest = hashlib.sha1(base.encode("utf-8")).hexdigest()
+    return f"{prefix}_{digest}"
 
 
 class QdrantVectorStore:
@@ -130,14 +130,6 @@ class QdrantVectorStore:
             try:
                 self.client.create_payload_index(
                     collection_name=collection_name, field_name=field, field_schema="keyword"
-                )
-            except Exception as idx_exc:  # noqa: BLE001
-                logger.debug("Payload index for %s exists or failed softly: %s", field, idx_exc)
-
-        for field, schema in PAYLOAD_INDEX_SCHEMAS.items():
-            try:
-                self.client.create_payload_index(
-                    collection_name=collection_name, field_name=field, field_schema=schema
                 )
             except Exception as idx_exc:  # noqa: BLE001
                 logger.debug("Payload index for %s exists or failed softly: %s", field, idx_exc)

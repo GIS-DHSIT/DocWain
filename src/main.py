@@ -149,7 +149,7 @@ class QuestionRequest(BaseModel):
     profile_id: constr(min_length=1) = "67ac62ddfaa3aee44d38f4a5"
     subscription_id: str = "default"
     model_name: str = "llama3.2"
-    persona: str = "Document Assistant"
+    persona: str = "DocWain"
     session_id: Optional[str] = None
     new_session: bool = False  # Frontend sends flag here
     agent_mode: Optional[bool] = None

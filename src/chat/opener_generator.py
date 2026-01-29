@@ -12,6 +12,8 @@ BANNED_OPENERS = [
     "here are the most relevant passages",
     "here's the most relevant passages",
     "here are the relevant passages",
+    "here's the most relevant info",
+    "here is the most relevant info",
     "based on the passages",
     "based on the passages above",
     "based on the passages provided",
@@ -77,16 +79,8 @@ def generate_opener(
 
     opener = _pick_variant(variants, seed)
     if follow_up:
-        follow_variants = [
-            "Picking up where we left off - ",
-            "Continuing from earlier - ",
-            "Following up - ",
-        ]
-        prefix = _pick_variant(follow_variants, seed + 13)
-        if opener:
-            opener = prefix + opener[0].lower() + opener[1:]
-        else:
-            opener = prefix.rstrip(" -")
+        # Avoid explicit continuation phrases in openers.
+        pass
 
     if not opener or contains_banned_opener(opener):
         opener = "Got it - here's what I found."
@@ -99,7 +93,7 @@ def _intent_variants(intent_key: str, *, humor_level: int, tone: str) -> List[st
         "factual": [
             "Here's what I found.",
             "Here's the answer I can support.",
-            "Here's the most relevant info.",
+            "Here's what I can confirm.",
         ],
         "summary": [
             "Here's a concise summary.",
