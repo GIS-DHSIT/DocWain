@@ -56,6 +56,8 @@ tiktoken
 pydantic
 regex
 redis
+ray[default]
+pynvml
 # --- Optional / Local Model Support ---
 ollama
 

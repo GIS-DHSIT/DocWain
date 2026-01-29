@@ -122,6 +122,11 @@ async def _startup_checks() -> None:
         log_legacy_vetting_notice_if_missing()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Legacy config notice skipped: %s", exc)
+    try:
+        from docwain_ollama_orchestrator.fastapi_integration_example import ensure_ollama_registry_actor
+        await ensure_ollama_registry_actor()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ollama registry bootstrap skipped: %s", exc)
 
 
 @app.exception_handler(HTTPException)
