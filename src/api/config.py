@@ -86,6 +86,7 @@ class Config:
         AZURE_PROJECT_NAME = "dhs-ai-competency"
         AZURE_AI_ENDPOINT = "https://dhs-ai-competency-resource.services.ai.azure.com/api/projects/dhs-ai-competency"
         AZURE_AI_KEY = "CpQaDiSSIBQBXcIysi5DpdoalYW8ghtDLwU8nGOsagVlkulbKvCsJQQJ99CAAC77bzfXJ3w3AAAAACOGG3Yu"
+
     class AzureGpt4o:
         AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
         AZUREGPT4O_DEPLOYMENT = "dw-dev1-gpt-4o"
