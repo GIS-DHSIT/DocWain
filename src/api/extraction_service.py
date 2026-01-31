@@ -283,6 +283,7 @@ def extract_uploaded_document(
     filename: str,
     subscription_id: Optional[str] = None,
     profile_id: Optional[str] = None,
+    profile_name: Optional[str] = None,
     doc_type: Optional[str] = None,
     content_type: Optional[str] = None,
     content_size: Optional[int] = None,
@@ -296,6 +297,8 @@ def extract_uploaded_document(
         content_type=content_type,
         size=content_size,
     )
+    if profile_name:
+        update_document_fields(document_id, {"profile_name": profile_name, "metadata.profile_name": profile_name})
 
     update_stage(document_id, "extraction", {"status": "IN_PROGRESS", "started_at": time.time(), "error": None})
 

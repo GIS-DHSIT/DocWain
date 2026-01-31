@@ -37,6 +37,8 @@ from src.api.dw_chat import (
 )
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
+from src.api.profile_documents_api import profile_docs_router
+from src.api.profiles_api import profiles_router
 from src.api.knowledge_graph import knowledge_graph_router
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
@@ -106,6 +108,8 @@ app.add_middleware(
 
 api_router.include_router(screening_router)
 api_router.include_router(documents_router, tags=["Documents"])
+api_router.include_router(profiles_router)
+api_router.include_router(profile_docs_router)
 api_router.include_router(tools_router, tags=["Tools"])
 
 session_state_store = SessionStateStore()
