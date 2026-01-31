@@ -15,6 +15,15 @@
 - Local development: `docker-compose up --build` now starts a Redis 7 container and wires the app to it with no auth and SSL disabled. Verify it is running with `docker compose exec redis redis-cli ping`.
 - If you point at your own Redis instance, update the env vars above and restart the service so the client reinitializes with the new settings.
 
+### Dialogue intelligence (persona + sentiment)
+Enable DocWain's conversation intelligence layer and tune routing sensitivity with:
+```bash
+export DOCWAIN_PERSONA_ENABLED=true
+export DOCWAIN_SENTIMENT_ENABLED=true
+export DOCWAIN_SMALLTALK_MODEL=llama3.2   # optional: model used for intent/sentiment fallback
+export DOCWAIN_INTENT_THRESHOLD=0.65
+```
+
 ## Embedding Pickles from Blob Storage
 
 How to run:
