@@ -13,7 +13,7 @@ from src.api.config import Config
 from src.api.genai_client import generate_text
 from src.nlp.intent_rules import IntentRuleMatch, match_intent_rules
 from src.nlp.sentiment_rules import SentimentRuleMatch, match_sentiment_rules
-from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
+from src.prompting.persona import DOCWAIN_META_RESPONSE, enforce_docwain_identity, get_docwain_persona, sanitize_response
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ class RouteDecision:
 
 _INTENT_FALLBACK_PROMPT = (
     "Classify the user message into one intent: GREETING, THANKS_OR_PRAISE, "
-    "NEGATIVE_FEEDBACK, SMALL_TALK, DOCUMENT_TASK, CLARIFICATION, UNKNOWN. "
+    "NEGATIVE_FEEDBACK, SMALL_TALK, META, DOCUMENT_TASK, CLARIFICATION, UNKNOWN. "
     "Return strict JSON: {{\"intent\": string, \"confidence\": number between 0 and 1}}. "
     "Message: {text}"
 )
@@ -200,6 +200,8 @@ def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentRe
             "I’m sorry about that—I’m DocWain and I’ll fix it. "
             "I can retry with deeper retrieval or focus on a specific document/section. Which should I prioritize?"
         )
+    elif intent.intent == "META":
+        response = DOCWAIN_META_RESPONSE
     elif intent.intent == "SMALL_TALK":
         response = (
             "Hi! I’m DocWain, an intelligent document assistant. "
@@ -212,7 +214,7 @@ def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentRe
     else:
         response = "I’m DocWain, your document assistant. How can I help with your documents?"
 
-    if sentiment and sentiment.sentiment == "mixed":
+    if sentiment and sentiment.sentiment == "mixed" and intent.intent != "META":
         response = (
             "I hear you. I’m DocWain and I can tighten the answer. "
             "Want me to retry with deeper retrieval or focus on a specific document/section?"
@@ -230,7 +232,7 @@ def route_message(user_text: str, state: Optional[dict] = None) -> RouteDecision
     intent = detect_intent(user_text)
     sentiment = analyze_sentiment(user_text) if sentiment_enabled else None
 
-    direct_intents = {"GREETING", "THANKS_OR_PRAISE", "NEGATIVE_FEEDBACK", "SMALL_TALK", "CLARIFICATION"}
+    direct_intents = {"GREETING", "THANKS_OR_PRAISE", "NEGATIVE_FEEDBACK", "SMALL_TALK", "CLARIFICATION", "META"}
     direct_response = intent.intent in direct_intents and intent.confidence >= threshold
 
     response_text = None
