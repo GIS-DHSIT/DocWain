@@ -36,6 +36,20 @@ _SMALL_TALK = re.compile(
     r"\b(how\s+are\s+you|what's\s+up|whats\s+up|how's\s+it\s+going|how\s+do\s+you\s+do)\b",
     re.IGNORECASE,
 )
+_META = re.compile(
+    r"\bwho\s+are\s+you\b|"
+    r"\bwhat\s+are\s+you\b|"
+    r"\bwhat\s+is\s+docwain\b|"
+    r"\bwhat\s+can\s+you\s+do\b|"
+    r"\bhow\s+do\s+you\s+work\b|"
+    r"\bthis\s+is\s+not\s+the\s+right\s+answer\b|"
+    r"\bnot\s+good\b|"
+    r"\bthis\s+is\s+bad\b|"
+    r"\bthank\s+you\b|"
+    r"\b(thanks|thx|ty)\b|"
+    r"\bwonderful\b",
+    re.IGNORECASE,
+)
 
 
 def match_intent_rules(text: str) -> Optional[IntentRuleMatch]:
@@ -51,4 +65,6 @@ def match_intent_rules(text: str) -> Optional[IntentRuleMatch]:
         return IntentRuleMatch(intent="CLARIFICATION", confidence=0.85, rule_name="clarification")
     if _SMALL_TALK.search(text):
         return IntentRuleMatch(intent="SMALL_TALK", confidence=0.75, rule_name="small_talk")
+    if _META.search(text):
+        return IntentRuleMatch(intent="META", confidence=0.95, rule_name="meta_question")
     return None
