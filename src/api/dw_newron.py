@@ -2188,7 +2188,10 @@ class PromptBuilder:
             conversation_summary: str = "",
             domain_guidance: str = "",
             feedback_memory: str = "",
-            retrieval_brief: str = ""
+            retrieval_brief: str = "",
+            profile_id: Optional[str] = None,
+            subscription_id: Optional[str] = None,
+            redis_client: Optional[Any] = None,
     ) -> str:
         """Build a structured QA prompt with grounding and citation requirements."""
         convo_block = f"\nPRIOR CONVERSATION SUMMARY:\n{conversation_summary}\n" if conversation_summary else ""
@@ -2222,7 +2225,15 @@ ANSWER STYLE (MANDATORY):
 
 Provide the answer now with citations inline after each claim."""
 
-        return prompt
+        from src.prompting.prompt_builder import inject_persona_prompt
+
+        return inject_persona_prompt(
+            prompt,
+            persona,
+            profile_id=profile_id,
+            subscription_id=subscription_id,
+            redis_client=redis_client,
+        )
 
 class ConversationSummarizer:
     """Summarizes the last few turns to keep context tight."""
@@ -2289,6 +2300,7 @@ class EnterpriseRAGSystem:
             self.answerability_detector = AnswerabilityDetector(self.llm_client)
             # Initialize Redis client for storing conversation history and feedback.
             redis_client = get_redis_client()
+            self.redis_client = redis_client
 
             # Initialize conversation history backed by Redis. Avoid instantiating
             # a non-redis version first since it would immediately be overwritten.
@@ -3142,7 +3154,10 @@ class EnterpriseRAGSystem:
                 conversation_summary=conversation_summary,
                 domain_guidance=adapter_text,
                 feedback_memory=feedback_text,
-                retrieval_brief=retrieval_brief
+                retrieval_brief=retrieval_brief,
+                profile_id=profile_id,
+                subscription_id=subscription_id,
+                redis_client=self.redis_client,
             )
 
             answer = self.llm_client.generate(prompt)

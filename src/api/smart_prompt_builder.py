@@ -11,6 +11,8 @@ import logging
 import re
 from typing import List, Dict, Any, Optional
 
+from src.prompting.prompt_builder import inject_persona_prompt
+
 logger = logging.getLogger(__name__)
 
 
@@ -141,7 +143,10 @@ class SmartPromptBuilder:
             query: str,
             chunks: List[Dict],
             persona: str = "document analysis assistant",
-            conversation_context: str = ""
+            conversation_context: str = "",
+            profile_id: Optional[str] = None,
+            subscription_id: Optional[str] = None,
+            redis_client: Optional[Any] = None,
     ) -> str:
         """
         Conversational, grounded prompt to keep answers accurate and human.
@@ -181,10 +186,24 @@ Answering guidelines:
 
 Now provide the answer with citations:"""
 
-        return prompt
+        return inject_persona_prompt(
+            prompt,
+            persona,
+            profile_id=profile_id,
+            subscription_id=subscription_id,
+            redis_client=redis_client,
+        )
 
     @staticmethod
-    def build_verification_prompt(answer: str, chunks: List[Dict], query: str) -> str:
+    def build_verification_prompt(
+        answer: str,
+        chunks: List[Dict],
+        query: str,
+        persona: str = "document analysis assistant",
+        profile_id: Optional[str] = None,
+        subscription_id: Optional[str] = None,
+        redis_client: Optional[Any] = None,
+    ) -> str:
         """
         FIXED: Verification prompt to catch hallucinations
         """
@@ -232,7 +251,13 @@ HALLUCINATIONS: [List any facts not in documents, or "None"]
 
 Your verification:"""
 
-        return prompt
+        return inject_persona_prompt(
+            prompt,
+            persona,
+            profile_id=profile_id,
+            subscription_id=subscription_id,
+            redis_client=redis_client,
+        )
 
 
 class DocumentMatcher:
@@ -360,7 +385,7 @@ def build_enhanced_answer_with_verification(
     if answer and '[SOURCE-' in answer:
         try:
             verification_prompt = prompt_builder.build_verification_prompt(
-                answer, chunks, query
+                answer, chunks, query, persona
             )
             verification_result = llm_client.generate(verification_prompt, max_retries=1)
             logger.info(f"Verification result: {verification_result[:200]}")
