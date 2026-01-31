@@ -1,67 +1,56 @@
-pdfplumber
-botbuilder
-# --- Core Web Framework ---
+argostranslate==1.10.0
+bitsandbytes==0.49.0
+botbuilder==0.0.1
+botbuilder_core==4.17.0
+botbuilder_schema==4.17.0
+botframework_connector==4.17.0
+botframework_streaming==4.17.0
+boto3==1.42.15
+datasets==4.3.0
+deepspeed
+easyocr
 fastapi
 httpx
-uvicorn[standard]
-python-multipart  # required for FastAPI file uploads
-
-# --- Bot Framework / Teams ---
-botbuilder-core
-botbuilder-schema  # ensures Teams schemas (FileDownloadInfo) are available
-
-# --- Cloud SDKs ---
-boto3
-azure-storage-blob
-azure-identity
-google-genai
-requests
-
-# --- Database & Vector Storage ---
-pymongo
-qdrant-client
 neo4j
-faiss-cpu
-rank-bm25
-
-# --- ML & NLP ---
-sentence-transformers
-scikit-learn
 numpy
-pandas
-unsloth
-trl
-peft
-datasets
-transformers
-accelerate
-bitsandbytes
-
-# --- Document Processing ---
-python-docx
-python-pptx
-pdfminer.six
-pypdf2
-pytesseract
-pillow
-openpyxl
-pytz
-pyyaml
-
-# --- Security & Encryption ---
-pycryptodome
-
-# --- Text Processing Utilities ---
-langchain
-tiktoken
-pydantic
-regex
-redis
-# --- Optional / Local Model Support ---
 ollama
-
-# --- Dev & Deployment (optional but recommended) ---
+openai
+rank_bm25
+pandas
+pdfplumber
+pymupdf
+Pillow
+pycryptodome
+pydantic
+pymongo
+pytesseract==0.3.13
 python-dotenv
-loguru
-gunicorn
-pytest
+python_docx
+python_pptx
+PyYAML
+qdrant_client
+redis
+Requests
+scikit_learn
+sentence_transformers
+spacy
+torch
+transformers
+unsloth
+uvicorn
+vllm
+wandb
+whisper
+zai
+
+# Azure SDKs (Blob + core + identity)
+azure-storage-blob
+azure-core
+azure-identity
+
+# Azure AI Foundry / Projects SDK
+azure-ai-projects
+
+# Google GenAI (you use BOTH client styles in code)
+google-genai
+google-generativeai
