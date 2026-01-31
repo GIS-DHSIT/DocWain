@@ -2516,6 +2516,10 @@ class EnterpriseRAGSystem:
         if not profile_id:
             raise ValueError("profile_id is required for retrieval")
 
+        primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=True)
+        is_vague = self._is_query_vague(primary_query)
+        attempt_records = []
+
         profile_context = self.retriever.get_profile_context(collection_name, profile_id)
         profile_context_data = {
             "keywords": profile_context.top_keywords[:12],
@@ -2523,7 +2527,7 @@ class EnterpriseRAGSystem:
             "sampled_chunks": profile_context.total_chunks
         }
 
-        person_name = self.extract_person_name_from_query(query)
+        person_name = self.extract_person_name_from_query(primary_query)
         target_document_id = None
 
         if person_name:
@@ -2534,11 +2538,6 @@ class EnterpriseRAGSystem:
                 logger.info(f" Will filter results to document: {target_document_id}")
             else:
                 logger.warning(f" Could not find document for '{person_name}' - will search all docs")
-
-        is_vague = self._is_query_vague(query)
-        attempt_records = []
-
-        primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=True)
         primary_metadata["vague_query"] = is_vague
         primary_metadata["profile_context"] = profile_context_data
         primary_metadata["person_name"] = person_name
