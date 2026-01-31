@@ -1330,6 +1330,7 @@ def save_embeddings_to_qdrant(
         languages = _coerce_list(doc_metadata.get("languages"))
         products_name = doc_metadata.get("products_name")
         document_type = doc_metadata.get("document_type")
+        profile_name = doc_metadata.get("profile_name")
         description = doc_metadata.get("description")
 
         if not texts:
@@ -1383,13 +1384,37 @@ def save_embeddings_to_qdrant(
                 if sv.get("indices") and sv.get("values"):
                     sparse_vector = sv
 
+            chunk_kind = chunk_meta.get("chunk_kind")
+            if not chunk_kind:
+                chunk_type = chunk_meta.get("chunk_type", "text")
+                if chunk_type in {"table", "table_row", "table_header"}:
+                    chunk_kind = "table_text"
+                elif chunk_type == "image_caption":
+                    chunk_kind = "image_caption"
+                elif chunk_type == "summary":
+                    chunk_kind = "section_summary"
+                else:
+                    chunk_kind = "section_text"
+
+            evidence_pointer = None
+            if section_val or page_start is not None or page_end is not None:
+                if page_start is None and page_end is None:
+                    page_range = "N/A"
+                elif page_end is None or page_end == page_start:
+                    page_range = str(page_start)
+                else:
+                    page_range = f"{page_start}-{page_end}"
+                evidence_pointer = f"Section: {section_val or 'Section'}, Page: {page_range}"
+
             payload = {
                 "subscription_id": str(subscription_id),
                 "profile_id": str(profile_id),
+                "profile_name": profile_name,
                 "text": text,
                 "document_id": str(doctag),
                 "source_file": source_filename,
                 "filename": filename,
+                "file_name": filename,
                 "chunk_index": idx,
                 "chunk_count": max_len,
                 "page": page_val,
@@ -1411,7 +1436,9 @@ def save_embeddings_to_qdrant(
                 "prev_chunk_id": chunk_meta.get("prev_chunk_id"),
                 "next_chunk_id": chunk_meta.get("next_chunk_id"),
                 "chunk_type": chunk_meta.get("chunk_type", "text"),
+                "chunk_kind": chunk_kind,
                 "section_id": chunk_meta.get("section_id"),
+                "evidence_pointer": evidence_pointer,
             }
 
             records.append(
@@ -1574,6 +1601,7 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
     description = record.get("description") or record.get("summary") or ""
 
     filename = _safe_basename(record.get("name") or doc_name)
+    profile_name = record.get("profile_name") or record.get("profileName")
 
     return {
         "filename": filename or _safe_basename(doc_name),
@@ -1582,6 +1610,7 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
         "products_name": str(products_name) if products_name else None,
         "document_type": str(document_type) if document_type else None,
         "description": str(description) if description else None,
+        "profile_name": str(profile_name) if profile_name else None,
     }
 
 
@@ -1794,6 +1823,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                         "page_number": page_start,
                         "chunk_index": idx,
                         "doc_type": meta.get("doc_type") or doc_type,
+                        "chunk_kind": meta.get("chunk_kind", "section_text"),
                     }
                 )
                 if "sentence_complete" not in meta:
@@ -1906,6 +1936,9 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             if not chunks:
                 raise ValueError(f"No valid chunks extracted for {doc_name}")
 
+            for meta in chunk_metadata:
+                meta.setdefault("chunk_kind", "section_text")
+
             chunk_lengths = [len(chunk) for chunk in chunks]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
             _record_chunking_metrics(
@@ -1947,6 +1980,58 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             sparse_vectors = build_sparse_vectors(chunks)
             summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
 
+            ctx = ContextUnderstanding()
+            doc_summary_bundle = ctx.summarize_document(text)
+            doc_summary_text = (doc_summary_bundle.get("abstract") or "").strip()
+            section_summary_map = doc_summary_bundle.get("section_summaries") or {}
+            section_title_to_pages = {
+                (sec.title or "").strip(): (sec.start_page, sec.end_page) for sec in text.sections
+            }
+
+            extra_chunks: List[str] = []
+            extra_meta: List[Dict[str, Any]] = []
+
+            if doc_summary_text:
+                extra_chunks.append(doc_summary_text)
+                extra_meta.append(
+                    {
+                        "document_id": doc_tag,
+                        "section_title": "Document Summary",
+                        "section_path": "Document Summary",
+                        "page_start": None,
+                        "page_end": None,
+                        "page_number": None,
+                        "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                        "chunk_type": "summary",
+                        "chunk_kind": "doc_summary",
+                        "doc_type": doc_type,
+                        "sentence_complete": True,
+                    }
+                )
+
+            for title, summary in section_summary_map.items():
+                summary_text = str(summary).strip()
+                if not summary_text:
+                    continue
+                pages = section_title_to_pages.get((title or "").strip())
+                page_start, page_end = (pages or (None, None))
+                extra_chunks.append(summary_text)
+                extra_meta.append(
+                    {
+                        "document_id": doc_tag,
+                        "section_title": title or "Section",
+                        "section_path": title or "Section",
+                        "page_start": page_start,
+                        "page_end": page_end,
+                        "page_number": page_start,
+                        "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                        "chunk_type": "summary",
+                        "chunk_kind": "section_summary",
+                        "doc_type": doc_type,
+                        "sentence_complete": True,
+                    }
+                )
+
             chunk_metadata = normalize_chunk_links(
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -1962,6 +2047,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     f"{doc_tag}|{section_path}".encode("utf-8")
                 ).hexdigest()[:12]
                 meta["chunk_type"] = meta.get("chunk_type", "text")
+                meta["chunk_kind"] = meta.get("chunk_kind", "section_text")
                 page_start = meta.get("page_start", meta.get("page_number"))
                 page_end = meta.get("page_end", page_start)
                 meta["page_start"] = page_start
@@ -1972,6 +2058,18 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     chunks[idx].encode("utf-8")
                 ).hexdigest()
                 meta["sentence_complete"] = bool(meta.get("sentence_complete", chunks[idx].strip().endswith((".", "?", "!"))))
+
+            if extra_chunks:
+                chunks.extend(extra_chunks)
+                chunk_metadata.extend(extra_meta)
+                sparse_vectors.extend(build_sparse_vectors(extra_chunks))
+                extra_embeddings = encode_with_fallback(
+                    extra_chunks,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                embeddings_array = list(embeddings_array) + list(extra_embeddings)
+                summaries.extend([None for _ in extra_chunks])
 
             embeddings_payload = {
                 "embeddings": embeddings_array,
@@ -2090,6 +2188,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     f"{doc_tag}|{section_path}".encode("utf-8")
                 ).hexdigest()[:12]
                 meta["chunk_type"] = meta.get("chunk_type", "text")
+                meta["chunk_kind"] = meta.get("chunk_kind", "section_text")
                 page_start = meta.get("page_start", meta.get("page_number"))
                 page_end = meta.get("page_end", page_start)
                 meta["page_start"] = page_start
