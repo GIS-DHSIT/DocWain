@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
 from src.api.config import Config
+from src.prompting.prompt_builder import inject_persona_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -508,7 +509,10 @@ class AnswerGenerator:
             query: str,
             context: str,
             persona: str,
-            conversation_context: str = ""
+            conversation_context: str = "",
+            profile_id: Optional[str] = None,
+            subscription_id: Optional[str] = None,
+            redis_client: Optional[object] = None,
     ) -> str:
         """Build optimized prompt for answer generation"""
 
@@ -530,7 +534,13 @@ Answer requirements:
 
 Answer:"""
 
-        return prompt
+        return inject_persona_prompt(
+            prompt,
+            persona,
+            profile_id=profile_id,
+            subscription_id=subscription_id,
+            redis_client=redis_client,
+        )
 
     def _verify_citations(self, answer: str, num_sources: int) -> Tuple[bool, str]:
         """
@@ -600,7 +610,10 @@ Answer:"""
             sources: List[Dict],
             persona: str,
             conversation_context: str = "",
-            max_retries: int = 2
+            max_retries: int = 2,
+            profile_id: Optional[str] = None,
+            subscription_id: Optional[str] = None,
+            redis_client: Optional[object] = None,
     ) -> Dict[str, Any]:
         """
         Generate and verify answer.
@@ -608,7 +621,15 @@ Answer:"""
         Returns:
             Dict with answer, sources, and verification metadata
         """
-        prompt = self.build_prompt(query, context, persona, conversation_context)
+        prompt = self.build_prompt(
+            query,
+            context,
+            persona,
+            conversation_context,
+            profile_id=profile_id,
+            subscription_id=subscription_id,
+            redis_client=redis_client,
+        )
 
         # Generate answer
         try:

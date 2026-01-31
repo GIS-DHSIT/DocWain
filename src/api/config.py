@@ -37,6 +37,12 @@ class Config:
         AGENT_MODEL_NAME = os.getenv("AGENT_MODEL_NAME", "nemotron-3-nano")
         RETRIEVER_MAX_WORKERS = int(os.getenv("RETRIEVER_MAX_WORKERS", "4"))
 
+    class DialogueIntel:
+        PERSONA_ENABLED = os.getenv("DOCWAIN_PERSONA_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SENTIMENT_ENABLED = os.getenv("DOCWAIN_SENTIMENT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SMALLTALK_MODEL = os.getenv("DOCWAIN_SMALLTALK_MODEL", "")
+        INTENT_THRESHOLD = float(os.getenv("DOCWAIN_INTENT_THRESHOLD", "0.65"))
+
     class Qdrant:
         URL = os.getenv("QDRANT_URL", 'https://89f776c3-76fb-493f-8509-c583d9579329.europe-west3-0.gcp.cloud.qdrant.io')
         API = os.getenv("QDRANT_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.-cJ2HVTYcH3u5KNuZuxZRNJhhTFfZwqkoVacNCKBYkY")

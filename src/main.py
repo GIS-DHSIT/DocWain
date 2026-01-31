@@ -61,6 +61,8 @@ from src.screening.api import screening_router
 from src.screening.config import log_legacy_vetting_notice_if_missing
 from src.storage.azure_blob_client import validate_containers_once
 from botbuilder.schema import Activity
+from src.nlp.dialogue_intel import route_message
+from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
 
 from src.teams import adapter as teams_adapter
 from src.teams.bot_app import (
@@ -631,6 +633,40 @@ def ask_question_api(
         _safe_snippet(request.query),
     )
 
+    route_state = {
+        "profile_id": request.profile_id,
+        "subscription_id": request.subscription_id,
+    }
+    decision = route_message(request.query, route_state)
+    if decision.direct_response:
+        response_text = decision.response_text or ""
+        response_text = sanitize_response(response_text)
+        if streaming:
+            return StreamingResponse(chunk_text_stream(response_text), media_type="text/plain")
+
+        answer_payload = AnswerPayload(
+            response=response_text,
+            sources=[],
+            grounded=False,
+            context_found=False,
+            metadata={
+                "routing": {
+                    "intent": decision.intent.intent,
+                    "intent_confidence": decision.intent.confidence,
+                    "policy": decision.policy,
+                    "sentiment": decision.sentiment.sentiment if decision.sentiment else None,
+                }
+            },
+        )
+        _, active_session_id = add_message_to_history(
+            request.user_id,
+            request.query,
+            answer_payload.model_dump(),
+            session_id=session_id,
+            new_session=request.new_session,
+        )
+        return AskResponse(answer=answer_payload, current_session_id=active_session_id, debug={})
+
     result = execute_request(request, session_state=session_state, ctx=ctx, stream=streaming, debug=bool(request.debug))
 
     explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
@@ -644,7 +680,11 @@ def ask_question_api(
         def _stream():
             try:
                 normalized_answer = _normalize_answer(result.answer)
-                stream_iterable = result.stream or chunk_text_stream(normalized_answer.get("response") or "")
+                persona_text = get_docwain_persona(request.profile_id, request.subscription_id, None)
+                response_text = normalized_answer.get("response") or ""
+                response_text = enforce_docwain_identity(response_text, request.query, persona_text)
+                response_text = sanitize_response(response_text)
+                stream_iterable = result.stream or chunk_text_stream(response_text)
                 logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
                 for chunk in stream_iterable:
                     yield chunk
@@ -655,6 +695,8 @@ def ask_question_api(
         return StreamingResponse(_stream(), media_type="text/plain")
 
     answer = AnswerPayload.model_validate(result.answer)
+    persona_text = get_docwain_persona(request.profile_id, request.subscription_id, None)
+    answer.response = sanitize_response(enforce_docwain_identity(str(answer.response), request.query, persona_text))
 
     _, active_session_id = add_message_to_history(
         request.user_id,
