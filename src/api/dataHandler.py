@@ -36,6 +36,7 @@ from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
 from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
+from src.metadata.normalizer import MetadataNormalizationError, normalize_payload_metadata
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 from azure.core.exceptions import ResourceNotFoundError
@@ -1440,6 +1441,12 @@ def save_embeddings_to_qdrant(
                 "section_id": chunk_meta.get("section_id"),
                 "evidence_pointer": evidence_pointer,
             }
+
+            try:
+                payload = normalize_payload_metadata(payload, strict=True)
+            except MetadataNormalizationError as exc:
+                logging.error("Metadata normalization failed for chunk %s: %s", idx, exc)
+                raise
 
             records.append(
                 ChunkRecord(
