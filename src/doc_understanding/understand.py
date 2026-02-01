@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import ollama
 
 from src.api.context_understanding import ContextUnderstanding
+from src.doc_understanding.structure_inference import infer_structure
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +119,15 @@ def understand_document(
     if not section_summaries:
         section_summaries = _extractive_section_summaries(extracted)
 
+    structure_signals = infer_structure(extracted)
+
     return {
         "document_summary": doc_summary.strip(),
         "section_summaries": section_summaries,
         "key_entities": key_entities,
         "key_facts": verified_facts,
         "intent_tags": intent_tags,
+        "structure_inference": structure_signals,
     }
 
 
