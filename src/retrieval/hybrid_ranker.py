@@ -25,18 +25,12 @@ class HybridRanker:
         self.section_terms = {
             "summary",
             "overview",
+            "abstract",
             "details",
-            "spec",
-            "experience",
-            "invoice",
-            "totals",
-            "financial",
-            "education",
-            "skills",
-            "contact",
-            "history",
+            "analysis",
+            "results",
+            "conclusion",
             "requirements",
-            "profile",
         }
 
     def rank(
@@ -91,14 +85,25 @@ class HybridRanker:
         section = str(meta.get("section_title") or meta.get("section_path") or meta.get("section") or "").lower()
         source = str(meta.get("source_file") or meta.get("filename") or "").lower()
         query_lower = (query or "").lower()
+        chunk_kind = str(meta.get("chunk_kind") or "").lower()
+        importance = meta.get("section_importance_score") or meta.get("element_importance_score")
+        try:
+            importance_score = float(importance) if importance is not None else 0.0
+        except (TypeError, ValueError):
+            importance_score = 0.0
+
+        score += min(0.35, max(0.0, importance_score)) * 0.6
 
         for term in self.section_terms:
             if term in section:
                 score += self.config.section_boost
                 break
 
+        if intent_type in {"summarization", "deep_analysis"}:
+            if chunk_kind in {"doc_summary", "section_summary"}:
+                score += self.config.section_boost
         if intent_type in {"numeric_lookup", "field_extraction"}:
-            if any(term in section for term in ("summary", "details", "totals", "invoice", "experience")):
+            if chunk_kind in {"table_text", "structured_field"}:
                 score += self.config.section_boost
 
         for field in ("title", "document_title", "heading"):

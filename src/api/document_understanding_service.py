@@ -9,6 +9,7 @@ from src.api.document_status import set_error, update_document_fields, update_st
 from src.api.embedding_service import embed_documents
 from src.api.extraction_service import extract_uploaded_document
 from src.doc_understanding import build_content_map, identify_document, understand_document
+from src.metadata.normalizer import MetadataNormalizationError, normalize_document_metadata
 from src.profiles.profile_store import resolve_profile_name
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,19 @@ def _select_extracted(extracted_payload: Any) -> Tuple[str, Any]:
 
 def _update_metadata(document_id: str, metadata: Dict[str, Any]) -> None:
     update_fields: Dict[str, Any] = {}
+    try:
+        normalized = normalize_document_metadata(metadata, strict=False)
+    except MetadataNormalizationError as exc:
+        logger.error("Metadata normalization failed for %s: %s", document_id, exc)
+        raise
+
+    normalized_dict = normalized.to_dict()
     for key, value in metadata.items():
+        if value is None:
+            continue
+        update_fields[key] = value
+        update_fields[f"metadata.{key}"] = value
+    for key, value in normalized_dict.items():
         if value is None:
             continue
         update_fields[key] = value
