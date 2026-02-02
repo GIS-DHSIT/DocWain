@@ -59,6 +59,7 @@ from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
 from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
 from src.execution.common import normalize_answer, chunk_text_stream
+from src.api.learning_signals import LearningSignalStore
 from src.screening.api import screening_router
 from src.screening.config import log_legacy_vetting_notice_if_missing
 from src.storage.azure_blob_client import validate_containers_once
@@ -111,6 +112,14 @@ api_router.include_router(documents_router, tags=["Documents"])
 api_router.include_router(profiles_router)
 api_router.include_router(profile_docs_router)
 api_router.include_router(tools_router, tags=["Tools"])
+
+
+class FeedbackRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    answer: str = Field(..., min_length=1)
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
+    reason: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 session_state_store = SessionStateStore()
 
@@ -1187,6 +1196,36 @@ def get_metrics(
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
+
+
+@api_router.post("/feedback/positive", tags=["Default"])
+def record_positive_feedback(request: FeedbackRequest):
+    """Capture positive user feedback for evaluation and fine-tuning."""
+    store = LearningSignalStore()
+    metadata = dict(request.metadata)
+    store.record_high_quality(
+        query=request.query,
+        context=metadata.get("context", ""),
+        answer=request.answer,
+        sources=request.sources,
+        metadata=metadata,
+    )
+    return {"status": "ok", "feedback": "positive"}
+
+
+@api_router.post("/feedback/negative", tags=["Default"])
+def record_negative_feedback(request: FeedbackRequest):
+    """Capture negative user feedback for evaluation and retrieval fixes."""
+    store = LearningSignalStore()
+    metadata = dict(request.metadata)
+    store.record_low_confidence(
+        query=request.query,
+        context=metadata.get("context", ""),
+        answer=request.answer,
+        reason=request.reason or "user_reported",
+        metadata=metadata,
+    )
+    return {"status": "ok", "feedback": "negative"}
 
 '''
 @api_router.get("/chat-history/{user_id}")
