@@ -59,7 +59,7 @@ class ContextAssembler:
                 token_budget -= tokens
                 meta = chunk.get("metadata") or {}
                 header = self._header(meta)
-                context_parts.append(f"[SOURCE-{source_id}] {header}\n{text}\n[/SOURCE-{source_id}]")
+                context_parts.append(f"[DOC-{source_id}] {header}\n{text}\n[/DOC-{source_id}]")
                 sources.append(
                     {
                         "source_id": source_id,

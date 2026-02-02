@@ -318,7 +318,8 @@ class AdaptiveRetriever:
             self,
             profile_id: str,
             document_ids: Optional[List[str]] = None,
-            source_files: Optional[List[str]] = None
+            source_files: Optional[List[str]] = None,
+            subscription_id: Optional[str] = None,
     ) -> Optional[Filter]:
         """
         FIXED: Use MatchAny for OR logic with multiple documents
@@ -331,6 +332,13 @@ class AdaptiveRetriever:
                 FieldCondition(
                     key="profile_id",
                     match=MatchValue(value=str(profile_id))
+                )
+            )
+        if subscription_id:
+            conditions.append(
+                FieldCondition(
+                    key="subscription_id",
+                    match=MatchValue(value=str(subscription_id))
                 )
             )
 
@@ -365,7 +373,8 @@ class AdaptiveRetriever:
             top_k: int,
             document_ids: Optional[List[str]] = None,
             source_files: Optional[List[str]] = None,
-            score_threshold: Optional[float] = None
+            score_threshold: Optional[float] = None,
+            subscription_id: Optional[str] = None,
     ) -> List[Dict]:
         """Dense vector search with proper document filtering"""
         try:
@@ -377,7 +386,7 @@ class AdaptiveRetriever:
             ).astype(np.float32).tolist()
 
             # Build filter with OR logic
-            query_filter = self._build_filter(profile_id, document_ids, source_files)
+            query_filter = self._build_filter(profile_id, document_ids, source_files, subscription_id)
 
             # Log filter for debugging
             if query_filter:
@@ -706,7 +715,8 @@ class GraphGuidedRetriever:
             document_ids: Optional[List[str]] = None,
             source_files: Optional[List[str]] = None,
             use_expansion: bool = True,
-            use_keyword_boost: bool = True
+            use_keyword_boost: bool = True,
+            subscription_id: Optional[str] = None,
     ) -> List[Dict]:
         """
         Main adaptive retrieval - FIXED FOR MULTI-DOCUMENT
@@ -722,7 +732,8 @@ class GraphGuidedRetriever:
             collection_name, query, profile_id, top_k,
             document_ids=document_ids,
             source_files=source_files,
-            score_threshold=0.15
+            score_threshold=0.15,
+            subscription_id=subscription_id,
         )
 
         # Strategy 2: Fallback without threshold
@@ -732,7 +743,8 @@ class GraphGuidedRetriever:
                 collection_name, query, profile_id, top_k,
                 document_ids=document_ids,
                 source_files=source_files,
-                score_threshold=None
+                score_threshold=None,
+                subscription_id=subscription_id,
             )
 
         # Strategy 3: Remove document filter if still empty
@@ -740,7 +752,8 @@ class GraphGuidedRetriever:
             logger.warning("No results with document filter, retrying without filter")
             chunks = self._dense_search(
                 collection_name, query, profile_id, top_k * 2,
-                score_threshold=None
+                score_threshold=None,
+                subscription_id=subscription_id,
             )
 
         if not chunks:

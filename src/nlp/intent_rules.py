@@ -41,13 +41,17 @@ _META = re.compile(
     r"\bwhat\s+are\s+you\b|"
     r"\bwhat\s+is\s+docwain\b|"
     r"\bwhat\s+can\s+you\s+do\b|"
+    r"\bwhat\s+do\s+you\s+do\b|"
+    r"\bwhat\s+is\s+your\s+role\b|"
+    r"\bwhat\s+is\s+your\s+purpose\b|"
     r"\bhow\s+do\s+you\s+work\b|"
-    r"\bthis\s+is\s+not\s+the\s+right\s+answer\b|"
-    r"\bnot\s+good\b|"
-    r"\bthis\s+is\s+bad\b|"
-    r"\bthank\s+you\b|"
-    r"\b(thanks|thx|ty)\b|"
-    r"\bwonderful\b",
+    r"\bprivacy\b|"
+    r"\bdata\s+handling\b|"
+    r"\bdata\s+use\b|"
+    r"\bdata\s+retention\b|"
+    r"\bpersonal\s+information\b|"
+    r"\bdo\s+you\s+store\b|"
+    r"\bdo\s+you\s+save\b",
     re.IGNORECASE,
 )
 

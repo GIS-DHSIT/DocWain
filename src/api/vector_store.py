@@ -1,5 +1,7 @@
 import hashlib
 import logging
+import threading
+import time
 import uuid
 from typing import Iterable, List, Optional
 
@@ -34,6 +36,9 @@ PAYLOAD_INDEX_FIELDS = [
     "chunk_id",
     "chunk_type",
 ]
+
+_INDEX_READY: set[str] = set()
+_INDEX_READY_LOCK = threading.Lock()
 
 
 def build_collection_name(subscription_id: str, profile_id: Optional[str] = None) -> str:
@@ -100,42 +105,131 @@ class QdrantVectorStore:
                     return vectors["content_vector"].get("size")
             return None
 
-        exists = False
-        try:
-            collections = self.client.get_collections().collections
-            existing = {col.name for col in collections}
-            exists = collection_name in existing
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Could not list collections; will check directly: %s", exc)
-
-        if exists:
+        def _check_existing() -> Optional[int]:
             info = self.client.get_collection(collection_name)
             dim = _existing_dim(info)
             if dim is not None and int(dim) != int(vector_size):
                 raise ValueError(f"Collection '{collection_name}' dimension mismatch: {dim} vs {vector_size}")
-        else:
-            try:
-                info = self.client.get_collection(collection_name)
-                dim = _existing_dim(info)
-                if dim is not None and int(dim) != int(vector_size):
-                    raise ValueError(f"Collection '{collection_name}' dimension mismatch: {dim} vs {vector_size}")
-                exists = True
-            except Exception:
-                logger.info("Creating Qdrant collection %s", collection_name)
-                self.client.create_collection(
-                    collection_name=collection_name,
-                    vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
-                    sparse_vectors_config={"keywords_vector": SparseVectorParams()},
-                )
-        self.collection_dims[collection_name] = int(vector_size)
+            return int(dim) if dim is not None else None
 
-        for field in PAYLOAD_INDEX_FIELDS:
+        def _wait_for_collection(attempts: int = 6, delay: float = 0.5) -> bool:
+            for attempt in range(1, attempts + 1):
+                try:
+                    _check_existing()
+                    return True
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == attempts:
+                        logger.debug(
+                            "Collection %s still unavailable after %s attempts: %s",
+                            collection_name,
+                            attempts,
+                            exc,
+                        )
+                        return False
+                    time.sleep(delay)
+            return False
+
+        with _INDEX_READY_LOCK:
+            if collection_name in _INDEX_READY:
+                try:
+                    _check_existing()
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Collection %s marked ready but check failed; will recreate if needed: %s",
+                        collection_name,
+                        exc,
+                    )
+
+        redis_client = None
+        ready_key = f"qdrant:index_ready:{collection_name}"
+        lock = None
+        lock_acquired = False
+        try:
+            from src.api.dw_newron import get_redis_client
+
+            redis_client = get_redis_client()
+        except Exception:  # noqa: BLE001
+            redis_client = None
+
+        if redis_client:
             try:
-                self.client.create_payload_index(
-                    collection_name=collection_name, field_name=field, field_schema="keyword"
-                )
-            except Exception as idx_exc:  # noqa: BLE001
-                logger.debug("Payload index for %s exists or failed softly: %s", field, idx_exc)
+                if redis_client.get(ready_key):
+                    try:
+                        _check_existing()
+                        with _INDEX_READY_LOCK:
+                            _INDEX_READY.add(collection_name)
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Redis ready set for %s but collection check failed; will recreate if needed: %s",
+                            collection_name,
+                            exc,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Redis index ready check failed for %s: %s", collection_name, exc)
+            try:
+                lock = redis_client.lock(f"qdrant:index_lock:{collection_name}", timeout=60)
+                lock_acquired = lock.acquire(blocking=False)
+                if not lock_acquired:
+                    logger.debug("Qdrant index lock held for %s; waiting for collection", collection_name)
+                    if _wait_for_collection():
+                        with _INDEX_READY_LOCK:
+                            _INDEX_READY.add(collection_name)
+                        return
+                    logger.warning(
+                        "Proceeding without Qdrant index lock for %s; collection still missing",
+                        collection_name,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Redis index lock failed for %s: %s", collection_name, exc)
+                lock = None
+
+        try:
+            exists = False
+            try:
+                collections = self.client.get_collections().collections
+                existing = {col.name for col in collections}
+                exists = collection_name in existing
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Could not list collections; will check directly: %s", exc)
+
+            if exists:
+                _check_existing()
+            else:
+                try:
+                    _check_existing()
+                    exists = True
+                except Exception:
+                    logger.info("Creating Qdrant collection %s", collection_name)
+                    self.client.create_collection(
+                        collection_name=collection_name,
+                        vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
+                        sparse_vectors_config={"keywords_vector": SparseVectorParams()},
+                    )
+            self.collection_dims[collection_name] = int(vector_size)
+
+            for field in PAYLOAD_INDEX_FIELDS:
+                try:
+                    self.client.create_payload_index(
+                        collection_name=collection_name, field_name=field, field_schema="keyword"
+                    )
+                except Exception as idx_exc:  # noqa: BLE001
+                    logger.debug("Payload index for %s exists or failed softly: %s", field, idx_exc)
+
+            if redis_client:
+                try:
+                    redis_client.setex(ready_key, 3600, "1")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Failed to set redis index ready for %s: %s", collection_name, exc)
+            with _INDEX_READY_LOCK:
+                _INDEX_READY.add(collection_name)
+        finally:
+            if lock and lock_acquired:
+                try:
+                    lock.release()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _get_collection_dim(self, collection_name: str) -> Optional[int]:
         if collection_name in self.collection_dims:

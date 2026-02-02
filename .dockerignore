@@ -1,17 +1,41 @@
-.git
-.venv
-venv
-__pycache__
+# Python
+__pycache__/
 *.pyc
-.idea
-.vscode
-*.log
-tmp
-docs-db
-images
-finetune_artifacts
-*.bin
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+
+# Data / artifacts (very important for DocWain)
+*.pdf
+*.pptx
+*.docx
+*.xlsx
+*.csv
+*.pickle
+*.pkl
 *.pt
+*.bin
 *.onnx
-*.safetensors
-*.zip
+*.log
+
+# OS
+.DS_Store
+
+# Node / UI if not needed in backend image
+node_modules/

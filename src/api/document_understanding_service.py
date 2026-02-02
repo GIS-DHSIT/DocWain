@@ -55,7 +55,7 @@ def run_document_understanding(
     profile_id: str,
     profile_name: Optional[str] = None,
     model_name: Optional[str] = None,
-    embed_after: bool = True,
+    embed_after: bool = False,
 ) -> Dict[str, Any]:
     update_stage(
         document_id,
@@ -81,7 +81,6 @@ def run_document_understanding(
         "profile_name": profile_name,
         "subscription_id": subscription_id,
         "document_type": identification.document_type,
-        "doc_type": identification.document_type,
         "doc_title": identification.doc_name,
         "doc_type_confidence": identification.confidence,
         "file_format": identification.file_format,
@@ -146,7 +145,7 @@ def extract_and_understand(
     content_type: Optional[str] = None,
     content_size: Optional[int] = None,
     model_name: Optional[str] = None,
-    embed_after: bool = True,
+    embed_after: bool = False,
 ) -> Dict[str, Any]:
     try:
         extract_uploaded_document(

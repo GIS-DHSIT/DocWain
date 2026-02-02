@@ -1,30 +1,35 @@
 import pickle
 
-import pytest
-
 from src.api import embedding_service
-from src.api.blob_store import BlobInfo
+from src.storage.azure_blob_client import BlobInfo
 from src.api.statuses import STATUS_EMBEDDING_COMPLETED, STATUS_TRAINING_COMPLETED
 
 
-class FakeBlobStore:
+class FakeAzureBlob:
     def __init__(self, payload):
-        self.prefix = ""
+        self.document_container_name = "document-content"
         self.payload = payload
         self.delete_calls = 0
 
-    def try_acquire_lease(self, blob_name, lease_duration=60):
-        return "lease-id"
+    def blob_exists(self, _container, _blob_name):
+        return True
 
-    def download_blob(self, blob_name, lease=None):
+    def download_bytes(self, _container, _blob_name):
         return self.payload
 
-    def delete_blob(self, blob_name, lease=None):
+    def delete_blob(self, _container, _blob_name, lease=None):
         self.delete_calls += 1
         return True
 
-    def release_lease(self, blob_name, lease_id):
-        return True
+    def lease_guard(self, *_args, **_kwargs):
+        class _Guard:
+            def __enter__(self_inner):
+                return object()
+
+            def __exit__(self_inner, *_exc):
+                return False
+
+        return _Guard()
 
 
 def _noop(*_args, **_kwargs):
@@ -59,7 +64,7 @@ def _setup_common_monkeypatch(monkeypatch, document_fields_sink=None):
 
 def test_blob_deleted_after_successful_embed(monkeypatch):
     payload = pickle.dumps({"texts": ["chunk-1", "chunk-2"]}, protocol=pickle.HIGHEST_PROTOCOL)
-    store = FakeBlobStore(payload)
+    azure_blob = FakeAzureBlob(payload)
     blob = BlobInfo(name="doc-1.pkl", metadata={"document_id": "doc-1"})
 
     _setup_common_monkeypatch(monkeypatch)
@@ -69,14 +74,21 @@ def test_blob_deleted_after_successful_embed(monkeypatch):
         lambda *_args, **_kwargs: {"chunks": 2, "points_saved": 2},
     )
 
-    result = embedding_service._process_blob(store=store, blob=blob, subscription_id=None, profile_id=None, doc_type=None)
+    result = embedding_service._process_blob(
+        azure_blob=azure_blob,
+        blob=blob,
+        subscription_id=None,
+        profile_id=None,
+        doc_type=None,
+        prefix="",
+    )
     assert result["status"] == "COMPLETED"
-    assert store.delete_calls == 1
+    assert azure_blob.delete_calls == 1
 
 
 def test_blob_not_deleted_on_qdrant_failure(monkeypatch):
     payload = pickle.dumps({"texts": ["chunk-1", "chunk-2"]}, protocol=pickle.HIGHEST_PROTOCOL)
-    store = FakeBlobStore(payload)
+    azure_blob = FakeAzureBlob(payload)
     blob = BlobInfo(name="doc-2.pkl", metadata={"document_id": "doc-2"})
 
     _setup_common_monkeypatch(monkeypatch)
@@ -86,14 +98,21 @@ def test_blob_not_deleted_on_qdrant_failure(monkeypatch):
         lambda *_args, **_kwargs: {"chunks": 2, "points_saved": 1},
     )
 
-    result = embedding_service._process_blob(store=store, blob=blob, subscription_id=None, profile_id=None, doc_type=None)
+    result = embedding_service._process_blob(
+        azure_blob=azure_blob,
+        blob=blob,
+        subscription_id=None,
+        profile_id=None,
+        doc_type=None,
+        prefix="",
+    )
     assert result["status"] == "FAILED"
-    assert store.delete_calls == 0
+    assert azure_blob.delete_calls == 0
 
 
 def test_blob_not_deleted_when_post_upsert_not_verified(monkeypatch):
     payload = pickle.dumps({"texts": ["chunk-1", "chunk-2"]}, protocol=pickle.HIGHEST_PROTOCOL)
-    store = FakeBlobStore(payload)
+    azure_blob = FakeAzureBlob(payload)
     blob = BlobInfo(name="doc-4.pkl", metadata={"document_id": "doc-4"})
 
     _setup_common_monkeypatch(monkeypatch)
@@ -108,14 +127,21 @@ def test_blob_not_deleted_when_post_upsert_not_verified(monkeypatch):
         lambda *_args, **_kwargs: {"chunks": 2, "points_saved": 2},
     )
 
-    result = embedding_service._process_blob(store=store, blob=blob, subscription_id=None, profile_id=None, doc_type=None)
+    result = embedding_service._process_blob(
+        azure_blob=azure_blob,
+        blob=blob,
+        subscription_id=None,
+        profile_id=None,
+        doc_type=None,
+        prefix="",
+    )
     assert result["status"] == "COMPLETED"
-    assert store.delete_calls == 0
+    assert azure_blob.delete_calls == 0
 
 
 def test_training_status_updated_on_success(monkeypatch):
     payload = pickle.dumps({"texts": ["chunk-1", "chunk-2"]}, protocol=pickle.HIGHEST_PROTOCOL)
-    store = FakeBlobStore(payload)
+    azure_blob = FakeAzureBlob(payload)
     blob = BlobInfo(name="doc-3.pkl", metadata={"document_id": "doc-3"})
     status_updates = []
 
@@ -126,7 +152,14 @@ def test_training_status_updated_on_success(monkeypatch):
         lambda *_args, **_kwargs: {"chunks": 2, "points_saved": 2},
     )
 
-    result = embedding_service._process_blob(store=store, blob=blob, subscription_id=None, profile_id=None, doc_type=None)
+    result = embedding_service._process_blob(
+        azure_blob=azure_blob,
+        blob=blob,
+        subscription_id=None,
+        profile_id=None,
+        doc_type=None,
+        prefix="",
+    )
     assert result["status"] == "COMPLETED"
     assert status_updates, "Expected at least one status update"
     latest = status_updates[-1]

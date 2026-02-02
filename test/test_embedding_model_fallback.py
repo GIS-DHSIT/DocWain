@@ -32,3 +32,29 @@ def test_encode_with_fallback_recovers_from_meta_tensor(monkeypatch):
     assert calls[0]["device"] == "cuda"
     assert calls[1]["device"] == "cpu"
     assert calls[1]["batch_size"] <= calls[0]["batch_size"]
+
+
+def test_load_sentence_transformer_retries_without_model_kwargs(monkeypatch):
+    calls = []
+
+    class FakeModel:
+        def __init__(self, name, device=None, model_kwargs=None):
+            calls.append({"device": device, "model_kwargs": model_kwargs})
+            if device == "cuda":
+                raise RuntimeError("Cannot copy out of meta tensor; no data!")
+            if device == "cpu" and model_kwargs:
+                raise RuntimeError("Cannot copy out of meta tensor; no data!")
+            self._target_device = device
+
+    monkeypatch.setattr(dataHandler, "SentenceTransformer", FakeModel)
+    monkeypatch.setattr(dataHandler, "_model_kwargs_for_device", lambda _device: {"torch_dtype": object()})
+
+    model = dataHandler._load_sentence_transformer("fake-model", "cuda")
+
+    assert model._target_device == "cpu"
+    assert calls[0]["device"] == "cuda"
+    assert calls[0]["model_kwargs"] is not None
+    assert calls[1]["device"] == "cpu"
+    assert calls[1]["model_kwargs"] is not None
+    assert calls[2]["device"] == "cpu"
+    assert calls[2]["model_kwargs"] is None
