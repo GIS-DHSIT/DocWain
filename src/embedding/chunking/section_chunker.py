@@ -25,6 +25,8 @@ _HEADING_RE = re.compile(
 _ALL_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9\s,:\-]{4,}$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[\.)])\s+")
 _TABLE_ROW_RE = re.compile(r"\|.*\|.*|(?:\S+\s{2,}){2,}\S+")
+_PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", re.IGNORECASE)
+_BOILERPLATE_RE = re.compile(r"^\s*(confidential|draft|internal use only)\s*$", re.IGNORECASE)
 
 
 def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
@@ -62,7 +64,26 @@ def normalize_text(text: str) -> str:
     # Collapse long newline runs while keeping paragraph boundaries.
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = _coalesce_whitespace(text)
+    text = _strip_boilerplate_lines(text)
     return text
+
+
+def _strip_boilerplate_lines(text: str) -> str:
+    lines = [ln for ln in text.splitlines()]
+    if not lines:
+        return text
+    filtered: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            filtered.append(line)
+            continue
+        if _PAGE_NUMBER_RE.match(stripped):
+            continue
+        if _BOILERPLATE_RE.match(stripped):
+            continue
+        filtered.append(line)
+    return "\n".join(filtered).strip()
 
 
 def _is_heading_line(line: str) -> bool:

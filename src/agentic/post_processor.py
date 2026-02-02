@@ -158,7 +158,7 @@ class PostProcessor:
         for sentence in sentences:
             if not sentence.strip():
                 continue
-            if re.search(r"\[SOURCE-\d+\]", sentence):
+            if re.search(r"\[SOURCE-\d+\]", sentence) or re.search(r"\(.*?Page.*?Section.*?\)", sentence):
                 cited.append(sentence)
                 continue
             sent_tokens = _tokenize(sentence)
@@ -183,10 +183,15 @@ class PostProcessor:
 
     @staticmethod
     def _format_label(source: Dict[str, Any]) -> str:
+        citation = str(source.get("citation") or "").strip()
+        if citation:
+            return f"({citation})"
         name = str(source.get("source_name") or "").strip()
         if not name:
             return ""
-        return f"[Source: {name}]"
+        page = source.get("page") or "N/A"
+        section = source.get("section") or "Section"
+        return f"({name}, Page {page}, Section: {section})"
 
     @staticmethod
     def _rewrite_banned_opener(text: str, *, opener: Optional[str] = None) -> str:
