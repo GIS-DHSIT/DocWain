@@ -446,8 +446,8 @@ class IntelligentContextBuilder:
             source_name = metadata.get('source_file', f"Document {i}")
             section = metadata.get('section_title', metadata.get('section', ''))
             page = metadata.get('page')
-            chunk_id = metadata.get('chunk_id', '')
             score = chunk['score']
+            citation = self._format_citation(metadata, fallback_name=source_name)
 
             # Build source header
             source_header_parts = [f"SOURCE-{i}: {source_name}"]
@@ -479,10 +479,10 @@ class IntelligentContextBuilder:
                 'source_name': source_name,
                 'section': section,
                 'page': page,
-                'chunk_id': chunk_id,
                 'relevance_score': round(score, 3),
                 'excerpt': chunk_text[:200] + "..." if len(chunk_text) > 200 else chunk_text,
-                'retrieval_methods': chunk.get('methods', [chunk.get('method', 'unknown')])
+                'retrieval_methods': chunk.get('methods', [chunk.get('method', 'unknown')]),
+                'citation': citation,
             })
 
         context_string = "\n".join(context_parts)
@@ -493,6 +493,17 @@ class IntelligentContextBuilder:
         )
 
         return context_string, sources
+
+    @staticmethod
+    def _format_citation(metadata: Dict[str, Any], *, fallback_name: str) -> str:
+        name = (metadata.get("source_file") or metadata.get("file_name") or metadata.get("filename") or fallback_name)
+        name = str(name or "Document").strip()
+        section = str(metadata.get("section_title") or metadata.get("section") or "Section").strip()
+        page = metadata.get("page") or metadata.get("page_start")
+        if page is None:
+            page = metadata.get("page_end")
+        page_text = f"Page {page}" if page else "Page N/A"
+        return f"{name}, {page_text}, Section: {section}"
 
 
 class AnswerGenerator:
@@ -529,7 +540,7 @@ USER QUESTION: {query}
 Answer requirements:
 - 3–6 sentences, flowing naturally (avoid bullet lists unless essential).
 - Every factual claim must cite [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-2].
-- If the docs lack the answer or focus on someone/something else, say that plainly.
+- If the exact answer is missing, use the closest related evidence you do have and finish with: "Exact context not found in the documents."
 - If sources disagree, acknowledge briefly with citations.
 
 Answer:"""
@@ -541,6 +552,28 @@ Answer:"""
             subscription_id=subscription_id,
             redis_client=redis_client,
         )
+
+    @staticmethod
+    def _render_citations(answer: str, sources: List[Dict[str, Any]]) -> str:
+        citation_map = {idx + 1: src.get("citation") for idx, src in enumerate(sources)}
+
+        def _replace(match: re.Match) -> str:
+            content = match.group(1)
+            ids = [int(val) for val in re.findall(r"SOURCE-(\d+)", content)]
+            citations = []
+            for ident in ids:
+                citation = citation_map.get(ident)
+                if citation:
+                    citations.append(citation)
+            if not citations:
+                return ""
+            unique = list(dict.fromkeys(citations))
+            if len(unique) == 1:
+                return f"({unique[0]})"
+            return "(" + "; ".join(unique) + ")"
+
+        rendered = re.sub(r"\[(SOURCE-[^\]]+)\]", _replace, answer)
+        return rendered.strip()
 
     def _verify_citations(self, answer: str, num_sources: int) -> Tuple[bool, str]:
         """
@@ -643,7 +676,7 @@ Answer:"""
                 'error': str(e)
             }
 
-        # Verify citations
+        # Verify citations against SOURCE tags before rendering to external format
         citations_valid, citation_error = self._verify_citations(answer, len(sources))
 
         # Verify factual grounding
@@ -659,6 +692,8 @@ Answer:"""
 
         if not verification_status['overall_verified']:
             logger.warning(f"Answer verification failed: {verification_status}")
+
+        answer = self._render_citations(answer, sources)
 
         return {
             'answer': answer,
@@ -699,7 +734,7 @@ def generate_accurate_answer(
 
     if not context:
         return {
-            'answer': "Please specify the document or section you want me to use so I can answer precisely.",
+            'answer': "I couldn't find relevant evidence in the provided documents. Exact context not found in the documents.",
             'sources': [],
             'verified': True  # Absence acknowledgment is valid
         }

@@ -1,5 +1,6 @@
 
 import copy
+import csv
 import hashlib
 import json
 import logging
@@ -8,7 +9,7 @@ import re
 import subprocess
 import time
 import uuid
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1645,6 +1646,86 @@ def _record_chunking_metrics(
     )
 
 
+def _score_chunk_quality(text: str) -> Tuple[float, Dict[str, float]]:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return 0.0, {"length": 0.0, "alpha_ratio": 0.0, "symbol_ratio": 1.0, "repeat_ratio": 1.0}
+    compact = re.sub(r"\s+", "", cleaned)
+    length = len(cleaned)
+    alpha_count = len(re.findall(r"[A-Za-z]", compact))
+    symbol_count = len(re.findall(r"[^\w]", compact))
+    line_tokens = [ln.strip() for ln in cleaned.splitlines() if ln.strip()]
+    repeat_ratio = 1.0
+    if line_tokens:
+        repeat_ratio = 1.0 - (len(set(line_tokens)) / max(1, len(line_tokens)))
+    alpha_ratio = alpha_count / max(1, len(compact))
+    symbol_ratio = symbol_count / max(1, len(compact))
+    length_target = max(1, int(getattr(Config.Retrieval, "MIN_CHUNK_SIZE", 150)))
+    length_score = min(1.0, length / max(1, length_target))
+    quality = (0.4 * length_score) + (0.3 * alpha_ratio) + (0.2 * (1 - symbol_ratio)) + (0.1 * (1 - repeat_ratio))
+    return round(max(0.0, min(1.0, quality)), 3), {
+        "length": length_score,
+        "alpha_ratio": alpha_ratio,
+        "symbol_ratio": symbol_ratio,
+        "repeat_ratio": repeat_ratio,
+    }
+
+
+def _apply_chunk_quality_filter(
+    chunks: List[str],
+    metadata: List[Dict[str, Any]],
+) -> Tuple[List[str], List[Dict[str, Any]], int]:
+    min_chars = int(getattr(Config.Retrieval, "MIN_CHUNK_CHARS", 40))
+    min_quality = float(getattr(Config.Retrieval, "MIN_CHUNK_QUALITY", 0.2))
+    max_symbol_ratio = float(getattr(Config.Retrieval, "MAX_SYMBOL_RATIO", 0.6))
+    filtered_chunks: List[str] = []
+    filtered_meta: List[Dict[str, Any]] = []
+    dropped = 0
+    for text, meta in zip(chunks, metadata):
+        quality, breakdown = _score_chunk_quality(text)
+        symbol_ratio = breakdown.get("symbol_ratio", 1.0)
+        if len(text.strip()) < min_chars or quality < min_quality or symbol_ratio > max_symbol_ratio:
+            dropped += 1
+            continue
+        meta["chunk_quality"] = quality
+        filtered_chunks.append(text)
+        filtered_meta.append(meta)
+    for idx, meta in enumerate(filtered_meta):
+        meta["chunk_index"] = idx
+    return filtered_chunks, filtered_meta, dropped
+
+
+def _extract_facts(text: str) -> List[str]:
+    facts: List[str] = []
+    for line in text.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        if re.search(r"\d", candidate) or ":" in candidate:
+            if len(candidate) <= 200:
+                facts.append(candidate)
+    return facts
+
+
+def _table_rows_from_csv(table_csv: str, *, max_rows: int = 25) -> List[str]:
+    rows: List[str] = []
+    if not table_csv:
+        return rows
+    try:
+        reader = csv.reader(StringIO(table_csv))
+        headers = next(reader, [])
+        for idx, row in enumerate(reader):
+            if idx >= max_rows:
+                break
+            cells = [cell.strip() for cell in row]
+            pairs = [f"{hdr}: {val}" for hdr, val in zip(headers, cells) if hdr.strip() and val.strip()]
+            if pairs:
+                rows.append("; ".join(pairs))
+    except Exception:
+        return rows
+    return rows
+
+
 def _build_chunk_metadata_from_section_chunks(
     section_chunks: List[Any],
     *,
@@ -1703,6 +1784,8 @@ def _chunk_with_section_chunker(
         meta["chunk_index"] = len(aligned_chunks)
         aligned_chunks.append(chunk_text)
         aligned_meta.append(meta)
+
+    aligned_chunks, aligned_meta, _dropped = _apply_chunk_quality_filter(aligned_chunks, aligned_meta)
 
     coverage_ratio = None
     if isinstance(content, ExtractedDocument) and content.full_text:
@@ -1836,6 +1919,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 if "sentence_complete" not in meta:
                     meta["sentence_complete"] = str(texts[idx]).strip().endswith((".", "?", "!"))
 
+            texts, chunk_metadata, dropped_chunks = _apply_chunk_quality_filter(texts, chunk_metadata)
+            if not texts:
+                raise ValueError(f"Chunk quality filter removed all chunks for document {doc_tag}")
+
             chunk_lengths = [len(t) for t in texts]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
             _record_chunking_metrics(
@@ -1862,7 +1949,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 "status": "success",
                 "points_saved": saved,
                 "chunks": expected_points,
-                "dropped_chunks": 0,
+                "dropped_chunks": dropped_chunks,
                 "coverage_ratio": None,
             }
         elif isinstance(text, ExtractedDocument):
@@ -1945,6 +2032,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
 
             for meta in chunk_metadata:
                 meta.setdefault("chunk_kind", "section_text")
+
+            chunks, chunk_metadata, dropped_chunks = _apply_chunk_quality_filter(chunks, chunk_metadata)
+            if not chunks:
+                raise ValueError(f"Chunk quality filter removed all chunks for {doc_name}")
 
             chunk_lengths = [len(chunk) for chunk in chunks]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
@@ -2039,6 +2130,65 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     }
                 )
 
+            for chunk_text, meta in zip(chunks, chunk_metadata):
+                facts = _extract_facts(chunk_text)
+                if len(facts) < 2:
+                    continue
+                fact_text = "\n".join(facts[:20])
+                extra_chunks.append(fact_text)
+                extra_meta.append(
+                    {
+                        "document_id": doc_tag,
+                        "section_title": meta.get("section_title") or "Facts",
+                        "section_path": meta.get("section_path") or meta.get("section_title") or "Facts",
+                        "page_start": meta.get("page_start"),
+                        "page_end": meta.get("page_end"),
+                        "page_number": meta.get("page_start"),
+                        "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                        "chunk_type": "fact",
+                        "chunk_kind": "structured_field",
+                        "doc_type": doc_type,
+                        "sentence_complete": True,
+                    }
+                )
+
+            for table in text.tables or []:
+                table_text = normalize_text(table.csv or table.text or "")
+                if table_text:
+                    extra_chunks.append(table_text)
+                    extra_meta.append(
+                        {
+                            "document_id": doc_tag,
+                            "section_title": "Table",
+                            "section_path": "Table",
+                            "page_start": table.page,
+                            "page_end": table.page,
+                            "page_number": table.page,
+                            "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                            "chunk_type": "table",
+                            "chunk_kind": "table_text",
+                            "doc_type": doc_type,
+                            "sentence_complete": True,
+                        }
+                    )
+                for row_text in _table_rows_from_csv(table.csv or ""):
+                    extra_chunks.append(row_text)
+                    extra_meta.append(
+                        {
+                            "document_id": doc_tag,
+                            "section_title": "Table Row",
+                            "section_path": "Table Row",
+                            "page_start": table.page,
+                            "page_end": table.page,
+                            "page_number": table.page,
+                            "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                            "chunk_type": "table_row",
+                            "chunk_kind": "structured_field",
+                            "doc_type": doc_type,
+                            "sentence_complete": True,
+                        }
+                    )
+
             chunk_metadata = normalize_chunk_links(
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -2067,6 +2217,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 meta["sentence_complete"] = bool(meta.get("sentence_complete", chunks[idx].strip().endswith((".", "?", "!"))))
 
             if extra_chunks:
+                extra_chunks, extra_meta, dropped_extra = _apply_chunk_quality_filter(extra_chunks, extra_meta)
+                for idx, meta in enumerate(extra_meta):
+                    meta["chunk_index"] = len(chunks) + idx
+                dropped_chunks += dropped_extra
                 chunks.extend(extra_chunks)
                 chunk_metadata.extend(extra_meta)
                 sparse_vectors.extend(build_sparse_vectors(extra_chunks))
@@ -2103,7 +2257,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 "status": "success",
                 "points_saved": saved,
                 "chunks": expected_points,
-                "dropped_chunks": 0,
+                "dropped_chunks": dropped_chunks,
                 "coverage_ratio": coverage_ratio,
             }
 
@@ -2143,6 +2297,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 sentence_complete_flags=sentence_flags,
             )
 
+            chunks, chunk_metadata, dropped_chunks = _apply_chunk_quality_filter(chunks, chunk_metadata)
+            if not chunks:
+                raise ValueError(f"Chunk quality filter removed all chunks for {doc_name}")
+
             # Normalize chunk linkage and ids to avoid mismatched prev/next references
             chunk_metadata = normalize_chunk_links(
                 chunk_metadata,
@@ -2152,6 +2310,37 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 doc_name=doc_name,
                 chunks=chunks
             )
+
+            fact_chunks: List[str] = []
+            fact_meta: List[Dict[str, Any]] = []
+            for chunk_text, meta in zip(chunks, chunk_metadata):
+                facts = _extract_facts(chunk_text)
+                if len(facts) < 2:
+                    continue
+                fact_text = "\n".join(facts[:20])
+                fact_chunks.append(fact_text)
+                fact_meta.append(
+                    {
+                        "document_id": doc_tag,
+                        "section_title": meta.get("section_title") or "Facts",
+                        "section_path": meta.get("section_path") or meta.get("section_title") or "Facts",
+                        "page_start": meta.get("page_start"),
+                        "page_end": meta.get("page_end"),
+                        "page_number": meta.get("page_start"),
+                        "chunk_index": len(chunks) + len(fact_chunks) - 1,
+                        "chunk_type": "fact",
+                        "chunk_kind": "structured_field",
+                        "doc_type": doc_type,
+                        "sentence_complete": True,
+                    }
+                )
+            if fact_chunks:
+                fact_chunks, fact_meta, dropped_facts = _apply_chunk_quality_filter(fact_chunks, fact_meta)
+                for idx, meta in enumerate(fact_meta):
+                    meta["chunk_index"] = len(chunks) + idx
+                dropped_chunks += dropped_facts
+                chunks.extend(fact_chunks)
+                chunk_metadata.extend(fact_meta)
 
             # Generate embeddings
             logging.info(f"Generating embeddings for {len(chunks)} chunks")
@@ -2245,7 +2434,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 "status": "success",
                 "points_saved": saved,
                 "chunks": expected_points,
-                "dropped_chunks": 0,
+                "dropped_chunks": dropped_chunks,
                 "coverage_ratio": None,
             }
 
