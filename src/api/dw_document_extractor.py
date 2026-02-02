@@ -2,7 +2,7 @@ import hashlib
 import io
 import logging
 import re
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import docx
 import fitz
@@ -61,12 +61,71 @@ class DocumentExtractor:
     def _detect_scanned_page(text: str, image_count: int) -> bool:
         return (not text or len(text.strip()) < 30) and image_count > 0
 
+    @staticmethod
+    def _page_number_line(text: str) -> bool:
+        return bool(re.match(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", text, re.IGNORECASE))
+
+    @staticmethod
+    def _extract_key_value_pairs(text: str) -> List[Dict[str, Any]]:
+        pairs: List[Dict[str, Any]] = []
+        if not text:
+            return pairs
+        for line in text.splitlines():
+            candidate = line.strip()
+            if not candidate or len(candidate) > 200:
+                continue
+            match = re.match(r"^([A-Za-z0-9][^:]{1,64}):\s*(.+)$", candidate)
+            if not match:
+                match = re.match(r"^([A-Za-z0-9][^-]{1,64})\s+-\s+(.+)$", candidate)
+            if match:
+                key = match.group(1).strip()
+                value = match.group(2).strip()
+                if key and value:
+                    pairs.append({"key": key, "value": value})
+        return pairs
+
+    @staticmethod
+    def _layout_confidence(chunks: List[ChunkCandidate]) -> float:
+        if not chunks:
+            return 0.0
+        structured = sum(1 for cand in chunks if cand.chunk_type in {"table", "table_row", "table_header"})
+        density = structured / max(1, len(chunks))
+        return round(min(1.0, 0.6 + density * 0.4), 3)
+
+    def _assess_doc_quality(
+        self,
+        *,
+        ocr_confidences: List[float],
+        chunk_candidates: List[ChunkCandidate],
+        has_images: bool,
+    ) -> Dict[str, Any]:
+        min_conf = float(getattr(Config.Retrieval, "MIN_OCR_CONFIDENCE", 60))
+        avg_conf = None
+        if ocr_confidences:
+            avg_conf = sum(ocr_confidences) / max(1, len(ocr_confidences))
+        layout_conf = self._layout_confidence(chunk_candidates)
+        if avg_conf is None:
+            quality = "MEDIUM" if chunk_candidates else "LOW"
+        elif avg_conf < min_conf:
+            quality = "LOW"
+        elif avg_conf < min_conf + 15:
+            quality = "MEDIUM"
+        else:
+            quality = "HIGH"
+        return {
+            "doc_quality": quality,
+            "ocr_confidence_avg": avg_conf,
+            "layout_confidence": layout_conf,
+            "ocr_upgrade_suggested": bool(has_images and quality == "LOW"),
+        }
+
     def _ensure_easyocr(self):
         if easyocr and self._easyocr_reader is None:
             self._easyocr_reader = easyocr.Reader(["en"], gpu=False)
 
-    def _ocr_image(self, image: Image.Image) -> Tuple[str, Optional[float]]:
-        if self.ocr_engine == "easyocr" and easyocr:
+    def _ocr_image(self, image: Image.Image, *, engine: Optional[str] = None) -> Tuple[str, Optional[float]]:
+        active_engine = (engine or self.ocr_engine).lower()
+        if active_engine == "easyocr" and easyocr:
             try:
                 self._ensure_easyocr()
                 result = self._easyocr_reader.readtext(np.array(image), detail=1)
@@ -145,6 +204,91 @@ class DocumentExtractor:
         except Exception:
             return io.BytesIO()
 
+    def _build_canonical_json(
+        self,
+        *,
+        pages: List[Dict[str, Any]],
+        sections: List[Section],
+        tables: List[Table],
+        figures: List[Figure],
+        chunk_candidates: List[ChunkCandidate],
+    ) -> Dict[str, Any]:
+        key_values: List[Dict[str, Any]] = []
+        for section in sections:
+            for pair in self._extract_key_value_pairs(section.text):
+                key_values.append(
+                    {
+                        "key": pair["key"],
+                        "value": pair["value"],
+                        "section_title": section.title,
+                        "page_start": section.start_page,
+                        "page_end": section.end_page,
+                    }
+                )
+        layout_spans = [
+            {
+                "section_id": cand.section_id,
+                "section_title": cand.section_title,
+                "page": cand.page,
+                "chunk_type": cand.chunk_type,
+                "text": cand.text,
+            }
+            for cand in chunk_candidates
+            if cand.text
+        ]
+        return {
+            "pages": pages,
+            "sections": [
+                {
+                    "section_id": sec.section_id,
+                    "title": sec.title,
+                    "level": sec.level,
+                    "start_page": sec.start_page,
+                    "end_page": sec.end_page,
+                    "text": sec.text,
+                }
+                for sec in sections
+            ],
+            "tables": [
+                {"page": tbl.page, "text": tbl.text, "csv": tbl.csv} for tbl in tables
+            ],
+            "figures": [
+                {"page": fig.page, "caption": fig.caption} for fig in figures
+            ],
+            "key_value_pairs": key_values,
+            "layout_spans": layout_spans,
+        }
+
+    @staticmethod
+    def _dedupe_page_lines(pages: Dict[int, List[str]]) -> Tuple[Dict[int, List[str]], List[str], List[str]]:
+        if not pages:
+            return {}, [], []
+        headers: Dict[str, int] = {}
+        footers: Dict[str, int] = {}
+        for lines in pages.values():
+            non_empty = [ln.strip() for ln in lines if ln.strip()]
+            if not non_empty:
+                continue
+            headers[non_empty[0]] = headers.get(non_empty[0], 0) + 1
+            footers[non_empty[-1]] = footers.get(non_empty[-1], 0) + 1
+        total_pages = max(1, len(pages))
+        header_lines = [line for line, count in headers.items() if count / total_pages >= 0.6]
+        footer_lines = [line for line, count in footers.items() if count / total_pages >= 0.6]
+        cleaned: Dict[int, List[str]] = {}
+        for page, lines in pages.items():
+            filtered = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if stripped in header_lines or stripped in footer_lines:
+                    continue
+                if DocumentExtractor._page_number_line(stripped):
+                    continue
+                filtered.append(line)
+            cleaned[page] = filtered
+        return cleaned, header_lines, footer_lines
+
     # ---------- Extraction routines ----------
     def extract_text_from_pdf(self, pdf_content: bytes, filename: Optional[str] = None) -> ExtractedDocument:
         sections: List[Section] = []
@@ -154,6 +298,8 @@ class DocumentExtractor:
         full_text_parts: List[str] = []
         errors: List[str] = []
         ocr_confidences: List[float] = []
+        pages_map: Dict[int, List[str]] = {}
+        ocr_targets: List[Dict[str, Any]] = []
 
         current_title = "Introduction"
         current_section_id = self._make_section_id(current_title, 1)
@@ -169,38 +315,38 @@ class DocumentExtractor:
                         blocks = page.get_text("blocks") or []
                         page_text_parts: List[str] = []
 
-                    for block in blocks:
-                        if len(block) < 5:
-                            continue
-                        block_text = (block[4] or "").strip()
-                        if not block_text:
-                            continue
+                        for block in blocks:
+                            if len(block) < 5:
+                                continue
+                            block_text = (block[4] or "").strip()
+                            if not block_text:
+                                continue
 
-                        first_line = block_text.splitlines()[0].strip()
-                        if self._is_heading(first_line):
-                            self._finalize_section(
-                                sections, current_title, current_section_id, current_start_page, page_index, section_buffer
-                            )
-                            section_buffer = []
-                            current_title = first_line
-                            current_section_id = self._make_section_id(first_line, page_index)
-                            current_start_page = page_index
-                            continue
+                            first_line = block_text.splitlines()[0].strip()
+                            if self._is_heading(first_line):
+                                self._finalize_section(
+                                    sections, current_title, current_section_id, current_start_page, page_index, section_buffer
+                                )
+                                section_buffer = []
+                                current_title = first_line
+                                current_section_id = self._make_section_id(first_line, page_index)
+                                current_start_page = page_index
+                                continue
 
-                        section_buffer.append(block_text)
-                        chunk_type = "table" if self._looks_like_table(block_text) else "text"
-                        chunk_candidates.append(
-                            ChunkCandidate(
-                                text=block_text,
-                                page=page_index,
-                                section_title=current_title,
-                                section_id=current_section_id,
-                                chunk_type=chunk_type,
+                            section_buffer.append(block_text)
+                            chunk_type = "table" if self._looks_like_table(block_text) else "text"
+                            chunk_candidates.append(
+                                ChunkCandidate(
+                                    text=block_text,
+                                    page=page_index,
+                                    section_title=current_title,
+                                    section_id=current_section_id,
+                                    chunk_type=chunk_type,
+                                )
                             )
-                        )
-                        page_text_parts.append(block_text)
-                        if chunk_type == "table":
-                            tables.append(Table(page=page_index, text=block_text))
+                            page_text_parts.append(block_text)
+                            if chunk_type == "table":
+                                tables.append(Table(page=page_index, text=block_text))
 
                         images = page.get_images(full=True)
                         page_text = "\n".join(page_text_parts).strip()
@@ -222,8 +368,20 @@ class DocumentExtractor:
                                             )
                                         )
                                         page_text_parts.append(ocr_text)
-                                    if ocr_conf is not None:
-                                        ocr_confidences.append(float(ocr_conf))
+                                        ocr_target = {
+                                            "page": page_index,
+                                            "section_title": current_title,
+                                            "section_id": current_section_id,
+                                            "image": image.copy(),
+                                            "candidate_index": len(chunk_candidates) - 1,
+                                            "figure_index": len(figures) - 1,
+                                            "original_text": ocr_text,
+                                            "original_conf": ocr_conf,
+                                        }
+                                        if ocr_conf is not None:
+                                            ocr_confidences.append(float(ocr_conf))
+                                            ocr_target["conf_index"] = len(ocr_confidences) - 1
+                                        ocr_targets.append(ocr_target)
                                 except Exception as exc:  # noqa: BLE001
                                     logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
                                     errors.append(f"image_extraction_failed: page={page_index} err={exc}")
@@ -232,6 +390,7 @@ class DocumentExtractor:
                             figures.append(Figure(page=page_index, caption=f"Image_{page_index}_{img_index}"))
 
                         if page_text_parts:
+                            pages_map[page_index] = list(page_text_parts)
                             full_text_parts.append(f"\n--- Page {page_index} ---\n" + "\n".join(page_text_parts))
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"pdf_layout_parse_failed: {exc}")
@@ -242,6 +401,7 @@ class DocumentExtractor:
                         last_page = max(last_page, page_index)
                         text = page.extract_text() or ""
                         if text.strip():
+                            page_lines = text.splitlines()
                             for para in text.split("\n"):
                                 para = para.strip()
                                 if not para:
@@ -269,6 +429,7 @@ class DocumentExtractor:
                                 if chunk_type == "table":
                                     tables.append(Table(page=page_index, text=para))
                             full_text_parts.append(f"\n--- Page {page_index} ---\n{text}")
+                            pages_map[page_index] = page_lines
 
                         try:
                             extracted_tables = page.extract_tables()
@@ -296,8 +457,75 @@ class DocumentExtractor:
             sections, current_title, current_section_id, current_start_page, last_page, section_buffer
         )
 
+        if pages_map:
+            cleaned_pages, header_lines, footer_lines = self._dedupe_page_lines(pages_map)
+            if cleaned_pages:
+                pages_map = cleaned_pages
+                full_text_parts = [
+                    f"\n--- Page {page} ---\n" + "\n".join(lines)
+                    for page, lines in sorted(cleaned_pages.items())
+                    if lines
+                ]
+                if header_lines or footer_lines:
+                    chunk_candidates = [
+                        cand
+                        for cand in chunk_candidates
+                        if cand.text.strip() not in header_lines
+                        and cand.text.strip() not in footer_lines
+                        and not self._page_number_line(cand.text.strip())
+                    ]
+
+        quality_snapshot = self._assess_doc_quality(
+            ocr_confidences=ocr_confidences,
+            chunk_candidates=chunk_candidates,
+            has_images=bool(ocr_targets),
+        )
+        if (
+            quality_snapshot["doc_quality"] == "LOW"
+            and ocr_targets
+            and easyocr
+            and self.ocr_engine != "easyocr"
+        ):
+            for target in ocr_targets:
+                new_text, new_conf = self._ocr_image(target["image"], engine="easyocr")
+                if not new_text:
+                    continue
+                old_text = target.get("original_text") or ""
+                old_conf = target.get("original_conf") or 0.0
+                if new_conf is None:
+                    new_conf = old_conf
+                if len(new_text) <= len(old_text) and new_conf <= old_conf:
+                    continue
+                idx = target.get("candidate_index")
+                if isinstance(idx, int) and 0 <= idx < len(chunk_candidates):
+                    chunk_candidates[idx].text = new_text
+                fig_idx = target.get("figure_index")
+                if isinstance(fig_idx, int) and 0 <= fig_idx < len(figures):
+                    figures[fig_idx].caption = new_text
+                conf_idx = target.get("conf_index")
+                if isinstance(conf_idx, int) and 0 <= conf_idx < len(ocr_confidences):
+                    ocr_confidences[conf_idx] = float(new_conf)
+
+            quality_snapshot = self._assess_doc_quality(
+                ocr_confidences=ocr_confidences,
+                chunk_candidates=chunk_candidates,
+                has_images=bool(ocr_targets),
+            )
+
         full_text = "\n".join(full_text_parts).strip()
         doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "document.pdf")
+        pages = [
+            {"page_number": page, "text": "\n".join(lines).strip()}
+            for page, lines in sorted(pages_map.items())
+            if lines
+        ]
+        canonical_json = self._build_canonical_json(
+            pages=pages,
+            sections=sections,
+            tables=tables,
+            figures=figures,
+            chunk_candidates=chunk_candidates,
+        )
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
@@ -306,7 +534,12 @@ class DocumentExtractor:
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=errors,
-            metrics={"ocr_confidences": ocr_confidences},
+            metrics={
+                "ocr_confidences": ocr_confidences,
+                **quality_snapshot,
+            },
+            canonical_json=canonical_json,
+            doc_quality=quality_snapshot.get("doc_quality"),
         )
 
     def extract_text_from_docx(self, doc_content: Union[bytes, bytearray, memoryview, str, io.IOBase], filename: Optional[str] = None) -> ExtractedDocument:
@@ -388,6 +621,19 @@ class DocumentExtractor:
 
         full_text = "\n".join(full_text_parts).strip()
         doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "document.docx")
+        quality_snapshot = self._assess_doc_quality(
+            ocr_confidences=[],
+            chunk_candidates=chunk_candidates,
+            has_images=bool(figures),
+        )
+        pages = [{"page_number": 1, "text": full_text}] if full_text else []
+        canonical_json = self._build_canonical_json(
+            pages=pages,
+            sections=sections,
+            tables=tables,
+            figures=figures,
+            chunk_candidates=chunk_candidates,
+        )
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
@@ -396,6 +642,9 @@ class DocumentExtractor:
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=errors,
+            metrics=quality_snapshot,
+            canonical_json=canonical_json,
+            doc_quality=quality_snapshot.get("doc_quality"),
         )
 
     def extract_text_from_pptx(self, ppt_content: Union[bytes, bytearray, memoryview, str, io.IOBase], filename: Optional[str] = None) -> ExtractedDocument:
@@ -465,6 +714,23 @@ class DocumentExtractor:
 
         full_text = "\n".join(full_text_parts).strip()
         doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "slides.pptx")
+        quality_snapshot = self._assess_doc_quality(
+            ocr_confidences=[],
+            chunk_candidates=chunk_candidates,
+            has_images=bool(figures),
+        )
+        pages = [
+            {"page_number": sec.start_page or 1, "text": sec.text}
+            for sec in sections
+            if sec.text
+        ]
+        canonical_json = self._build_canonical_json(
+            pages=pages,
+            sections=sections,
+            tables=tables,
+            figures=figures,
+            chunk_candidates=chunk_candidates,
+        )
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
@@ -473,6 +739,9 @@ class DocumentExtractor:
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=errors,
+            metrics=quality_snapshot,
+            canonical_json=canonical_json,
+            doc_quality=quality_snapshot.get("doc_quality"),
         )
 
     def extract_text_from_txt(self, text_content: Union[bytes, str], filename: Optional[str] = None) -> ExtractedDocument:
@@ -492,6 +761,13 @@ class DocumentExtractor:
 
         text = text.replace("\r\n", "\n").strip()
         if not text:
+            canonical_json = self._build_canonical_json(
+                pages=[],
+                sections=[],
+                tables=[],
+                figures=[],
+                chunk_candidates=[],
+            )
             return ExtractedDocument(
                 full_text="",
                 sections=[],
@@ -500,6 +776,9 @@ class DocumentExtractor:
                 chunk_candidates=[],
                 doc_type="document",
                 errors=errors or ["empty_text"],
+                metrics={"doc_quality": "LOW"},
+                canonical_json=canonical_json,
+                doc_quality="LOW",
             )
 
         paragraphs = [para.strip() for para in re.split(r"\n\s*\n", text) if para.strip()]
@@ -531,6 +810,19 @@ class DocumentExtractor:
 
         full_text = "\n\n".join(paragraphs)
         doc_type = self._doc_intel.infer_type([], [], sections, full_text, filename_hint=filename or "document.txt")
+        quality_snapshot = self._assess_doc_quality(
+            ocr_confidences=[],
+            chunk_candidates=chunk_candidates,
+            has_images=False,
+        )
+        pages = [{"page_number": 1, "text": full_text}] if full_text else []
+        canonical_json = self._build_canonical_json(
+            pages=pages,
+            sections=sections,
+            tables=[],
+            figures=[],
+            chunk_candidates=chunk_candidates,
+        )
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
@@ -539,6 +831,9 @@ class DocumentExtractor:
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=errors,
+            metrics=quality_snapshot,
+            canonical_json=canonical_json,
+            doc_quality=quality_snapshot.get("doc_quality"),
         )
 
     def extract_dataframe(self, df: pd.DataFrame, sheet_name: str = "Sheet1", filename: Optional[str] = None) -> ExtractedDocument:
@@ -618,6 +913,19 @@ class DocumentExtractor:
         full_text = "\n".join([part for part in full_text_parts if part]).strip()
 
         doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or sheet_name)
+        quality_snapshot = self._assess_doc_quality(
+            ocr_confidences=[],
+            chunk_candidates=chunk_candidates,
+            has_images=False,
+        )
+        pages = [{"page_number": 1, "text": full_text}] if full_text else []
+        canonical_json = self._build_canonical_json(
+            pages=pages,
+            sections=sections,
+            tables=tables,
+            figures=figures,
+            chunk_candidates=chunk_candidates,
+        )
         return ExtractedDocument(
             full_text=full_text,
             sections=sections,
@@ -626,6 +934,9 @@ class DocumentExtractor:
             chunk_candidates=chunk_candidates,
             doc_type=doc_type,
             errors=[],
+            metrics=quality_snapshot,
+            canonical_json=canonical_json,
+            doc_quality=quality_snapshot.get("doc_quality"),
         )
 class DocumentIntelligence:
     """Lightweight classifier to tag document type from observed layout/content."""
