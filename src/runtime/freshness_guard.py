@@ -50,7 +50,7 @@ class FreshnessGuard:
     def _insufficient_response(self, ctx: RequestContext, evidence_ids: List[str]) -> Dict[str, Any]:
         suggestion = f"Try a more specific question about these documents: {', '.join(sorted(set(evidence_ids)))[:200]}" if evidence_ids else "Try naming a document or section to search."
         return {
-            "response": "Not found in the selected documents. The request was re-run because the previous answer looked stale.",
+            "response": "No explicit match in the selected documents. The request was re-run because the previous answer looked stale.",
             "sources": [],
             "grounded": False,
             "context_found": False,

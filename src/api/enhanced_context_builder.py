@@ -6,6 +6,7 @@ Replaces context building logic in dw_newron.py
 import re
 import time
 import logging
+import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
@@ -29,20 +30,31 @@ class IntelligentContextBuilder:
         self.max_context_chunks = max_context_chunks
 
     def _deduplicate_by_chunk_id(self, chunks: List[Dict]) -> List[Dict]:
-        """Keep highest scoring chunk per unique chunk_id or doc/index tuple."""
-        best = {}
+        """Keep highest scoring chunk per unique chunk_id."""
+        best: Dict[str, Dict] = {}
+        remainder: List[Dict] = []
         for chunk in chunks:
             meta = chunk.get("metadata") or {}
-            key = meta.get("chunk_id") or (
-                meta.get("document_id"),
-                meta.get("chunk_index"),
-            )
-            if key not in best or chunk.get("score", 0) > best[key].get("score", 0):
-                best[key] = chunk
-        deduped = list(best.values())
+            chunk_id = meta.get("chunk_id")
+            if chunk_id:
+                key = str(chunk_id)
+                if key not in best or chunk.get("score", 0) > best[key].get("score", 0):
+                    best[key] = chunk
+            else:
+                remainder.append(chunk)
+        deduped = list(best.values()) + remainder
         if len(deduped) != len(chunks):
             logger.info("Deduplicated by chunk_id: %s -> %s", len(chunks), len(deduped))
         return deduped
+
+    @staticmethod
+    def _location_key(meta: Dict) -> Optional[Tuple[str, str, str]]:
+        doc_id = meta.get("document_id") or meta.get("doc_id") or meta.get("docId")
+        page = meta.get("page") or meta.get("page_start") or meta.get("page_end")
+        idx = meta.get("chunk_index")
+        if doc_id is None or page is None or idx is None:
+            return None
+        return str(doc_id), str(page), str(idx)
 
     def _calculate_text_similarity(self, text1: str, text2: str) -> float:
         """Calculate Jaccard similarity between two texts"""
@@ -58,36 +70,27 @@ class IntelligentContextBuilder:
         return len(intersection) / len(union)
 
     def _deduplicate_chunks(self, chunks: List[Dict], threshold: float = 0.7) -> List[Dict]:
-        """Remove highly similar chunks"""
+        """Deduplicate only when (document_id, page, chunk_index) match and text hashes match."""
+        _ = threshold
         if len(chunks) <= 1:
             return chunks
-
-        unique_chunks = []
-
+        best: Dict[Tuple[str, str, str, str], Dict] = {}
+        keep: List[Dict] = []
         for chunk in chunks:
-            is_duplicate = False
-            chunk_text = chunk['text']
-
-            for unique in unique_chunks:
-                similarity = self._calculate_text_similarity(
-                    chunk_text,
-                    unique['text']
-                )
-
-                if similarity >= threshold:
-                    # Keep the one with higher score
-                    if chunk['score'] > unique['score']:
-                        unique_chunks.remove(unique)
-                        break
-                    else:
-                        is_duplicate = True
-                        break
-
-            if not is_duplicate:
-                unique_chunks.append(chunk)
-
-        logger.info(f"Deduplicated {len(chunks)} → {len(unique_chunks)} chunks")
-        return unique_chunks
+            meta = chunk.get("metadata") or {}
+            location = self._location_key(meta)
+            text = (chunk.get("text") or "").strip()
+            if not location or not text:
+                keep.append(chunk)
+                continue
+            text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            key = (*location, text_hash)
+            if key not in best or chunk.get("score", 0) > best[key].get("score", 0):
+                best[key] = chunk
+        deduped = list(best.values()) + keep
+        if len(deduped) != len(chunks):
+            logger.info("Deduplicated by location+text hash: %s -> %s", len(chunks), len(deduped))
+        return deduped
 
     def _group_by_document(self, chunks: List[Dict]) -> Dict[str, List[Dict]]:
         """Group chunks by source document"""
@@ -349,7 +352,14 @@ class IntelligentContextBuilder:
             self,
             chunks: List[Dict],
             query: str,
-            include_metadata: bool = True
+            include_metadata: bool = True,
+            *,
+            intent: Optional[str] = None,
+            min_chunks: int = 0,
+            max_chunks: Optional[int] = None,
+            preserve_chunks: bool = False,
+            min_text_len: Optional[int] = None,
+            max_tokens: Optional[int] = None,
     ) -> Tuple[str, List[Dict]]:
         """
         Build optimized context string from chunks.
@@ -368,7 +378,10 @@ class IntelligentContextBuilder:
         # Deduplicate exact chunk ids before text-level dedup
         min_conf = getattr(Config.Retrieval, "MIN_OCR_CONFIDENCE", None)
         min_conf = float(min_conf) / 100.0 if isinstance(min_conf, (int, float)) and min_conf > 1 else min_conf
-        filtered = self._filter_low_confidence(self._filter_low_signal(chunks), min_conf)
+        min_len = 30 if min_text_len is None else int(min_text_len)
+        if intent in {"NUMERIC_AGGREGATION", "TABULAR_SUMMARY"} and min_text_len is None:
+            min_len = 8
+        filtered = self._filter_low_confidence(self._filter_low_signal(chunks, min_len=min_len), min_conf)
         dedup_by_id = self._deduplicate_by_chunk_id(filtered)
 
         # Deduplicate similar chunks
@@ -377,60 +390,76 @@ class IntelligentContextBuilder:
         for chunk in unique_chunks:
             chunk["quality_score"] = self._score_chunk_quality(chunk)
 
-        # Ensure multi-document coverage by round-robin selection across docs
-        def _doc_key(chunk: Dict) -> str:
-            meta = chunk.get('metadata', {})
-            return meta.get('document_id') or meta.get('source_file') or "unknown"
+        target_max = int(max_chunks or self.max_context_chunks)
+        if min_chunks:
+            target_max = max(target_max, int(min_chunks))
 
-        buckets: Dict[str, List[Dict]] = {}
-        for c in unique_chunks:
-            buckets.setdefault(_doc_key(c), []).append(c)
+        if preserve_chunks:
+            selected_chunks = unique_chunks[:target_max]
+        else:
+            # Ensure multi-document coverage by round-robin selection across docs
+            def _doc_key(chunk: Dict) -> str:
+                meta = chunk.get('metadata', {})
+                return meta.get('document_id') or meta.get('source_file') or "unknown"
 
-        for doc_chunks in buckets.values():
-            doc_chunks.sort(key=lambda x: float(x.get('quality_score', x.get("score", 0.0))), reverse=True)
+            buckets: Dict[str, List[Dict]] = {}
+            for c in unique_chunks:
+                buckets.setdefault(_doc_key(c), []).append(c)
 
-        selected_chunks: List[Dict] = []
+            for doc_chunks in buckets.values():
+                doc_chunks.sort(key=lambda x: float(x.get('quality_score', x.get("score", 0.0))), reverse=True)
 
-        # Let the top doc contribute a deeper slice to preserve narrative, then
-        # round-robin the remainder for coverage.
-        if buckets:
-            top_doc_id = max(
-                buckets.keys(),
-                key=lambda k: float(buckets[k][0].get('quality_score', buckets[k][0].get('score', 0.0)))
-                if buckets[k] else 0.0
-            )
-            top_doc = buckets[top_doc_id]
-            max_from_top = min(len(top_doc), max(3, self.max_context_chunks // 2))
-            selected_chunks.extend(top_doc[:max_from_top])
-            buckets[top_doc_id] = top_doc[max_from_top:]
-            if not buckets[top_doc_id]:
-                buckets.pop(top_doc_id, None)
+            selected_chunks = []
 
-        while len(selected_chunks) < self.max_context_chunks and buckets:
-            # Order docs by best available score to favor stronger evidence
-            doc_order = sorted(
-                buckets.items(),
-                key=lambda item: float(item[1][0].get('quality_score', item[1][0].get('score', 0.0)))
-                if item[1] else 0.0,
-                reverse=True
-            )
-            progress = False
-            for doc_id, doc_chunks in doc_order:
-                if not doc_chunks:
-                    continue
-                selected_chunks.append(doc_chunks.pop(0))
-                progress = True
-                if len(selected_chunks) >= self.max_context_chunks:
+            # Let the top doc contribute a deeper slice to preserve narrative, then
+            # round-robin the remainder for coverage.
+            if buckets:
+                top_doc_id = max(
+                    buckets.keys(),
+                    key=lambda k: float(buckets[k][0].get('quality_score', buckets[k][0].get('score', 0.0)))
+                    if buckets[k] else 0.0
+                )
+                top_doc = buckets[top_doc_id]
+                max_from_top = min(len(top_doc), max(3, target_max // 2))
+                selected_chunks.extend(top_doc[:max_from_top])
+                buckets[top_doc_id] = top_doc[max_from_top:]
+                if not buckets[top_doc_id]:
+                    buckets.pop(top_doc_id, None)
+
+            while len(selected_chunks) < target_max and buckets:
+                # Order docs by best available score to favor stronger evidence
+                doc_order = sorted(
+                    buckets.items(),
+                    key=lambda item: float(item[1][0].get('quality_score', item[1][0].get('score', 0.0)))
+                    if item[1] else 0.0,
+                    reverse=True
+                )
+                progress = False
+                for doc_id, doc_chunks in doc_order:
+                    if not doc_chunks:
+                        continue
+                    selected_chunks.append(doc_chunks.pop(0))
+                    progress = True
+                    if len(selected_chunks) >= target_max:
+                        break
+                buckets = {k: v for k, v in buckets.items() if v}
+                if not progress:
                     break
-            buckets = {k: v for k, v in buckets.items() if v}
-            if not progress:
-                break
 
-        diversity_threshold = float(getattr(Config.Retrieval, "DIVERSITY_THRESHOLD", 0.6))
-        diversified = self._diversify_chunks(selected_chunks, self.max_context_chunks, diversity_threshold)
+            diversity_threshold = float(getattr(Config.Retrieval, "DIVERSITY_THRESHOLD", 0.6))
+            selected_chunks = self._diversify_chunks(selected_chunks, target_max, diversity_threshold)
 
-        # Order logically
-        ordered_chunks = self._order_chunks_logically(diversified)
+        # Order logically (skip merging when preserving chunk count)
+        if preserve_chunks:
+            ordered_chunks = sorted(
+                selected_chunks,
+                key=lambda x: (
+                    x.get("metadata", {}).get("chunk_index") is None,
+                    x.get("metadata", {}).get("chunk_index", 0),
+                ),
+            )
+        else:
+            ordered_chunks = self._order_chunks_logically(selected_chunks)
 
         # Build context string
         context_parts = []
@@ -438,6 +467,13 @@ class IntelligentContextBuilder:
 
         # Add query restatement for focus
         context_parts.append(f"[QUERY: {query}]\n")
+
+        packed_chunks: List[Dict] = []
+        token_budget = None
+        if max_tokens is None:
+            max_tokens = getattr(Config.Retrieval, "MAX_CONTEXT_TOKENS", None)
+        if isinstance(max_tokens, (int, float)) and max_tokens:
+            token_budget = int(max_tokens)
 
         for i, chunk in enumerate(ordered_chunks, 1):
             metadata = chunk['metadata']
@@ -468,10 +504,17 @@ class IntelligentContextBuilder:
             chunk_text = re.sub(r'\[CONTINUES:.*?\]', '', chunk_text)
             chunk_text = chunk_text.strip()
 
+            tokens = len((chunk_text or "").split())
+            if token_budget is not None and tokens > token_budget and len(packed_chunks) >= max(int(min_chunks), 0):
+                break
+            if token_budget is not None:
+                token_budget -= tokens
+
             # Add to context
             context_parts.append(f"\n[{source_header}]")
             context_parts.append(chunk_text)
             context_parts.append("[/SOURCE]\n")
+            packed_chunks.append(chunk)
 
             # Add to sources list
             sources.append({
@@ -486,10 +529,17 @@ class IntelligentContextBuilder:
             })
 
         context_string = "\n".join(context_parts)
-
+        selected_chunks_count = len(selected_chunks)
+        packed_chunks_count = len(packed_chunks)
+        context_chars = len(context_string)
+        assert packed_chunks_count <= selected_chunks_count or not selected_chunks_count
         logger.info(
-            f"Built context: {len(ordered_chunks)} chunks, "
-            f"{len(context_string)} chars"
+            "Context built",
+            extra={
+                "selected_chunks_count": selected_chunks_count,
+                "packed_chunks_count": packed_chunks_count,
+                "context_chars": context_chars,
+            },
         )
 
         return context_string, sources
@@ -540,7 +590,10 @@ USER QUESTION: {query}
 Answer requirements:
 - 3–6 sentences, flowing naturally (avoid bullet lists unless essential).
 - Every factual claim must cite [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-2].
-- If the exact answer is missing, use the closest related evidence you do have and finish with: "Exact context not found in the documents."
+- Normalize relevant facts into structured data before answering (lists, tables, numeric fields).
+- Perform calculations explicitly and show the math when numbers are present.
+- Do not expose internal IDs, chunk references, hashes, or system metadata.
+- If the exact answer is missing, use the closest related evidence you do have and finish with: "Exact context not stated in the documents."
 - If sources disagree, acknowledge briefly with citations.
 
 Answer:"""
@@ -734,7 +787,7 @@ def generate_accurate_answer(
 
     if not context:
         return {
-            'answer': "I couldn't find relevant evidence in the provided documents. Exact context not found in the documents.",
+            'answer': "I couldn't locate relevant evidence in the provided documents. Exact context not stated in the documents.",
             'sources': [],
             'verified': True  # Absence acknowledgment is valid
         }

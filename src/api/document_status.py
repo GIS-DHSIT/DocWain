@@ -106,13 +106,16 @@ def update_document_fields(document_id: str, fields: Dict[str, Any]):
 
 def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
     now = time.time()
-    flat = _flatten(stage, patch)
-    flat["updated_at"] = now
+    update: Dict[str, Any] = {}
+    for key, value in patch.items():
+        target = f"{stage}.{key}" if stage else key
+        update[target] = value
+    update["updated_at"] = now
     collection = get_documents_collection()
     return collection.find_one_and_update(
         _doc_filter(document_id),
         {
-            "$set": flat,
+            "$set": update,
             "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id)},
         },
         upsert=True,

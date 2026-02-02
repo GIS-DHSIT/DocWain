@@ -19,6 +19,8 @@ class DocumentEmbedRequest(BaseModel):
     profile_id: Optional[str] = Field(None, description="Optional profile id override")
     doc_type: Optional[str] = Field(None, description="Optional document type override")
     max_blobs: Optional[int] = Field(None, description="Optional max blobs to process per request")
+    force_reembed: bool = Field(False, description="Whether to force re-embedding if points already exist")
+    collection_name: Optional[str] = Field(None, description="Optional collection name override")
 
 
 class DocumentIntegrityRequest(BaseModel):
@@ -69,6 +71,21 @@ def get_documents(
 @documents_router.post("/documents/embed")
 def embed_document(request: DocumentEmbedRequest = Body(...)):
     try:
+        if not request.subscription_id:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": {"code": "subscription_id_required", "message": "subscription_id is required"}},
+            )
+        if not (request.profile_id or request.document_id or request.document_ids):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": {
+                        "code": "profile_or_document_required",
+                        "message": "profile_id or document_id(s) must be provided",
+                    }
+                },
+            )
         result = embed_documents(
             document_id=request.document_id,
             document_ids=request.document_ids,
@@ -76,8 +93,11 @@ def embed_document(request: DocumentEmbedRequest = Body(...)):
             profile_id=request.profile_id,
             doc_type=request.doc_type,
             max_blobs=request.max_blobs,
+            force_reembed=request.force_reembed,
         )
         return sanitize_user_payload(result)
+    except HTTPException:
+        raise
     except BlobConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:  # noqa: BLE001

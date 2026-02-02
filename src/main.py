@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,9 +21,7 @@ from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.api.dataHandler import (
-    db,
     clear_legacy_vetting_metadata,
-    delete_embeddings,
     get_subscription_pii_setting,
     trainData,
     train_single_document,
@@ -78,12 +77,25 @@ from src.teams.bot_app import (
 from src.tools.router import tools_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
+from src.core.db.mongo_provider import MongoProviderError, mongo_provider
 
 logger = logging.getLogger(__name__)
 
 
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details or {}}}
+
+
+def _resolve_mongo_db(request: Optional[Request] = None):
+    if request is not None:
+        db_handle = getattr(request.app.state, "mongo_db", None)
+        if db_handle is not None:
+            return db_handle
+        init_error = getattr(request.app.state, "mongo_init_error", None)
+        if init_error:
+            init_code = getattr(request.app.state, "mongo_init_error_code", "DB_NOT_INITIALIZED")
+            raise MongoProviderError(init_code, init_error)
+    return mongo_provider.get_db()
 
 
 def _get_dw_newron():
@@ -96,7 +108,42 @@ def _get_dw_newron():
     return dw_newron
 
 
-app = FastAPI(title="DocWain API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        app.state.mongo_db = mongo_provider.init()
+        app.state.mongo_provider = mongo_provider
+        app.state.mongo_init_error = None
+        app.state.mongo_init_error_code = None
+    except MongoProviderError as exc:
+        app.state.mongo_db = None
+        app.state.mongo_provider = mongo_provider
+        app.state.mongo_init_error = str(exc)
+        app.state.mongo_init_error_code = exc.code
+        logger.error("MongoDB init failed: %s", exc)
+
+    try:
+        clear_legacy_vetting_metadata()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Legacy metadata cleanup skipped: %s", exc)
+    try:
+        log_legacy_vetting_notice_if_missing()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Legacy config notice skipped: %s", exc)
+    try:
+        validate_containers_once()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Azure blob container validation skipped: %s", exc)
+
+    yield
+
+    try:
+        mongo_provider.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MongoDB shutdown skipped: %s", exc)
+
+
+app = FastAPI(title="DocWain API", lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
 
 app.add_middleware(
@@ -124,20 +171,7 @@ class FeedbackRequest(BaseModel):
 session_state_store = SessionStateStore()
 
 
-@app.on_event("startup")
-async def _startup_checks() -> None:
-    try:
-        validate_containers_once()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Azure blob container validation skipped: %s", exc)
-    try:
-        clear_legacy_vetting_metadata()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Legacy metadata cleanup skipped: %s", exc)
-    try:
-        log_legacy_vetting_notice_if_missing()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Legacy config notice skipped: %s", exc)
+
 
 
 @app.exception_handler(HTTPException)
@@ -735,40 +769,58 @@ def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool]
 
 
 @api_router.post("/extract/{doc_id}", tags=["Default"])
-def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
+def trigger_single_extraction(doc_id: str, request: Request, subscription_id: str = "default"):
     """API endpoint to extract a single document by its document ID."""
     try:
         logging.info(f"Received single document extraction request for: {doc_id} (subscription: {subscription_id})")
-        result = train_single_document(doc_id)
+        mongo_db = _resolve_mongo_db(request)
+        result = train_single_document(doc_id, mongo_db=mongo_db)
+        if isinstance(result, dict) and result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("message", "Single document extraction failed"))
         return {"status": "success", "message": result}
+    except MongoProviderError as exc:
+        raise HTTPException(status_code=500, detail=_error(exc.code, str(exc)))
+    except RuntimeError as exc:
+        if "DB not ready / invalid db handle" in str(exc):
+            raise HTTPException(status_code=500, detail=_error("DB_NOT_READY", str(exc)))
+        raise
     except Exception as e:
         logging.error(f"Single extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Single document extraction failed")
 
 
 @api_router.post("/train/{doc_id}", tags=["Default"], deprecated=True)
-def trigger_single_training(doc_id: str, subscription_id: str = "default"):
+def trigger_single_training(doc_id: str, request: Request, subscription_id: str = "default"):
     """Deprecated alias for /extract/{doc_id}. Performs extraction only."""
-    return trigger_single_extraction(doc_id=doc_id, subscription_id=subscription_id)
+    return trigger_single_extraction(doc_id=doc_id, request=request, subscription_id=subscription_id)
 
 
 @api_router.get("/extract", tags=["Default"])
-def trigger_extraction(subscription_id: str = "default"):
+def trigger_extraction(request: Request, subscription_id: str = "default"):
     """API endpoint to trigger document extraction."""
     try:
         logging.info(f"Received extraction request (subscription: {subscription_id})")
-        status_response = trainData()
+        mongo_db = _resolve_mongo_db(request)
+        status_response = trainData(mongo_db=mongo_db)
+        if isinstance(status_response, dict) and status_response.get("status") == "error":
+            raise HTTPException(status_code=500, detail=status_response.get("message", "Extraction process failed"))
         logging.info(status_response)
         return {"status": "success", "message": status_response, "response": "Executed"}
+    except MongoProviderError as exc:
+        raise HTTPException(status_code=500, detail=_error(exc.code, str(exc)))
+    except RuntimeError as exc:
+        if "DB not ready / invalid db handle" in str(exc):
+            raise HTTPException(status_code=500, detail=_error("DB_NOT_READY", str(exc)))
+        raise
     except Exception as e:
         logging.error(f"Extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Extraction process failed")
 
 
 @api_router.get("/train", tags=["Default"], deprecated=True)
-def trigger_training(subscription_id: str = "default"):
+def trigger_training(request: Request, subscription_id: str = "default"):
     """Deprecated alias for /extract. Performs extraction only."""
-    return trigger_extraction(subscription_id=subscription_id)
+    return trigger_extraction(request=request, subscription_id=subscription_id)
 
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])
@@ -1025,6 +1077,7 @@ def list_available_models():
 @api_router.delete("/document/{doc_id}/embeddings", tags=["Default"])
 def delete_document_embeddings_api(
         doc_id: str,
+        request: Request,
         subscription_id: str = "default",
         profile_id: Optional[str] = None
 ):
@@ -1033,11 +1086,12 @@ def delete_document_embeddings_api(
     This is useful when a document is marked as DELETED in MongoDB.
     """
     try:
-        from src.api.dataHandler import delete_embeddings, db, Config
+        from src.api.dataHandler import delete_embeddings, Config
         from bson.objectid import ObjectId
 
         # Fetch document details from MongoDB
-        doc = db[Config.MongoDB.DOCUMENTS].find_one({"_id": ObjectId(doc_id)})
+        mongo_db = _resolve_mongo_db(request)
+        doc = mongo_db[Config.MongoDB.DOCUMENTS].find_one({"_id": ObjectId(doc_id)})
 
         if not doc:
             raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
@@ -1098,6 +1152,8 @@ def delete_document_embeddings_api(
 
     except HTTPException:
         raise
+    except MongoProviderError as exc:
+        raise HTTPException(status_code=500, detail=_error(exc.code, str(exc)))
     except Exception as e:
         logging.error(f"[API] Failed to delete embeddings: {e}", exc_info=True)
         raise HTTPException(
@@ -1372,7 +1428,8 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
     """
     try:
         subscriptions_collection = getattr(Config.MongoDB, 'SUBSCRIPTIONS', 'subscriptions')
-        collection = db[subscriptions_collection]
+        mongo_db = _resolve_mongo_db()
+        collection = mongo_db[subscriptions_collection]
         # Find subscription
         subscription = None
         if ObjectId.is_valid(subscription_id):
@@ -1412,20 +1469,23 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
             }
     except HTTPException:
         raise
+    except MongoProviderError as exc:
+        raise HTTPException(status_code=500, detail=_error(exc.code, str(exc)))
     except Exception as e:
         logging.error(f"Failed to update PII setting: {e}")
         raise HTTPException(status_code=500, detail="Failed to update PII setting")
 
 
 @api_router.post("/subscription/{subscription_id}/reprocess-documents", tags=["Subscriptions"])
-def reprocess_documents_with_new_pii_setting(subscription_id: str):
+def reprocess_documents_with_new_pii_setting(request: Request, subscription_id: str):
     """
     Reprocess all documents in a subscription with updated PII setting
     This will re-extract documents with new PII masking rules
     """
     try:
         # Get all documents for this subscription
-        documents_collection = db[Config.MongoDB.DOCUMENTS]
+        mongo_db = _resolve_mongo_db(request)
+        documents_collection = mongo_db[Config.MongoDB.DOCUMENTS]
         # Update all documents in this subscription to UNDER_REVIEW
         # so they get reprocessed with new PII setting
         result = documents_collection.update_many(
@@ -1447,13 +1507,15 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
         )
         logging.info(f"Marked {result.modified_count} documents for reprocessing")
         # Trigger extraction
-        training_result = trainData()
+        training_result = trainData(mongo_db=mongo_db)
         return {
             "status": "success",
             "subscription_id": subscription_id,
             "documents_marked_for_reprocessing": result.modified_count,
             "extraction_result": training_result
         }
+    except MongoProviderError as exc:
+        raise HTTPException(status_code=500, detail=_error(exc.code, str(exc)))
     except Exception as e:
         logging.error(f"Failed to reprocess documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to reprocess documents")

@@ -30,13 +30,15 @@ except Exception:  # noqa: BLE001
     torch = None
 
 from src.api.config import Config
+from src.core.db.mongo_provider import MongoProviderError, mongo_db_proxy, mongo_provider
 from src.api.context_understanding import ContextUnderstanding
 from src.api.pii_masking import mask_document_content
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
+from src.api.pipeline_state import is_screening_stage
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
-from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
+from src.chunking.section_chunker import SectionChunker, normalize_text
 from src.metadata.normalizer import MetadataNormalizationError, normalize_payload_metadata
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
@@ -44,14 +46,17 @@ from azure.core.exceptions import ResourceNotFoundError
 
 from src.storage.azure_blob_client import (
     classify_blob_error,
-    get_container_client,
-    get_document_container_client,
+    extract_azure_error_details,
+    get_azure_blob,
     iter_blob_name_candidates,
     normalize_blob_name,
     sanitize_blob_url,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+mongoClient: Optional[MongoClient] = None
+db = mongo_db_proxy
 
 # Lazy-loaded globals to avoid heavy initialization during import
 docEx = None
@@ -219,38 +224,23 @@ def compute_section_summaries(
     return ContextUnderstanding.attach_summaries_to_chunks(chunk_metadata, section_summaries)
 
 
-def create_mongo_client():
-    """Create a Mongo client with a graceful fallback when the primary URI is misconfigured."""
-    primary_uri = Config.MongoDB.URI
-    fallback_uri = getattr(Config.MongoDB, "FALLBACK_URI", None)
-    try:
-        client = MongoClient(primary_uri, serverSelectionTimeoutMS=5000)
-        try:
-            # Verify connectivity early so failures are visible
-            client.admin.command('ping')
-            logging.info(f"Connected to MongoDB primary URI: {primary_uri}")
-        except Exception as ping_exc:
-            logging.warning(f"Ping to primary MongoDB URI failed: {ping_exc}")
-            # allow fallback to kick in below
-            raise ping_exc
-        return client
-    except Exception as exc:
-        if fallback_uri and fallback_uri != primary_uri:
-            logging.warning(f"Primary MongoDB URI failed ({exc}); attempting fallback {fallback_uri}")
-            try:
-                client = MongoClient(fallback_uri, serverSelectionTimeoutMS=5000)
-                client.admin.command('ping')
-                logging.info(f"Connected to MongoDB fallback URI: {fallback_uri}")
-                return client
-            except Exception as fb_exc:
-                logging.error(f"Fallback MongoDB URI also failed: {fb_exc}")
-                raise
-        logging.error(f"Unable to create MongoClient: {exc}")
-        raise
+
+def create_mongo_client() -> MongoClient:
+    """
+    Create a Mongo client using the shared provider.
+    """
+    mongo_provider.init()
+    return mongo_provider.get_client()
 
 
-mongoClient = create_mongo_client()
-db = mongoClient[Config.MongoDB.DB]
+def get_mongo_db():
+    return mongo_provider.init()
+
+
+def _resolve_mongo_db(mongo_db=None):
+    if mongo_db is not None:
+        return mongo_db
+    return mongo_provider.get_db()
 
 
 def get_doc_extractor():
@@ -295,12 +285,12 @@ def _resolve_torch_dtype(device: str):
         return torch.bfloat16
     if raw in {"fp32", "float32", "full"}:
         return torch.float32
-    # Default to float32 for robustness unless explicitly overridden.
-    return torch.float32
+    # Only set dtype when explicitly requested; rely on HF defaults otherwise.
+    return None
 
 
 def _model_kwargs_for_device(device: str) -> Dict[str, Any]:
-    kwargs: Dict[str, Any] = {"device_map": None, "low_cpu_mem_usage": False}
+    kwargs: Dict[str, Any] = {}
     dtype = _resolve_torch_dtype(device)
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
@@ -324,8 +314,16 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
     logging.info("Loading sentence transformer model: %s (device=%s)", name, device)
     model_kwargs = _model_kwargs_for_device(device)
     try:
-        return SentenceTransformer(name, device=device, model_kwargs=model_kwargs)
+        if model_kwargs:
+            return SentenceTransformer(name, device=device, model_kwargs=model_kwargs)
+        return SentenceTransformer(name, device=device)
     except Exception as exc:  # noqa: BLE001
+        if device == "cpu" and model_kwargs and _is_meta_tensor_error(exc):
+            logging.warning(
+                "Model load on cpu failed (%s); retrying without model kwargs",
+                exc,
+            )
+            return SentenceTransformer(name, device="cpu")
         if device != "cpu" and (_is_meta_tensor_error(exc) or _is_cuda_oom(exc)):
             logging.warning(
                 "Model load on %s failed (%s); retrying on cpu for stability",
@@ -333,7 +331,18 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
                 exc,
             )
             cpu_kwargs = _model_kwargs_for_device("cpu")
-            return SentenceTransformer(name, device="cpu", model_kwargs=cpu_kwargs)
+            try:
+                if cpu_kwargs:
+                    return SentenceTransformer(name, device="cpu", model_kwargs=cpu_kwargs)
+                return SentenceTransformer(name, device="cpu")
+            except Exception as cpu_exc:  # noqa: BLE001
+                if cpu_kwargs and _is_meta_tensor_error(cpu_exc):
+                    logging.warning(
+                        "Model load on cpu failed (%s); retrying without model kwargs",
+                        cpu_exc,
+                    )
+                    return SentenceTransformer(name, device="cpu")
+                raise
         raise
 
 
@@ -402,6 +411,11 @@ def get_model(*, reload: bool = False, device: Optional[str] = None):
                 if idx == len(candidates) - 1 and last_error:
                     raise last_error
 
+        if _MODEL is None:
+            if last_error:
+                raise last_error
+            raise RuntimeError("Sentence transformer model could not be loaded.")
+
     return _MODEL
 
 
@@ -424,13 +438,24 @@ def encode_with_fallback(
     global _MODEL, _MODEL_DEVICE
     effective_batch_size = batch_size or _embedding_batch_size()
     model = get_model()
+    if model is None:
+        raise RuntimeError("Sentence transformer model is unavailable after load attempts.")
     try:
-        return model.encode(
-            texts,
-            batch_size=effective_batch_size,
-            convert_to_numpy=convert_to_numpy,
-            normalize_embeddings=normalize_embeddings,
-        )
+        try:
+            return model.encode(
+                texts,
+                batch_size=effective_batch_size,
+                convert_to_numpy=convert_to_numpy,
+                normalize_embeddings=normalize_embeddings,
+            )
+        except TypeError as exc:
+            if "batch_size" not in str(exc):
+                raise
+            return model.encode(
+                texts,
+                convert_to_numpy=convert_to_numpy,
+                normalize_embeddings=normalize_embeddings,
+            )
     except Exception as exc:  # noqa: BLE001
         if _is_meta_tensor_error(exc) or (_is_cuda_oom(exc) and _MODEL_DEVICE != "cpu"):
             logging.error(
@@ -657,11 +682,11 @@ def update_extraction_metadata(
             "updated_at": time.time(),
         }
         if pickle_path:
-            from src.api.blob_store import blob_storage_configured
+            from src.storage.azure_blob_client import has_blob_credentials
 
             container_name = (
-                os.getenv("DOCWAIN_BLOB_CONTAINER")
-                if blob_storage_configured()
+                getattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", "document-content")
+                if has_blob_credentials()
                 else os.getenv("DOCUMENT_CONTENT_DIR", "document-content")
             )
             update_data["blob_reference"] = {
@@ -819,6 +844,7 @@ def get_pii_stats(document_id):
 
 def get_azure_docs(files, *, document_id: Optional[str] = None):
     """Fetch documents from Azure Blob Storage."""
+    azure_blob = get_azure_blob()
     container_name = getattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", "document-content")
     blob_name = normalize_blob_name(files, container_name=container_name)
     container_candidates = []
@@ -849,11 +875,7 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
             if candidate_container in seen_containers:
                 continue
             seen_containers.add(candidate_container)
-            container_client = (
-                get_document_container_client()
-                if candidate_container == container_name
-                else get_container_client(candidate_container)
-            )
+            container_client = azure_blob.get_container_client(candidate_container)
             name_variants = [blob_name]
             if candidate_container == teams_container and local_prefixed_blob:
                 name_variants.insert(0, local_prefixed_blob)
@@ -880,13 +902,14 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
         raise ResourceNotFoundError(message="Blob name candidates empty", response=None)  # type: ignore[arg-type]
     except Exception as exc:  # noqa: BLE001
         error = classify_blob_error(exc, document_id=document_id, blob_name=blob_name)
+        error_code, request_id = extract_azure_error_details(exc)
         logging.error(
-            "Blob download failed document_id=%s blob=%s error_type=%s message=%s request_id=%s",
+            "Blob download failed document_id=%s blob=%s error_type=%s error_code=%s request_id=%s",
             document_id,
             blob_name,
             error.__class__.__name__,
-            exc,
-            error.request_id,
+            error_code,
+            request_id,
         )
         raise error from exc
 
@@ -897,8 +920,6 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
 
 def connectData(documentConnection):
     """
-     FINAL FIX: Ensures each document processes ONLY its exact file
-
     Critical fix: Uses EXACT filename matching to prevent document_id collision
     """
     dataDict = {}
@@ -1160,11 +1181,11 @@ def connectData(documentConnection):
 
 
 
-def collectionConnect(name):
+def collectionConnect(name, mongo_db=None):
     """Fetches documents from a MongoDB collection."""
     logging.info(f"Fetching connection details for collection: {name}")
     try:
-        collection = db[name]
+        collection = _resolve_mongo_db(mongo_db)[name]
         try:
             # Count documents to make emptiness explicit in the logs
             count = collection.count_documents({})
@@ -1174,22 +1195,25 @@ def collectionConnect(name):
         return collection.find()
     except Exception as e:
         logging.error(f"Error connecting to collection {name}: {e}")
-        # return an empty iterator to keep calling code behavior predictable
-        return []
+        raise
 
 
-def extract_document_info():
+def extract_document_info(mongo_db=None):
     """Retrieves connector details from MongoDB."""
     try:
+        db_handle = _resolve_mongo_db(mongo_db)
         logging.info(
             f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
         try:
-            existing = db.list_collection_names()
+            if not hasattr(db_handle, "list_collection_names") or not hasattr(db_handle, "__getitem__"):
+                raise RuntimeError("DB not ready / invalid db handle")
+            existing = db_handle.list_collection_names()
             logging.info(f"Existing collections in DB '{Config.MongoDB.DB}': {existing}")
         except Exception as lc_exc:
-            logging.warning(f"Could not list collections: {lc_exc}")
+            logging.error("DB not ready / invalid db handle: %s", lc_exc)
+            raise RuntimeError("DB not ready / invalid db handle") from lc_exc
 
-        docs = collectionConnect(Config.MongoDB.DOCUMENTS)
+        docs = collectionConnect(Config.MongoDB.DOCUMENTS, mongo_db=db_handle)
         Docs = {}
         # If docs is a cursor/iterable, iterate, otherwise it's probably an empty list
         for doc in docs:
@@ -1202,7 +1226,7 @@ def extract_document_info():
         logging.info(f"Found {len(Docs)} document definitions in collection '{Config.MongoDB.DOCUMENTS}'")
 
         connInfo = {}
-        connectors = collectionConnect(Config.MongoDB.CONNECTOR)
+        connectors = collectionConnect(Config.MongoDB.CONNECTOR, mongo_db=db_handle)
         for conn in connectors:
             try:
                 connId = conn.get('_id').__str__()
@@ -1229,7 +1253,7 @@ def extract_document_info():
 
     except Exception as e:
         logging.error(f"Error fetching connection details: {e}")
-        return {}
+        raise
 
 
 from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -1334,6 +1358,19 @@ def save_embeddings_to_qdrant(
         document_type = doc_metadata.get("document_type")
         profile_name = doc_metadata.get("profile_name")
         description = doc_metadata.get("description")
+        doc_type = _pick_doc_type(doc_type, doc_metadata.get("doc_type"), doc_metadata.get("document_type"))
+        document_type = _pick_doc_type(document_type, doc_metadata.get("document_type"), doc_metadata.get("doc_type"), doc_type)
+        if doc_type and document_type:
+            if doc_type.lower() != document_type.lower():
+                logging.warning(
+                    "Embedding metadata doc_type mismatch for %s: doc_type=%s document_type=%s; using document_type",
+                    doctag,
+                    doc_type,
+                    document_type,
+                )
+                doc_type = document_type
+            elif doc_type != document_type:
+                doc_type = document_type
 
         if not texts:
             raise ValueError(f"No texts found for document {doctag}")
@@ -1408,6 +1445,26 @@ def save_embeddings_to_qdrant(
                     page_range = f"{page_start}-{page_end}"
                 evidence_pointer = f"Section: {section_val or 'Section'}, Page: {page_range}"
 
+            chunk_doc_type = _pick_doc_type(chunk_meta.get("doc_type"), doc_type, doc_metadata.get("doc_type"))
+            chunk_document_type = _pick_doc_type(
+                chunk_meta.get("document_type"),
+                document_type,
+                doc_metadata.get("document_type"),
+                chunk_doc_type,
+            )
+            if chunk_doc_type and chunk_document_type:
+                if chunk_doc_type.lower() != chunk_document_type.lower():
+                    logging.warning(
+                        "Chunk metadata doc_type mismatch for %s chunk %s: doc_type=%s document_type=%s; using document_type",
+                        doctag,
+                        idx,
+                        chunk_doc_type,
+                        chunk_document_type,
+                    )
+                    chunk_doc_type = chunk_document_type
+                elif chunk_doc_type != chunk_document_type:
+                    chunk_doc_type = chunk_document_type
+
             payload = {
                 "subscription_id": str(subscription_id),
                 "profile_id": str(profile_id),
@@ -1415,24 +1472,33 @@ def save_embeddings_to_qdrant(
                 "text": text,
                 "document_id": str(doctag),
                 "source_file": source_filename,
+                "source_uri": chunk_meta.get("source_uri") or doc_metadata.get("source_uri") or source_filename,
                 "filename": filename,
                 "file_name": filename,
+                "document_name": filename,
                 "chunk_index": idx,
                 "chunk_count": max_len,
                 "page": page_val,
                 "page_start": page_start,
                 "page_end": page_end,
                 "section_title": section_val or chunk_meta.get("section"),
+                "section": section_val or chunk_meta.get("section"),
                 "section_path": section_path,
                 "summary": summary_val,
-                "doc_type": chunk_meta.get("doc_type") or doc_type or doc_metadata.get("doc_type"),
-                "document_type": chunk_meta.get("document_type") or document_type,
+                "document_type": chunk_document_type or chunk_doc_type,
                 "languages": chunk_meta.get("languages") or languages,
                 "products_name": chunk_meta.get("products_name") or products_name,
                 "description": chunk_meta.get("description") or description,
+                "screening_status": chunk_meta.get("screening_status") or doc_metadata.get("screening_status"),
+                "extraction_timestamp": (
+                    chunk_meta.get("extraction_timestamp")
+                    or doc_metadata.get("extraction_timestamp")
+                    or doc_metadata.get("extracted_at")
+                ),
                 "ocr_confidence": chunk_meta.get("ocr_confidence") or ocr_confidence,
                 "chunk_char_len": chunk_meta.get("chunk_char_len") or chunk_char_len,
                 "chunk_hash": chunk_meta.get("chunk_hash") or chunk_hash,
+                "text_hash": chunk_meta.get("text_hash") or chunk_hash,
                 "chunk_sentence_complete": bool(chunk_meta.get("sentence_complete", False)),
                 "chunk_id": chunk_id,
                 "prev_chunk_id": chunk_meta.get("prev_chunk_id"),
@@ -1581,6 +1647,45 @@ def _coerce_list(value: Any) -> List[str]:
     return [str(value)]
 
 
+_SOURCE_TYPE_HINTS = {
+    "LOCAL",
+    "S3",
+    "AZURE",
+    "BLOB",
+    "GCS",
+    "GDRIVE",
+    "GOOGLE_DRIVE",
+    "ONEDRIVE",
+    "DROPBOX",
+    "BOX",
+    "SHAREPOINT",
+    "HTTP",
+    "HTTPS",
+    "URL",
+    "FTP",
+    "SFTP",
+}
+
+
+def _sanitize_doc_type(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.upper() in _SOURCE_TYPE_HINTS:
+        return None
+    return text
+
+
+def _pick_doc_type(*candidates: Any) -> Optional[str]:
+    for candidate in candidates:
+        cleaned = _sanitize_doc_type(candidate)
+        if cleaned:
+            return cleaned
+    return None
+
+
 def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optional[str]) -> Dict[str, Any]:
     """Best-effort document metadata lookup for payload enrichment."""
     record: Dict[str, Any] = {}
@@ -1596,30 +1701,91 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
         logging.debug("Document metadata lookup failed for %s: %s", doc_tag, exc)
         record = {}
 
-    doc_type = (
-        record.get("doc_type")
-        or record.get("document_type")
-        or record.get("type")
-        or doc_type_hint
-        or ""
+    metadata = record.get("metadata") or {}
+    doc_type_hint = _sanitize_doc_type(doc_type_hint)
+    doc_type = _pick_doc_type(
+        record.get("doc_type"),
+        record.get("document_type"),
+        record.get("type"),
+        metadata.get("doc_type"),
+        metadata.get("document_type"),
+        doc_type_hint,
     )
-    languages = _coerce_list(record.get("languages") or record.get("language"))
-    products_name = record.get("products_name") or record.get("product_name") or record.get("product")
-    document_type = record.get("document_type") or record.get("doc_type") or doc_type_hint
-    description = record.get("description") or record.get("summary") or ""
+    languages = _coerce_list(record.get("languages") or record.get("language") or metadata.get("languages"))
+    products_name = (
+        record.get("products_name")
+        or record.get("product_name")
+        or record.get("product")
+        or metadata.get("products_name")
+        or metadata.get("product_name")
+        or metadata.get("product")
+    )
+    document_type = _pick_doc_type(
+        record.get("document_type"),
+        record.get("doc_type"),
+        metadata.get("document_type"),
+        metadata.get("doc_type"),
+        doc_type_hint,
+        doc_type,
+    )
+    if doc_type and document_type:
+        if doc_type.lower() != document_type.lower():
+            logging.warning(
+                "Document type conflict for %s: doc_type=%s document_type=%s; using document_type",
+                doc_tag,
+                doc_type,
+                document_type,
+            )
+            doc_type = document_type
+        elif doc_type != document_type:
+            doc_type = document_type
+    description = record.get("description") or record.get("summary") or metadata.get("description") or ""
 
-    filename = _safe_basename(record.get("name") or doc_name)
-    profile_name = record.get("profile_name") or record.get("profileName")
+    filename = _safe_basename(record.get("name") or metadata.get("name") or doc_name)
+    profile_name = (
+        record.get("profile_name")
+        or record.get("profileName")
+        or metadata.get("profile_name")
+        or metadata.get("profileName")
+    )
+    if not profile_name:
+        subscription_id = record.get("subscription_id") or record.get("subscriptionId") or metadata.get("subscription_id")
+        profile_id = record.get("profile_id") or record.get("profileId") or metadata.get("profile_id")
+        if subscription_id and profile_id:
+            try:
+                from src.profiles.profile_store import resolve_profile_name
+
+                profile_name = resolve_profile_name(subscription_id=str(subscription_id), profile_id=str(profile_id))
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Profile name lookup failed for %s: %s", doc_tag, exc)
 
     return {
         "filename": filename or _safe_basename(doc_name),
         "doc_type": str(doc_type) if doc_type else None,
         "languages": languages,
         "products_name": str(products_name) if products_name else None,
-        "document_type": str(document_type) if document_type else None,
+        "document_type": str(document_type or doc_type) if (document_type or doc_type) else None,
         "description": str(description) if description else None,
         "profile_name": str(profile_name) if profile_name else None,
     }
+
+
+def _maybe_update_document_fields(doc_tag: str, doc_metadata: Dict[str, Any]) -> None:
+    update_fields: Dict[str, Any] = {}
+    for key in ("profile_name", "products_name", "description", "document_type"):
+        value = doc_metadata.get(key)
+        if value is None or str(value).strip() == "":
+            continue
+        update_fields[key] = value
+        update_fields[f"metadata.{key}"] = value
+    if not update_fields:
+        return
+    try:
+        from src.api.document_status import update_document_fields
+
+        update_document_fields(doc_tag, update_fields)
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("Document metadata update skipped for %s: %s", doc_tag, exc)
 
 
 def _record_chunking_metrics(
@@ -1805,6 +1971,9 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
     3. Verify metadata before saving to Qdrant
     """
     try:
+        if is_screening_stage():
+            logging.warning("EMBED_BLOCKED_DURING_SCREENING: doc_id=%s", doc_tag)
+            return {"status": "blocked", "chunks": 0, "points_saved": 0}
         telemetry = telemetry_store() if METRICS_V2_ENABLED else None
         metrics_store = get_metrics_store()
         logging.info(f"=" * 80)
@@ -1827,9 +1996,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             raise ValueError("profile_id is required for training")
 
         if isinstance(text, dict):
-            doc_type_hint = text.get("doc_type") or text.get("document_type") or text.get("type")
+            doc_type_hint = _pick_doc_type(text.get("doc_type"), text.get("document_type"), text.get("type"))
             doc_metadata = _fetch_document_metadata(doc_tag, doc_name, doc_type_hint)
             doc_type = doc_metadata.get("doc_type") or doc_type_hint
+            _maybe_update_document_fields(doc_tag, doc_metadata)
 
             chunk_metadata = list(text.get("chunk_metadata") or [])
             texts = [str(t) for t in (text.get("texts") or []) if str(t).strip()]
@@ -2000,6 +2170,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
 
             doc_metadata = _fetch_document_metadata(doc_tag, doc_name, doc_type)
             doc_type = doc_metadata.get("doc_type") or doc_type
+            _maybe_update_document_fields(doc_tag, doc_metadata)
 
             chunks, chunk_metadata, coverage_ratio = _chunk_with_section_chunker(
                 text,
@@ -2461,6 +2632,7 @@ def process_document_pipeline(
     filename: str,
     subscription_id: Optional[str] = None,
     profile_id: Optional[str] = None,
+    embed_after: bool = False,
 ) -> Dict[str, Any]:
     """End-to-end ingestion pipeline for a single document."""
     errors: List[str] = []
@@ -2567,6 +2739,27 @@ def process_document_pipeline(
             "errors": errors,
         }
 
+    if not embed_after:
+        embedding_info = {"status": "pending", "chunks": 0, "upserted": 0}
+        try:
+            from src.api.document_status import update_document_fields
+            from src.api.statuses import STATUS_SCREENING_COMPLETED
+
+            update_document_fields(
+                document_id,
+                {"status": STATUS_SCREENING_COMPLETED, "updated_at": time.time()},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Failed to update screening status for %s: %s", document_id, exc)
+        return {
+            "document_id": document_id,
+            "extraction": extraction_info,
+            "security": security_info,
+            "embedding": embedding_info,
+            "cleanup": cleanup_info,
+            "errors": errors,
+        }
+
     try:
         total_chunks = 0
         total_upserted = 0
@@ -2613,7 +2806,7 @@ def process_document_pipeline(
     }
 
 
-def trainData():
+def trainData(mongo_db=None):
     """Extraction-only pipeline for documents eligible for processing."""
     try:
         from src.api.extraction_service import extract_documents
@@ -2621,20 +2814,28 @@ def trainData():
         logging.info("=" * 80)
         logging.info("Starting extraction process")
         logging.info("=" * 80)
-        return extract_documents()
+        return extract_documents(mongo_db=mongo_db)
+    except MongoProviderError:
+        raise
+    except RuntimeError:
+        raise
     except Exception as e:
         logging.error(f"Critical error in extraction data: {e}", exc_info=True)
         return {"status": "error", "message": str(e), "results": None}
 
 
 # New function: train_single_document
-def train_single_document(doc_id: str):
+def train_single_document(doc_id: str, mongo_db=None):
     """Extract a single document identified by its string ID."""
     try:
         from src.api.extraction_service import extract_single_document
 
         logging.info(f"Starting single-document extraction for ID: {doc_id}")
-        return extract_single_document(doc_id)
+        return extract_single_document(doc_id, mongo_db=mongo_db)
+    except MongoProviderError:
+        raise
+    except RuntimeError:
+        raise
     except Exception as e:
         logging.error(f"Critical error during single-document extraction for {doc_id}: {e}", exc_info=True)
         update_training_status(doc_id, 'TRAINING_FAILED', str(e))
