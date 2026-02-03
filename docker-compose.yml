@@ -4,31 +4,9 @@ services:
     container_name: docwain-api
     ports:
       - "8000:8000"
-
-    # Use your .env for secrets and endpoints
     env_file: .env
-
     environment:
-      # DocWain should call Ollama running on the HOST VM
       OLLAMA_HOST: "http://host.docker.internal:11434"
-
-      # IMPORTANT: Use NON-SRV Mongo string (mongodb://...:10255)
-      # Put this in .env as MONGO_URI
-      # MONGO_URI: "mongodb://user:pass@...:10255/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false"
-
-    # Required on Linux for host.docker.internal
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-    # Fix Cosmos SRV DNS lookups inside container (Azure DNS first)
-    dns:
-      - 168.63.129.16   # Azure recursive resolver on Azure VMs
-      - 1.1.1.1         # fallback
-
     restart: unless-stopped
-
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/docs >/dev/null || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 5

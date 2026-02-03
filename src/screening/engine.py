@@ -8,7 +8,6 @@ from . import storage_adapter
 from .config import ScreeningConfig
 from .models import ScreeningContext, ScreeningReport, ToolResult
 from src.api.pipeline_models import ExtractedDocument
-from src.api.pipeline_state import pipeline_stage
 from .resume import run_resume_analysis
 from .search import NullSearchClient, SearchClient, SimpleHttpSearchClient
 from .tools import (
@@ -279,33 +278,32 @@ class ScreeningEngine:
         return results
 
     def screen(self, ctx: ScreeningContext, cfg: Optional[ScreeningConfig] = None) -> ScreeningReport:
-        with pipeline_stage("SCREENING"):
-            active_config = cfg or ctx.config or self.config
-            ctx.config = active_config
-            results: List[ToolResult] = []
-            active_tools = self._active_tools(ctx.doc_type, active_config)
-            results.extend(self._run_tools(ctx, active_tools))
+        active_config = cfg or ctx.config or self.config
+        ctx.config = active_config
+        results: List[ToolResult] = []
+        active_tools = self._active_tools(ctx.doc_type, active_config)
+        results.extend(self._run_tools(ctx, active_tools))
 
-            overall = self._blend_score(results, active_config) if results else 0.0
-            risk_level = self._risk_level(overall, active_config)
-            top_findings = self._top_findings(results)
+        overall = self._blend_score(results, active_config) if results else 0.0
+        risk_level = self._risk_level(overall, active_config)
+        top_findings = self._top_findings(results)
 
-            provenance = {
-                "tool_versions": {r.tool_name: r.tool_version for r in results},
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "config_source": active_config.config_source,
-                "config_hash": active_config.config_hash,
-            }
+        provenance = {
+            "tool_versions": {r.tool_name: r.tool_version for r in results},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "config_source": active_config.config_source,
+            "config_hash": active_config.config_hash,
+        }
 
-            return ScreeningReport(
-                overall_score_0_100=overall,
-                risk_level=risk_level,
-                results=results,
-                top_findings=top_findings,
-                generated_at=datetime.now(timezone.utc),
-                config_version=active_config.config_hash,
-                provenance=provenance,
-            )
+        return ScreeningReport(
+            overall_score_0_100=overall,
+            risk_level=risk_level,
+            results=results,
+            top_findings=top_findings,
+            generated_at=datetime.now(timezone.utc),
+            config_version=active_config.config_hash,
+            provenance=provenance,
+        )
 
     def run_one(
         self,
@@ -315,17 +313,16 @@ class ScreeningEngine:
         doc_type: Optional[str] = None,
         internet_enabled_override: Optional[bool] = None,
     ) -> ToolResult:
-        with pipeline_stage("SCREENING"):
-            ctx = self._build_context_from_doc(
-                doc_id, doc_type_override=doc_type, internet_enabled_override=internet_enabled_override
-            )
-            cfg = ctx.config or self.config
-            tool = self._tools.get(tool_name)
-            if not tool:
-                raise ValueError(f"Unknown screening tool '{tool_name}'")
-            if (cfg.enabled_tools and tool_name not in cfg.enabled_tools) or not tool.applies_to(ctx.doc_type):
-                raise ValueError(f"Tool '{tool_name}' is not enabled for document type {ctx.doc_type}")
-            return self._run_tools(ctx, [tool])[0]
+        ctx = self._build_context_from_doc(
+            doc_id, doc_type_override=doc_type, internet_enabled_override=internet_enabled_override
+        )
+        cfg = ctx.config or self.config
+        tool = self._tools.get(tool_name)
+        if not tool:
+            raise ValueError(f"Unknown screening tool '{tool_name}'")
+        if (cfg.enabled_tools and tool_name not in cfg.enabled_tools) or not tool.applies_to(ctx.doc_type):
+            raise ValueError(f"Tool '{tool_name}' is not enabled for document type {ctx.doc_type}")
+        return self._run_tools(ctx, [tool])[0]
 
     def run_category(
         self,
@@ -337,22 +334,21 @@ class ScreeningEngine:
         region: Optional[str] = None,
         jurisdiction: Optional[str] = None,
     ) -> List[ToolResult]:
-        with pipeline_stage("SCREENING"):
-            normalized = category.lower().replace("_", "-")
-            allow_region = normalized == "legality"
-            ctx = self._build_context_from_doc(
-                doc_id,
-                doc_type_override=doc_type,
-                internet_enabled_override=internet_enabled_override,
-                region_override=region,
-                jurisdiction_override=jurisdiction,
-                allow_region_jurisdiction=allow_region,
-            )
-            cfg = ctx.config or self.config
-            tools = self._resolve_tools_for_category(category, ctx.doc_type, cfg)
-            if not tools:
-                raise ValueError(f"No screening tools found for category '{category}'")
-            return self._run_tools(ctx, tools)
+        normalized = category.lower().replace("_", "-")
+        allow_region = normalized == "legality"
+        ctx = self._build_context_from_doc(
+            doc_id,
+            doc_type_override=doc_type,
+            internet_enabled_override=internet_enabled_override,
+            region_override=region,
+            jurisdiction_override=jurisdiction,
+            allow_region_jurisdiction=allow_region,
+        )
+        cfg = ctx.config or self.config
+        tools = self._resolve_tools_for_category(category, ctx.doc_type, cfg)
+        if not tools:
+            raise ValueError(f"No screening tools found for category '{category}'")
+        return self._run_tools(ctx, tools)
 
     def run_category_from_payload(
         self,
@@ -365,23 +361,22 @@ class ScreeningEngine:
         region: Optional[str] = None,
         jurisdiction: Optional[str] = None,
     ) -> List[ToolResult]:
-        with pipeline_stage("SCREENING"):
-            normalized = category.lower().replace("_", "-")
-            allow_region = normalized == "legality"
-            ctx = self._build_context_from_doc(
-                doc_id,
-                doc_type_override=doc_type,
-                internet_enabled_override=internet_enabled_override,
-                region_override=region,
-                jurisdiction_override=jurisdiction,
-                allow_region_jurisdiction=allow_region,
-                extracted_payload=extracted_payload,
-            )
-            cfg = ctx.config or self.config
-            tools = self._resolve_tools_for_category(category, ctx.doc_type, cfg)
-            if not tools:
-                raise ValueError(f"No screening tools found for category '{category}'")
-            return self._run_tools(ctx, tools)
+        normalized = category.lower().replace("_", "-")
+        allow_region = normalized == "legality"
+        ctx = self._build_context_from_doc(
+            doc_id,
+            doc_type_override=doc_type,
+            internet_enabled_override=internet_enabled_override,
+            region_override=region,
+            jurisdiction_override=jurisdiction,
+            allow_region_jurisdiction=allow_region,
+            extracted_payload=extracted_payload,
+        )
+        cfg = ctx.config or self.config
+        tools = self._resolve_tools_for_category(category, ctx.doc_type, cfg)
+        if not tools:
+            raise ValueError(f"No screening tools found for category '{category}'")
+        return self._run_tools(ctx, tools)
 
     def run_all(
         self,

@@ -170,7 +170,7 @@ class ContextAssembler:
                     header_parts.append(f"Page: {safe_page}")
                 header = " | ".join(header_parts)
 
-                context_parts.append(f"[DOC-{source_id}] {header}\n{text}\n[/DOC-{source_id}]")
+                context_parts.append(f"[SOURCE-{source_id}] {header}\n{text}\n[/SOURCE-{source_id}]")
                 sources.append(
                     {
                         "source_id": source_id,

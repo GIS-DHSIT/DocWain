@@ -1,0 +1,69 @@
+{
+  "enabled_tools": [
+    "integrity_hash",
+    "metadata_consistency",
+    "template_conformance",
+    "policy_compliance",
+    "numeric_unit_consistency",
+    "citation_sanity",
+    "ambiguity_vagueness",
+    "readability_style",
+    "passive_voice",
+    "pii_sensitivity",
+    "ai_authorship",
+    "resume_entity_validation",
+    "resume_vetting"
+  ],
+  "weights": {
+    "integrity_hash": 0.07,
+    "metadata_consistency": 0.07,
+    "template_conformance": 0.1,
+    "policy_compliance": 0.1,
+    "numeric_unit_consistency": 0.07,
+    "citation_sanity": 0.06,
+    "ambiguity_vagueness": 0.06,
+    "readability_style": 0.07,
+    "passive_voice": 0.05,
+    "pii_sensitivity": 0.12,
+    "ai_authorship": 0.11,
+    "resume_entity_validation": 0.08,
+    "resume_vetting": 0.12
+  },
+  "sigmoid": {
+    "a": 6.0,
+    "b": 0.5
+  },
+  "risk_thresholds": {
+    "high": 75,
+    "medium": 45
+  },
+  "internet_enabled": false,
+  "search_provider": {
+    "provider": "bing",
+    "api_key": "",
+    "endpoint": ""
+  },
+  "doc_type_templates": {
+    "RESUME": {
+      "mandatory_sections": ["summary", "experience", "education", "skills"],
+      "heading_order": ["summary", "experience", "education", "skills"]
+    },
+    "POLICY": {
+      "mandatory_sections": ["scope", "purpose", "policy", "responsibilities"],
+      "heading_order": ["scope", "purpose", "policy", "responsibilities", "exceptions"]
+    }
+  },
+  "policy_rules": {
+    "POLICY": {
+      "forbidden_phrases": ["not liable", "no responsibility"],
+      "required_disclaimers": ["subject to change"],
+      "required_keywords": ["scope", "compliance", "responsibilities"]
+    },
+    "RESUME": {
+      "forbidden_phrases": ["lorem ipsum"],
+      "required_keywords": ["experience", "education"]
+    }
+  },
+  "auto_attach_on_ingest": false,
+  "block_high_risk": false
+}

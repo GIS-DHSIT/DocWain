@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, root_validator
 
 
 IntentCategory = Literal[
@@ -85,12 +85,12 @@ class RouterDecision(BaseModel):
     retrieval_plan: RetrievalPlan
     response_policy: ResponsePolicy
 
-    @model_validator(mode="after")
-    def _enforce_rules(self) -> "RouterDecision":
-        intent: Optional[IntentModel] = self.intent
-        retrieval: Optional[RetrievalPlan] = self.retrieval_plan
-        policy: Optional[ResponsePolicy] = self.response_policy
-        scope: Optional[ScopeModel] = self.scope
+    @root_validator
+    def _enforce_rules(cls, values: dict) -> dict:
+        intent: Optional[IntentModel] = values.get("intent")
+        retrieval: Optional[RetrievalPlan] = values.get("retrieval_plan")
+        policy: Optional[ResponsePolicy] = values.get("response_policy")
+        scope: Optional[ScopeModel] = values.get("scope")
 
         if intent and policy:
             if intent.category == "meta":
@@ -108,7 +108,7 @@ class RouterDecision(BaseModel):
             if not scope.profile_id:
                 scope.profile_id = ""
 
-        return self
+        return values
 
 
 __all__ = [

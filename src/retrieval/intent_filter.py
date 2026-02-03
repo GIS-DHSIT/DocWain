@@ -209,18 +209,12 @@ def build_intent_miss_response(entity: str, intent_label: str) -> str:
     entity = (entity or "").strip()
     intent_label = (intent_label or "").strip()
     if entity and intent_label:
-        searched = f"{intent_label} details for {entity}"
-    elif entity:
-        searched = f"details about {entity}"
-    elif intent_label:
-        searched = f"{intent_label} details"
-    else:
-        searched = "relevant details"
-    return (
-        "I couldn’t find this information in the selected documents. "
-        f"I searched for {searched}. "
-        "Please point me to the document or section that contains the answer."
-    )
+        return f"I could not find {intent_label} details for {entity} in the available documents."
+    if entity:
+        return f"I could not find relevant details about {entity} in the available documents."
+    if intent_label:
+        return f"I could not find {intent_label} details in the available documents."
+    return "I could not find relevant details in the available documents."
 
 
 def _chunk_text(chunk: object) -> str:

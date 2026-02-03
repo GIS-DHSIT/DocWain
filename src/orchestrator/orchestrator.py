@@ -6,8 +6,7 @@ from typing import Any, Dict, List, Optional
 from src.observability.metrics import metrics_store
 from src.orchestrator.answer import generate_answer, generate_meta_response
 from src.orchestrator.citations import build_citations
-from src.rag.grounding import enforce_grounding, filter_chunks_by_query_entity
-from src.response.formatter import format_response_text
+from src.orchestrator.grounding_guard import apply_grounding_guard
 from src.orchestrator.retrieval import retrieve_chunks
 from src.orchestrator.rerank import rerank_chunks
 from src.router.router import route
@@ -56,7 +55,7 @@ def run_query(
     )
 
     if decision.intent.category == "meta":
-        answer = format_response_text(generate_meta_response())
+        answer = generate_meta_response()
         return {
             "intent": decision.intent.dict(),
             "answer": answer,
@@ -75,7 +74,6 @@ def run_query(
         chunk_kinds=chunk_kinds,
         top_k=top_k,
     )
-    raw_chunks = filter_chunks_by_query_entity(query, raw_chunks)
     metrics_store().observe_ms("retrieval_latency_ms", (time.perf_counter() - retrieval_start) * 1000)
 
     if decision.retrieval_plan.strategy == "multi_doc":
@@ -85,7 +83,6 @@ def run_query(
     metrics_store().set_gauge("evidence_found_count", float(len(chunks)))
 
     reranked_chunks = rerank_chunks(chunks, query)
-    reranked_chunks = filter_chunks_by_query_entity(query, reranked_chunks)
 
     answer_start = time.perf_counter()
     answer_text, exact_match = generate_answer(
@@ -99,8 +96,8 @@ def run_query(
     metrics_store().observe_ms("answer_latency_ms", (time.perf_counter() - answer_start) * 1000)
     metrics_store().set_gauge("exact_match_found", 1.0 if exact_match else 0.0)
 
-    answer_text, _ = enforce_grounding(answer_text, reranked_chunks)
-    answer_text = format_response_text(answer_text)
+    evidence_text = "\n\n".join(chunk.get("text") or "" for chunk in reranked_chunks)
+    answer_text = apply_grounding_guard(answer_text, evidence_text)
 
     citations = build_citations(reranked_chunks)
     return {
