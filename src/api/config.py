@@ -55,6 +55,11 @@ class Config:
 
     class KnowledgeGraph:
         QDRANT_COLLECTION = os.getenv("KG_QDRANT_COLLECTION", os.getenv("QDRANT_COLLECTION", "default"))
+        ENABLED = os.getenv("KG_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        MAX_EXPANSION_ENTITIES = int(os.getenv("KG_MAX_EXPANSION_ENTITIES", "8"))
+        MAX_GRAPH_SNIPPETS = int(os.getenv("KG_MAX_GRAPH_SNIPPETS", "10"))
+        GRAPH_SCORE_ALPHA = float(os.getenv("KG_GRAPH_SCORE_ALPHA", "0.7"))
+        MAX_GRAPH_RESULTS = int(os.getenv("KG_MAX_GRAPH_RESULTS", "200"))
 
     class Gemini:
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
