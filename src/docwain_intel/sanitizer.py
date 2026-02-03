@@ -83,8 +83,11 @@ def sanitize_output(text: str) -> str:
     text = _dedupe_blocks(text)
     lines = text.splitlines()
     lines = _strip_meta_lines(lines)
-    cleaned = "\n".join(lines)
+    cleaned = "\n".join(line for line in lines if line.strip() and line.strip() != _REDACTED)
     cleaned = _redact_ids(cleaned)
+    cleaned = "\n".join(
+        line for line in cleaned.splitlines() if line.strip() and line.strip() != _REDACTED
+    )
     cleaned = _normalize_spacing(cleaned)
     return cleaned
 
