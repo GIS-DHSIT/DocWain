@@ -10,6 +10,7 @@ from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.api.vector_store import build_collection_name
+from src.utils.payload_utils import get_source_name
 from src.finetune import qdrant_discovery
 from src.finetune.pair_generator import (
     ChunkRecord,
@@ -160,8 +161,9 @@ def _sample_chunks(
         min_len = int(getattr(Config.Finetune, "MIN_CHUNK_CHARS", 200))
         if len(text) < min_len:
             continue
+        source_name = get_source_name(payload) or ""
         identity = hashlib.sha256(
-            f"{text}|{payload.get('source_file')}|{payload.get('document_id')}|{payload.get('chunk_index')}".encode("utf-8")
+            f"{text}|{source_name}|{payload.get('document_id')}|{payload.get('chunk_index')}".encode("utf-8")
         ).hexdigest()
         if identity in seen:
             continue
@@ -170,7 +172,7 @@ def _sample_chunks(
         payload.setdefault("collection_name", target_collection)
         payload.setdefault("profile_id", str(profile_id))
         entry = {"text": text, "metadata": payload}
-        group_key = (str(payload.get("source_file") or ""), str(payload.get("document_id") or ""))
+        group_key = (str(source_name), str(payload.get("document_id") or ""))
         groups.setdefault(group_key, []).append(entry)
 
     while groups and len(chunks) < limit:
@@ -183,7 +185,7 @@ def _sample_chunks(
                 break
     chunks.sort(
         key=lambda ch: (
-            str(ch["metadata"].get("source_file") or ""),
+            str(get_source_name(ch["metadata"]) or ""),
             ch["metadata"].get("page") or ch["metadata"].get("page_number") or 0,
             ch["metadata"].get("chunk_index") or 0,
             str(ch["metadata"].get("chunk_id") or ""),

@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.utils.payload_utils import get_source_name
 logger = logging.getLogger(__name__)
 
 
@@ -63,18 +64,17 @@ class ContextAssembler:
 
     @staticmethod
     def _group_key(meta: Dict[str, Any]) -> Tuple[str, str]:
-        doc_id = str(meta.get("document_id") or meta.get("doc_id") or meta.get("document_name") or "unknown")
+        doc_id = str(meta.get("document_id") or meta.get("doc_id") or get_source_name(meta) or "unknown")
         section = str(meta.get("section_title") or meta.get("section") or "")
         return doc_id, section
 
     @staticmethod
     def _safe_doc_name(meta: Dict[str, Any]) -> str:
-        for field in ("source_file", "filename", "document_name", "title"):
-            value = meta.get(field)
-            if value:
-                base = os.path.basename(str(value))
-                base = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", base)
-                return base.strip() or "Document"
+        value = get_source_name(meta) or meta.get("title")
+        if value:
+            base = os.path.basename(str(value))
+            base = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", base)
+            return base.strip() or "Document"
         return "Document"
 
     @staticmethod

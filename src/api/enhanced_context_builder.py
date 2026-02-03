@@ -9,6 +9,8 @@ import logging
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
+from src.utils.payload_utils import get_source_name
+
 from src.api.config import Config
 from src.prompting.prompt_builder import inject_persona_prompt
 
@@ -380,7 +382,7 @@ class IntelligentContextBuilder:
         # Ensure multi-document coverage by round-robin selection across docs
         def _doc_key(chunk: Dict) -> str:
             meta = chunk.get('metadata', {})
-            return meta.get('document_id') or meta.get('source_file') or "unknown"
+            return meta.get('document_id') or get_source_name(meta) or "unknown"
 
         buckets: Dict[str, List[Dict]] = {}
         for c in unique_chunks:
@@ -443,7 +445,7 @@ class IntelligentContextBuilder:
             metadata = chunk['metadata']
 
             # Extract source information
-            source_name = metadata.get('source_file', f"Document {i}")
+            source_name = get_source_name(metadata) or f"Document {i}"
             section = metadata.get('section_title', metadata.get('section', ''))
             page = metadata.get('page')
             score = chunk['score']
@@ -496,7 +498,7 @@ class IntelligentContextBuilder:
 
     @staticmethod
     def _format_citation(metadata: Dict[str, Any], *, fallback_name: str) -> str:
-        name = (metadata.get("source_file") or metadata.get("file_name") or metadata.get("filename") or fallback_name)
+        name = get_source_name(metadata) or fallback_name
         name = str(name or "Document").strip()
         section = str(metadata.get("section_title") or metadata.get("section") or "Section").strip()
         page = metadata.get("page") or metadata.get("page_start")

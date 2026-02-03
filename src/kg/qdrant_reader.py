@@ -3,6 +3,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from src.utils.payload_utils import get_document_type, get_source_name
+
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Filter
 
@@ -81,6 +83,8 @@ def _normalize_payload(point_id: Any, payload: Dict[str, Any]) -> Optional[Qdran
         return None
 
     chunk_hash = _get_first(payload, ["chunk_hash", "chunkHash"])
+    if not chunk_hash:
+        chunk_hash = (payload.get("chunk") or {}).get("hash")
     if not chunk_hash and text_val:
         chunk_hash = hashlib.sha256(str(text_val).encode("utf-8")).hexdigest()
 
@@ -97,15 +101,15 @@ def _normalize_payload(point_id: Any, payload: Dict[str, Any]) -> Optional[Qdran
         chunk_hash=str(chunk_hash) if chunk_hash else None,
         text=str(text_val or ""),
         document_id=str(document_id),
-        filename=_get_first(payload, ["filename"]),
-        source_file=_get_first(payload, ["source_file", "sourceFile"]),
+        filename=get_source_name(payload),
+        source_file=get_source_name(payload),
         section_title=_get_first(payload, ["section_title", "sectionTitle", "section"]),
         section_path=_get_first(payload, ["section_path", "sectionPath"]),
         chunk_index=chunk_index,
         page_start=page_start,
         page_end=page_end,
-        doc_type=_get_first(payload, ["doc_type", "docType"]),
-        document_type=_get_first(payload, ["document_type", "documentType"]),
+        doc_type=get_document_type(payload),
+        document_type=get_document_type(payload),
         chunk_char_len=chunk_char_len,
         prev_chunk_id=_get_first(payload, ["prev_chunk_id", "prevChunkId"]),
         next_chunk_id=_get_first(payload, ["next_chunk_id", "nextChunkId"]),

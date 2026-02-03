@@ -7,6 +7,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.utils.payload_utils import (
+    get_chunk_hash,
+    get_chunk_sentence_complete,
+    get_source_name,
+)
 
 @dataclass
 class ContextBuildResult:
@@ -89,9 +94,7 @@ class ContextAssembler:
             if not text.strip():
                 continue
             meta = chunk.get("metadata") or {}
-            chunk_hash = meta.get("chunk_hash")
-            if not chunk_hash:
-                chunk_hash = hashlib.md5(text.encode("utf-8")).hexdigest()  # noqa: S324
+            chunk_hash = get_chunk_hash(meta) or hashlib.md5(text.encode("utf-8")).hexdigest()  # noqa: S324
             key = str(chunk_hash)
             if key in seen:
                 if float(chunk.get("score", 0.0)) > float(seen[key].get("score", 0.0)):
@@ -104,7 +107,7 @@ class ContextAssembler:
         grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
         for chunk in chunks:
             meta = chunk.get("metadata") or {}
-            doc_id = str(meta.get("document_id") or meta.get("doc_id") or meta.get("source_file") or "unknown")
+            doc_id = str(meta.get("document_id") or meta.get("doc_id") or get_source_name(meta) or "unknown")
             section = str(meta.get("section_path") or meta.get("section_title") or meta.get("section") or "")
             grouped[(doc_id, section)].append(chunk)
         return grouped
@@ -122,7 +125,7 @@ class ContextAssembler:
         items_sorted = sorted(
             items,
             key=lambda c: (
-                not (c.get("metadata") or {}).get("chunk_sentence_complete", True),
+                not get_chunk_sentence_complete(c.get("metadata") or {}, True),
                 -float(c.get("score", 0.0)),
                 self._chunk_index(c),
             ),
@@ -132,7 +135,7 @@ class ContextAssembler:
             if len(picked) >= limit:
                 break
             picked.append(chunk)
-            if not (chunk.get("metadata") or {}).get("chunk_sentence_complete", True):
+            if not get_chunk_sentence_complete(chunk.get("metadata") or {}, True):
                 neighbor = self._find_neighbor(items_sorted, chunk)
                 if neighbor and neighbor not in picked and len(picked) < limit:
                     picked.append(neighbor)
@@ -166,12 +169,11 @@ class ContextAssembler:
 
     @staticmethod
     def _safe_doc_name(meta: Dict[str, Any]) -> str:
-        for field in ("source_file", "filename", "document_name", "title"):
-            value = meta.get(field)
-            if value:
-                base = os.path.basename(str(value))
-                base = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", base)
-                return base.strip() or "Document"
+        value = get_source_name(meta) or meta.get("title")
+        if value:
+            base = os.path.basename(str(value))
+            base = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", base)
+            return base.strip() or "Document"
         return "Document"
 
     @staticmethod
