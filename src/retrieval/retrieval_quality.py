@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from src.utils.payload_utils import get_source_name
+
 from .evidence_constraints import EvidenceConstraints, EvidenceRequirements
 
 
@@ -101,7 +103,7 @@ class RetrievalQualityScorer:
         keys = set()
         for chunk in chunks[:8]:
             meta = getattr(chunk, "metadata", {}) or {}
-            doc_id = str(meta.get("document_id") or meta.get("doc_id") or meta.get("source_file") or "")
+            doc_id = str(meta.get("document_id") or meta.get("doc_id") or get_source_name(meta) or "")
             section = str(meta.get("section_path") or meta.get("section_title") or meta.get("section") or "")
             keys.add((doc_id, section))
         total = min(len(chunks), 8)

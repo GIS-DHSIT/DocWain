@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from src.utils.payload_utils import get_source_name
+
 
 def _page_range(page_start: Any, page_end: Any) -> str:
     if page_start is None:
@@ -12,7 +14,7 @@ def _page_range(page_start: Any, page_end: Any) -> str:
 
 
 def format_citation(hit: Dict[str, Any]) -> str:
-    file_name = hit.get("file_name") or "Unknown"
+    file_name = get_source_name(hit) or hit.get("file_name") or "Unknown"
     section_title = hit.get("section_title") or "Section"
     page_range = _page_range(hit.get("page_start"), hit.get("page_end"))
     return f"[Source: {file_name}, Section: {section_title}, Page: {page_range}]"

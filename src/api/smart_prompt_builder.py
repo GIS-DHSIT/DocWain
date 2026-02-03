@@ -11,6 +11,8 @@ import logging
 import re
 from typing import List, Dict, Any, Optional
 
+from src.utils.payload_utils import get_source_name
+
 from src.prompting.prompt_builder import inject_persona_prompt
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,7 @@ class SmartPromptBuilder:
         doc_groups = {}
         for chunk in chunks:
             metadata = chunk.get('metadata', {})
-            source = metadata.get('source_file', 'Unknown')
+            source = get_source_name(metadata) or 'Unknown'
             doc_id = metadata.get('document_id', 'unknown')
 
             if source not in doc_groups:
@@ -103,7 +105,7 @@ class SmartPromptBuilder:
 
         for i, chunk in enumerate(chunks[:max_chunks], 1):
             metadata = chunk.get('metadata', {})
-            source = metadata.get('source_file', f'Document-{i}')
+            source = get_source_name(metadata) or f'Document-{i}'
             doc_id = metadata.get('document_id', 'unknown')
             section = metadata.get('section_title', '')
             text = chunk.get('text', '')
@@ -158,7 +160,7 @@ class SmartPromptBuilder:
 
         # Get unique documents
         unique_docs = list(set([
-            c.get('metadata', {}).get('source_file', 'Unknown')
+            get_source_name(c.get('metadata', {}) or {}) or 'Unknown'
             for c in chunks
         ]))
 
@@ -210,14 +212,14 @@ Now provide the answer with citations:"""
 
         # Extract unique documents from chunks
         unique_docs = list(set([
-            c.get('metadata', {}).get('source_file', 'Unknown')
+            get_source_name(c.get('metadata', {}) or {}) or 'Unknown'
             for c in chunks
         ]))
 
         # Build mini context for verification
         context_snippets = []
         for i, chunk in enumerate(chunks[:5], 1):
-            source = chunk.get('metadata', {}).get('source_file', f'Doc-{i}')
+            source = get_source_name(chunk.get('metadata', {}) or {}) or f'Doc-{i}'
             text_snippet = chunk.get('text', '')[:300]
             context_snippets.append(f"[SOURCE-{i}] {source}:\n{text_snippet}...")
 
@@ -357,7 +359,7 @@ def build_enhanced_answer_with_verification(
 
     # Get retrieved documents
     retrieved_sources = list(set([
-        c.get('metadata', {}).get('source_file', 'Unknown')
+        get_source_name(c.get('metadata', {}) or {}) or 'Unknown'
         for c in chunks
     ]))
     logger.info(f"Retrieved sources: {retrieved_sources}")
@@ -398,7 +400,7 @@ def build_enhanced_answer_with_verification(
 
     for i, chunk in enumerate(chunks[:7], 1):
         metadata = chunk.get('metadata', {})
-        source_name = metadata.get('source_file', f'Document {i}')
+        source_name = get_source_name(metadata) or f'Document {i}'
 
         if source_name not in seen_sources:
             sources.append({

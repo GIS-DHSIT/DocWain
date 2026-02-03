@@ -7,6 +7,7 @@ Key Fixes:
 """
 
 import logging
+import hashlib
 import time
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
@@ -16,10 +17,11 @@ from qdrant_client.models import SparseVector, Filter, FieldCondition, MatchValu
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
-from src.api.vector_store import compute_chunk_id
+from src.embedding.pipeline.embed_pipeline import compute_stable_chunk_id
 from src.kg.entity_extractor import EntityExtractor
 from src.kg.neo4j_store import Neo4jStore
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
+from src.utils.payload_utils import get_source_name
 
 logger = logging.getLogger(__name__)
 
@@ -271,10 +273,14 @@ def normalize_chunk_links(
     if len(chunk_metadata) != len(chunks):
         raise ValueError("chunk_metadata and chunks length mismatch")
 
-    computed_ids = [
-        compute_chunk_id(subscription_id, profile_id, document_id, doc_name, idx, chunks[idx])
-        for idx in range(len(chunks))
-    ]
+    computed_ids = []
+    for idx in range(len(chunks)):
+        meta = chunk_metadata[idx] or {}
+        chunk_hash = meta.get("chunk_hash") or hashlib.sha256(chunks[idx].encode("utf-8")).hexdigest()
+        section_id = meta.get("section_id") or meta.get("section_path") or meta.get("section_title") or "section"
+        computed_ids.append(
+            compute_stable_chunk_id(subscription_id, profile_id, document_id, str(section_id), idx, chunk_hash)
+        )
 
     normalized = []
     for idx, meta in enumerate(chunk_metadata):
@@ -324,6 +330,7 @@ class AdaptiveRetriever:
         FIXED: Use MatchAny for OR logic with multiple documents
         """
         conditions = []
+        should = []
 
         # Profile filter (always required)
         if profile_id:
@@ -345,17 +352,23 @@ class AdaptiveRetriever:
 
         # FIXED: Use MatchAny for source file filtering (OR logic)
         if source_files and len(source_files) > 0:
-            conditions.append(
+            should.append(
+                FieldCondition(
+                    key="source.name",
+                    match=MatchAny(any=source_files)
+                )
+            )
+            should.append(
                 FieldCondition(
                     key="source_file",
-                    match=MatchAny(any=source_files)  # FIXED: OR logic
+                    match=MatchAny(any=source_files)
                 )
             )
 
         if not conditions:
             return None
 
-        return Filter(must=conditions)
+        return Filter(must=conditions, should=should or None)
 
     def _dense_search(
             self,
@@ -415,7 +428,7 @@ class AdaptiveRetriever:
             logger.info(f"Dense search returned {len(chunks)} results")
             if chunks:
                 # ADDED: Log which documents were returned
-                returned_docs = list(set([c['metadata'].get('source_file', 'unknown') for c in chunks[:10]]))
+                returned_docs = list(set([get_source_name(c.get("metadata") or {}) or "unknown" for c in chunks[:10]]))
                 logger.info(f"Returned documents: {returned_docs}")
                 logger.info(f"Top 3 scores: {[round(c['score'], 4) for c in chunks[:3]]}")
 
@@ -762,7 +775,7 @@ class GraphGuidedRetriever:
 
         logger.info(f"Final retrieval: {len(chunks)} chunks")
         if chunks:
-            unique_docs = list(set([c['metadata'].get('source_file', 'unknown') for c in chunks]))
+            unique_docs = list(set([get_source_name(c.get("metadata") or {}) or "unknown" for c in chunks]))
             logger.info(f"Unique documents in results: {unique_docs}")
             logger.info(f"Top 5 scores: {[round(c['score'], 4) for c in chunks[:5]]}")
 
