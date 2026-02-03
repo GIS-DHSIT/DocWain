@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REDIS_CONNECTION_STRING = "docwain-rediscache.redis.cache.windows.net:6380,password=2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo=,ssl=True,abortConnect=False"
+DEFAULT_REDIS_CONNECTION_STRING = "docwain-rediscache.redis.cache.windows.net:6380,password=2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo=,ssl=True,abortConnect=False"
 
 
 class Config:
@@ -103,7 +103,7 @@ class Config:
         # Allow overriding the Mongo connection string via env; fall back to a localhost URI
         DEFAULT_URI = 'mongodb+srv://dhsdbadmin:d%21p%40s5w0rd@dw-dev-mongodb.global.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000'
         URI = os.getenv("MONGODB_URI", DEFAULT_URI)
-        FALLBACK_URI = os.getenv("MONGODB_FALLBACK_URI", "mongodb://dhsdbadmin:d%21p%40s5w0rd@dw-dev-mongodb.global.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000")
+        FALLBACK_URI = os.getenv("MONGODB_FALLBACK_URI", "mongodb://localhost:27017")
         DB = os.getenv("MONGODB_DB", 'docwain')
         CONNECTOR = os.getenv("MONGODB_CONNECTORS", 'connectors')
         DOCUMENTS = os.getenv("MONGODB_DOCUMENTS", 'documents')
@@ -138,7 +138,7 @@ class Config:
 
 
     class Redis:
-        CONNECTION_STRING = REDIS_CONNECTION_STRING
+        CONNECTION_STRING = DEFAULT_REDIS_CONNECTION_STRING
         HOST = "docwain-rediscache.redis.cache.windows.net"
         PORT = 6380
         PASSWORD = "2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo="
@@ -183,12 +183,8 @@ class Config:
         HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.75"))
         MIN_CONFIDENCE_TO_ANSWER = float(os.getenv("MIN_CONFIDENCE_TO_ANSWER", "0.62"))
         DEDUP_THRESHOLD = float(os.getenv("RETRIEVAL_DEDUP_THRESHOLD", "0.92"))
-        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "4096"))
+        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2048"))
         MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
-        AGGREGATION_MIN_TOPK = int(os.getenv("RETRIEVAL_AGGREGATION_MIN_TOPK", "50"))
-        AGGREGATION_DOC_LIMIT = int(os.getenv("RETRIEVAL_AGGREGATION_DOC_LIMIT", "3"))
-        AGGREGATION_MIN_CHUNKS = int(os.getenv("RETRIEVAL_AGGREGATION_MIN_CHUNKS", "6"))
-        AGGREGATION_MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_AGGREGATION_MAX_CONTEXT_CHUNKS", "18"))
         SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
         USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
         USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"

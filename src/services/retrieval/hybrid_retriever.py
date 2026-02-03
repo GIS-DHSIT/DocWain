@@ -248,12 +248,8 @@ class HybridRetriever:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
             conditions.append(FieldCondition(key="source_file", match=MatchAny(any=[str(s) for s in source_files])))
-        doc_type_conditions: List[FieldCondition] = []
         if doc_types:
-            doc_values = [str(d) for d in doc_types]
-            doc_type_conditions.append(FieldCondition(key="document_type", match=MatchAny(any=doc_values)))
-            # Backward compatibility for older payloads
-            doc_type_conditions.append(FieldCondition(key="doc_type", match=MatchAny(any=doc_values)))
+            conditions.append(FieldCondition(key="doc_type", match=MatchAny(any=[str(d) for d in doc_types])))
         if section_titles:
             conditions.append(FieldCondition(key="section_title", match=MatchAny(any=[str(s) for s in section_titles])))
         if page_numbers:
@@ -272,15 +268,13 @@ class HybridRetriever:
                 conditions.append(FieldCondition(key="ocr_confidence", range=Range(gte=min_conf)))
             except Exception:
                 pass
-        if doc_type_conditions:
-            return Filter(must=conditions, should=doc_type_conditions)
         return Filter(must=conditions)
 
     def _metadata_boost(self, query: str, payload: Dict[str, Any], hints: Dict[str, Any]) -> Dict[str, float]:
         boosts: Dict[str, float] = {}
         lowered = (query or "").lower()
 
-        for field in ("document_type", "doc_type"):
+        for field in ("doc_type", "document_type"):
             value = payload.get(field)
             if value and str(value).lower() in lowered:
                 boosts["doc_type"] = self.config.metadata_boost

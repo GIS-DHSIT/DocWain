@@ -202,8 +202,8 @@ def normalize_payload_metadata(payload: Dict[str, Any], *, strict: bool = True) 
     for key, value in normalized_dict.items():
         if value is not None:
             merged[key] = value
-    if normalized.document_type and "doc_type" in merged:
-        merged.pop("doc_type", None)
+    if normalized.document_type and _stringify(merged.get("doc_type")) in {None, ""}:
+        merged["doc_type"] = normalized.document_type
     if normalized.file_name and _stringify(merged.get("filename")) in {None, ""}:
         merged["filename"] = normalized.file_name
     if normalized.file_name and _stringify(merged.get("source_file")) in {None, ""}:

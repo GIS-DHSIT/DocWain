@@ -49,10 +49,12 @@ class SmartPromptBuilder:
         for chunk in chunks:
             metadata = chunk.get('metadata', {})
             source = metadata.get('source_file', 'Unknown')
+            doc_id = metadata.get('document_id', 'unknown')
 
             if source not in doc_groups:
                 doc_groups[source] = {
                     'chunks': [],
+                    'doc_id': doc_id,
                     'max_score': 0
                 }
 
@@ -76,9 +78,11 @@ class SmartPromptBuilder:
         for i, (source, info) in enumerate(sorted_docs[:max_sources], 1):
             chunk_count = len(info['chunks'])
             max_score = info['max_score']
+            doc_id = info['doc_id']
 
             lines.append(
-                f"DOC-{i} {source}\n"
+                f"[SOURCE-{i}] {source}\n"
+                f"  Document ID: {doc_id[:12]}...\n"
                 f"  Chunks available: {chunk_count}\n"
                 f"  Best relevance: {max_score:.3f}\n"
             )
@@ -102,7 +106,6 @@ class SmartPromptBuilder:
             source = metadata.get('source_file', f'Document-{i}')
             doc_id = metadata.get('document_id', 'unknown')
             section = metadata.get('section_title', '')
-            page = metadata.get('page')
             text = chunk.get('text', '')
 
             # FIXED: Clear document boundaries
@@ -114,15 +117,14 @@ class SmartPromptBuilder:
 
                 context_parts.append(f"\n{'=' * 80}")
                 context_parts.append(f"START OF NEW DOCUMENT: {source}")
+                context_parts.append(f"Document ID: {doc_id}")
                 context_parts.append(f"{'=' * 80}\n")
                 current_doc_id = doc_id
 
             # Chunk header
-            header = f"[DOC-{i}]"
+            header = f"[SOURCE-{i}]"
             if section:
                 header += f" | Section: {section}"
-            if page:
-                header += f" | Page: {page}"
             context_parts.append(f"\n{header}")
             context_parts.append("-" * 80)
             context_parts.append(text)
@@ -160,11 +162,11 @@ class SmartPromptBuilder:
             for c in chunks
         ]))
 
-        prompt = f"""Answer questions using the document excerpts below.
+        prompt = f"""You are a thoughtful, personable {persona}. Speak like a helpful colleague: clear, concise, and warm while staying 100% grounded in the documents below.
 
 Available documents: {', '.join(unique_docs)}
 
-DOCUMENT MAP (for reference): 
+SOURCES (keep citations aligned to these): 
 {source_map}
 
 DOCUMENT EXCERPTS:
@@ -174,18 +176,15 @@ DOCUMENT EXCERPTS:
 
 USER QUESTION: {query}
 
-RESPONSE GUIDANCE:
-- Base your answer on the document excerpts above.
-- Be clear and detailed; use short paragraphs and bullets when helpful.
-- Normalize relevant facts into structured data (lists, tables, numeric fields) before answering.
-- Perform calculations explicitly and show the math when numbers are present.
-- If the excerpts do not contain the full answer, provide any partial/computable info and say what is missing.
-- Do not expose internal IDs, chunk references, hashes, or system metadata.
-- End with a single citations line in this format:
-  "Citations: file_name | section | page; file_name | section | page"
-- Do not use [SOURCE-*] tags or inline citations.
+Answering guidelines:
+- Use only information from the sources; if something is missing, say so plainly.
+- Keep the tone human and context-aware (no robotic bullet dumps).
+- Cite each factual claim with [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-3].
+- If the question is about an entity not in the sources, say the docs cover someone/something else and stop.
+- 3–6 sentences max, flowing as a short narrative, not a list.
+- Note contradictions or gaps briefly with citations.
 
-Now provide the answer:"""
+Now provide the answer with citations:"""
 
         return inject_persona_prompt(
             prompt,
@@ -220,7 +219,7 @@ Now provide the answer:"""
         for i, chunk in enumerate(chunks[:5], 1):
             source = chunk.get('metadata', {}).get('source_file', f'Doc-{i}')
             text_snippet = chunk.get('text', '')[:300]
-            context_snippets.append(f"[DOC-{i}] {source}:\n{text_snippet}...")
+            context_snippets.append(f"[SOURCE-{i}] {source}:\n{text_snippet}...")
 
         context_text = "\n\n".join(context_snippets)
 
@@ -239,7 +238,7 @@ ANSWER TO VERIFY:
 CHECK THE FOLLOWING:
 1. Does the answer address the correct entity/document mentioned in the query?
 2. Is every factual claim supported by the document excerpts?
-3. Is a citations line present and consistent with the documents?
+3. Are citations present and correct?
 4. Does the answer acknowledge if information is missing?
 5. Are there any claims that could not have come from these documents?
 
@@ -383,8 +382,7 @@ def build_enhanced_answer_with_verification(
 
     # ADDED: Verification step
     verification_result = None
-    has_citations = bool(re.search(r'^\s*citations:\s*\S', answer or "", flags=re.IGNORECASE | re.MULTILINE))
-    if answer and has_citations:
+    if answer and '[SOURCE-' in answer:
         try:
             verification_prompt = prompt_builder.build_verification_prompt(
                 answer, chunks, query, persona
@@ -415,7 +413,7 @@ def build_enhanced_answer_with_verification(
             seen_sources.add(source_name)
 
     # Check for warnings
-    has_citations = bool(re.search(r'^\s*citations:\s*\S', answer or "", flags=re.IGNORECASE | re.MULTILINE))
+    has_citations = '[SOURCE-' in answer
     mentions_wrong_doc = any(
         phrase in answer.lower()
         for phrase in [

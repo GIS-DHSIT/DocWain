@@ -1,33 +1,26 @@
 import pickle
 
 from src.api import embedding_service
-from src.storage.azure_blob_client import BlobInfo
+from src.api.blob_store import BlobInfo
 from src.api.statuses import STATUS_SCREENING_COMPLETED
 
 
-class FakeAzureBlob:
+class FakeBlobStore:
     def __init__(self, payload):
-        self.document_container_name = "document-content"
+        self.prefix = ""
         self.payload = payload
 
-    def blob_exists(self, *_args, **_kwargs):
-        return True
+    def try_acquire_lease(self, *_args, **_kwargs):
+        return "lease-id"
 
-    def download_bytes(self, *_args, **_kwargs):
+    def download_blob(self, *_args, **_kwargs):
         return self.payload
 
     def delete_blob(self, *_args, **_kwargs):
         return False
 
-    def lease_guard(self, *_args, **_kwargs):
-        class _Guard:
-            def __enter__(self_inner):
-                return object()
-
-            def __exit__(self_inner, *_exc):
-                return False
-
-        return _Guard()
+    def release_lease(self, *_args, **_kwargs):
+        return True
 
 
 def _noop(*_args, **_kwargs):
@@ -72,7 +65,7 @@ def test_prepare_extracted_docs_incomplete_triggers_fallback(monkeypatch):
 
 def test_process_blob_no_data_present(monkeypatch):
     payload = pickle.dumps({"texts": []}, protocol=pickle.HIGHEST_PROTOCOL)
-    azure_blob = FakeAzureBlob(payload)
+    store = FakeBlobStore(payload)
     blob = BlobInfo(name="doc-2.pkl", metadata={"document_id": "doc-2"})
 
     monkeypatch.setattr(embedding_service, "resolve_subscription_id", lambda *_args, **_kwargs: "sub-1")
@@ -96,14 +89,7 @@ def test_process_blob_no_data_present(monkeypatch):
         lambda **_kwargs: (None, None, [], "no_data_present"),
     )
 
-    result = embedding_service._process_blob(
-        azure_blob=azure_blob,
-        blob=blob,
-        subscription_id=None,
-        profile_id=None,
-        doc_type=None,
-        prefix="",
-    )
+    result = embedding_service._process_blob(store=store, blob=blob, subscription_id=None, profile_id=None, doc_type=None)
 
     assert result["status"] == "FAILED"
     assert result["error"] == "no_data_present"
@@ -111,7 +97,7 @@ def test_process_blob_no_data_present(monkeypatch):
 
 def test_process_blob_meta_error_retries_cpu(monkeypatch):
     payload = pickle.dumps({"texts": ["chunk-1"]}, protocol=pickle.HIGHEST_PROTOCOL)
-    azure_blob = FakeAzureBlob(payload)
+    store = FakeBlobStore(payload)
     blob = BlobInfo(name="doc-3.pkl", metadata={"document_id": "doc-3"})
 
     monkeypatch.setattr(embedding_service, "resolve_subscription_id", lambda *_args, **_kwargs: "sub-1")
@@ -151,14 +137,7 @@ def test_process_blob_meta_error_retries_cpu(monkeypatch):
     monkeypatch.setattr(embedding_service, "train_on_document", _train)
     monkeypatch.setattr(embedding_service, "get_model", _get_model)
 
-    result = embedding_service._process_blob(
-        azure_blob=azure_blob,
-        blob=blob,
-        subscription_id=None,
-        profile_id=None,
-        doc_type=None,
-        prefix="",
-    )
+    result = embedding_service._process_blob(store=store, blob=blob, subscription_id=None, profile_id=None, doc_type=None)
 
     assert result["status"] == "COMPLETED"
     assert calls["cpu_reload"] == 1

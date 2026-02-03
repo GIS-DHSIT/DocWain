@@ -18,7 +18,6 @@ from src.api.dataHandler import (
     update_extraction_metadata,
     update_pii_stats,
 )
-from src.core.db.mongo_provider import MongoProviderError, mongo_provider
 from src.api.document_status import init_document_record, set_error, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
 from src.api.statuses import (
@@ -30,23 +29,6 @@ from src.api.statuses import (
 from src.storage.azure_blob_client import BlobDownloadError, CredentialError, normalize_blob_name
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_mongo_db(mongo_db: Optional[Any] = None) -> Any:
-    if mongo_db is not None:
-        return mongo_db
-    return mongo_provider.get_db()
-
-
-def _log_db_diagnostics(db_handle: Any) -> None:
-    logger.info(
-        "Extraction DB handle: type=%s id=%s module=%s has_list_collection_names=%s has_getitem=%s",
-        type(db_handle).__name__,
-        id(db_handle),
-        type(db_handle).__module__,
-        hasattr(db_handle, "list_collection_names"),
-        hasattr(db_handle, "__getitem__"),
-    )
 
 
 def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
@@ -250,11 +232,9 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
     }
 
 
-def extract_documents(mongo_db: Optional[Any] = None) -> Dict[str, Any]:
-    db_handle = _resolve_mongo_db(mongo_db)
-    _log_db_diagnostics(db_handle)
+def extract_documents() -> Dict[str, Any]:
     try:
-        doc_coll = extract_document_info(mongo_db=db_handle)
+        doc_coll = extract_document_info()
         if not doc_coll:
             return {"status": "no_documents", "message": "No documents found for extraction"}
 
@@ -283,17 +263,13 @@ def extract_documents(mongo_db: Optional[Any] = None) -> Dict[str, Any]:
                 results["failed"].append(res)
 
         return {"status": "completed", "results": results}
-    except (MongoProviderError, RuntimeError):
-        raise
     except Exception as exc:  # noqa: BLE001
         logger.error("Extraction process failed: %s", exc, exc_info=True)
         return {"status": "error", "message": str(exc), "results": None}
 
 
-def extract_single_document(doc_id: str, mongo_db: Optional[Any] = None) -> Dict[str, Any]:
-    db_handle = _resolve_mongo_db(mongo_db)
-    _log_db_diagnostics(db_handle)
-    doc_coll = extract_document_info(mongo_db=db_handle)
+def extract_single_document(doc_id: str) -> Dict[str, Any]:
+    doc_coll = extract_document_info()
     if not doc_coll or doc_id not in doc_coll:
         return {"status": "not_found", "message": f"Document {doc_id} not found"}
     doc_info = doc_coll[doc_id]

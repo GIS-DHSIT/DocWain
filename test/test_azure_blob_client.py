@@ -1,5 +1,4 @@
 import base64
-from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -7,6 +6,7 @@ from azure.core.exceptions import ResourceNotFoundError
 
 from src.api.config import Config
 from src.api import dw_chat
+from src.api.blob_store import BlobStore
 from src.storage import azure_blob_client
 
 
@@ -15,7 +15,6 @@ def reset_blob_clients(monkeypatch):
     monkeypatch.setattr(azure_blob_client, "_SERVICE_CLIENT", None)
     monkeypatch.setattr(azure_blob_client, "_CHAT_CONTAINER_CLIENT", None)
     monkeypatch.setattr(azure_blob_client, "_DOCUMENT_CONTAINER_CLIENT", None)
-    monkeypatch.setattr(azure_blob_client, "_AZURE_BLOB", None)
 
 
 def test_decode_connection_string_if_base64():
@@ -86,18 +85,16 @@ def test_chat_history_uses_chat_container(monkeypatch):
         def __init__(self):
             self.data = None
 
-        def upload_blob(self, payload, overwrite=False, content_settings=None, lease=None, **_kwargs):
+        def upload_blob(self, payload, overwrite=False, content_settings=None):
             self.data = payload
 
         def download_blob(self):
             class Downloader:
-                def __init__(self, payload):
-                    self.payload = payload
+                @staticmethod
+                def readall():
+                    return b'{"sessions":[]}'
 
-                def readall(self):
-                    return self.payload
-
-            return Downloader(self.data or b'{"sessions":[]}')
+            return Downloader()
 
     class FakeContainer:
         def __init__(self):
@@ -111,15 +108,7 @@ def test_chat_history_uses_chat_container(monkeypatch):
     fake_container = FakeContainer()
     monkeypatch.setattr(azure_blob_client, "get_chat_container_client", lambda: fake_container)
     monkeypatch.setattr(dw_chat, "get_chat_container_client", lambda: fake_container)
-
-    class FakeAzureBlob:
-        chat_container_name = "chat-container"
-
-        def upload_bytes(self, _container, blob_name, payload, **_kwargs):
-            blob_client = fake_container.get_blob_client(blob_name)
-            blob_client.upload_blob(payload)
-
-    monkeypatch.setattr(azure_blob_client, "get_azure_blob", lambda: FakeAzureBlob())
+    monkeypatch.setattr(azure_blob_client, "get_document_container_client", lambda: (_ for _ in ()).throw(RuntimeError()))
 
     dw_chat.save_chat_history("user-1", {"sessions": []})
     history = dw_chat.get_chat_history("user-1")
@@ -128,16 +117,20 @@ def test_chat_history_uses_chat_container(monkeypatch):
     assert fake_container.blob_names == ["chat_history/user-1.json", "chat_history/user-1.json"]
 
 
-def test_azure_blob_uses_document_container(monkeypatch):
+def test_blob_store_uses_document_container(monkeypatch):
     class FakeContainer:
         pass
 
     fake_container = FakeContainer()
-    azure_blob = azure_blob_client.AzureBlob()
-    monkeypatch.setattr(azure_blob, "get_container_client", lambda _name: fake_container)
+    from src.api import blob_store as blob_store_module
+
+    monkeypatch.setattr(blob_store_module, "get_document_container_client", lambda: fake_container)
+    monkeypatch.setattr(azure_blob_client, "get_chat_container_client", lambda: (_ for _ in ()).throw(RuntimeError()))
     monkeypatch.setattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", "document-content")
 
-    assert azure_blob.get_document_container_client() is fake_container
+    store = BlobStore()
+    assert store.container == "document-content"
+    assert store.container_client is fake_container
 
 
 def test_get_azure_docs_preserves_blob_name_with_spaces(monkeypatch):
@@ -163,7 +156,7 @@ def test_get_azure_docs_preserves_blob_name_with_spaces(monkeypatch):
     from src.api import dataHandler
 
     container = FakeContainerClient()
-    monkeypatch.setattr(dataHandler, "get_azure_blob", lambda: SimpleNamespace(get_container_client=lambda _n: container))
+    monkeypatch.setattr(dataHandler, "get_document_container_client", lambda: container)
     monkeypatch.setattr(Config.Teams, "BLOB_CONTAINER", "")
     monkeypatch.setattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", "document-content")
 
@@ -211,10 +204,8 @@ def test_get_azure_docs_falls_back_to_teams_container(monkeypatch):
     doc_container = DocContainer()
     teams_container = TeamsContainer()
 
-    def _container_for(name):
-        return doc_container if name == "document-content" else teams_container
-
-    monkeypatch.setattr(dataHandler, "get_azure_blob", lambda: SimpleNamespace(get_container_client=_container_for))
+    monkeypatch.setattr(dataHandler, "get_document_container_client", lambda: doc_container)
+    monkeypatch.setattr(dataHandler, "get_container_client", lambda name: teams_container)
     monkeypatch.setattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", "document-content")
     monkeypatch.setattr(Config.Teams, "BLOB_CONTAINER", "local-uploads")
 

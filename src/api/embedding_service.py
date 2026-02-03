@@ -11,9 +11,14 @@ try:
 except Exception:  # noqa: BLE001
     ObjectId = None  # type: ignore[assignment]
 
-from azure.core.exceptions import ResourceNotFoundError
-
-from src.api.blob_store import BlobConfigurationError
+from src.api.blob_store import (
+    BlobConfigurationError,
+    BlobInfo,
+    BlobStore,
+    blob_storage_configured,
+    extract_document_id,
+    is_trusted_blob,
+)
 from src.api.config import Config
 from src.api.content_store import build_pickle_path, delete_extracted_pickle, load_extracted_pickle, save_extracted_pickle
 from src.api.dataHandler import (
@@ -44,17 +49,10 @@ from src.api.statuses import (
     STATUS_TRAINING_PARTIALLY_COMPLETED,
 )
 from src.api.vector_store import build_collection_name
-from src.chunking.section_chunker import SectionChunker, normalize_text
+from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
-from src.storage.azure_blob_client import (
-    BlobInfo,
-    extract_document_id,
-    get_azure_blob,
-    has_blob_credentials,
-    is_trusted_blob,
-    normalize_blob_name,
-)
+from src.storage.azure_blob_client import normalize_blob_name
 
 logger = logging.getLogger(__name__)
 
@@ -138,17 +136,6 @@ def _lease_seconds() -> int:
     except ValueError:
         parsed = None
     return parsed or 60
-
-
-def _blob_prefix() -> str:
-    prefix = os.getenv("DOCWAIN_BLOB_PREFIX", "")
-    if not prefix:
-        return ""
-    return prefix if prefix.endswith("/") else f"{prefix}/"
-
-
-def _build_blob_name(document_id: str, *, extension: str = ".pkl") -> str:
-    return f"{_blob_prefix()}{document_id}{extension}"
 
 
 def _normalize_requested_ids(document_id: Optional[str], document_ids: Optional[List[str]]) -> List[str]:
@@ -270,26 +257,23 @@ def _fetch_document_ids_for_integrity(
 
 def _load_extracted_for_doc(document_id: str) -> Tuple[Optional[Any], Dict[str, Any]]:
     details: Dict[str, Any] = {"source": "missing"}
-    if has_blob_credentials():
-        azure_blob = get_azure_blob()
-        container = azure_blob.document_container_name
-        blob_name = _build_blob_name(document_id)
-        try:
-            payload = azure_blob.download_bytes(container, blob_name)
-            details.update({"source": "blob", "blob_name": blob_name, "bytes": len(payload or b"")})
+    if blob_storage_configured():
+        store = _build_blob_store()
+        for ext in (".pkl", ".pickle"):
+            blob_name = store.build_blob_name(document_id, extension=ext)
+            info = store.get_blob_info(blob_name)
+            if not info:
+                continue
+            payload = store.download_blob(blob_name)
+            details.update(
+                {
+                    "source": "blob",
+                    "blob_name": blob_name,
+                    "bytes": len(payload or b""),
+                }
+            )
             return pickle.loads(payload), details
-        except ResourceNotFoundError:
-            legacy_blob = _build_blob_name(document_id, extension=".pickle")
-            try:
-                payload = azure_blob.download_bytes(container, legacy_blob)
-            except ResourceNotFoundError:
-                return None, details
-            try:
-                azure_blob.upload_bytes(container, blob_name, payload, overwrite=True)
-            except Exception:
-                logger.warning("Legacy pickle migration failed for %s", document_id)
-            details.update({"source": "blob", "blob_name": blob_name, "bytes": len(payload or b"")})
-            return pickle.loads(payload), details
+        return None, details
 
     path = build_pickle_path(document_id)
     if not path.exists():
@@ -660,43 +644,31 @@ def _prepare_extracted_docs(
 
 
 def _select_blob_candidates(
-    *,
-    azure_blob,
+    store: BlobStore,
     document_ids: List[str],
     subscription_id: Optional[str],
     profile_id: Optional[str],
     max_blobs: int,
-    prefix: str,
 ) -> List[BlobInfo]:
-    container = azure_blob.document_container_name
-
-    def _list_pickles() -> List[BlobInfo]:
-        blobs = azure_blob.list_blobs(
-            container,
-            prefix=prefix,
-            include_metadata=True,
-            limit=max_blobs,
-        )
-        return [blob for blob in blobs if (blob.name or "").lower().endswith(".pkl")]
-
     candidates: List[BlobInfo] = []
     if document_ids:
         for doc_id in document_ids:
-            blob_name = _build_blob_name(doc_id)
-            info = azure_blob.get_blob_info(container, blob_name)
-            if info:
-                candidates.append(info)
+            for ext in (".pkl", ".pickle"):
+                blob_name = store.build_blob_name(doc_id, extension=ext)
+                info = store.get_blob_info(blob_name)
+                if info:
+                    candidates.append(info)
         if not candidates:
-            candidates = _list_pickles()
+            candidates = store.list_pickle_blobs(limit=max_blobs)
     else:
-        candidates = _list_pickles()
+        candidates = store.list_pickle_blobs(limit=max_blobs)
 
     filtered: List[BlobInfo] = []
     doc_id_set = set(document_ids)
     for blob in candidates:
-        if not is_trusted_blob(blob, expected_prefix=prefix):
+        if not is_trusted_blob(blob, expected_prefix=store.prefix):
             continue
-        doc_id = (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=prefix)
+        doc_id = (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=store.prefix)
         if doc_id_set and doc_id not in doc_id_set:
             continue
 
@@ -1018,31 +990,45 @@ def _verify_post_upsert_count(
     return last_count, expected == 0
 
 
+def _build_blob_store() -> BlobStore:
+    return BlobStore()
+
+
 def _process_blob(
     *,
-    azure_blob,
+    store: BlobStore,
     blob: BlobInfo,
     subscription_id: Optional[str],
     profile_id: Optional[str],
     doc_type: Optional[str],
-    prefix: str,
-    force_reembed: bool = False,
 ) -> Dict[str, Any]:
     telemetry = _telemetry()
     result = {
         "blob_name": blob.name,
         "document_id": (blob.metadata or {}).get("document_id")
-        or extract_document_id(blob.name, prefix=prefix),
+        or extract_document_id(blob.name, prefix=store.prefix),
         "status": "FAILED",
         "chunks_count": 0,
         "points_upserted": 0,
         "error": None,
         "failed_reason": None,
     }
-    container = azure_blob.document_container_name
+
+    lease_id = None
     try:
+        lease_id = store.try_acquire_lease(blob.name, lease_duration=_lease_seconds())
+        if not lease_id:
+            if telemetry:
+                telemetry.increment("embed_pickles_lease_conflict_total")
+            result["status"] = "SKIPPED"
+            result["error"] = "lease_conflict"
+            result["failed_reason"] = "lease_conflict"
+            return result
+        if telemetry:
+            telemetry.increment("embed_pickles_leased_total")
+
         try:
-            payload = azure_blob.download_bytes(container, blob.name)
+            payload = store.download_blob(blob.name, lease=lease_id)
         except Exception as exc:  # noqa: BLE001
             if telemetry:
                 telemetry.increment("embed_pickles_download_fail_total")
@@ -1071,7 +1057,7 @@ def _process_blob(
                 )
             return result
 
-        doc_id = (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=prefix)
+        doc_id = (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=store.prefix)
         if not doc_id:
             result["error"] = "document_id_missing"
             result["failed_reason"] = "document_id_missing"
@@ -1169,7 +1155,7 @@ def _process_blob(
                 logger.warning("Qdrant count failed for %s: %s", doc_id, exc)
         logger.info("Existing Qdrant points for %s: %s", doc_id, qdrant_count)
 
-        if not force_reembed and qdrant_count and expected_chunks and qdrant_count >= expected_chunks:
+        if qdrant_count and expected_chunks and qdrant_count >= expected_chunks:
             if telemetry:
                 telemetry.increment("embed_skipped_already_embedded_total")
             update_stage(
@@ -1184,15 +1170,7 @@ def _process_blob(
                 },
             )
             _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
-            deleted = False
-            try:
-                if azure_blob.blob_exists(container, blob.name):
-                    with azure_blob.lease_guard(container, blob.name, duration=_lease_seconds(), renew_every=30) as lease:
-                        deleted = azure_blob.delete_blob(container, blob.name, lease=lease)
-                else:
-                    deleted = azure_blob.delete_blob(container, blob.name)
-            except Exception:  # noqa: BLE001
-                deleted = False
+            deleted = store.delete_blob(blob.name, lease=lease_id)
             if telemetry:
                 telemetry.increment("embed_pickles_deleted_total" if deleted else "embed_pickles_delete_fail_total")
             update_stage(
@@ -1338,14 +1316,7 @@ def _process_blob(
 
         deleted = False
         if cleanup_allowed:
-            try:
-                if azure_blob.blob_exists(container, blob.name):
-                    with azure_blob.lease_guard(container, blob.name, duration=_lease_seconds(), renew_every=30) as lease:
-                        deleted = azure_blob.delete_blob(container, blob.name, lease=lease)
-                else:
-                    deleted = azure_blob.delete_blob(container, blob.name)
-            except Exception:  # noqa: BLE001
-                deleted = False
+            deleted = store.delete_blob(blob.name, lease=lease_id)
             if telemetry:
                 telemetry.increment("embed_pickles_deleted_total" if deleted else "embed_pickles_delete_fail_total")
             if not deleted:
@@ -1367,15 +1338,9 @@ def _process_blob(
         result["points_upserted"] = total_upserted
         result["failed_reason"] = None
         return result
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Embedding processing failed for blob %s: %s", blob.name, exc)
-        result["error"] = "unexpected_error"
-        result["error_message"] = str(exc)
-        result["failed_reason"] = "unexpected_error"
-        doc_id_hint = result.get("document_id")
-        if doc_id_hint:
-            _set_document_status(doc_id_hint, STATUS_TRAINING_FAILED, str(exc), error_summary="unexpected_error")
-        return result
+    finally:
+        if lease_id:
+            store.release_lease(blob.name, lease_id)
 
 
 def _process_local_document(
@@ -1384,7 +1349,6 @@ def _process_local_document(
     subscription_id: Optional[str],
     profile_id: Optional[str],
     doc_type: Optional[str],
-    force_reembed: bool = False,
 ) -> Dict[str, Any]:
     result = {
         "blob_name": f"{document_id}.pkl",
@@ -1398,7 +1362,7 @@ def _process_local_document(
 
     record = get_document_record(document_id) or {}
     current_status = record.get("status")
-    if current_status in COMPLETED_STATUSES and not force_reembed:
+    if current_status in COMPLETED_STATUSES:
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
         return result
@@ -1643,7 +1607,6 @@ def _embed_from_local_pickles(
     profile_id: Optional[str],
     doc_type: Optional[str],
     max_blobs: Optional[int],
-    force_reembed: bool = False,
 ) -> Dict[str, Any]:
     logger.warning("Blob storage not configured; using local pickles (deprecated).")
     requested_ids = _normalize_requested_ids(document_id, document_ids)
@@ -1675,7 +1638,6 @@ def _embed_from_local_pickles(
                 subscription_id=subscription_id,
                 profile_id=profile_id,
                 doc_type=doc_type,
-                force_reembed=force_reembed,
             ): index
             for index, doc_id in enumerate(ordered_ids)
         }
@@ -1695,9 +1657,8 @@ def embed_documents(
     profile_id: Optional[str] = None,
     doc_type: Optional[str] = None,
     max_blobs: Optional[int] = None,
-    force_reembed: bool = False,
 ) -> Dict[str, Any]:
-    if not has_blob_credentials():
+    if not blob_storage_configured():
         return _embed_from_local_pickles(
             document_id=document_id,
             document_ids=document_ids,
@@ -1705,24 +1666,24 @@ def embed_documents(
             profile_id=profile_id,
             doc_type=doc_type,
             max_blobs=max_blobs,
-            force_reembed=force_reembed,
         )
 
     requested_ids = _normalize_requested_ids(document_id, document_ids)
     limit = _get_max_blobs(max_blobs)
 
-    azure_blob = get_azure_blob()
-    prefix = _blob_prefix()
-    if not azure_blob.document_container_name:
-        raise BlobConfigurationError("AzureBlob.DOCUMENT_CONTAINER_NAME is missing.")
+    try:
+        store = _build_blob_store()
+    except BlobConfigurationError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise BlobConfigurationError(str(exc)) from exc
 
     blob_candidates = _select_blob_candidates(
-        azure_blob=azure_blob,
-        document_ids=requested_ids,
-        subscription_id=subscription_id,
-        profile_id=profile_id,
-        max_blobs=limit,
-        prefix=prefix,
+        store,
+        requested_ids,
+        subscription_id,
+        profile_id,
+        limit,
     )
 
     telemetry = _telemetry()
@@ -1738,13 +1699,11 @@ def embed_documents(
         future_map = {
             executor.submit(
                 _process_blob,
-                azure_blob=azure_blob,
+                store=store,
                 blob=blob,
                 subscription_id=subscription_id,
                 profile_id=profile_id,
                 doc_type=doc_type,
-                prefix=prefix,
-                force_reembed=force_reembed,
             ): index
             for index, blob in enumerate(blob_candidates)
         }

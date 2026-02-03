@@ -89,12 +89,9 @@ class AnswerVerifier:
         support_scores = []
         numeric_supported = 0
         numeric_total = 0
-        global_citations = self._extract_citations_from_answer(answer, sources)
 
         for sentence in sentences:
             cited = self._extract_citations(sentence, sources)
-            if not cited:
-                cited = global_citations
             if not cited:
                 if not self._is_meta_statement(sentence):
                     missing_citations += 1
@@ -153,7 +150,7 @@ class AnswerVerifier:
             return numeric
 
         # Match doc/section style citations
-        labels = re.findall(r"\[(?:Doc|Document|Source):([^\]]+)\]", text, flags=re.IGNORECASE)
+        labels = re.findall(r"\[(?:Doc|Document):([^\]]+)\]", text, flags=re.IGNORECASE)
         if not labels:
             return []
 
@@ -163,30 +160,6 @@ class AnswerVerifier:
             if idx is not None:
                 indices.append(idx + 1)
         return indices
-
-    @staticmethod
-    def _extract_citations_from_answer(answer: str, sources: List[Dict[str, Any]]) -> List[int]:
-        if not answer or not sources:
-            return []
-        citations_line = ""
-        for line in answer.splitlines():
-            if line.strip().lower().startswith("citations:"):
-                citations_line = line.strip()
-                break
-        if not citations_line:
-            return []
-        payload = citations_line.split(":", 1)[1].strip()
-        if not payload:
-            return []
-        labels = [entry.strip() for entry in payload.split(";") if entry.strip()]
-        indices: List[int] = []
-        for label in labels:
-            idx = AnswerVerifier._match_label_to_source(label, sources)
-            if idx is not None:
-                indices.append(idx + 1)
-        if indices:
-            return sorted(set(indices))
-        return list(range(1, len(sources) + 1))
 
     @staticmethod
     def _match_label_to_source(label: str, sources: List[Dict[str, Any]]) -> Optional[int]:

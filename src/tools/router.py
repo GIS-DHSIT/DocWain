@@ -21,7 +21,6 @@ from src.tools import (  # noqa: F401
     medical,
     lawhere,
     resumes,
-    resume_analyzer_v2,
     jira_confluence,
     web_extract,
 )
@@ -82,9 +81,9 @@ router.include_router(code_docs.router)
 router.include_router(medical.router)
 router.include_router(lawhere.router)
 router.include_router(resumes.router)
-router.include_router(resume_analyzer_v2.router)
 router.include_router(jira_confluence.router)
 router.include_router(web_extract.router)
 
 # Alias for import convenience
 tools_router = router
+
