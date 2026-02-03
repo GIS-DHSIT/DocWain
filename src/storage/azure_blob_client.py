@@ -20,6 +20,7 @@ _SERVICE_CLIENT: Optional[BlobServiceClient] = None
 _CHAT_CONTAINER_CLIENT: Optional[ContainerClient] = None
 _DOCUMENT_CONTAINER_CLIENT: Optional[ContainerClient] = None
 _CONTAINERS_VALIDATED = False
+_STORAGE_CONFIG_VALIDATED = False
 
 
 class BlobDownloadError(RuntimeError):
@@ -251,6 +252,19 @@ def validate_containers_once() -> None:
             continue
         if not exists:
             logger.warning("Configured container %s not found. Please verify Azure Blob setup.", name)
+
+
+def validate_storage_configured_once() -> bool:
+    """Validate blob credentials once and log a single actionable message."""
+    global _STORAGE_CONFIG_VALIDATED
+    if _STORAGE_CONFIG_VALIDATED:
+        return has_blob_credentials()
+    _STORAGE_CONFIG_VALIDATED = True
+    if not has_blob_credentials():
+        logger.warning("Azure blob storage is not configured; set AzureBlob.CONNECTION_STRING to enable storage.")
+        return False
+    logger.info("Azure blob storage configured.")
+    return True
 
 
 def upload_chat_history(blob_name: str, payload: bytes) -> None:
