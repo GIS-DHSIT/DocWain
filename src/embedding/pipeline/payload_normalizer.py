@@ -117,7 +117,8 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "uri": _stringify(payload.get("source_uri")),
         },
         "document": {
-            "type": _stringify(payload.get("doc_type") or payload.get("document_type")),
+            "type": _stringify(payload.get("document_type") or payload.get("doc_type")),
+            "ingestion_source": _stringify(payload.get("ingestion_source") or payload.get("source_type")),
         },
         "section": {
             "id": section_id,
@@ -167,6 +168,8 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "chunk_type": chunk_type,
         "chunk_kind": chunk_role,
         "chunk_sentence_complete": canonical["chunk"]["sentence_complete"],
+        "document_type": canonical["document"]["type"],
+        "ingestion_source": canonical["document"]["ingestion_source"],
     }
 
     canonical.update(flattened)

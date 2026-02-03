@@ -27,6 +27,7 @@ from src.api.statuses import (
     STATUS_UNDER_REVIEW,
 )
 from src.storage.azure_blob_client import BlobDownloadError, CredentialError, normalize_blob_name
+from src.utils.idempotency import acquire_lock, release_lock
 
 logger = logging.getLogger(__name__)
 
@@ -107,129 +108,138 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
         return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
+    lock = acquire_lock(stage="extraction", document_id=doc_id, subscription_id=subscription_id)
+    if not lock.acquired:
+        logger.info("Extraction already in progress for %s; skipping duplicate trigger.", doc_id)
+        return {"document_id": doc_id, "status": "SKIPPED", "reason": "duplicate_extraction_in_progress"}
+
     pii_masking_enabled = get_subscription_pii_setting(subscription_id)
     logger.info("Document %s (subscription %s): PII masking=%s", doc_id, subscription_id, pii_masking_enabled)
 
-    all_extracted_docs: Dict[str, Any] = {}
     try:
-        if doc_data.get("type") == "S3":
-            bk_name = conn_data["s3_details"]["bucketName"]
-            region = conn_data["s3_details"]["region"]
-            ak = decrypt_data(conn_data["s3_details"]["accessKey"]).split("\x0c")[0].strip()
-            sk = decrypt_data(conn_data["s3_details"]["secretKey"]).split("\x08")[0].strip()
-            s3 = get_s3_client(ak, sk, region)
-            if not s3:
-                raise ValueError("Failed to create S3 client")
+        all_extracted_docs: Dict[str, Any] = {}
+        try:
+            if doc_data.get("type") == "S3":
+                bk_name = conn_data["s3_details"]["bucketName"]
+                region = conn_data["s3_details"]["region"]
+                ak = decrypt_data(conn_data["s3_details"]["accessKey"]).split("\x0c")[0].strip()
+                sk = decrypt_data(conn_data["s3_details"]["secretKey"]).split("\x08")[0].strip()
+                s3 = get_s3_client(ak, sk, region)
+                if not s3:
+                    raise ValueError("Failed to create S3 client")
 
-            objs = s3.list_objects_v2(Bucket=bk_name)
-            file_keys = [obj["Key"] for obj in objs.get("Contents", []) if obj["Key"] == doc_data.get("name")]
-            if not file_keys:
-                raise ValueError("File not found in S3")
+                objs = s3.list_objects_v2(Bucket=bk_name)
+                file_keys = [obj["Key"] for obj in objs.get("Contents", []) if obj["Key"] == doc_data.get("name")]
+                if not file_keys:
+                    raise ValueError("File not found in S3")
 
-            doc_content = read_s3_file(s3, bk_name, file_keys[0])
-            if doc_content is None:
-                raise ValueError("Failed to read S3 file")
+                doc_content = read_s3_file(s3, bk_name, file_keys[0])
+                if doc_content is None:
+                    raise ValueError("Failed to read S3 file")
 
-            extracted_doc = fileProcessor(doc_content, file_keys[0])
-            if not extracted_doc:
-                raise ValueError("Content extraction failed")
+                extracted_doc = fileProcessor(doc_content, file_keys[0])
+                if not extracted_doc:
+                    raise ValueError("Content extraction failed")
 
-            all_extracted_docs.update(extracted_doc)
-        elif doc_data.get("type") == "LOCAL":
-            doc_name = doc_data.get("name", "")
-            if not doc_name:
-                raise ValueError("No filename specified")
+                all_extracted_docs.update(extracted_doc)
+            elif doc_data.get("type") == "LOCAL":
+                doc_name = doc_data.get("name", "")
+                if not doc_name:
+                    raise ValueError("No filename specified")
 
-            all_connector_files = conn_data.get("locations", [])
-            matching_files: List[str] = []
-            for file_path in all_connector_files:
-                file_name_only = file_path.split("/")[-1] if "/" in file_path else file_path
-                if file_name_only == doc_name:
-                    matching_files.append(file_path)
-                    break
+                all_connector_files = conn_data.get("locations", [])
+                matching_files: List[str] = []
+                for file_path in all_connector_files:
+                    file_name_only = file_path.split("/")[-1] if "/" in file_path else file_path
+                    if file_name_only == doc_name:
+                        matching_files.append(file_path)
+                        break
 
-            if not matching_files:
-                raise ValueError(f"Exact file match not found: {doc_name}")
-            if len(matching_files) > 1:
-                raise ValueError("Multiple file matches")
+                if not matching_files:
+                    raise ValueError(f"Exact file match not found: {doc_name}")
+                if len(matching_files) > 1:
+                    raise ValueError("Multiple file matches")
 
-            file_path = matching_files[0]
-            file_key = normalize_blob_name(file_path, container_name=Config.AzureBlob.DOCUMENT_CONTAINER_NAME)
-            doc_content = get_azure_docs(file_key, document_id=doc_id)
-            if doc_content is None:
-                raise ValueError(f"Failed to read file {file_key}")
+                file_path = matching_files[0]
+                file_key = normalize_blob_name(file_path, container_name=Config.AzureBlob.DOCUMENT_CONTAINER_NAME)
+                doc_content = get_azure_docs(file_key, document_id=doc_id)
+                if doc_content is None:
+                    raise ValueError(f"Failed to read file {file_key}")
 
-            extracted_doc = fileProcessor(doc_content, file_path)
-            if not extracted_doc:
-                raise ValueError("Content extraction failed")
+                extracted_doc = fileProcessor(doc_content, file_path)
+                if not extracted_doc:
+                    raise ValueError("Content extraction failed")
 
-            all_extracted_docs.update(extracted_doc)
+                all_extracted_docs.update(extracted_doc)
+            else:
+                raise ValueError(f"Unsupported connector type: {doc_data.get('type')}")
+        except CredentialError as exc:
+            _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"CredentialError: {exc}")
+            raise
+        except BlobDownloadError as exc:
+            _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"{exc.__class__.__name__}: {exc}")
+            return {
+                "document_id": doc_id,
+                "status": STATUS_EXTRACTION_FAILED,
+                "error": f"{exc.__class__.__name__}: {exc}",
+            }
+        except Exception as exc:  # noqa: BLE001
+            _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
+            return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
+
+        if not all_extracted_docs:
+            _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, "No content extracted")
+            return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": "No content extracted"}
+
+        masked_docs = all_extracted_docs
+        pii_count = 0
+        pii_items: List[Any] = []
+        if pii_masking_enabled:
+            masked_docs, pii_count, _high_conf, pii_items = mask_document_content(all_extracted_docs)
+            update_pii_stats(doc_id, pii_count, False, pii_items)
         else:
-            raise ValueError(f"Unsupported connector type: {doc_data.get('type')}")
-    except CredentialError as exc:
-        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"CredentialError: {exc}")
-        raise
-    except BlobDownloadError as exc:
-        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"{exc.__class__.__name__}: {exc}")
+            update_pii_stats(doc_id, 0, False, [])
+
+        if pii_masking_enabled:
+            for fname, content in masked_docs.items():
+                if isinstance(content, dict) and "texts" in content:
+                    texts = content.get("texts") or []
+                    if texts:
+                        from src.api.dataHandler import encode_with_fallback
+
+                        content["embeddings"] = encode_with_fallback(
+                            texts,
+                            convert_to_numpy=True,
+                            normalize_embeddings=False,
+                        )
+                    masked_docs[fname] = content
+
+        try:
+            save_info = save_extracted_pickle(doc_id, masked_docs)
+            update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
+        except Exception as exc:  # noqa: BLE001
+            _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
+            return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
+
+        extra_fields = {
+            "subscription_id": subscription_id,
+            "profile_id": profile_id,
+            "extracted_pickle_path": save_info.get("path"),
+            "extracted_hash": save_info.get("sha256"),
+        }
+        _set_document_status(doc_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
+
+        summary = _build_extraction_summary(masked_docs)
         return {
             "document_id": doc_id,
-            "status": STATUS_EXTRACTION_FAILED,
-            "error": f"{exc.__class__.__name__}: {exc}",
+            "status": STATUS_EXTRACTION_COMPLETED,
+            "pickle_path": save_info.get("path"),
+            "summary": summary,
+            "doc_name": doc_data.get("name", "Unknown"),
         }
-    except Exception as exc:  # noqa: BLE001
-        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
-        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
-
-    if not all_extracted_docs:
-        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, "No content extracted")
-        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": "No content extracted"}
-
-    masked_docs = all_extracted_docs
-    pii_count = 0
-    pii_items: List[Any] = []
-    if pii_masking_enabled:
-        masked_docs, pii_count, _high_conf, pii_items = mask_document_content(all_extracted_docs)
-        update_pii_stats(doc_id, pii_count, False, pii_items)
-    else:
-        update_pii_stats(doc_id, 0, False, [])
-
-    if pii_masking_enabled:
-        for fname, content in masked_docs.items():
-            if isinstance(content, dict) and "texts" in content:
-                texts = content.get("texts") or []
-                if texts:
-                    from src.api.dataHandler import encode_with_fallback
-
-                    content["embeddings"] = encode_with_fallback(
-                        texts,
-                        convert_to_numpy=True,
-                        normalize_embeddings=False,
-                    )
-                masked_docs[fname] = content
-
-    try:
-        save_info = save_extracted_pickle(doc_id, masked_docs)
-        update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
-    except Exception as exc:  # noqa: BLE001
-        _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
-        return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
-
-    extra_fields = {
-        "subscription_id": subscription_id,
-        "profile_id": profile_id,
-        "extracted_pickle_path": save_info.get("path"),
-        "extracted_hash": save_info.get("sha256"),
-    }
-    _set_document_status(doc_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
-
-    summary = _build_extraction_summary(masked_docs)
-    return {
-        "document_id": doc_id,
-        "status": STATUS_EXTRACTION_COMPLETED,
-        "pickle_path": save_info.get("path"),
-        "summary": summary,
-        "doc_name": doc_data.get("name", "Unknown"),
-    }
+    finally:
+        if lock.acquired:
+            release_lock(lock)
 
 
 def extract_documents() -> Dict[str, Any]:
@@ -288,6 +298,10 @@ def extract_uploaded_document(
     content_type: Optional[str] = None,
     content_size: Optional[int] = None,
 ) -> Dict[str, Any]:
+    lock = acquire_lock(stage="extraction", document_id=document_id, subscription_id=subscription_id)
+    if not lock.acquired:
+        logger.info("Extraction already in progress for %s; skipping duplicate upload.", document_id)
+        return {"status": "skipped", "reason": "duplicate_extraction_in_progress", "document_id": document_id}
     init_document_record(
         document_id=document_id,
         subscription_id=subscription_id,
@@ -318,6 +332,8 @@ def extract_uploaded_document(
         set_error(document_id, "extraction", exc)
         _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
         raise
+    finally:
+        release_lock(lock)
 
     stats = _build_extraction_summary(extracted)
     update_stage(

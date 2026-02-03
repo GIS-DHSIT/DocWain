@@ -53,6 +53,8 @@ from src.embedding.chunking.section_chunker import SectionChunker, normalize_tex
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 from src.storage.azure_blob_client import normalize_blob_name
+from src.storage.blob_persistence import load_pickle as load_blob_pickle
+from src.utils.idempotency import acquire_lock, release_lock
 
 logger = logging.getLogger(__name__)
 
@@ -261,18 +263,16 @@ def _load_extracted_for_doc(document_id: str) -> Tuple[Optional[Any], Dict[str, 
         store = _build_blob_store()
         for ext in (".pkl", ".pickle"):
             blob_name = store.build_blob_name(document_id, extension=ext)
-            info = store.get_blob_info(blob_name)
-            if not info:
-                continue
-            payload = store.download_blob(blob_name)
-            details.update(
-                {
-                    "source": "blob",
-                    "blob_name": blob_name,
-                    "bytes": len(payload or b""),
-                }
-            )
-            return pickle.loads(payload), details
+            payload = load_blob_pickle(blob_name)
+            if payload:
+                details.update(
+                    {
+                        "source": "blob",
+                        "blob_name": blob_name,
+                        "bytes": len(payload or b""),
+                    }
+                )
+                return pickle.loads(payload), details
         return None, details
 
     path = build_pickle_path(document_id)
@@ -1015,6 +1015,7 @@ def _process_blob(
     }
 
     lease_id = None
+    lock = None
     try:
         lease_id = store.try_acquire_lease(blob.name, lease_duration=_lease_seconds())
         if not lease_id:
@@ -1090,6 +1091,14 @@ def _process_blob(
             _set_document_status(doc_id, STATUS_TRAINING_FAILED, str(exc), error_summary="resolve_ids_failed")
             result["error"] = "resolve_ids_failed"
             result["failed_reason"] = "resolve_ids_failed"
+            return result
+
+        lock = acquire_lock(stage="embedding", document_id=doc_id, subscription_id=subscription_id)
+        if not lock.acquired:
+            logger.info("Embedding already in progress for %s; skipping duplicate.", doc_id)
+            result["status"] = "SKIPPED"
+            result["error"] = "duplicate_embedding_in_progress"
+            result["failed_reason"] = "duplicate_embedding_in_progress"
             return result
 
         update_stage(
@@ -1341,6 +1350,8 @@ def _process_blob(
     finally:
         if lease_id:
             store.release_lease(blob.name, lease_id)
+        if lock and lock.acquired:
+            release_lock(lock)
 
 
 def _process_local_document(
@@ -1390,6 +1401,15 @@ def _process_local_document(
         result["error_message"] = str(exc)
         result["failed_reason"] = "resolve_ids_failed"
         return result
+
+    lock = acquire_lock(stage="embedding", document_id=document_id, subscription_id=subscription_id)
+    if not lock.acquired:
+        logger.info("Embedding already in progress for %s; skipping duplicate.", document_id)
+        result["status"] = "SKIPPED"
+        result["error"] = "duplicate_embedding_in_progress"
+        result["failed_reason"] = "duplicate_embedding_in_progress"
+        return result
+
     _set_document_status(document_id, STATUS_TRAINING_STARTED)
 
     update_stage(
@@ -1399,182 +1419,186 @@ def _process_local_document(
     )
 
     try:
-        extracted = load_extracted_pickle(document_id)
-    except Exception as exc:  # noqa: BLE001
-        update_stage(
-            document_id,
-            "embedding",
-            {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
-        )
-        _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="blob_read_failed")
-        result["error"] = "blob_read_failed"
-        result["error_message"] = str(exc)
-        result["failed_reason"] = "blob_read_failed"
-        return result
+        try:
+            extracted = load_extracted_pickle(document_id)
+        except Exception as exc:  # noqa: BLE001
+            update_stage(
+                document_id,
+                "embedding",
+                {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
+            )
+            _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="blob_read_failed")
+            result["error"] = "blob_read_failed"
+            result["error_message"] = str(exc)
+            result["failed_reason"] = "blob_read_failed"
+            return result
 
-    extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
-        document_id=document_id,
-        extracted=extracted,
-        record=record,
-        subscription_id=subscription_id,
-    )
-    if prep_error or extracted_docs is None or expected_chunks is None:
-        reason = prep_error or "empty_extraction"
-        message = {
-            "empty_extraction": "empty extraction",
-            "chunking_failed": "chunking failed",
-        }.get(reason, "embedding preparation failed")
+        extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
+            document_id=document_id,
+            extracted=extracted,
+            record=record,
+            subscription_id=subscription_id,
+        )
+        if prep_error or extracted_docs is None or expected_chunks is None:
+            reason = prep_error or "empty_extraction"
+            message = {
+                "empty_extraction": "empty extraction",
+                "chunking_failed": "chunking failed",
+            }.get(reason, "embedding preparation failed")
+            update_stage(
+                document_id,
+                "embedding",
+                {
+                    "status": "FAILED",
+                    "completed_at": time.time(),
+                    "reason": reason,
+                    "error": {"message": message},
+                },
+            )
+            _set_document_status(document_id, STATUS_TRAINING_FAILED, message, error_summary=reason)
+            result["error"] = reason
+            result["error_message"] = message
+            result["failed_reason"] = reason
+            return result
+
+        result["chunks_count"] = expected_chunks
+        logger.info("Embedding pre-check for %s: expected_chunks=%s", document_id, expected_chunks)
+
+        total_chunks = 0
+        total_upserted = 0
+        total_dropped = 0
+        coverage_values = coverage_values or []
+        try:
+            for file_name, content in extracted_docs.items():
+                try:
+                    embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
+                except Exception as exc:  # noqa: BLE001
+                    if _is_meta_tensor_error(exc):
+                        logger.warning(
+                            "Meta tensor error during training for %s; forcing CPU reload and retrying once",
+                            document_id,
+                        )
+                        try:
+                            get_model(reload=True, device="cpu")
+                            embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
+                        except Exception as retry_exc:  # noqa: BLE001
+                            raise retry_exc from exc
+                    else:
+                        raise
+                total_chunks += int(embed_result.get("chunks", 0))
+                total_upserted += int(embed_result.get("points_saved", 0))
+                total_dropped += int(embed_result.get("dropped_chunks", 0))
+                ratio = embed_result.get("coverage_ratio")
+                if isinstance(ratio, (int, float)):
+                    coverage_values.append(float(ratio))
+        except Exception as exc:  # noqa: BLE001
+            update_stage(
+                document_id,
+                "embedding",
+                {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
+            )
+            _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="training_failed")
+            result["error"] = "training_failed"
+            result["error_message"] = str(exc)
+            result["failed_reason"] = "training_failed"
+            return result
+
+        if total_chunks != total_upserted:
+            error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
+            update_stage(
+                document_id,
+                "embedding",
+                {"status": "FAILED", "completed_at": time.time(), "error": {"message": error_msg}},
+            )
+            _set_document_status(document_id, STATUS_TRAINING_FAILED, error_msg, error_summary="qdrant_upsert_failed")
+            result["error"] = "qdrant_upsert_failed"
+            result["error_message"] = error_msg
+            result["failed_reason"] = "qdrant_upsert_failed"
+            result["points_upserted"] = total_upserted
+            return result
+
+        collection_name = build_collection_name(subscription_id)
+        logger.info(
+            "Embedding results for %s: chunks=%s upserted=%s dropped=%s collection=%s",
+            document_id,
+            total_chunks,
+            total_upserted,
+            total_dropped,
+            collection_name,
+        )
+        coverage_ratio = min(coverage_values) if coverage_values else None
         update_stage(
             document_id,
             "embedding",
             {
-                "status": "FAILED",
+                "status": "COMPLETED",
                 "completed_at": time.time(),
-                "reason": reason,
-                "error": {"message": message},
+                "error": None,
+                "chunking": {
+                    "chunks": total_chunks,
+                    "coverage_ratio": coverage_ratio,
+                    "dropped_empty": total_dropped,
+                },
+                "qdrant": {"collection": collection_name, "expected": total_chunks, "upserted": total_upserted},
             },
         )
-        _set_document_status(document_id, STATUS_TRAINING_FAILED, message, error_summary=reason)
-        result["error"] = reason
-        result["error_message"] = message
-        result["failed_reason"] = reason
-        return result
 
-    result["chunks_count"] = expected_chunks
-    logger.info("Embedding pre-check for %s: expected_chunks=%s", document_id, expected_chunks)
+        _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
 
-    total_chunks = 0
-    total_upserted = 0
-    total_dropped = 0
-    coverage_values = coverage_values or []
-    try:
-        for file_name, content in extracted_docs.items():
-            try:
-                embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
-            except Exception as exc:  # noqa: BLE001
-                if _is_meta_tensor_error(exc):
-                    logger.warning(
-                        "Meta tensor error during training for %s; forcing CPU reload and retrying once",
-                        document_id,
-                    )
-                    try:
-                        get_model(reload=True, device="cpu")
-                        embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
-                    except Exception as retry_exc:  # noqa: BLE001
-                        raise retry_exc from exc
-                else:
-                    raise
-            total_chunks += int(embed_result.get("chunks", 0))
-            total_upserted += int(embed_result.get("points_saved", 0))
-            total_dropped += int(embed_result.get("dropped_chunks", 0))
-            ratio = embed_result.get("coverage_ratio")
-            if isinstance(ratio, (int, float)):
-                coverage_values.append(float(ratio))
-    except Exception as exc:  # noqa: BLE001
+        post_count: Optional[int] = None
+        cleanup_allowed = True
+        cleanup_error: Optional[Dict[str, Any]] = None
+        if subscription_id and profile_id:
+            post_count, cleanup_allowed = _verify_post_upsert_count(
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=document_id,
+                expected_chunks=total_chunks,
+            )
+            if post_count is not None:
+                logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
+            if not cleanup_allowed:
+                cleanup_error = (
+                    {"message": "post_upsert_count_unavailable"}
+                    if post_count is None
+                    else {
+                        "message": "post_upsert_count_mismatch",
+                        "post_count": post_count,
+                        "expected": total_chunks,
+                    }
+                )
+                logger.warning(
+                    "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
+                    document_id,
+                    post_count,
+                    total_chunks,
+                )
+
+        deleted = False
+        if cleanup_allowed:
+            deleted = delete_extracted_pickle(document_id)
+            if not deleted:
+                cleanup_error = {"message": "local_pickle_delete_failed"}
         update_stage(
             document_id,
-            "embedding",
-            {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
+            "cleanup",
+            {
+                "pickle_deleted": deleted,
+                "deleted_at": time.time() if deleted else None,
+                "cleanup_pending": not deleted,
+                "error": None if deleted else cleanup_error or {"message": "cleanup_deferred"},
+            },
         )
-        _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="training_failed")
-        result["error"] = "training_failed"
-        result["error_message"] = str(exc)
-        result["failed_reason"] = "training_failed"
-        return result
 
-    if total_chunks != total_upserted:
-        error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
-        update_stage(
-            document_id,
-            "embedding",
-            {"status": "FAILED", "completed_at": time.time(), "error": {"message": error_msg}},
-        )
-        _set_document_status(document_id, STATUS_TRAINING_FAILED, error_msg, error_summary="qdrant_upsert_failed")
-        result["error"] = "qdrant_upsert_failed"
-        result["error_message"] = error_msg
-        result["failed_reason"] = "qdrant_upsert_failed"
+        result["status"] = "COMPLETED"
+        result["error"] = None
+        result["chunks_count"] = total_chunks
         result["points_upserted"] = total_upserted
+        result["failed_reason"] = None
         return result
-
-    collection_name = build_collection_name(subscription_id)
-    logger.info(
-        "Embedding results for %s: chunks=%s upserted=%s dropped=%s collection=%s",
-        document_id,
-        total_chunks,
-        total_upserted,
-        total_dropped,
-        collection_name,
-    )
-    coverage_ratio = min(coverage_values) if coverage_values else None
-    update_stage(
-        document_id,
-        "embedding",
-        {
-            "status": "COMPLETED",
-            "completed_at": time.time(),
-            "error": None,
-            "chunking": {
-                "chunks": total_chunks,
-                "coverage_ratio": coverage_ratio,
-                "dropped_empty": total_dropped,
-            },
-            "qdrant": {"collection": collection_name, "expected": total_chunks, "upserted": total_upserted},
-        },
-    )
-
-    _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
-
-    post_count: Optional[int] = None
-    cleanup_allowed = True
-    cleanup_error: Optional[Dict[str, Any]] = None
-    if subscription_id and profile_id:
-        post_count, cleanup_allowed = _verify_post_upsert_count(
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-            document_id=document_id,
-            expected_chunks=total_chunks,
-        )
-        if post_count is not None:
-            logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
-        if not cleanup_allowed:
-            cleanup_error = (
-                {"message": "post_upsert_count_unavailable"}
-                if post_count is None
-                else {
-                    "message": "post_upsert_count_mismatch",
-                    "post_count": post_count,
-                    "expected": total_chunks,
-                }
-            )
-            logger.warning(
-                "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
-                document_id,
-                post_count,
-                total_chunks,
-            )
-
-    deleted = False
-    if cleanup_allowed:
-        deleted = delete_extracted_pickle(document_id)
-        if not deleted:
-            cleanup_error = {"message": "local_pickle_delete_failed"}
-    update_stage(
-        document_id,
-        "cleanup",
-        {
-            "pickle_deleted": deleted,
-            "deleted_at": time.time() if deleted else None,
-            "cleanup_pending": not deleted,
-            "error": None if deleted else cleanup_error or {"message": "cleanup_deferred"},
-        },
-    )
-
-    result["status"] = "COMPLETED"
-    result["error"] = None
-    result["chunks_count"] = total_chunks
-    result["points_upserted"] = total_upserted
-    result["failed_reason"] = None
-    return result
+    finally:
+        if lock and lock.acquired:
+            release_lock(lock)
 
 
 def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:

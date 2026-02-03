@@ -38,6 +38,12 @@ from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocume
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
 from src.embedding.pipeline.embed_pipeline import prepare_embedding_chunks, normalize_chunk_chain
 from src.embedding.pipeline.payload_normalizer import normalize_payload
+from src.metadata.normalizer import normalize_ingestion_metadata
+from src.embedding.model_loader import (
+    encode_with_fallback as model_encode_with_fallback,
+    get_embedding_model,
+    get_model_info,
+)
 from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
@@ -341,69 +347,10 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
 def get_model(*, reload: bool = False, device: Optional[str] = None):
     """Lazy init for sentence transformer model with robust device fallback."""
     global _MODEL, _MODEL_DEVICE
-    candidates = _embedding_candidates()
-    target_device = (device or _preferred_embedding_device()).strip().lower()
-
-    should_reload = reload or _MODEL is None
-    if _MODEL is not None and _MODEL_DEVICE and target_device and _MODEL_DEVICE != target_device:
-        should_reload = True
-
-    if should_reload:
-        last_error: Optional[Exception] = None
-        for idx, candidate_name in enumerate(candidates):
-            try:
-                model = _load_sentence_transformer(candidate_name, target_device)
-                _MODEL = model
-                _MODEL_DEVICE = getattr(model, "_target_device", None) or target_device
-                expected_dim = getattr(Config.Model, "EMBEDDING_DIM", None)
-                model_dim = _MODEL.get_sentence_embedding_dimension()
-                if expected_dim and model_dim != expected_dim:
-                    logging.warning(
-                        "Configured EMBEDDING_DIM=%s but model dimension is %s",
-                        expected_dim,
-                        model_dim,
-                    )
-                logging.info(
-                    "Loaded sentence transformer model: %s (dim=%s, device=%s)",
-                    candidate_name,
-                    model_dim,
-                    _MODEL_DEVICE,
-                )
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                logging.warning(
-                    "Failed to load sentence transformer candidate %s on %s: %s",
-                    candidate_name,
-                    target_device,
-                    exc,
-                )
-                # On meta tensor errors, immediately try CPU for the same candidate.
-                if target_device != "cpu" and _is_meta_tensor_error(exc):
-                    try:
-                        model = _load_sentence_transformer(candidate_name, "cpu")
-                        _MODEL = model
-                        _MODEL_DEVICE = getattr(model, "_target_device", None) or "cpu"
-                        model_dim = _MODEL.get_sentence_embedding_dimension()
-                        logging.info(
-                            "Loaded sentence transformer model on cpu after meta error: %s (dim=%s)",
-                            candidate_name,
-                            model_dim,
-                        )
-                        break
-                    except Exception as cpu_exc:  # noqa: BLE001
-                        last_error = cpu_exc
-                        logging.warning(
-                            "CPU retry failed for candidate %s: %s",
-                            candidate_name,
-                            cpu_exc,
-                        )
-                        continue
-                # Try the next candidate.
-                if idx == len(candidates) - 1 and last_error:
-                    raise last_error
-
-    return _MODEL
+    model = get_embedding_model(reload=reload, device=device)
+    _MODEL = model
+    _MODEL_DEVICE = getattr(model, "_target_device", None) or _MODEL_DEVICE
+    return model
 
 
 def _embedding_batch_size(default: int = 32) -> int:
@@ -422,58 +369,13 @@ def encode_with_fallback(
     batch_size: Optional[int] = None,
 ):
     """Encode with recovery from meta-device and CUDA OOM failures."""
-    global _MODEL, _MODEL_DEVICE
     effective_batch_size = batch_size or _embedding_batch_size()
-    model = get_model()
-    try:
-        return model.encode(
-            texts,
-            batch_size=effective_batch_size,
-            convert_to_numpy=convert_to_numpy,
-            normalize_embeddings=normalize_embeddings,
-        )
-    except Exception as exc:  # noqa: BLE001
-        if _is_meta_tensor_error(exc) or (_is_cuda_oom(exc) and _MODEL_DEVICE != "cpu"):
-            logging.error(
-                "Embedding encode failed on device=%s (%s); retrying on cpu with smaller batch size",
-                _MODEL_DEVICE,
-                exc,
-            )
-            safe_batch_size = min(effective_batch_size, 16)
-            try:
-                model = get_model(reload=True, device="cpu")
-                _MODEL_DEVICE = "cpu"
-                return model.encode(
-                    texts,
-                    batch_size=safe_batch_size,
-                    convert_to_numpy=convert_to_numpy,
-                    normalize_embeddings=normalize_embeddings,
-                )
-            except Exception as retry_exc:  # noqa: BLE001
-                if not _is_meta_tensor_error(retry_exc):
-                    raise
-                logging.error("CPU retry still failed with meta tensor error: %s", retry_exc)
-                for fallback_name in _embedding_candidates()[1:]:
-                    try:
-                        logging.warning("Trying fallback embedding model on cpu: %s", fallback_name)
-                        model = _load_sentence_transformer(fallback_name, "cpu")
-                        _MODEL = model
-                        _MODEL_DEVICE = "cpu"
-                        return model.encode(
-                            texts,
-                            batch_size=safe_batch_size,
-                            convert_to_numpy=convert_to_numpy,
-                            normalize_embeddings=normalize_embeddings,
-                        )
-                    except Exception as fallback_exc:  # noqa: BLE001
-                        logging.warning(
-                            "Fallback embedding model %s failed: %s",
-                            fallback_name,
-                            fallback_exc,
-                        )
-                        continue
-                raise retry_exc
-        raise
+    return model_encode_with_fallback(
+        texts,
+        normalize_embeddings=normalize_embeddings,
+        convert_to_numpy=convert_to_numpy,
+        batch_size=effective_batch_size,
+    )
 
 
 def get_qdrant_client():
@@ -1280,7 +1182,7 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
         raise
 
 
-def save_embeddings_to_qdrant(
+    def save_embeddings_to_qdrant(
     embeddings: Dict,
     subscription_id: str,
     profile_id: str,
@@ -1415,6 +1317,7 @@ def save_embeddings_to_qdrant(
                     page_range = f"{page_start}-{page_end}"
                 evidence_pointer = f"Section: {section_val or 'Section'}, Page: {page_range}"
 
+            model_name, model_dim, _device = get_model_info()
             payload = {
                 "subscription_id": str(subscription_id),
                 "profile_id": str(profile_id),
@@ -1433,6 +1336,7 @@ def save_embeddings_to_qdrant(
                 "section_path": section_path,
                 "summary": summary_val,
                 "doc_type": chunk_meta.get("doc_type") or doc_type or doc_metadata.get("doc_type"),
+                "document_type": doc_metadata.get("document_type"),
                 "languages": chunk_meta.get("languages") or languages,
                 "products_name": chunk_meta.get("products_name") or products_name,
                 "description": chunk_meta.get("description") or description,
@@ -1447,7 +1351,25 @@ def save_embeddings_to_qdrant(
                 "chunk_kind": chunk_kind,
                 "section_id": chunk_meta.get("section_id"),
                 "evidence_pointer": evidence_pointer,
+                "embedding_model": model_name,
+                "embedding_dim": model_dim,
             }
+
+            normalized_meta = normalize_ingestion_metadata(
+                {
+                    **doc_metadata,
+                    **chunk_meta,
+                    "subscription_id": subscription_id,
+                    "profile_id": profile_id,
+                    "document_id": doctag,
+                    "document_name": filename or source_filename,
+                    "chunk_id": chunk_id,
+                    "chunk_kind": chunk_kind,
+                    "doc_type": payload.get("doc_type"),
+                    "document_type": payload.get("document_type"),
+                }
+            )
+            payload.update({k: v for k, v in normalized_meta.items() if v is not None})
 
             payload = normalize_payload(payload)
 
