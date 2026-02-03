@@ -10,8 +10,19 @@ def _split_lines(text: str) -> List[str]:
     return [line.strip() for line in (text or "").splitlines() if line.strip()]
 
 
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    normalized = re.sub(r"(\d)([A-Za-z])", r"\1 \2", normalized)
+    normalized = re.sub(r"([A-Za-z])(\d)", r"\1 \2", normalized)
+    normalized = re.sub(r"\s{2,}", " ", normalized)
+    return normalized.strip()
+
+
 def _extract_entities(line: str) -> List[Tuple[str, str]]:
     entities: List[Tuple[str, str]] = []
+    line = _normalize_text(line)
     money = re.findall(r"[$€£¥]\s?\d[\d,]*(?:\.\d+)?", line)
     for m in money:
         entities.append(("money", m))
@@ -32,6 +43,7 @@ def _extract_entities(line: str) -> List[Tuple[str, str]]:
 
 
 def _extract_skills(line: str) -> List[str]:
+    line = _normalize_text(line)
     tokens = re.split(r"[,;/•|]\s*", line)
     return [tok.strip() for tok in tokens if tok.strip()]
 
@@ -52,13 +64,14 @@ def _chunk_doc_name(chunk) -> str:
 def build_fact_cache(evidence_pack: Iterable) -> FactCache:
     cache = FactCache()
     for chunk in evidence_pack or []:
-        text = getattr(chunk, "text", None) or ""
+        text = _normalize_text(getattr(chunk, "text", None) or "")
         doc_name = _chunk_doc_name(chunk)
         if doc_name not in cache.doc_names:
             cache.doc_names.append(doc_name)
 
         heading = None
         for line in _split_lines(text):
+            line = _normalize_text(line)
             if line.endswith(":") and len(line) < 60:
                 heading = line.rstrip(":")
                 continue
