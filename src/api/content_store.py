@@ -6,10 +6,12 @@ from pathlib import Path
 from typing import Any, Dict
 
 from src.api.blob_store import BlobStore, BlobConfigurationError, blob_storage_configured
+from src.storage.blob_persistence import load_pickle as load_blob_pickle
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_DIR = "document-content"
+_BLOB_UNCONFIGURED_LOGGED = False
 
 
 def _sanitize_document_id(document_id: str) -> str:
@@ -44,6 +46,7 @@ def build_pickle_path(document_id: str) -> Path:
 
 
 def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any]:
+    global _BLOB_UNCONFIGURED_LOGGED
     if blob_storage_configured():
         try:
             store = BlobStore()
@@ -56,7 +59,9 @@ def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any
             logger.error("Failed to persist extracted pickle to blob: %s", exc)
             logger.warning("Falling back to local pickle storage for %s", document_id)
 
-    logger.warning("Blob storage not configured; falling back to local pickle storage.")
+    if not _BLOB_UNCONFIGURED_LOGGED:
+        logger.warning("Blob storage not configured; falling back to local pickle storage.")
+        _BLOB_UNCONFIGURED_LOGGED = True
     payload = pickle.dumps(extracted_obj, protocol=pickle.HIGHEST_PROTOCOL)
     path = build_pickle_path(document_id)
     tmp_path = path.with_suffix(".pkl.tmp")
@@ -76,9 +81,9 @@ def load_extracted_pickle(document_id: str) -> Any:
     if blob_storage_configured():
         store = BlobStore()
         blob_name = store.build_blob_name(document_id)
-        if not store.get_blob_info(blob_name):
+        payload = load_blob_pickle(blob_name)
+        if payload is None:
             raise ValueError(f"Extracted content not found for document_id={document_id}")
-        payload = store.download_blob(blob_name)
         return pickle.loads(payload)
 
     path = build_pickle_path(document_id)

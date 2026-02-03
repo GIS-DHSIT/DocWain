@@ -62,7 +62,7 @@ from src.execution.common import normalize_answer, chunk_text_stream
 from src.api.learning_signals import LearningSignalStore
 from src.screening.api import screening_router
 from src.screening.config import log_legacy_vetting_notice_if_missing
-from src.storage.azure_blob_client import validate_containers_once
+from src.storage.azure_blob_client import validate_containers_once, validate_storage_configured_once
 from botbuilder.schema import Activity
 from src.nlp.dialogue_intel import route_message
 from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
@@ -80,6 +80,8 @@ from src.training.qdrant_profile_discovery import discover_profile_ids_from_coll
 from src.runtime.request_context import RequestContext
 
 logger = logging.getLogger(__name__)
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -126,6 +128,10 @@ session_state_store = SessionStateStore()
 
 @app.on_event("startup")
 async def _startup_checks() -> None:
+    try:
+        validate_storage_configured_once()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Azure blob storage configuration check skipped: %s", exc)
     try:
         validate_containers_once()
     except Exception as exc:  # noqa: BLE001
