@@ -158,3 +158,8 @@ POST /api/profiles/{profile_id}/query
 2) Backfill `document_type` (run `/profiles/{profile_id}/documents/{document_id}/understand` or batch understand).
 3) Re-embed documents so Qdrant payloads include `profile_name`, `document_type`, and `chunk_kind`.
 4) Validate retrieval filters: ensure all profile queries include `subscription_id` + `profile_id` filters.
+
+### Running tests
+```bash
+pytest src/tests
+```
