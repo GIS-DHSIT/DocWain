@@ -9,6 +9,7 @@ from src.api.config import Config
 from src.api.dataHandler import encode_with_fallback
 from src.api.vector_store import build_collection_name
 from src.router.schema import DocumentFilters
+from src.utils.payload_utils import get_source_name
 
 
 def _build_filter(
@@ -22,20 +23,27 @@ def _build_filter(
         FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
         FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
     ]
+    should = []
     if filters.document_type_hints:
-        must.append(FieldCondition(key="document_type", match=MatchAny(any=filters.document_type_hints)))
+        values = filters.document_type_hints
+        should.append(FieldCondition(key="document.type", match=MatchAny(any=values)))
+        should.append(FieldCondition(key="document_type", match=MatchAny(any=values)))
+        should.append(FieldCondition(key="doc_type", match=MatchAny(any=values)))
     if filters.file_name_hints:
-        must.append(FieldCondition(key="file_name", match=MatchAny(any=filters.file_name_hints)))
+        values = filters.file_name_hints
+        should.append(FieldCondition(key="source.name", match=MatchAny(any=values)))
+        should.append(FieldCondition(key="file_name", match=MatchAny(any=values)))
+        should.append(FieldCondition(key="source_file", match=MatchAny(any=values)))
     if chunk_kind:
         must.append(FieldCondition(key="chunk_kind", match=MatchValue(value=chunk_kind)))
-    return Filter(must=must)
+    return Filter(must=must, should=should or None)
 
 
 def _map_hit(hit: Any) -> Dict[str, Any]:
     payload = hit.payload or {}
     return {
         "text": payload.get("text") or "",
-        "file_name": payload.get("file_name") or payload.get("filename") or payload.get("source_file"),
+        "file_name": get_source_name(payload) or payload.get("file_name"),
         "section_title": payload.get("section_title") or "",
         "page_start": payload.get("page_start"),
         "page_end": payload.get("page_end"),

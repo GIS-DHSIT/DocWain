@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue, Range
+from src.utils.payload_utils import get_document_type, get_source_name
 
 try:
     from rank_bm25 import BM25Okapi
@@ -238,6 +239,7 @@ class HybridRetriever:
             raise ValueError("profile_id is required for retrieval")
         profile_value = str(profile_id)
         conditions: List[FieldCondition] = []
+        should: List[FieldCondition] = []
         identity = self._resolve_profile_identity(collection_name, profile_value)
         if identity:
             profile_key, profile_values = identity
@@ -247,9 +249,13 @@ class HybridRetriever:
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
-            conditions.append(FieldCondition(key="source_file", match=MatchAny(any=[str(s) for s in source_files])))
+            values = [str(s) for s in source_files]
+            should.append(FieldCondition(key="source.name", match=MatchAny(any=values)))
+            should.append(FieldCondition(key="source_file", match=MatchAny(any=values)))
         if doc_types:
-            conditions.append(FieldCondition(key="doc_type", match=MatchAny(any=[str(d) for d in doc_types])))
+            values = [str(d) for d in doc_types]
+            should.append(FieldCondition(key="document.type", match=MatchAny(any=values)))
+            should.append(FieldCondition(key="doc_type", match=MatchAny(any=values)))
         if section_titles:
             conditions.append(FieldCondition(key="section_title", match=MatchAny(any=[str(s) for s in section_titles])))
         if page_numbers:
@@ -268,16 +274,15 @@ class HybridRetriever:
                 conditions.append(FieldCondition(key="ocr_confidence", range=Range(gte=min_conf)))
             except Exception:
                 pass
-        return Filter(must=conditions)
+        return Filter(must=conditions, should=should or None)
 
     def _metadata_boost(self, query: str, payload: Dict[str, Any], hints: Dict[str, Any]) -> Dict[str, float]:
         boosts: Dict[str, float] = {}
         lowered = (query or "").lower()
 
-        for field in ("doc_type", "document_type"):
-            value = payload.get(field)
-            if value and str(value).lower() in lowered:
-                boosts["doc_type"] = self.config.metadata_boost
+        value = get_document_type(payload)
+        if value and str(value).lower() in lowered:
+            boosts["doc_type"] = self.config.metadata_boost
 
         for field in ("section_title", "section", "heading"):
             value = payload.get(field)
@@ -296,7 +301,8 @@ class HybridRetriever:
 
         # Soft boosts for hinted docs/sections when no explicit filter applied
         for hint in hints.get("document_hints", []) or []:
-            if hint and hint.lower() in (payload.get("source_file") or "").lower():
+            source_name = get_source_name(payload) or ""
+            if hint and hint.lower() in source_name.lower():
                 boosts["document_hint"] = self.config.metadata_boost * 0.6
         return boosts
 
@@ -406,7 +412,7 @@ class HybridRetriever:
                     vector_score=float(vector_score),
                     lexical_score=float(lexical_score),
                     metadata=payload,
-                    source=payload.get("source_file") or payload.get("source"),
+                    source=get_source_name(payload) or payload.get("source"),
                     method="dense+lexical",
                     boosts=boosts,
                 )
@@ -488,7 +494,7 @@ class HybridRetriever:
                     vector_score=0.0,
                     lexical_score=float(lexical_score),
                     metadata=payload,
-                    source=payload.get("source_file") or payload.get("source"),
+                    source=get_source_name(payload) or payload.get("source"),
                     method="lexical_fallback",
                     boosts=boosts,
                 )

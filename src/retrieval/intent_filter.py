@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, List, Pattern, Tuple
 
+from src.utils.payload_utils import get_source_name
+
 
 _ATTRIBUTE_TERMS = {
     "education": [
@@ -225,7 +227,7 @@ def _chunk_text(chunk: object) -> str:
         meta = chunk.get("metadata") if meta is None else meta
     meta = meta or {}
     section = str(meta.get("section_title") or meta.get("section_path") or meta.get("section") or "")
-    source = str(meta.get("source_file") or meta.get("filename") or "")
+    source = str(get_source_name(meta) or "")
     return " ".join(part for part in (text or "", section, source) if part)
 
 

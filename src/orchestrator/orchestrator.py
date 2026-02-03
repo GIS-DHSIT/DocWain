@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from src.observability.metrics import metrics_store
+from src.utils.payload_utils import get_source_name
 from src.orchestrator.answer import generate_answer, generate_meta_response
 from src.orchestrator.citations import build_citations
 from src.orchestrator.grounding_guard import apply_grounding_guard
@@ -16,7 +17,7 @@ def _unique_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     unique: List[Dict[str, Any]] = []
     for chunk in chunks:
-        key = (chunk.get("file_name"), chunk.get("section_title"), chunk.get("page_start"), chunk.get("text"))
+        key = (get_source_name(chunk) or chunk.get("file_name"), chunk.get("section_title"), chunk.get("page_start"), chunk.get("text"))
         if key in seen:
             continue
         seen.add(key)
@@ -28,7 +29,7 @@ def _diversify_by_doc(chunks: List[Dict[str, Any]], max_per_doc: int) -> List[Di
     counts: Dict[str, int] = {}
     diversified: List[Dict[str, Any]] = []
     for chunk in chunks:
-        file_name = chunk.get("file_name") or "Unknown"
+        file_name = get_source_name(chunk) or chunk.get("file_name") or "Unknown"
         count = counts.get(file_name, 0)
         if count >= max_per_doc:
             continue

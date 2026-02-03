@@ -26,10 +26,11 @@ PAYLOAD_INDEX_FIELDS = [
     "profile_name",
     "profileId",
     "document_id",
-    "source_file",
+    "source.name",
     "page",
+    "section.id",
     "section_title",
-    "document_type",
+    "document.type",
     "chunk_kind",
     "chunk_id",
     "chunk_type",
@@ -160,10 +161,31 @@ class QdrantVectorStore:
             logger.warning("Could not fetch collection dim for %s: %s", collection_name, exc)
             return None
 
+    def _compute_point_id(self, payload: dict, fallback_chunk_id: str) -> uuid.UUID:
+        subscription_id = payload.get("subscription_id")
+        profile_id = payload.get("profile_id")
+        document_id = payload.get("document_id")
+        section_id = (payload.get("section") or {}).get("id") or payload.get("section_id")
+        chunk_index = (payload.get("chunk") or {}).get("index") or payload.get("chunk_index")
+        chunk_hash = (payload.get("chunk") or {}).get("hash") or payload.get("chunk_hash")
+        if all([subscription_id, profile_id, document_id, section_id, chunk_index is not None, chunk_hash]):
+            base = "|".join(
+                [
+                    str(subscription_id),
+                    str(profile_id),
+                    str(document_id),
+                    str(section_id),
+                    str(chunk_index),
+                    str(chunk_hash),
+                ]
+            )
+            return uuid.uuid5(uuid.NAMESPACE_URL, base)
+        return uuid.uuid5(uuid.NAMESPACE_URL, fallback_chunk_id)
+
     def upsert_records(
         self, collection_name: str, records: Iterable[ChunkRecord], batch_size: int = 100
     ) -> int:
-        """Idempotent upsert using deterministic chunk ids."""
+        """Idempotent upsert using deterministic point ids."""
         expected_dim = self._get_collection_dim(collection_name)
         all_points: List[PointStruct] = []
         for record in records:
@@ -183,13 +205,16 @@ class QdrantVectorStore:
             if sparse_vec is not None:
                 vector_payload["keywords_vector"] = sparse_vec
 
-            # Qdrant accepts UUID or integer IDs; derive a deterministic UUID from chunk_id
-            point_id = uuid.uuid5(uuid.NAMESPACE_URL, record.chunk_id)
+            # Qdrant accepts UUID or integer IDs; derive deterministic UUID from payload fields
+            point_id = self._compute_point_id(record.payload or {}, record.chunk_id)
             all_points.append(PointStruct(id=point_id, vector=vector_payload, payload=record.payload))
 
         for i in range(0, len(all_points), batch_size):
             batch = all_points[i : i + batch_size]
-            self.client.upsert(collection_name=collection_name, points=batch, wait=True)
+            result = self.client.upsert(collection_name=collection_name, points=batch, wait=True)
+            status = getattr(result, "status", None)
+            if status and status not in {"completed", "acknowledged"}:
+                raise ValueError(f"Qdrant upsert failed with status={status}")
         return len(all_points)
 
     def delete_document(self, subscription_id: str, profile_id: str, document_id: str) -> dict:
