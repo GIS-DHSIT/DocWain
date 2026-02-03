@@ -39,6 +39,29 @@ curl -X POST http://localhost:8000/api/documents/embed \\
   -d '{\"max_blobs\": 5}'
 ```
 
+## Embedding Pipeline Notes
+
+### Canonical Qdrant payload schema
+- Identifiers: `subscription_id`, `profile_id`, `document_id`.
+- Source: `source.name`, `source.uri`.
+- Document: `document.type`.
+- Chunk: `chunk.id`, `chunk.index`, `chunk.count`, `chunk.type`, `chunk.role`, `chunk.hash`, `chunk.size.chars`, `chunk.links.prev`, `chunk.links.next`, `chunk.sentence_complete`.
+- Section: `section.id`, `section.title`, `section.path[]`.
+- Provenance: `provenance.page_start`, `provenance.page_end`, `provenance.section_title`.
+- Text: `text` (clean for retrieval), plus `text_data.clean`/`text_data.raw` when available.
+
+### Chunking parameters
+- Target tokens: 250–450 per chunk, hard max 520.
+- Minimum chars: 300 (except headers/captions).
+- Overlap: 60 tokens (only within the same section, trailing tail of previous chunk).
+
+### Dedupe gate thresholds
+- Simhash64 similarity threshold: ≥0.92 for near-duplicate detection.
+- Overlap ratio cap: overlap tokens / chunk tokens ≤0.20.
+
+### Tests
+- `pytest tests/test_embedding_pipeline_fix.py`
+
 ### Fine-tuning with Unsloth (LLama 3.2) from a Qdrant collection
 
 1) Install deps: `pip install -r requirements.txt` (includes `unsloth`, `trl`, `datasets`, `transformers`, `bitsandbytes`).

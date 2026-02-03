@@ -37,6 +37,7 @@ from src.chat.companion_classifier import CompanionClassifier
 from src.chat.opener_generator import contains_banned_opener, generate_opener
 from src.kg.neo4j_store import Neo4jStore
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
+from src.utils.payload_utils import get_source_name
 from src.agentic.retriever_manager import RetrieverManager
 from src.agentic.verification_agent import VerificationAgent
 from src.services.retrieval import (
@@ -1339,11 +1340,14 @@ class QdrantRetriever:
         conditions = [
             FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
         ]
+        should = []
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
-            conditions.append(FieldCondition(key="source_file", match=MatchAny(any=[str(s) for s in source_files])))
-        return Filter(must=conditions)
+            values = [str(s) for s in source_files]
+            should.append(FieldCondition(key="source.name", match=MatchAny(any=values)))
+            should.append(FieldCondition(key="source_file", match=MatchAny(any=values)))
+        return Filter(must=conditions, should=should or None)
 
     def _build_sparse_query(self, query: str) -> SparseVector:
         matrix = self._hash_vectorizer.transform([query])
@@ -1361,7 +1365,7 @@ class QdrantRetriever:
 
         for pt in points:
             payload = pt.payload or {}
-            source = payload.get("source_file") or payload.get("source") or ""
+            source = get_source_name(payload) or payload.get("source") or ""
             chunks.append(
                 RetrievedChunk(
                     id=str(pt.id),
@@ -1518,7 +1522,7 @@ class QdrantRetriever:
             text = payload.get("text", "")
             snippet = text[:120].replace("\n", " ")
             logger.debug("Hit score=%.4f snippet=%s", pt.score, snippet)
-            source = payload.get("source_file") or payload.get("source") or "unknown"
+            source = get_source_name(payload) or payload.get("source") or "unknown"
             chunk = RetrievedChunk(
                 id=str(pt.id),
                 text=text,
@@ -1696,7 +1700,7 @@ class QdrantRetriever:
                         seen.add(neighbor_key)
                     neighbor_score = max(float(chunk.score) - 0.05, 0.0)
                     neighbor_source = (
-                        payload.get("source_file")
+                        get_source_name(payload)
                         or payload.get("source")
                         or chunk.source
                         or "unknown"
@@ -1778,8 +1782,12 @@ class QdrantRetriever:
             if text:
                 token_counts.update(self.preprocessor.tokenize(text))
 
-            for hint_key in ("source_file", "document_id", "section"):
-                hint_val = payload.get(hint_key)
+            hint_values = [
+                get_source_name(payload),
+                payload.get("document_id"),
+                payload.get("section"),
+            ]
+            for hint_val in hint_values:
                 if hint_val:
                     hint_val = str(hint_val)
                     if hint_val not in seen_hints:
@@ -1906,7 +1914,7 @@ class ContextBuilder:
         lines = []
         for i, chunk in enumerate(chunks[:5], 1):
             meta = chunk.metadata or {}
-            source_name = chunk.source or meta.get('source_file', f"doc_{chunk.id[:8]}")
+            source_name = chunk.source or get_source_name(meta) or f"doc_{chunk.id[:8]}"
             page = meta.get('page')
             section = meta.get('section')
             score = round(float(chunk.score), 3)
@@ -1939,8 +1947,8 @@ class ContextBuilder:
         if source_map:
             context_parts.append(source_map)
         for i, chunk in enumerate(selected_chunks, 1):
-            # Use source_file directly from metadata as fallback
-            source_name = chunk.source or chunk.metadata.get('source_file', f"doc_{chunk.id[:8]}")
+            # Use source_name directly from metadata as fallback
+            source_name = chunk.source or get_source_name(chunk.metadata or {}) or f"doc_{chunk.id[:8]}"
             context_parts.append(
                 f"[SOURCE: {source_name}]\n{chunk.text}\n[/SOURCE]"
             )
@@ -2489,7 +2497,7 @@ class EnterpriseRAGSystem:
             for pt in results.points:
                 payload = pt.payload or {}
                 text = payload.get("text", "").lower()
-                source = payload.get("source_file", "").lower()
+                source = (get_source_name(payload) or "").lower()
 
                 for part in person_name.lower().split():
                     if part in text or part in source:

@@ -36,8 +36,9 @@ from src.api.dw_document_extractor import DocumentExtractor
 from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
+from src.embedding.pipeline.embed_pipeline import prepare_embedding_chunks, normalize_chunk_chain
+from src.embedding.pipeline.payload_normalizer import normalize_payload
 from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
-from src.metadata.normalizer import MetadataNormalizationError, normalize_payload_metadata
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 from azure.core.exceptions import ResourceNotFoundError
@@ -1338,7 +1339,13 @@ def save_embeddings_to_qdrant(
         if not texts:
             raise ValueError(f"No texts found for document {doctag}")
 
-        max_len = min(len(texts), len(normalized_vectors))
+        if len(texts) != len(normalized_vectors):
+            raise ValueError(
+                f"Embeddings/text length mismatch for document {doctag}: "
+                f"texts={len(texts)} embeddings={len(normalized_vectors)}"
+            )
+
+        max_len = len(texts)
         if max_len == 0:
             raise ValueError(f"No valid vectors for document {doctag}")
 
@@ -1413,10 +1420,10 @@ def save_embeddings_to_qdrant(
                 "profile_id": str(profile_id),
                 "profile_name": profile_name,
                 "text": text,
+                "text_raw": chunk_meta.get("text_raw"),
                 "document_id": str(doctag),
-                "source_file": source_filename,
-                "filename": filename,
-                "file_name": filename,
+                "source_name": filename or source_filename,
+                "source_uri": doc_metadata.get("source_uri"),
                 "chunk_index": idx,
                 "chunk_count": max_len,
                 "page": page_val,
@@ -1426,7 +1433,6 @@ def save_embeddings_to_qdrant(
                 "section_path": section_path,
                 "summary": summary_val,
                 "doc_type": chunk_meta.get("doc_type") or doc_type or doc_metadata.get("doc_type"),
-                "document_type": chunk_meta.get("document_type") or document_type,
                 "languages": chunk_meta.get("languages") or languages,
                 "products_name": chunk_meta.get("products_name") or products_name,
                 "description": chunk_meta.get("description") or description,
@@ -1443,11 +1449,7 @@ def save_embeddings_to_qdrant(
                 "evidence_pointer": evidence_pointer,
             }
 
-            try:
-                payload = normalize_payload_metadata(payload, strict=True)
-            except MetadataNormalizationError as exc:
-                logging.error("Metadata normalization failed for chunk %s: %s", idx, exc)
-                raise
+            payload = normalize_payload(payload)
 
             records.append(
                 ChunkRecord(
@@ -1560,7 +1562,7 @@ def save_embeddings_to_qdrant(
 
 # Replace your existing train_on_document function with this:
 
-from src.api.enhanced_retrieval import chunk_text_for_embedding, normalize_chunk_links
+from src.api.enhanced_retrieval import chunk_text_for_embedding
 
 
 def _safe_basename(value: Optional[str]) -> str:
@@ -1919,9 +1921,18 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 if "sentence_complete" not in meta:
                     meta["sentence_complete"] = str(texts[idx]).strip().endswith((".", "?", "!"))
 
-            texts, chunk_metadata, dropped_chunks = _apply_chunk_quality_filter(texts, chunk_metadata)
+            texts, chunk_metadata, prep_stats = prepare_embedding_chunks(
+                texts,
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                doc_name=doc_name,
+                quality_filter=_apply_chunk_quality_filter,
+            )
+            dropped_chunks = prep_stats.dropped_quality + prep_stats.dropped_dedupe
             if not texts:
-                raise ValueError(f"Chunk quality filter removed all chunks for document {doc_tag}")
+                raise ValueError(f"Chunk preparation removed all chunks for document {doc_tag}")
 
             chunk_lengths = [len(t) for t in texts]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
@@ -1931,6 +1942,19 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 chunk_lengths=chunk_lengths,
                 sentence_complete_flags=sentence_flags,
             )
+
+            if isinstance(text.get("embeddings"), (list, tuple)) and len(text.get("embeddings") or []) != len(texts):
+                logging.info(
+                    "Re-embedding structured chunks after integrity/dedupe: %s -> %s",
+                    len(text.get("embeddings") or []),
+                    len(texts),
+                )
+                text["embeddings"] = encode_with_fallback(
+                    texts,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                text["sparse_vectors"] = build_sparse_vectors(texts)
 
             text["texts"] = texts
             text["chunk_metadata"] = chunk_metadata
@@ -2033,9 +2057,18 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             for meta in chunk_metadata:
                 meta.setdefault("chunk_kind", "section_text")
 
-            chunks, chunk_metadata, dropped_chunks = _apply_chunk_quality_filter(chunks, chunk_metadata)
+            chunks, chunk_metadata, prep_stats = prepare_embedding_chunks(
+                chunks,
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                doc_name=doc_name,
+                quality_filter=_apply_chunk_quality_filter,
+            )
+            dropped_chunks = prep_stats.dropped_quality + prep_stats.dropped_dedupe
             if not chunks:
-                raise ValueError(f"Chunk quality filter removed all chunks for {doc_name}")
+                raise ValueError(f"Chunk preparation removed all chunks for {doc_name}")
 
             chunk_lengths = [len(chunk) for chunk in chunks]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
@@ -2189,33 +2222,6 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                         }
                     )
 
-            chunk_metadata = normalize_chunk_links(
-                chunk_metadata,
-                subscription_id=subscription_id,
-                profile_id=profile_id,
-                document_id=doc_tag,
-                doc_name=doc_name,
-                chunks=chunks,
-            )
-            for idx, meta in enumerate(chunk_metadata):
-                section_path = meta.get("section_path") or meta.get("section_title") or "Untitled Section"
-                meta["section_path"] = section_path
-                meta["section_id"] = meta.get("section_id") or hashlib.sha1(
-                    f"{doc_tag}|{section_path}".encode("utf-8")
-                ).hexdigest()[:12]
-                meta["chunk_type"] = meta.get("chunk_type", "text")
-                meta["chunk_kind"] = meta.get("chunk_kind", "section_text")
-                page_start = meta.get("page_start", meta.get("page_number"))
-                page_end = meta.get("page_end", page_start)
-                meta["page_start"] = page_start
-                meta["page_end"] = page_end
-                meta["page_number"] = page_start
-                meta["chunk_char_len"] = meta.get("chunk_char_len") or len(chunks[idx])
-                meta["chunk_hash"] = meta.get("chunk_hash") or hashlib.sha256(
-                    chunks[idx].encode("utf-8")
-                ).hexdigest()
-                meta["sentence_complete"] = bool(meta.get("sentence_complete", chunks[idx].strip().endswith((".", "?", "!"))))
-
             if extra_chunks:
                 extra_chunks, extra_meta, dropped_extra = _apply_chunk_quality_filter(extra_chunks, extra_meta)
                 for idx, meta in enumerate(extra_meta):
@@ -2231,6 +2237,23 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 )
                 embeddings_array = list(embeddings_array) + list(extra_embeddings)
                 summaries.extend([None for _ in extra_chunks])
+
+            for meta in chunk_metadata:
+                section_title = (meta.get("section_title") or "Untitled Section").strip() or "Untitled Section"
+                section_path = (meta.get("section_path") or section_title).strip() or section_title
+                meta["section_title"] = section_title
+                meta["section_path"] = section_path
+                meta["section_id"] = meta.get("section_id") or hashlib.sha1(
+                    f"{doc_tag}|{section_path}".encode("utf-8")
+                ).hexdigest()[:12]
+
+            chunk_metadata = normalize_chunk_chain(
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                chunks=chunks,
+            )
 
             embeddings_payload = {
                 "embeddings": embeddings_array,
@@ -2288,6 +2311,19 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             if not chunks:
                 raise ValueError(f"No valid chunks in {doc_name}")
 
+            chunks, chunk_metadata, prep_stats = prepare_embedding_chunks(
+                chunks,
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                doc_name=doc_name,
+                quality_filter=_apply_chunk_quality_filter,
+            )
+            dropped_chunks = prep_stats.dropped_quality + prep_stats.dropped_dedupe
+            if not chunks:
+                raise ValueError(f"Chunk preparation removed all chunks for {doc_name}")
+
             chunk_lengths = [len(chunk) for chunk in chunks]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
             _record_chunking_metrics(
@@ -2295,20 +2331,6 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 doc_tag=doc_tag,
                 chunk_lengths=chunk_lengths,
                 sentence_complete_flags=sentence_flags,
-            )
-
-            chunks, chunk_metadata, dropped_chunks = _apply_chunk_quality_filter(chunks, chunk_metadata)
-            if not chunks:
-                raise ValueError(f"Chunk quality filter removed all chunks for {doc_name}")
-
-            # Normalize chunk linkage and ids to avoid mismatched prev/next references
-            chunk_metadata = normalize_chunk_links(
-                chunk_metadata,
-                subscription_id=subscription_id,
-                profile_id=profile_id,
-                document_id=doc_tag,
-                doc_name=doc_name,
-                chunks=chunks
             )
 
             fact_chunks: List[str] = []
@@ -2341,6 +2363,14 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 dropped_chunks += dropped_facts
                 chunks.extend(fact_chunks)
                 chunk_metadata.extend(fact_meta)
+
+            chunk_metadata = normalize_chunk_chain(
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                chunks=chunks,
+            )
 
             # Generate embeddings
             logging.info(f"Generating embeddings for {len(chunks)} chunks")
@@ -2395,7 +2425,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     chunks[idx].encode("utf-8")
                 ).hexdigest()
                 meta["sentence_complete"] = bool(meta.get("sentence_complete", chunks[idx].strip().endswith((".", "?", "!"))))
-                # chunk_id/prev/next already normalized by normalize_chunk_links
+                # chunk_id/prev/next already normalized by normalize_chunk_chain
 
             # Prepare embeddings dict with metadata
             embeddings = {

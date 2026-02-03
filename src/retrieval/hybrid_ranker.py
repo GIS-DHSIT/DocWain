@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .evidence_constraints import EvidenceConstraints, EvidenceRequirements
+from src.utils.payload_utils import get_source_name
 
 
 @dataclass
@@ -83,7 +84,7 @@ class HybridRanker:
     def _metadata_boost(self, meta: Dict[str, Any], query: str, intent_type: str) -> float:
         score = 0.0
         section = str(meta.get("section_title") or meta.get("section_path") or meta.get("section") or "").lower()
-        source = str(meta.get("source_file") or meta.get("filename") or "").lower()
+        source = str(get_source_name(meta) or "").lower()
         query_lower = (query or "").lower()
         chunk_kind = str(meta.get("chunk_kind") or "").lower()
         importance = meta.get("section_importance_score") or meta.get("element_importance_score")
