@@ -8,7 +8,7 @@ import concurrent.futures
 import random
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections import deque, Counter
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -78,12 +78,61 @@ from src.rag.grounding import enforce_grounding, filter_chunks_by_query_entity
 from src.rag.citations import build_citations, filter_inline_citations, replace_citations_line
 from src.rag.context_reasoning import (
     AnswerRenderer,
+    AnswerRenderResult,
     ContextAwareQueryAnalyzer,
     EvidencePlanBuilder,
     EvidenceQualityScorer,
     WorkingContextAssembler,
 )
+from src.rag.doc_inventory import DocInventoryItem, fetch_doc_inventory
+from src.rag.intent_scope_orchestrator import retrieve_per_doc
+from src.rag.intent_profile_entity_orchestrator import orchestrate_intent_profile_entity
+from src.rag.cache_guard_v2 import CacheGuardV2, compute_retrieval_signature
+from src.rag.answer_orchestrator_v3 import (
+    build_clarification_response,
+    build_state as build_orchestration_state_v3,
+    dominant_doc_for_lookup,
+    enforce_single_doc_filter,
+    remove_junk_sections,
+)
+from src.rag.citation_policy import apply as apply_citation_policy
+from src.rag.formatting_rules import apply as apply_formatting_rules
+from src.rag.format_enforcer import enforce_response_formatting
+from src.rag.table_renderer import render_markdown_table
+from src.rag.candidate_profile_extractor import CandidateProfile, extract_candidate_profile
+from src.rag.ranking_engine import rank_candidates
+from src.rag.intent_classifier import (
+    INTENT_COMPARE,
+    INTENT_PRODUCTS_SERVICES,
+    INTENT_SUMMARIZE,
+    INTENT_TOTALS,
+    classify_intent,
+    has_multi_doc_cues,
+)
+from src.rag.query_cache import (
+    QueryContextFingerprintCache,
+    compute_retrieval_fingerprint,
+    is_query_answer_consistent,
+    normalize_query,
+)
+from src.rag.grounding_guard import verify_grounding
+from src.rag.response_formatter import (
+    format_conservative_response,
+    format_structured_response,
+    format_candidate_profile_response,
+    format_multi_candidate_response,
+)
+from src.rag.output_formatter_resume import ResumeProfileView, format_resume_response
 from src.response.formatter import format_response_text
+from src.tools.resume_analyzer_v2 import analyze_resume_chunks
+from src.tools.resume_router import (
+    has_resume_docs,
+    is_multi_profile_request,
+    match_resume_docs_by_name,
+    should_bypass_clarification,
+    should_route_resume_analyzer,
+    select_resume_docs,
+)
 
 try:
     import torch
@@ -4504,11 +4553,6 @@ class EnterpriseRAGSystem:
         if analysis.scope == "multi_doc" or analysis.intent == "compare":
             return [doc_id for doc_id, _ in ranked[:max_docs]]
 
-        if last_active_document:
-            last_doc_id = last_active_document.get("doc_id")
-            if last_doc_id and last_doc_id in doc_scores:
-                return [last_doc_id]
-
         if analysis.target_hint:
             hints = [self._normalize_name(h) for h in analysis.target_hint]
             candidates = []
@@ -4518,6 +4562,12 @@ class EnterpriseRAGSystem:
                     candidates.append((doc_id, score))
             if candidates:
                 return [candidates[0][0]]
+            if last_active_document:
+                last_doc_name = self._normalize_name(last_active_document.get("doc_name") or "")
+                last_doc_id = last_active_document.get("doc_id")
+                if last_doc_name and any(hint and hint in last_doc_name for hint in hints):
+                    if last_doc_id and last_doc_id in doc_scores:
+                        return [last_doc_id]
 
         return [ranked[0][0]]
 
@@ -4815,6 +4865,115 @@ class EnterpriseRAGSystem:
             "selected_doc_ids": selected_doc_ids,
         }
 
+    def _retrieve_multi_doc_with_plan(
+            self,
+            *,
+            query: str,
+            user_id: str,
+            profile_id: str,
+            subscription_id: str,
+            collection_name: str,
+            namespace: str,
+            decision: "IntentScopeDecision",
+            doc_inventory: List["DocInventoryItem"],
+    ) -> Dict[str, Any]:
+        processed_query, preprocessing_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=False)
+        attempts: List[Dict[str, Any]] = []
+        profile_context = self.retriever.get_profile_context(collection_name, profile_id)
+        profile_context_data = {
+            "keywords": profile_context.top_keywords[:12],
+            "hints": profile_context.document_hints[:6],
+            "sampled_chunks": profile_context.total_chunks,
+        }
+
+        if isinstance(decision.target_docs, list) and decision.target_docs:
+            selected_docs = list(decision.target_docs)
+        else:
+            selected_docs = list(doc_inventory)
+
+        max_docs = max(1, int(decision.retrieval_plan.max_docs))
+        if len(selected_docs) > max_docs:
+            selected_docs = selected_docs[:max_docs]
+            preprocessing_metadata["doc_limit_applied"] = True
+
+        per_doc_top_k = max(5, int(decision.retrieval_plan.per_doc_top_k))
+
+        def _retrieve(doc: "DocInventoryItem", top_k: int) -> List[RetrievedChunk]:
+            doc_id = doc.doc_id or None
+            source_file = doc.source_file or None
+            chunks = self.retriever.hybrid_retrieve(
+                collection_name=collection_name,
+                query=processed_query,
+                profile_id=profile_id,
+                subscription_id=subscription_id,
+                top_k=top_k,
+                document_ids=[doc_id] if doc_id else None,
+                source_files=[source_file] if source_file else None,
+            )
+            attempts.append(
+                {
+                    "label": "per_doc_hybrid",
+                    "query": processed_query,
+                    "hits": len(chunks),
+                    "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
+                    "document_filter": doc_id or source_file,
+                }
+            )
+            return chunks
+
+        def _fallback(doc: "DocInventoryItem", remaining: int) -> List[RetrievedChunk]:
+            if not doc.doc_id or remaining <= 0:
+                return []
+            return self.retriever.collect_document_chunks(
+                collection_name=collection_name,
+                profile_id=profile_id,
+                subscription_id=subscription_id,
+                document_ids=[doc.doc_id],
+                max_chunks=remaining,
+            )
+
+        all_chunks, chunks_by_doc, docs_used = retrieve_per_doc(
+            doc_inventory=selected_docs,
+            retrieve_fn=_retrieve,
+            per_doc_top_k=per_doc_top_k,
+            min_chunks_per_doc=5,
+            fallback_fn=_fallback,
+            max_docs=max_docs,
+        )
+
+        if decision.retrieval_plan.adjacent_expand and all_chunks:
+            expanded_chunks = self.retriever.expand_with_neighbors(
+                collection_name=collection_name,
+                seed_chunks=all_chunks,
+                profile_id=profile_id,
+                window=1,
+                max_new=10,
+            )
+            all_chunks = _merge_retrieved_chunks(all_chunks, expanded_chunks)
+
+        if decision.scope == "multi_doc" and len(docs_used) < 2 and len(doc_inventory) > 1:
+            remaining_docs = [doc for doc in doc_inventory if (doc.source_file or doc.doc_id) not in docs_used]
+            broadened: List[RetrievedChunk] = []
+            for doc in remaining_docs[:3]:
+                broadened.extend(_fallback(doc, 3))
+            if broadened:
+                all_chunks = _merge_retrieved_chunks(all_chunks, broadened)
+                preprocessing_metadata["broadened_multi_doc"] = True
+
+        selected_doc_ids = [doc.doc_id for doc in selected_docs if doc.doc_id]
+        return {
+            "query": processed_query,
+            "metadata": preprocessing_metadata,
+            "chunks": all_chunks,
+            "retrieved_chunks": all_chunks,
+            "reranked_chunks": all_chunks,
+            "attempts": attempts,
+            "selected_strategy": "per_doc_hybrid",
+            "profile_context": profile_context_data,
+            "selected_doc_ids": selected_doc_ids,
+            "chunks_by_doc": chunks_by_doc,
+        }
+
 
     def _warm_up_llm(self):
         """Warm LLM backend so first user calls do not fail cold."""
@@ -4851,6 +5010,7 @@ class EnterpriseRAGSystem:
         metrics_store = get_metrics_store()
         tool_list = tools or []
         use_tooling = bool(use_tools or tool_list)
+        use_intel_layer = True
         global _FIRST_METRICS_REQUEST
         is_cold_start = False
         if _FIRST_METRICS_REQUEST:
@@ -4949,15 +5109,189 @@ class EnterpriseRAGSystem:
                 subscription_id=subscription_id,
             )
 
+            doc_inventory = fetch_doc_inventory(
+                qdrant_client=self.client,
+                collection_name=collection_name,
+                profile_id=profile_id,
+                subscription_id=subscription_id,
+                redis_client=self.redis_client,
+                cache_ttl_seconds=900,
+            )
+            if not doc_inventory and available_sources:
+                doc_inventory = [
+                    DocInventoryItem(doc_id="", source_file=source, document_name=source, doc_type="")
+                    for source in available_sources
+                    if source
+                ]
+
+            intel_scope = None
+            intel_domain_hint = None
+            intel_known_docs = []
+            try:
+                from src.docwain_intel.doc_type_inferer import infer_doc_domain_from_prompt, infer_doc_type
+                from src.docwain_intel.scope_resolver import DocMeta, resolve_scope
+
+                for doc in doc_inventory:
+                    hint_text = " ".join(
+                        token for token in [doc.doc_type, doc.document_name, doc.source_file] if token
+                    )
+                    inferred = infer_doc_type(hint_text)
+                    intel_known_docs.append(
+                        DocMeta(
+                            doc_id=doc.doc_id or "",
+                            filename=doc.source_file or "",
+                            title=doc.document_name or "",
+                            doc_domain=inferred.get("doc_domain", "general"),
+                            doc_kind=inferred.get("doc_kind", "general_doc"),
+                        )
+                    )
+
+                intel_scope = resolve_scope(query, intel_known_docs)
+                intel_domain_hint = infer_doc_domain_from_prompt(query)
+
+                filtered = doc_inventory
+                if intel_scope and intel_scope.matched_docs:
+                    match_ids = {
+                        doc.doc_id or doc.filename or doc.title
+                        for doc in intel_scope.matched_docs
+                    }
+                    filtered = [
+                        doc
+                        for doc in doc_inventory
+                        if (doc.doc_id in match_ids)
+                        or (doc.source_file in match_ids)
+                        or (doc.document_name in match_ids)
+                    ]
+                if intel_domain_hint and intel_domain_hint != "general" and intel_known_docs:
+                    allowed = {
+                        doc.doc_id or doc.filename or doc.title
+                        for doc in intel_known_docs
+                        if doc.doc_domain == intel_domain_hint
+                    }
+                    domain_filtered = [
+                        doc
+                        for doc in filtered
+                        if (doc.doc_id in allowed)
+                        or (doc.source_file in allowed)
+                        or (doc.document_name in allowed)
+                    ]
+                    if domain_filtered:
+                        filtered = domain_filtered
+                if filtered:
+                    doc_inventory = filtered
+            except Exception as intel_exc:  # noqa: BLE001
+                logger.debug("Intel scope resolution skipped: %s", intel_exc)
+
+            orchestration_v3 = build_orchestration_state_v3(
+                qdrant_client=self.client,
+                collection_name=collection_name,
+                profile_id=profile_id,
+                subscription_id=subscription_id,
+                redis_client=self.redis_client,
+                doc_inventory=doc_inventory,
+                query_text=query,
+            )
+
             analysis = self.query_analyzer.analyze(
                 query=query,
                 conversation_history=conversation_context,
                 available_sources=available_sources,
                 last_active_document=last_active_document,
             )
+
+            resume_clarification_bypass = should_bypass_clarification(query, doc_inventory)
+            if orchestration_v3.intent.is_vague and not resume_clarification_bypass and not use_intel_layer:
+                clarification_text = build_clarification_response(query, orchestration_v3.digest, orchestration_v3.intent)
+                clarification_text = apply_formatting_rules(clarification_text)
+                clarification_text = apply_citation_policy(
+                    clarification_text,
+                    [],
+                    scope_type=orchestration_v3.scope.scope_type,
+                )
+                clarification_text = format_response_text(clarification_text)
+                self.conversation_history.add_turn(namespace, user_id, query, clarification_text)
+                return {
+                    "response": clarification_text,
+                    "sources": [],
+                    "user_id": user_id,
+                    "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
+                    "context_found": False,
+                    "query_type": "clarification",
+                    "grounded": True,
+                }
+
+            session_context = {
+                "conversation_context": conversation_context,
+                "recent_doc_ids": self.conversation_history.get_recent_doc_ids(namespace, user_id),
+                "last_active_document": last_active_document,
+            }
+            orchestration = orchestrate_intent_profile_entity(
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                session_id=session_id,
+                query_text=query,
+                session_context=session_context,
+                doc_inventory=doc_inventory,
+                model_id=self.model_name,
+            )
+            decision = orchestration.decision
+            scope_v3 = orchestration_v3.scope
+            if scope_v3.scope_type != decision.scope or (
+                isinstance(decision.target_docs, list) and scope_v3.target_docs and decision.target_docs != scope_v3.target_docs
+            ):
+                decision = replace(decision, scope=scope_v3.scope_type, target_docs=scope_v3.target_docs)
+                orchestration = replace(
+                    orchestration,
+                    intent_type=orchestration_v3.intent.intent_type,
+                    scope=scope_v3.scope_type,
+                    target_docs=scope_v3.target_docs,
+                    decision=decision,
+                )
+            if should_route_resume_analyzer(query_text=query, chunks=[], doc_inventory=doc_inventory):
+                matched_docs = match_resume_docs_by_name(query, doc_inventory)
+                if matched_docs:
+                    decision = replace(decision, scope="single_doc", target_docs=matched_docs[:1])
+                    orchestration = replace(
+                        orchestration,
+                        scope="single_doc",
+                        target_docs=matched_docs[:1],
+                        decision=decision,
+                    )
+            if is_multi_profile_request(query) and has_resume_docs(doc_inventory):
+                resume_docs = select_resume_docs(doc_inventory=doc_inventory, chunks_by_doc=None)
+                if resume_docs:
+                    decision = replace(decision, scope="multi_doc", target_docs=resume_docs)
+                    orchestration = replace(
+                        orchestration,
+                        scope="multi_doc",
+                        target_docs=resume_docs,
+                        decision=decision,
+                    )
+            table_requested = orchestration.output_requirements.wants_table or (
+                orchestration_v3.intent.intent_type == "request_table"
+            )
+
+            if decision.scope in {"multi_doc", "targeted_docs"}:
+                analysis.scope = "multi_doc"
+                analysis.target_hint = []
+                analysis.assumptions = []
+                analysis.clarification_needed = False
+                analysis.clarification_question = None
+            elif isinstance(decision.target_docs, list) and decision.target_docs:
+                analysis.scope = "single_doc_default"
+                analysis.target_hint = [
+                    doc.source_file or doc.document_name for doc in decision.target_docs if (doc.source_file or doc.document_name)
+                ]
+                if decision.assumption_line:
+                    analysis.assumptions = [decision.assumption_line]
+                analysis.clarification_needed = False
+                analysis.clarification_question = None
+
             plan = self.evidence_plan_builder.build(analysis, query)
 
-            if analysis.clarification_needed:
+            if analysis.clarification_needed and not use_intel_layer:
                 clarification_text = analysis.clarification_question or "Which document should I use?"
                 clarification_text = format_response_text(clarification_text)
                 self.conversation_history.add_turn(namespace, user_id, query, clarification_text)
@@ -4973,18 +5307,72 @@ class EnterpriseRAGSystem:
                     "grounded": True,
                 }
 
+            if analysis.clarification_needed:
+                analysis.clarification_needed = False
+                analysis.clarification_question = None
+
+            if decision.intent in {"candidate_profile_extract", "multi_candidate_extract", "ranking"}:
+                plan.retrieval_mode = "coverage"
+                plan.adjacent_expand = True
+                plan.rerank_policy = "order_only"
+                plan.max_chunks = max(plan.max_chunks, decision.retrieval_plan.per_doc_top_k)
+                plan.min_chunks = max(plan.min_chunks, 8)
+
             retrieval_start = time.time()
-            retrieval_plan = self._retrieve_with_plan(
-                query=query,
-                user_id=user_id,
-                profile_id=profile_id,
-                subscription_id=subscription_id,
-                collection_name=collection_name,
-                namespace=namespace,
-                analysis=analysis,
-                plan=plan,
-                last_active_document=last_active_document,
-            )
+            forced_last_active_document = last_active_document
+            if decision.scope == "single_doc" and isinstance(decision.target_docs, list) and decision.target_docs:
+                target_doc = decision.target_docs[0]
+                forced_last_active_document = {
+                    "doc_id": target_doc.doc_id,
+                    "doc_name": target_doc.source_file or target_doc.document_name,
+                }
+                analysis.scope = "single_doc_default"
+                analysis.target_hint = [
+                    target_doc.source_file or target_doc.document_name
+                ]
+                plan.adjacent_expand = True
+            if decision.scope in {"multi_doc", "targeted_docs"}:
+                retrieval_plan = self._retrieve_multi_doc_with_plan(
+                    query=query,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    subscription_id=subscription_id,
+                    collection_name=collection_name,
+                    namespace=namespace,
+                    decision=decision,
+                    doc_inventory=doc_inventory,
+                )
+            else:
+                retrieval_plan = self._retrieve_with_plan(
+                    query=query,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    subscription_id=subscription_id,
+                    collection_name=collection_name,
+                    namespace=namespace,
+                    analysis=analysis,
+                    plan=plan,
+                    last_active_document=forced_last_active_document,
+                )
+
+            if decision.scope == "multi_doc" and len(doc_inventory) > 1:
+                chunks_by_doc = retrieval_plan.get("chunks_by_doc") or {}
+                if len(chunks_by_doc) < 2 and not retrieval_plan.get("metadata", {}).get("broadened_retry"):
+                    boosted_top_k = min(decision.retrieval_plan.per_doc_top_k + 6, 30)
+                    if boosted_top_k > decision.retrieval_plan.per_doc_top_k:
+                        boosted_plan = replace(decision.retrieval_plan, per_doc_top_k=boosted_top_k)
+                        decision = replace(decision, retrieval_plan=boosted_plan)
+                        retrieval_plan = self._retrieve_multi_doc_with_plan(
+                            query=query,
+                            user_id=user_id,
+                            profile_id=profile_id,
+                            subscription_id=subscription_id,
+                            collection_name=collection_name,
+                            namespace=namespace,
+                            decision=decision,
+                            doc_inventory=doc_inventory,
+                        )
+                        retrieval_plan.setdefault("metadata", {})["broadened_retry"] = True
 
             processed_query = retrieval_plan.get("query", query)
             preprocessing_metadata = retrieval_plan.get("metadata", {})
@@ -4995,6 +5383,33 @@ class EnterpriseRAGSystem:
             selected_strategy = retrieval_plan.get("selected_strategy", "adaptive_dense")
             profile_context_data = retrieval_plan.get("profile_context", {})
             selected_doc_ids = retrieval_plan.get("selected_doc_ids", []) or []
+
+            if decision.scope == "single_doc" and isinstance(decision.target_docs, list) and decision.target_docs:
+                target_doc = decision.target_docs[0]
+                retrieved_chunks = enforce_single_doc_filter(retrieved_chunks, target_doc)
+                reranked_chunks = enforce_single_doc_filter(reranked_chunks, target_doc)
+                final_chunks = enforce_single_doc_filter(final_chunks, target_doc)
+
+            final_chunks = remove_junk_sections(final_chunks, query)
+
+            if decision.scope in {"multi_doc", "targeted_docs"}:
+                dominant_doc_id = dominant_doc_for_lookup(orchestration_v3.intent, final_chunks)
+                if dominant_doc_id:
+                    dominant_doc = next(
+                        (doc for doc in doc_inventory if doc.doc_id == dominant_doc_id),
+                        None,
+                    )
+                    if dominant_doc:
+                        retrieved_chunks = enforce_single_doc_filter(retrieved_chunks, dominant_doc)
+                        reranked_chunks = enforce_single_doc_filter(reranked_chunks, dominant_doc)
+                        final_chunks = enforce_single_doc_filter(final_chunks, dominant_doc)
+                        decision = replace(decision, scope="targeted_docs", target_docs=[dominant_doc])
+                        orchestration = replace(
+                            orchestration,
+                            scope=decision.scope,
+                            target_docs=[dominant_doc],
+                            decision=decision,
+                        )
 
             retrieval_hits = 1.0 if retrieved_chunks else 0.0
             mrr_score = 0.0
@@ -5107,46 +5522,9 @@ class EnterpriseRAGSystem:
                 for doc_id in set(doc_ids):
                     telemetry.record_doc_metric(doc_id, "last_retrieval_time", time.time())
 
-            # Cache lookup (per subscription/profile/query + recent memory fingerprint)
-            cache = get_redis_client() if (ENABLE_ANSWER_CACHE and not disable_answer_cache) else None
-            cache_key = None
-            conversation_context_for_cache = self.conversation_history.get_context(namespace, user_id, max_turns=2)
-            memory_fingerprint = "noctx"
-            if conversation_context_for_cache:
-                memory_fingerprint = hashlib.md5(conversation_context_for_cache.encode("utf-8")).hexdigest()
-            session_fingerprint = _slug(session_id) if session_id else "default"
-            profile_context_fingerprint = "noprof"
-            try:
-                profile_context_fingerprint = hashlib.md5(
-                    json.dumps(profile_context_data or {}, sort_keys=True, default=str).encode("utf-8")
-                ).hexdigest()
-            except Exception as fp_exc:
-                logger.debug("Failed to fingerprint profile context: %s", fp_exc)
-            if cache:
-                cache_key = (
-                    f"rag:{ANSWER_CACHE_VERSION}:"
-                    f"sub={_slug(subscription_id)}:"  # ✅ Added subscription
-                    f"col={_slug(collection_name)}:"
-                    f"prof={_slug(profile_id)}:"
-                    f"usr={hashlib.md5(user_id.encode('utf-8')).hexdigest()[:8]}:"  # ✅ Added user
-                    f"sess={session_fingerprint}:"
-                    f"model={_slug(self.model_name)}:"
-                    f"strat={selected_strategy}:"
-                    f"mem={memory_fingerprint[:8]}:"  # ✅ Shortened to avoid key bloat
-                    f"q={hashlib.md5(processed_query.encode('utf-8')).hexdigest()}"
-                )
-                cached = cache.get(cache_key)
-                if cached:
-                    try:
-                        cached_obj = json.loads(cached)
-                        if cached_obj.get("cache_version") and cached_obj["cache_version"] != ANSWER_CACHE_VERSION:
-                            raise ValueError("Cache version mismatch")
-                        logger.info("Cache hit for query; ignoring because answer cache is disabled")
-                    except Exception:
-                        logger.warning("Failed to parse cached answer; ignoring")
             logger.info(f"Preprocessed query: {processed_query}")
 
-            if not retrieved_chunks and not use_tooling:
+            if not retrieved_chunks and not use_tooling and not use_intel_layer:
                 no_results_response = (
                     "I couldn’t find this information in the selected documents. "
                     f"I searched the available documents for: '{query}'. "
@@ -5279,6 +5657,143 @@ class EnterpriseRAGSystem:
             if tool_chunks:
                 final_chunks = _merge_retrieved_chunks(final_chunks, tool_chunks)
 
+            intent_label = classify_intent(query)
+            normalized_query = normalize_query(processed_query or query)
+            retrieval_fingerprint = compute_retrieval_fingerprint(final_chunks)
+            normalized_query_hash = hashlib.sha256(normalized_query.encode("utf-8")).hexdigest()
+
+            doc_name_map = self._doc_name_map(final_chunks)
+            doc_names = sorted({name for name in doc_name_map.values() if name})
+            if not doc_names:
+                doc_names = sorted({
+                    (chunk.metadata or {}).get("source_file")
+                    or (chunk.metadata or {}).get("file_name")
+                    or (chunk.metadata or {}).get("filename")
+                    or (chunk.metadata or {}).get("source")
+                    or chunk.source
+                    for chunk in final_chunks
+                    if chunk and ((chunk.metadata or {}).get("source_file") or chunk.source)
+                })
+            doc_id_set = sorted({
+                (chunk.metadata or {}).get("document_id")
+                or (chunk.metadata or {}).get("doc_id")
+                or (chunk.metadata or {}).get("docId")
+                for chunk in final_chunks
+                if chunk and ((chunk.metadata or {}).get("document_id") or (chunk.metadata or {}).get("doc_id") or (chunk.metadata or {}).get("docId"))
+            })
+            doc_set = doc_id_set or doc_names
+
+            structured_extraction = extract_structured_data(final_chunks)
+            item_evidence = [
+                (item.name, item.chunk_id)
+                for item in (structured_extraction.items or [])
+                if item.name
+            ]
+            computed_values = [
+                str(val)
+                for val in (structured_extraction.computed or {}).values()
+                if val is not None
+            ]
+
+            use_cache = bool(final_chunks) and not disable_answer_cache and not force_refresh and not use_intel_layer
+            qcache = QueryContextFingerprintCache.build(get_redis_client()) if use_cache else None
+            cache_key = None
+            cache_hit = False
+            cached_response_obj = None
+            cache_reason = "miss"
+
+            retrieval_signature = compute_retrieval_signature(final_chunks)
+            cache_guard_v2 = CacheGuardV2(ttl_seconds=600)
+            cache_context = cache_guard_v2.build_context(
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                query_text=processed_query or query,
+                intent_type=orchestration_v3.intent.intent_type,
+                scope_type=decision.scope,
+                target_docs=decision.target_docs if isinstance(decision.target_docs, list) else [],
+                entities=orchestration_v3.entities,
+                corpus_fingerprint=orchestration_v3.digest.get("corpus_fingerprint") or "",
+                model_id=self.model_name,
+                retrieval_signature=retrieval_signature,
+                is_vague=orchestration_v3.intent.is_vague,
+            )
+
+            if qcache:
+                cache_key = cache_guard_v2.build_cache_key(cache_context)
+                cached_payload = qcache.get(cache_key)
+                cache_decision = cache_guard_v2.evaluate_cached_payload(
+                    context=cache_context,
+                    cache_key=cache_key,
+                    cached_payload=cached_payload,
+                )
+                cache_reason = cache_decision.reason
+                if cache_decision.hit and cached_payload:
+                    candidate = cached_payload.get("response") or {}
+                    if is_query_answer_consistent(normalized_query, candidate.get("response", ""), intent_label):
+                        grounding = verify_grounding(
+                            candidate.get("response", ""),
+                            final_chunks,
+                            intent=intent_label,
+                            extracted_items=[name for name, _ in item_evidence],
+                            computed_values=computed_values,
+                            doc_names=doc_names,
+                        )
+                        if grounding.passed:
+                            cache_hit = True
+                            cached_response_obj = candidate
+                        else:
+                            cache_reason = "grounding_failed"
+                            logger.warning("grounding_failed_first_pass cache_key_prefix=%s", cache_key[:8])
+                            logger.warning("stale_cache_rejected cache_key_prefix=%s", cache_key[:8])
+                    else:
+                        cache_reason = "intent_mismatch"
+                        logger.warning("stale_cache_rejected cache_key_prefix=%s", cache_key[:8])
+
+            logger.info(
+                "cache_hit=%s cache_reason=%s cache_key_hash_prefix=%s normalized_query_hash_prefix=%s retrieval_fingerprint_prefix=%s intent=%s docs_in_context=%s",
+                cache_hit,
+                cache_reason,
+                cache_key[:8] if cache_key else "none",
+                normalized_query_hash[:8] if normalized_query_hash else "none",
+                retrieval_fingerprint[:8] if retrieval_fingerprint else "none",
+                intent_label,
+                f"count={len(doc_names)} top={doc_names[:3]}",
+            )
+
+            if cache_hit and cached_response_obj:
+                response_obj = cached_response_obj
+                self.conversation_history.add_turn(namespace, user_id, query, response_obj.get("response") or "")
+                final_doc_ids = [
+                    (chunk.metadata or {}).get("document_id") for chunk in final_chunks
+                ]
+                final_doc_ids = [d for d in final_doc_ids if d]
+                if final_doc_ids:
+                    self.conversation_history.add_sources(namespace, user_id, final_doc_ids)
+                    doc_name_map = self._doc_name_map(final_chunks)
+                    primary_doc_id = max(set(final_doc_ids), key=final_doc_ids.count)
+                    self.conversation_history.set_last_active_document(
+                        namespace,
+                        user_id,
+                        primary_doc_id,
+                        doc_name_map.get(primary_doc_id),
+                    )
+                self.feedback_memory.add_feedback(namespace, user_id, query, response_obj.get("response") or "", response_obj.get("sources") or [])
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type=response_obj.get("query_type", "document_qa"),
+                        context_found=bool(response_obj.get("context_found", True)),
+                        grounded=bool(response_obj.get("grounded", True)),
+                        cached=True,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats=response_obj.get("retrieval_stats") or {},
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (cache hit) failed: %s", metric_exc)
+                return response_obj
+
             evidence_cap = max(15, len(final_chunks))
             evidence_set = build_evidence_set(final_chunks, max_chunks=evidence_cap)
             working_context = self.working_context_assembler.assemble(
@@ -5287,23 +5802,570 @@ class EnterpriseRAGSystem:
                 analysis=analysis,
             )
 
-            if analysis.scope == "single_doc_default" and not analysis.target_hint:
-                doc_name_map = self._doc_name_map(final_chunks)
-                if selected_doc_ids:
-                    assumed_doc = doc_name_map.get(selected_doc_ids[0])
-                    if assumed_doc and all(assumed_doc not in a for a in analysis.assumptions):
-                        analysis.assumptions.append(f"Assuming you mean {assumed_doc}.")
+            multi_doc_scope = decision.scope in {"multi_doc", "targeted_docs"}
+            only_one_doc = len(doc_names) == 1
+            assumption_line = None
 
-            render_result = self.answer_renderer.render(
-                query=query,
-                analysis=analysis,
-                context=working_context,
+            if analysis.scope == "single_doc_default" and not analysis.target_hint and len(doc_names) > 1:
+                doc_counts = Counter()
+                for chunk in final_chunks:
+                    doc_id = (chunk.metadata or {}).get("document_id")
+                    if doc_id:
+                        doc_counts[str(doc_id)] += 1
+                best_doc_id = doc_counts.most_common(1)[0][0] if doc_counts else None
+                assumed_doc = doc_name_map.get(best_doc_id) if best_doc_id else None
+                assumed_doc = assumed_doc or (doc_names[0] if doc_names else None)
+                if assumed_doc:
+                    assumption_line = (
+                        f"I used {assumed_doc} because it has the most relevant evidence in this session."
+                    )
+                    analysis.assumptions = [assumption_line]
+                    logger.warning("fallback_scope_applied scope=single_doc_default")
+            if not assumption_line and analysis.assumptions:
+                assumption_line = analysis.assumptions[0]
+            if not assumption_line and decision.assumption_line:
+                assumption_line = decision.assumption_line
+            if decision.scope == "multi_doc" and len(doc_names) == 1 and doc_names:
+                if len(doc_inventory) <= 1:
+                    assumption_line = assumption_line or f"Only one document is available ({doc_names[0]}), so I used it."
+                else:
+                    assumption_line = assumption_line or (
+                        f"I only found matching sections in {doc_names[0]}; other documents did not surface matches."
+                    )
+
+            if use_intel_layer:
+                from collections import Counter
+
+                from src.docwain_intel.doc_type_inferer import infer_doc_domain_from_prompt, infer_doc_type
+                from src.docwain_intel.fact_builder import build_fact_cache
+                from src.docwain_intel.hr_renderers import render_generic, render_task
+                from src.docwain_intel.intent_router import TASK_1, TASK_2, TASK_3, TASK_4, TASK_5, TASK_6, route_intent
+                from src.docwain_intel.sanitizer import sanitize_output
+
+                doc_text_map = {}
+                for chunk in final_chunks:
+                    meta = chunk.metadata or {}
+                    doc_name = (
+                        meta.get("source_file")
+                        or meta.get("file_name")
+                        or meta.get("filename")
+                        or meta.get("source")
+                        or chunk.source
+                        or ""
+                    )
+                    if doc_name:
+                        doc_text_map.setdefault(doc_name, []).append(chunk.text or "")
+
+                doc_metadata = []
+                for doc in doc_inventory:
+                    doc_name = doc.source_file or doc.document_name or doc.doc_id or "Document"
+                    text_hint = " ".join(doc_text_map.get(doc_name, [])) or " ".join(
+                        token for token in [doc.doc_type, doc.document_name, doc.source_file] if token
+                    )
+                    inferred = infer_doc_type(text_hint)
+                    doc_metadata.append(
+                        {
+                            "doc_id": doc.doc_id,
+                            "doc_name": doc_name,
+                            "doc_domain": inferred.get("doc_domain", "general"),
+                            "doc_kind": inferred.get("doc_kind", "general_doc"),
+                            "confidence": inferred.get("confidence", 0.1),
+                        }
+                    )
+
+                if not doc_metadata and doc_text_map:
+                    for doc_name, texts in doc_text_map.items():
+                        inferred = infer_doc_type(" ".join(texts))
+                        doc_metadata.append(
+                            {
+                                "doc_id": "",
+                                "doc_name": doc_name,
+                                "doc_domain": inferred.get("doc_domain", "general"),
+                                "doc_kind": inferred.get("doc_kind", "general_doc"),
+                                "confidence": inferred.get("confidence", 0.1),
+                            }
+                        )
+
+                if doc_metadata:
+                    for chunk in final_chunks:
+                        meta = chunk.metadata or {}
+                        doc_name = (
+                            meta.get("source_file")
+                            or meta.get("file_name")
+                            or meta.get("filename")
+                            or meta.get("source")
+                            or chunk.source
+                        )
+                        for doc in doc_metadata:
+                            if doc.get("doc_name") == doc_name:
+                                meta["doc_domain"] = doc.get("doc_domain")
+                                meta["doc_kind"] = doc.get("doc_kind")
+                                chunk.metadata = meta
+                                break
+
+                domain_hint = infer_doc_domain_from_prompt(query)
+                if doc_metadata:
+                    domain_counts = Counter([doc.get("doc_domain") for doc in doc_metadata if doc.get("doc_domain")])
+                    doc_domain = domain_counts.most_common(1)[0][0] if domain_counts else domain_hint
+                else:
+                    doc_domain = domain_hint
+
+                fact_cache = build_fact_cache(final_chunks)
+                task = route_intent(query)
+                if task in {TASK_1, TASK_2, TASK_3, TASK_4, TASK_5, TASK_6}:
+                    answer = render_task(task, fact_cache, doc_metadata)
+                else:
+                    answer = render_generic(doc_domain, fact_cache, doc_metadata)
+
+                answer = format_response_text(answer)
+                answer = sanitize_output(answer)
+
+                self.conversation_history.add_turn(namespace, user_id, query, answer)
+                final_doc_ids = [
+                    (chunk.metadata or {}).get("document_id") for chunk in final_chunks
+                ]
+                final_doc_ids = [d for d in final_doc_ids if d]
+                if final_doc_ids:
+                    self.conversation_history.add_sources(namespace, user_id, final_doc_ids)
+                    doc_name_map = self._doc_name_map(final_chunks)
+                    primary_doc_id = max(set(final_doc_ids), key=final_doc_ids.count)
+                    self.conversation_history.set_last_active_document(
+                        namespace,
+                        user_id,
+                        primary_doc_id,
+                        doc_name_map.get(primary_doc_id),
+                    )
+                self.feedback_memory.add_feedback(namespace, user_id, query, answer, [])
+
+                processing_time = time.time() - start_time
+                retrieval_brief = (
+                    f"strategy={selected_strategy}; processed_query=\"{processed_query}\"; "
+                    f"context_chunks={len(final_chunks)}; attempts={len(retrieval_attempts)}"
+                )
+                context_found_flag = bool(evidence_set.chunks)
+                redacted_doc_ids = ["[redacted]"] * len(final_doc_ids)
+
+                response_obj = {
+                    "response": answer,
+                    "sources": [],
+                    "user_id": user_id,
+                    "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
+                    "context_found": context_found_flag,
+                    "query_type": "document_qa",
+                    "num_sources": 0,
+                    "source_doc_ids": redacted_doc_ids,
+                    "preprocessing": preprocessing_metadata,
+                    "processed_query": processed_query,
+                    "answerability": {
+                        "is_answerable": bool(final_chunks),
+                        "reason": "Context available from retrieved chunks" if final_chunks else "No validated context",
+                    },
+                    "grounded": bool(final_chunks),
+                    "has_citations": False,
+                    "retrieval_attempts": retrieval_attempts,
+                    "selected_strategy": selected_strategy,
+                    "profile_context": profile_context_data,
+                    "processing_time": round(processing_time, 2),
+                    "retrieval_notes": retrieval_brief,
+                    "model_name": self.model_name,
+                    "persona": persona,
+                    "cache_version": ANSWER_CACHE_VERSION,
+                    "context_fingerprint": "[redacted]",
+                    "profile_context_fingerprint": "[redacted]",
+                    "retrieval_stats": {
+                        "initial_retrieved": len(retrieved_chunks),
+                        "after_rerank": len(reranked_chunks),
+                        "final_context": len(final_chunks),
+                    },
+                    "force_refresh": force_refresh,
+                    "disable_answer_cache": disable_answer_cache,
+                }
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type=response_obj.get("query_type", "document_qa"),
+                        context_found=context_found_flag,
+                        grounded=bool(response_obj.get("grounded", True)),
+                        cached=False,
+                        processing_time=processing_time,
+                        retrieval_stats=response_obj.get("retrieval_stats") or {},
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (intel) failed: %s", metric_exc)
+
+                _record_request_metrics(
+                    query_type=response_obj.get("query_type", "document_qa"),
+                    answer_text=answer,
+                    context_text=working_context.brief_text(),
+                    context_found=context_found_flag,
+                    grounded=bool(response_obj.get("grounded", True)),
+                    has_citations=False,
+                    processing_seconds=processing_time,
+                    prompt_text=processed_query,
+                    tool_successes=tool_successes,
+                    document_ids=final_doc_ids,
+                )
+
+                return response_obj
+
+            candidate_profiles_payload = None
+            resume_analysis_payload = None
+            candidate_intents = {"candidate_profile_extract", "multi_candidate_extract", "ranking", "compare", "summarize"}
+            candidate_mode = decision.candidate_mode and decision.intent in candidate_intents
+            if candidate_mode:
+                chunks_by_doc = retrieval_plan.get("chunks_by_doc") or {}
+                if not chunks_by_doc:
+                    chunks_by_doc = {}
+                    for chunk in final_chunks:
+                        doc_name = (
+                            (chunk.metadata or {}).get("source_file")
+                            or (chunk.metadata or {}).get("file_name")
+                            or (chunk.metadata or {}).get("filename")
+                            or (chunk.metadata or {}).get("source")
+                            or chunk.source
+                            or "Document"
+                        )
+                        chunks_by_doc.setdefault(doc_name, []).append(chunk)
+
+                resume_route = should_route_resume_analyzer(
+                    query_text=query,
+                    chunks=final_chunks,
+                    doc_inventory=doc_inventory,
+                )
+                used_chunk_ids = []
+                if resume_route:
+                    force_all_docs = is_multi_profile_request(query)
+                    if force_all_docs:
+                        resume_docs = select_resume_docs(doc_inventory=doc_inventory, chunks_by_doc=chunks_by_doc)
+                        if resume_docs:
+                            resume_names = {
+                                (doc.source_file or doc.document_name or doc.doc_id or "").lower(): doc
+                                for doc in resume_docs
+                            }
+                            filtered = {}
+                            for name, doc_chunks in chunks_by_doc.items():
+                                if name.lower() in resume_names:
+                                    filtered[name] = doc_chunks
+                            if filtered:
+                                chunks_by_doc = filtered
+
+                    resume_analysis = analyze_resume_chunks(
+                        chunks_by_doc=chunks_by_doc,
+                        doc_inventory=doc_inventory,
+                        force_all_docs=force_all_docs,
+                        query_text=query,
+                    )
+                    resume_analysis_payload = []
+                    for profile in resume_analysis.profiles:
+                        payload = dict(profile.__dict__)
+                        payload["achievements_awards"] = profile.awards
+                        resume_analysis_payload.append(payload)
+                    candidate_profiles_payload = resume_analysis_payload
+                    resume_views = [
+                        ResumeProfileView(
+                            candidate_name=profile.candidate_name,
+                            source_type=profile.source_type,
+                            source_document=profile.source_document,
+                            total_years_experience=profile.total_years_experience,
+                            experience_confidence=profile.experience_confidence,
+                            experience_basis=profile.experience_basis,
+                            experience_details=profile.experience_details,
+                            experience_summary=profile.experience_summary,
+                            technical_skills=profile.technical_skills,
+                            functional_skills=profile.functional_skills,
+                            certifications=profile.certifications,
+                            education=profile.education,
+                            awards=profile.awards,
+                        )
+                        for profile in resume_analysis.profiles
+                    ]
+                    ranking_lines = None
+                    if decision.intent == "ranking" and resume_analysis.profiles:
+                        ranked_candidates = rank_candidates(
+                            [
+                                CandidateProfile(
+                                    candidate_name=profile.candidate_name,
+                                    total_years_experience=float(profile.total_years_experience or 0),
+                                    experience_summary=profile.experience_summary
+                                    or profile.experience_details
+                                    or "Summary based on retrieved resume sections.",
+                                    technical_skills=profile.technical_skills,
+                                    functional_skills=profile.functional_skills,
+                                    certifications=profile.certifications,
+                                    education=profile.education,
+                                    achievements_awards=profile.awards,
+                                    source_type="resume",
+                                    source_document=profile.source_document,
+                                    evidence_chunk_ids=[],
+                                )
+                                for profile in resume_analysis.profiles
+                            ],
+                            query,
+                        )
+                        ranking_lines = []
+                        ordered_views = []
+                        ordered_payload = []
+                        payload_by_doc = {
+                            (item.get("source_document") or ""): item for item in resume_analysis_payload
+                        }
+                        for idx, ranked in enumerate(ranked_candidates, start=1):
+                            ranking_lines.append(
+                                f"{idx}. {ranked.profile.candidate_name or 'Candidate'} — score {ranked.score:.2f}. {ranked.rationale}"
+                            )
+                            for view in resume_views:
+                                if view.source_document == ranked.profile.source_document:
+                                    ordered_views.append(view)
+                                    break
+                            payload = payload_by_doc.get(ranked.profile.source_document)
+                            if payload:
+                                ordered_payload.append(payload)
+                        resume_views = ordered_views or resume_views
+                        resume_analysis_payload = ordered_payload or resume_analysis_payload
+                        candidate_profiles_payload = resume_analysis_payload
+                        if len(resume_views) > 5 and re.search(r"\\btop\\s+5\\b|top five", query.lower()):
+                            resume_views = resume_views[:5]
+                            candidate_profiles_payload = candidate_profiles_payload[:5]
+
+                    answer_text = format_resume_response(
+                        profiles=resume_views,
+                        assumption_line=assumption_line,
+                        wants_table=False,
+                        ranking_lines=ranking_lines,
+                    )
+                    used_chunk_ids = resume_analysis.used_chunk_ids
+                else:
+                    profiles = []
+                    for doc_name, doc_chunks in chunks_by_doc.items():
+                        profile = extract_candidate_profile(chunks=doc_chunks, source_document=doc_name)
+                        profiles.append(profile)
+                        used_chunk_ids.extend(profile.evidence_chunk_ids or [])
+
+                    candidate_profiles_payload = [profile.__dict__ for profile in profiles]
+
+                    if decision.intent == "ranking":
+                        ranked = rank_candidates(profiles, query)
+                        ranking_payload = [(rc.profile.__dict__, rc.score, rc.rationale) for rc in ranked]
+                        answer_text = format_multi_candidate_response(
+                            profiles=[rc.profile.__dict__ for rc in ranked],
+                            assumption_line=assumption_line,
+                            ranking=ranking_payload,
+                        )
+                    elif decision.scope == "single_doc" and profiles:
+                        answer_text = format_candidate_profile_response(
+                            profile=profiles[0].__dict__,
+                            assumption_line=assumption_line,
+                        )
+                    else:
+                        answer_text = format_multi_candidate_response(
+                            profiles=[profile.__dict__ for profile in profiles],
+                            assumption_line=assumption_line,
+                            ranking=None,
+                        )
+
+                if not used_chunk_ids:
+                    used_chunk_ids = [c.chunk_id for c in evidence_set.chunks[:3]]
+                sources = _build_sources_from_chunk_ids(evidence_set, used_chunk_ids)
+                citations_line = build_citations(sources)
+                answer = replace_citations_line(answer_text, citations_line)
+                answer = format_response_text(answer)
+                render_result = AnswerRenderResult(text=answer, used_chunk_ids=used_chunk_ids)
+            else:
+                render_result = self.answer_renderer.render(
+                    query=query,
+                    analysis=analysis,
+                    context=working_context,
+                )
+
+            if not candidate_mode:
+                formatted = format_structured_response(
+                    query=query,
+                    intent=intent_label,
+                    context=working_context,
+                    doc_names=doc_names,
+                    assumption_line=assumption_line,
+                    item_evidence=item_evidence,
+                    strict=False,
+                    multi_doc=multi_doc_scope,
+                    only_one_doc=only_one_doc,
+                )
+                used_chunk_ids = formatted.used_chunk_ids or render_result.used_chunk_ids or [
+                    c.chunk_id for c in evidence_set.chunks[:3]
+                ]
+                sources = _build_sources_from_chunk_ids(evidence_set, used_chunk_ids)
+                citations_line = build_citations(sources)
+                answer = replace_citations_line(formatted.text, citations_line)
+                answer = format_response_text(answer)
+
+            grounding = verify_grounding(
+                answer,
+                final_chunks,
+                intent=intent_label,
+                extracted_items=[name for name, _ in item_evidence],
+                computed_values=computed_values,
+                doc_names=doc_names,
             )
+            if not grounding.passed and candidate_mode:
+                logger.warning("grounding_failed_first_pass candidate_mode")
+            if not grounding.passed and not candidate_mode:
+                logger.warning("grounding_failed_first_pass")
+                strict_formatted = format_structured_response(
+                    query=query,
+                    intent=intent_label,
+                    context=working_context,
+                    doc_names=doc_names,
+                    assumption_line=assumption_line,
+                    item_evidence=item_evidence,
+                    strict=True,
+                    multi_doc=multi_doc_scope,
+                    only_one_doc=only_one_doc,
+                )
+                used_chunk_ids = strict_formatted.used_chunk_ids or used_chunk_ids
+                sources = _build_sources_from_chunk_ids(evidence_set, used_chunk_ids)
+                citations_line = build_citations(sources)
+                answer = replace_citations_line(strict_formatted.text, citations_line)
+                answer = format_response_text(answer)
+                grounding = verify_grounding(
+                    answer,
+                    final_chunks,
+                    intent=intent_label,
+                    extracted_items=[name for name, _ in item_evidence],
+                    computed_values=computed_values,
+                    doc_names=doc_names,
+                )
+                if not grounding.passed:
+                    logger.warning("grounding_failed_second_pass")
+                    conservative = format_conservative_response(
+                        intent=intent_label,
+                        doc_names=doc_names,
+                        include_products_message=not item_evidence and intent_label == INTENT_PRODUCTS_SERVICES,
+                    )
+                    used_chunk_ids = used_chunk_ids or [c.chunk_id for c in evidence_set.chunks[:3]]
+                    sources = _build_sources_from_chunk_ids(evidence_set, used_chunk_ids)
+                    citations_line = build_citations(sources)
+                    answer = replace_citations_line(conservative.text, citations_line)
+                    answer = format_response_text(answer)
 
-            used_chunk_ids = render_result.used_chunk_ids or [c.chunk_id for c in evidence_set.chunks[:3]]
-            sources = _build_sources_from_chunk_ids(evidence_set, used_chunk_ids)
-            citations_line = build_citations(sources)
-            answer = replace_citations_line(render_result.text, citations_line)
+            if table_requested:
+                table_columns: List[str] = []
+                table_records: List[Dict[str, Any]] = []
+                table_intro = assumption_line or "Here is the table based on the retrieved sections."
+
+                if candidate_profiles_payload:
+                    table_columns = [
+                        "Name",
+                        "Experience (Years)",
+                        "Technical Skills",
+                        "Functional Skills",
+                        "Certifications",
+                        "Education",
+                        "Awards",
+                        "Source",
+                        "Document",
+                    ]
+                    for profile in candidate_profiles_payload:
+                        years_value = profile.get("total_years_experience")
+                        years_display = years_value if years_value is not None else ""
+                        table_records.append(
+                            {
+                                "Name": profile.get("candidate_name") or "Candidate",
+                                "Experience (Years)": years_display,
+                                "Technical Skills": ", ".join(profile.get("technical_skills") or []),
+                                "Functional Skills": ", ".join(profile.get("functional_skills") or []),
+                                "Certifications": ", ".join(profile.get("certifications") or []),
+                                "Education": ", ".join(profile.get("education") or []),
+                                "Awards": ", ".join(profile.get("achievements_awards") or []),
+                                "Source": profile.get("source_type") or "Resume",
+                                "Document": profile.get("source_document") or "",
+                            }
+                        )
+                elif structured_extraction.items:
+                    table_columns = ["Product/Service", "Qty", "Unit Price", "Line Total", "Document"]
+                    chunk_doc_map = {}
+                    for chunk in final_chunks:
+                        meta = chunk.metadata or {}
+                        chunk_id = meta.get("chunk_id") or getattr(chunk, "id", None)
+                        if not chunk_id:
+                            continue
+                        doc_name = (
+                            meta.get("source_file")
+                            or meta.get("file_name")
+                            or meta.get("filename")
+                            or meta.get("source")
+                            or chunk.source
+                        )
+                        chunk_doc_map[str(chunk_id)] = doc_name or ""
+                    for item in structured_extraction.items:
+                        table_records.append(
+                            {
+                                "Product/Service": item.name,
+                                "Qty": "",
+                                "Unit Price": "",
+                                "Line Total": item.raw_amount,
+                                "Document": chunk_doc_map.get(item.chunk_id, ""),
+                            }
+                        )
+                else:
+                    table_columns = ["Document", "Key Points", "Entities", "Totals (if any)"]
+                    facts_by_doc: Dict[str, List[str]] = {}
+                    totals_by_doc: Dict[str, List[str]] = {}
+                    for fact in working_context.key_facts:
+                        facts_by_doc.setdefault(fact.doc_name, []).append(f"{fact.label}: {fact.value}")
+                    for claim in working_context.numeric_claims:
+                        label = (claim.label or "").lower()
+                        if any(tok in label for tok in ("total", "subtotal", "amount due", "balance")):
+                            totals_by_doc.setdefault(claim.doc_name, []).append(f"{claim.label}: {claim.value}")
+                    entity_text = ", ".join(orchestration.entities.people + orchestration.entities.products)
+                    for doc_name in doc_names or ["Document"]:
+                        key_points = "; ".join((facts_by_doc.get(doc_name) or [])[:3])
+                        totals = "; ".join((totals_by_doc.get(doc_name) or [])[:2])
+                        table_records.append(
+                            {
+                                "Document": doc_name,
+                                "Key Points": key_points or "No high-signal facts extracted.",
+                                "Entities": entity_text,
+                                "Totals (if any)": totals,
+                            }
+                        )
+
+                if not table_columns:
+                    table_columns = ["Document", "Note"]
+                    for doc_name in doc_names or ["Document"]:
+                        table_records.append(
+                            {
+                                "Document": doc_name,
+                                "Note": "No table-ready fields were found in the retrieved sections.",
+                            }
+                        )
+
+                table_markdown = render_markdown_table(table_columns, table_records)
+                answer = enforce_response_formatting(
+                    text=answer,
+                    wants_table=True,
+                    table_markdown=table_markdown,
+                    intro=table_intro,
+                )
+                answer = replace_citations_line(answer, citations_line)
+            else:
+                answer = enforce_response_formatting(text=answer)
+
+            answer = apply_formatting_rules(
+                answer,
+                wants_table=table_requested,
+            )
+            user_requested_evidence = bool(
+                re.search(r"\b(show|provide)\s+(evidence|sources|supporting lines)\b", query or "", re.IGNORECASE)
+            )
+            answer = apply_citation_policy(
+                answer,
+                sources,
+                scope_type=decision.scope,
+                user_requested_evidence=user_requested_evidence,
+            )
             answer = format_response_text(answer)
 
             is_answerable = bool(final_chunks)
@@ -5406,11 +6468,19 @@ class EnterpriseRAGSystem:
 
             # Persist the response in Redis before returning. Only cache successful
             # answers (document_qa) to improve subsequent response accuracy.
-            if cache and cache_key:
-                try:
-                    cache.setex(cache_key, ANSWER_CACHE_TTL, json.dumps(response_obj))
-                except Exception as cache_exc:
-                    logger.warning(f"Failed to cache answer: {cache_exc}")
+            if (
+                qcache
+                and cache_key
+                and response_obj.get("query_type") == "document_qa"
+                and cache_guard_v2.is_cacheable(cache_context)
+            ):
+                qcache.set(
+                    cache_key=cache_key,
+                    response_obj=response_obj,
+                    normalized_query_hash=normalized_query_hash,
+                    retrieval_fingerprint=retrieval_fingerprint,
+                    metadata=cache_context.to_metadata(),
+                )
 
             # Return the constructed response
             return response_obj

@@ -51,7 +51,7 @@ class RequestChain:
             persona=self.ctx.persona or "Document Assistant",
             session_id=self.ctx.session_id,
             new_session=force_refresh,
-            disable_answer_cache=True,
+            disable_answer_cache=False,
             force_refresh=force_refresh,
             request_id=self.ctx.request_id,
             index_version=self.ctx.index_version,

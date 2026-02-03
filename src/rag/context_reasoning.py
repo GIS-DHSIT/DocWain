@@ -17,6 +17,8 @@ _INTENT_KEYWORDS = {
 _OUTPUT_TABLE_CUES = {"table", "tabular", "spreadsheet", "grid", "matrix"}
 _OUTPUT_BULLET_CUES = {"bullet", "bullets", "list", "steps"}
 _COMPARE_CUES = {"compare", "difference", "vs", "versus", "across", "between"}
+_MULTI_DOC_CUES = {"documents", "invoices", "files", "across", "compare", "all"}
+_MULTI_DOC_PHRASES = {"these invoices", "these documents", "all documents", "all invoices"}
 _PRONOUN_CUES = {"this", "that", "the above", "previous", "same document", "it", "that one"}
 
 _BLOCKED_NUMERIC_LABELS = {
@@ -163,13 +165,17 @@ class ContextAwareQueryAnalyzer:
         convo_docs = _rank_doc_candidates(conversation_history or "", available_sources)
         convo_doc = convo_docs[0][0] if convo_docs else None
 
-        has_compare = _contains_any(query.lower(), _COMPARE_CUES)
+        lowered_query = query.lower()
+        has_compare = _contains_any(lowered_query, _COMPARE_CUES)
+        has_multi_doc = _contains_any(lowered_query, _MULTI_DOC_CUES) or any(
+            phrase in lowered_query for phrase in _MULTI_DOC_PHRASES
+        )
         has_pronoun = _mentions_pronoun(query)
 
         scope = "unknown"
         target_hint: List[str] = []
 
-        if has_compare:
+        if has_compare or has_multi_doc:
             scope = "multi_doc"
         elif doc_candidates:
             scope = "single_doc_default"
@@ -182,14 +188,6 @@ class ContextAwareQueryAnalyzer:
             scope = "single_doc_default"
             target_hint = [convo_doc]
             assumptions.append("Assuming you mean the document mentioned earlier in this conversation.")
-        elif last_active_document and (has_pronoun or _query_is_short(query)):
-            scope = "single_doc_default"
-            target_hint = [last_active_document.get("doc_name") or "previous document"]
-            assumptions.append("Assuming you mean the most recently used document.")
-        elif last_active_document and intent in {"compute", "lookup"} and not doc_candidates:
-            scope = "single_doc_default"
-            target_hint = [last_active_document.get("doc_name") or "previous document"]
-            assumptions.append("Assuming you mean the most recently used document.")
         elif len(available_sources or []) == 1:
             scope = "single_doc_default"
             target_hint = [available_sources[0]]
@@ -607,6 +605,12 @@ class AnswerRenderResult:
 
 
 class AnswerRenderer:
+    @staticmethod
+    def _primary_doc(context: WorkingContext, analysis: AnalyzerOutput) -> Optional[str]:
+        if analysis.scope == "single_doc_default" and context.resolved_scope:
+            return context.resolved_scope[0]
+        return None
+
     def render(self, *, query: str, analysis: AnalyzerOutput, context: WorkingContext) -> AnswerRenderResult:
         if analysis.output_mode == "table":
             text, used = self._render_table(query, analysis, context)
@@ -631,6 +635,7 @@ class AnswerRenderer:
 
         rows: List[List[str]] = []
         used_chunk_ids: List[str] = []
+        primary_doc = self._primary_doc(context, analysis)
         if context.tables:
             table = context.tables[0]
             headers = table.headers
@@ -649,6 +654,8 @@ class AnswerRenderer:
             headers = ["Document", "Label", "Value"]
             seen = set()
             for claim in context.numeric_claims:
+                if primary_doc and claim.doc_name != primary_doc:
+                    continue
                 key = (claim.doc_name, claim.label, claim.value)
                 if key in seen:
                     continue
@@ -661,6 +668,8 @@ class AnswerRenderer:
         headers = ["Document", "Detail", "Value"]
         seen = set()
         for fact in context.key_facts[:10]:
+            if primary_doc and fact.doc_name != primary_doc:
+                continue
             key = (fact.doc_name, fact.label, fact.value)
             if key in seen:
                 continue
@@ -678,18 +687,30 @@ class AnswerRenderer:
     ) -> Tuple[str, List[str]]:
         lines = []
         used_chunk_ids: List[str] = []
+        primary_doc = self._primary_doc(context, analysis)
         if analysis.assumptions:
             lines.append(analysis.assumptions[0])
+        if context.resolved_scope:
+            lines.append(f"- Document focus: {', '.join(context.resolved_scope[:2])}")
         if context.numeric_claims:
-            for claim in context.numeric_claims[:6]:
+            for claim in context.numeric_claims[:8]:
+                if primary_doc and claim.doc_name != primary_doc:
+                    continue
                 lines.append(f"- {claim.label}: {claim.value}")
                 used_chunk_ids.append(claim.chunk_id)
         elif context.key_facts:
-            for fact in context.key_facts[:6]:
+            for fact in context.key_facts[:8]:
+                if primary_doc and fact.doc_name != primary_doc:
+                    continue
                 lines.append(f"- {fact.label}: {fact.value}")
                 used_chunk_ids.append(fact.chunk_id)
         else:
             lines.append("- I could not find labeled facts in the retrieved sections.")
+        if context.contradictions:
+            contra = context.contradictions[0]
+            lines.append(f"- Conflicts: {contra.label} has multiple values ({', '.join(contra.values)}).")
+        if context.missing_fields:
+            lines.append(f"- Missing in retrieved sections: {', '.join(context.missing_fields)}.")
         return "\n".join(lines).strip(), used_chunk_ids
 
     def _render_narrative(
@@ -700,6 +721,7 @@ class AnswerRenderer:
     ) -> Tuple[str, List[str]]:
         sentences: List[str] = []
         used_chunk_ids: List[str] = []
+        primary_doc = self._primary_doc(context, analysis)
 
         if analysis.assumptions:
             sentences.append(analysis.assumptions[0])
@@ -712,7 +734,7 @@ class AnswerRenderer:
             sentences.append(f"The {label} is {value}.")
             used_chunk_ids.append(chunk_id)
         elif context.key_facts:
-            fact = context.key_facts[0]
+            fact = next((f for f in context.key_facts if not primary_doc or f.doc_name == primary_doc), context.key_facts[0])
             sentences.append(f"{fact.label} is listed as {fact.value}.")
             used_chunk_ids.append(fact.chunk_id)
         else:
@@ -740,8 +762,8 @@ class AnswerRenderer:
 
         sentences = [s.strip() for s in sentences if s.strip()]
         filler = [
-            "If you want a comparison across documents, let me know.",
-            "I can dig into additional sections if you need more detail.",
+            "If you want a comparison across documents, tell me which ones to include.",
+            "If you need more detail, tell me the section or field to focus on.",
         ]
         while len(sentences) < 4 and filler:
             sentences.append(filler.pop(0))
