@@ -638,6 +638,10 @@ def ask_question_api(
     Unified /ask handler. Toggle `stream=true` to receive a streamed response instead of JSON.
     """
     streaming = bool(stream if stream is not None else request.stream)
+    if request.agent_mode is True:
+        from src.agent.orchestrator import AgentOrchestrator
+
+        return AgentOrchestrator.run(request)
     session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
     logger.info(
         "[ASK%s] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s stream(body)=%s stream(query)=%s query_snippet=%s",
