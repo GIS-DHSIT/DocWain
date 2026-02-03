@@ -59,6 +59,20 @@ class Neo4jStore:
             for query in queries:
                 session.run(query)
 
+    def ensure_graph_constraints(self) -> None:
+        queries = [
+            "CREATE CONSTRAINT kg_graph_document_id IF NOT EXISTS FOR (d:Document) REQUIRE d.doc_id IS UNIQUE",
+            "CREATE CONSTRAINT kg_graph_entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE",
+        ]
+        with self._session() as session:
+            for query in queries:
+                session.run(query)
+
+    def run_query(self, query: str, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        with self._session() as session:
+            result = session.run(query, **(params or {}))
+            return [dict(record) for record in result]
+
     def get_state(self, name: str) -> KGState:
         query = (
             "MERGE (k:KGState {name: $name}) "

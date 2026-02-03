@@ -36,6 +36,8 @@ from src.agentic.response_templates import ResponseTemplateSelector
 from src.chat.companion_classifier import CompanionClassifier
 from src.chat.opener_generator import contains_banned_opener, generate_opener
 from src.kg.neo4j_store import Neo4jStore
+from src.kg.retrieval import GraphAugmenter, GraphHints
+from src.kg.score import GraphSupportScorer
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
 from src.utils.payload_utils import get_source_name
 from src.agentic.retriever_manager import RetrieverManager
@@ -2197,6 +2199,7 @@ class PromptBuilder:
             domain_guidance: str = "",
             feedback_memory: str = "",
             retrieval_brief: str = "",
+            kg_evidence: str = "",
             profile_id: Optional[str] = None,
             subscription_id: Optional[str] = None,
             redis_client: Optional[Any] = None,
@@ -2206,11 +2209,13 @@ class PromptBuilder:
         domain_block = f"\nDOMAIN ADAPTER:\n{domain_guidance}\n" if domain_guidance else ""
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
+        kg_block = f"\nKG EVIDENCE PACK (use only if supported by Document Context):\n{kg_evidence}\n" if kg_evidence else ""
 
         prompt = f"""You are a {persona}. Deliver a clear, reader-friendly answer that feels human and intentional, not robotic. Start with a tight summary, then unpack the best evidence.
 
 DOCUMENT CONTEXT:
 {context}
+{kg_block}
 {convo_block}
 {domain_block}
 {retrieval_block}
@@ -2223,7 +2228,8 @@ GROUNDING & CITATION RULES (MANDATORY):
 2) EVERY factual claim must cite immediately with [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-3].
 3) Prefer quoting exact figures, names, dates, section titles, and short snippets with citations.
 4) If sources disagree, briefly note the discrepancy with citations.
-5) Do not invent, pad, or generalize beyond the provided text.
+5) If you use a KG fact, it MUST appear in the Document Context and be cited with [SOURCE-X].
+6) Do not invent, pad, or generalize beyond the provided text.
 
 ANSWER STYLE (MANDATORY):
 - Format: 1-2 sentence overview, then 3-6 concise bullet points with citations, then a one-line takeaway.
@@ -2316,6 +2322,20 @@ class EnterpriseRAGSystem:
             self.conversation_summarizer = ConversationSummarizer(self.llm_client)
             self.feedback_memory = ChatFeedbackMemory(max_items=12, redis_client=redis_client)
             self._warm_up_llm()
+
+            neo4j_store = None
+            if getattr(Config.KnowledgeGraph, "ENABLED", False):
+                try:
+                    neo4j_store = Neo4jStore()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Neo4j unavailable, KG disabled: %s", exc)
+            self.graph_augmenter = GraphAugmenter(
+                neo4j_store=neo4j_store,
+                enabled=bool(neo4j_store),
+            )
+            self.graph_support_scorer = GraphSupportScorer(
+                alpha=float(getattr(Config.KnowledgeGraph, "GRAPH_SCORE_ALPHA", 0.7))
+            )
 
             logger.info("EnterpriseRAGSystem initialized successfully")
         except Exception as e:
@@ -2514,6 +2534,7 @@ class EnterpriseRAGSystem:
             query: str,
             user_id: str,
             profile_id: str,
+            subscription_id: str,
             collection_name: str,
             namespace: str,
             top_k_retrieval: int = 50
@@ -2527,6 +2548,18 @@ class EnterpriseRAGSystem:
         primary_query, primary_metadata = self.preprocess_query(query, user_id, namespace, use_reformulation=True)
         is_vague = self._is_query_vague(primary_query)
         attempt_records = []
+        graph_hints = GraphHints()
+        retrieval_query = primary_query
+        if self.graph_augmenter:
+            graph_hints = self.graph_augmenter.augment(
+                primary_query,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                agent_mode=False,
+            )
+            if graph_hints.query_expansion_terms:
+                expansion = " ".join(graph_hints.query_expansion_terms)
+                retrieval_query = f"{primary_query} {expansion}"
 
         profile_context = self.retriever.get_profile_context(collection_name, profile_id)
         profile_context_data = {
@@ -2551,17 +2584,31 @@ class EnterpriseRAGSystem:
         primary_metadata["person_name"] = person_name
         primary_metadata["target_document_id"] = target_document_id
 
+        document_filter_ids = [target_document_id] if target_document_id else None
+        candidate_doc_ids = graph_hints.candidate_filters.get("document_ids") if graph_hints else None
+        kg_chunks: List[RetrievedChunk] = []
+        if candidate_doc_ids:
+            kg_chunks = self.retriever.hybrid_retrieve(
+                collection_name=collection_name,
+                query=retrieval_query,
+                profile_id=profile_id,
+                top_k=min(top_k_retrieval, 60),
+                document_ids=candidate_doc_ids,
+            )
         chunks = self.retriever.hybrid_retrieve(
             collection_name=collection_name,
-            query=primary_query,
+            query=retrieval_query,
             profile_id=profile_id,
             top_k=top_k_retrieval,
-            document_ids=[target_document_id] if target_document_id else None,
+            document_ids=document_filter_ids,
         )
+        if kg_chunks:
+            chunks = self.retriever._rrf_merge(kg_chunks, chunks)
+            chunks = chunks[:top_k_retrieval]
         attempt_records.append(
             {
                 "label": "hybrid",
-                "query": primary_query,
+                "query": retrieval_query,
                 "hits": len(chunks),
                 "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
                 "document_filter": target_document_id,
@@ -2571,7 +2618,7 @@ class EnterpriseRAGSystem:
         if not chunks and target_document_id:
             chunks = self.retriever.hybrid_retrieve(
                 collection_name=collection_name,
-                query=primary_query,
+                query=retrieval_query,
                 profile_id=profile_id,
                 top_k=top_k_retrieval,
                 document_ids=None,
@@ -2579,7 +2626,7 @@ class EnterpriseRAGSystem:
             attempt_records.append(
                 {
                     "label": "hybrid_no_doc_filter",
-                    "query": primary_query,
+                    "query": retrieval_query,
                     "hits": len(chunks),
                     "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
                     "document_filter": None,
@@ -2593,6 +2640,7 @@ class EnterpriseRAGSystem:
             "attempts": attempt_records,
             "selected_strategy": "hybrid",
             "profile_context": profile_context_data,
+            "graph_hints": graph_hints,
         }
 
 
@@ -2718,6 +2766,7 @@ class EnterpriseRAGSystem:
                 query=query,
                 user_id=user_id,
                 profile_id=profile_id,
+                subscription_id=subscription_id,
                 collection_name=collection_name,
                 namespace=namespace,
                 top_k_retrieval=top_k_retrieval
@@ -2728,6 +2777,7 @@ class EnterpriseRAGSystem:
             processed_query = retrieval_plan.get("query", query)
             preprocessing_metadata = retrieval_plan.get("metadata", {})
             retrieved_chunks = retrieval_plan.get("chunks") or []
+            graph_hints = retrieval_plan.get("graph_hints")
 
             retrieval_attempts = retrieval_plan.get("attempts", [])
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
@@ -2953,6 +3003,7 @@ class EnterpriseRAGSystem:
                 top_k=top_k_rerank,
                 use_cross_encoder=True
             )
+            reranked_chunks = self.graph_support_scorer.score_chunks(reranked_chunks, graph_hints)
 
             if getattr(Config.Retrieval, "USE_ADJACENT_EXPANSION", False):
                 neighbor_window = getattr(Config.Retrieval, "NEIGHBOR_WINDOW", 2) or 2
@@ -2997,6 +3048,24 @@ class EnterpriseRAGSystem:
                     context_sources = self.context_builder.extract_sources(final_chunks)
 
             logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
+
+            kg_evidence_pack = ""
+            if graph_hints and graph_hints.graph_snippets:
+                allowed_chunk_ids = {
+                    (chunk.metadata or {}).get("chunk_id") for chunk in final_chunks if chunk.metadata
+                }
+                snippets = [
+                    snippet for snippet in graph_hints.graph_snippets if snippet.chunk_id in allowed_chunk_ids
+                ]
+                if snippets:
+                    lines = []
+                    max_snippets = int(getattr(Config.KnowledgeGraph, "MAX_GRAPH_SNIPPETS", 10))
+                    for idx, snippet in enumerate(snippets[:max_snippets]):
+                        doc_label = snippet.doc_name or snippet.doc_id
+                        lines.append(
+                            f"{idx + 1}. {snippet.text} (Doc: {doc_label}, Chunk: {snippet.chunk_id})"
+                        )
+                    kg_evidence_pack = "\n".join(lines)
 
             tool_successes = 0
             tool_failures = 0
@@ -3162,6 +3231,7 @@ class EnterpriseRAGSystem:
                 domain_guidance=adapter_text,
                 feedback_memory=feedback_text,
                 retrieval_brief=retrieval_brief,
+                kg_evidence=kg_evidence_pack,
                 profile_id=profile_id,
                 subscription_id=subscription_id,
                 redis_client=self.redis_client,

@@ -39,6 +39,7 @@ from src.api.vector_store import QdrantVectorStore, build_collection_name, compu
 from src.embedding.pipeline.embed_pipeline import prepare_embedding_chunks, normalize_chunk_chain
 from src.embedding.pipeline.payload_normalizer import normalize_payload
 from src.metadata.normalizer import normalize_ingestion_metadata
+from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
 from src.embedding.model_loader import (
     encode_with_fallback as model_encode_with_fallback,
     get_embedding_model,
@@ -1389,6 +1390,31 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
         logging.info(
             f"Saved {saved} embeddings for document {doctag} in collection {collection_name} (profile={profile_id})"
         )
+
+        try:
+            from src.api.dw_newron import get_redis_client
+        except Exception:  # noqa: BLE001
+            get_redis_client = None
+
+        redis_client = None
+        if get_redis_client:
+            try:
+                redis_client = get_redis_client()
+            except Exception:  # noqa: BLE001
+                redis_client = None
+
+        graph_payload = build_graph_payload(
+            embeddings_payload=embeddings,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            document_id=doctag,
+            doc_name=filename or source_filename,
+            doc_metadata=doc_metadata,
+        )
+        if graph_payload:
+            queue = get_graph_ingest_queue(redis_client)
+            queue.enqueue(graph_payload)
+
         return {"status": "success", "points_saved": saved}
 
     except Exception as e:
