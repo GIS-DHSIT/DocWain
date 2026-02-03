@@ -1,0 +1,415 @@
+import hashlib
+import json
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
+
+from src.api.config import Config
+from src.kg.entity_extractor import EntityExtractor, ExtractedEntity, normalize_entity_name
+from src.kg.neo4j_store import Neo4jStore
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_QUEUE_KEY = "kg:ingest:queue"
+DEFAULT_DEAD_KEY = "kg:ingest:dead"
+
+
+@dataclass
+class GraphEntity:
+    entity_id: str
+    name: str
+    type: str
+    normalized_name: str
+
+
+@dataclass
+class GraphMention:
+    doc_id: str
+    entity_id: str
+    chunk_id: str
+    evidence_span: Optional[str]
+    confidence: float
+    edge_key: str
+
+
+@dataclass
+class GraphField:
+    doc_id: str
+    entity_id: str
+    chunk_id: str
+    key: str
+    value: str
+    confidence: float
+    edge_key: str
+
+
+@dataclass
+class GraphIngestPayload:
+    document: Dict[str, Any]
+    entities: List[GraphEntity]
+    mentions: List[GraphMention]
+    fields: List[GraphField]
+    attempts: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "document": self.document,
+            "entities": [entity.__dict__ for entity in self.entities],
+            "mentions": [mention.__dict__ for mention in self.mentions],
+            "fields": [field.__dict__ for field in self.fields],
+            "attempts": self.attempts,
+        }
+
+    @staticmethod
+    def from_dict(payload: Dict[str, Any]) -> "GraphIngestPayload":
+        return GraphIngestPayload(
+            document=payload.get("document") or {},
+            entities=[GraphEntity(**entity) for entity in payload.get("entities", [])],
+            mentions=[GraphMention(**mention) for mention in payload.get("mentions", [])],
+            fields=[GraphField(**field) for field in payload.get("fields", [])],
+            attempts=int(payload.get("attempts", 0)),
+        )
+
+
+class GraphIngestQueue:
+    def __init__(
+        self,
+        *,
+        redis_client: Optional[Any] = None,
+        queue_key: str = DEFAULT_QUEUE_KEY,
+        dead_key: str = DEFAULT_DEAD_KEY,
+        enabled: Optional[bool] = None,
+        max_retries: int = 3,
+        poll_interval_s: float = 0.5,
+    ) -> None:
+        self.redis_client = redis_client
+        self.queue_key = queue_key
+        self.dead_key = dead_key
+        self.enabled = enabled if enabled is not None else bool(getattr(Config.KnowledgeGraph, "ENABLED", False))
+        self.max_retries = max_retries
+        self.poll_interval_s = poll_interval_s
+        self._queue: queue.Queue = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._worker and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=self._run_worker, name="kg-ingest-worker", daemon=True)
+            self._worker.start()
+
+    def enqueue(self, payload: GraphIngestPayload) -> None:
+        if not self.enabled:
+            return
+        self.start()
+        serialized = json.dumps(payload.to_dict())
+        if self.redis_client is not None:
+            try:
+                self.redis_client.lpush(self.queue_key, serialized)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to enqueue KG payload in Redis: %s", exc)
+        self._queue.put(serialized)
+
+    def _pop_payload(self) -> Optional[str]:
+        if self.redis_client is not None:
+            try:
+                item = self.redis_client.brpop(self.queue_key, timeout=1)
+                if item:
+                    return item[1]
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("KG Redis pop failed: %s", exc)
+        try:
+            return self._queue.get(timeout=1)
+        except queue.Empty:
+            return None
+
+    def _requeue(self, payload: GraphIngestPayload) -> None:
+        payload.attempts += 1
+        serialized = json.dumps(payload.to_dict())
+        if payload.attempts > self.max_retries:
+            if self.redis_client is not None:
+                try:
+                    self.redis_client.lpush(self.dead_key, serialized)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Failed to push KG payload to dead letter queue: %s", exc)
+            logger.error("KG payload dropped after %s attempts", payload.attempts)
+            return
+        if self.redis_client is not None:
+            try:
+                self.redis_client.lpush(self.queue_key, serialized)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to requeue KG payload in Redis: %s", exc)
+        self._queue.put(serialized)
+
+    def _run_worker(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            store = Neo4jStore()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("KG worker disabled: %s", exc)
+            return
+        try:
+            store.ensure_graph_constraints()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("KG constraints setup failed: %s", exc)
+        while True:
+            payload_raw = self._pop_payload()
+            if not payload_raw:
+                time.sleep(self.poll_interval_s)
+                continue
+            try:
+                payload = GraphIngestPayload.from_dict(json.loads(payload_raw))
+                ingest_graph_payload(store, payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("KG ingest failed: %s", exc, exc_info=True)
+                try:
+                    payload = GraphIngestPayload.from_dict(json.loads(payload_raw))
+                    self._requeue(payload)
+                except Exception:  # noqa: BLE001
+                    logger.error("Failed to requeue KG payload after error")
+
+
+_graph_ingest_queue: Optional[GraphIngestQueue] = None
+
+
+def get_graph_ingest_queue(redis_client: Optional[Any] = None) -> GraphIngestQueue:
+    global _graph_ingest_queue
+    if _graph_ingest_queue is None:
+        _graph_ingest_queue = GraphIngestQueue(redis_client=redis_client)
+    return _graph_ingest_queue
+
+
+def build_graph_payload(
+    *,
+    embeddings_payload: Dict[str, Any],
+    subscription_id: str,
+    profile_id: str,
+    document_id: str,
+    doc_name: str,
+    doc_metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[GraphIngestPayload]:
+    if not embeddings_payload:
+        return None
+    if not getattr(Config.KnowledgeGraph, "ENABLED", False):
+        return None
+
+    texts = embeddings_payload.get("texts") or []
+    chunk_metadata = embeddings_payload.get("chunk_metadata") or []
+    if not texts:
+        return None
+
+    doc_metadata = doc_metadata or embeddings_payload.get("doc_metadata") or {}
+    detected_language = _coerce_language(doc_metadata.get("languages"))
+    document_category = doc_metadata.get("document_type") or doc_metadata.get("doc_type") or "generic"
+
+    graph_version = _graph_version(document_id, chunk_metadata)
+
+    document = {
+        "doc_id": str(document_id),
+        "profile_id": str(profile_id),
+        "subscription_id": str(subscription_id),
+        "doc_name": doc_name,
+        "document_category": document_category,
+        "detected_language": detected_language,
+        "created_at": doc_metadata.get("created_at"),
+        "graph_version": graph_version,
+    }
+
+    extractor = EntityExtractor()
+    entities: Dict[str, GraphEntity] = {}
+    mentions: List[GraphMention] = []
+    fields: List[GraphField] = []
+
+    for idx, text in enumerate(texts):
+        meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
+        chunk_id = meta.get("chunk_id")
+        if not chunk_id:
+            continue
+        extracted = extractor.extract_with_metadata(text)
+        for ent in extracted:
+            entities.setdefault(
+                ent.entity_id,
+                GraphEntity(
+                    entity_id=ent.entity_id,
+                    name=ent.name,
+                    type=ent.type,
+                    normalized_name=ent.normalized_name,
+                ),
+            )
+            evidence_span = _extract_evidence_span(text, ent.name)
+            edge_key = f"mentions::{document_id}::{ent.entity_id}::{chunk_id}"
+            mentions.append(
+                GraphMention(
+                    doc_id=str(document_id),
+                    entity_id=ent.entity_id,
+                    chunk_id=str(chunk_id),
+                    evidence_span=evidence_span,
+                    confidence=ent.confidence,
+                    edge_key=edge_key,
+                )
+            )
+
+        field_map = _extract_structured_fields(meta)
+        if field_map:
+            for key, value in field_map:
+                normalized_value = normalize_entity_name(str(value))
+                entity_id = f"FIELD::{key.lower()}::{normalized_value}"
+                entities.setdefault(
+                    entity_id,
+                    GraphEntity(
+                        entity_id=entity_id,
+                        name=str(value),
+                        type="FIELD",
+                        normalized_name=normalized_value,
+                    ),
+                )
+                edge_key = f"field::{document_id}::{entity_id}::{chunk_id}"
+                fields.append(
+                    GraphField(
+                        doc_id=str(document_id),
+                        entity_id=entity_id,
+                        chunk_id=str(chunk_id),
+                        key=key,
+                        value=str(value),
+                        confidence=0.85,
+                        edge_key=edge_key,
+                    )
+                )
+
+    if not mentions and not fields:
+        return None
+
+    return GraphIngestPayload(
+        document=document,
+        entities=list(entities.values()),
+        mentions=mentions,
+        fields=fields,
+    )
+
+
+def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None:
+    if not payload or not payload.document:
+        return
+
+    documents = [payload.document]
+    entities = [entity.__dict__ for entity in payload.entities]
+    mentions = [mention.__dict__ for mention in payload.mentions]
+    fields = [field.__dict__ for field in payload.fields]
+
+    store.ensure_graph_constraints()
+
+    doc_query = (
+        "UNWIND $docs AS doc "
+        "MERGE (d:Document {doc_id: doc.doc_id}) "
+        "SET d.profile_id = doc.profile_id, "
+        "    d.subscription_id = doc.subscription_id, "
+        "    d.doc_name = doc.doc_name, "
+        "    d.document_category = doc.document_category, "
+        "    d.detected_language = doc.detected_language, "
+        "    d.graph_version = doc.graph_version, "
+        "    d.created_at = coalesce(d.created_at, doc.created_at, datetime())"
+    )
+    store.run_query(doc_query, {"docs": documents})
+
+    if entities:
+        entity_query = (
+            "UNWIND $entities AS ent "
+            "MERGE (e:Entity {entity_id: ent.entity_id}) "
+            "SET e.name = ent.name, e.type = ent.type, e.normalized_name = ent.normalized_name "
+            "WITH e, ent "
+            "FOREACH (_ IN CASE WHEN ent.type = 'PERSON' THEN [1] ELSE [] END | SET e:Person) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'ORGANIZATION' THEN [1] ELSE [] END | SET e:Organization) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'SKILL' THEN [1] ELSE [] END | SET e:Skill) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'LOCATION' THEN [1] ELSE [] END | SET e:Location) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'DATE' THEN [1] ELSE [] END | SET e:Date) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'AMOUNT' THEN [1] ELSE [] END | SET e:Amount) "
+            "FOREACH (_ IN CASE WHEN ent.type IN ['CLAUSE','TERM'] THEN [1] ELSE [] END | SET e:Clause)"
+        )
+        store.run_query(entity_query, {"entities": entities})
+
+    if mentions:
+        mention_query = (
+            "UNWIND $mentions AS row "
+            "MATCH (d:Document {doc_id: row.doc_id}) "
+            "MATCH (e:Entity {entity_id: row.entity_id}) "
+            "MERGE (d)-[r:MENTIONS {edge_key: row.edge_key}]->(e) "
+            "SET r.chunk_id = row.chunk_id, "
+            "    r.evidence_span = row.evidence_span, "
+            "    r.confidence = row.confidence"
+        )
+        store.run_query(mention_query, {"mentions": mentions})
+
+    if fields:
+        field_query = (
+            "UNWIND $fields AS row "
+            "MATCH (d:Document {doc_id: row.doc_id}) "
+            "MATCH (e:Entity {entity_id: row.entity_id}) "
+            "MERGE (d)-[r:HAS_FIELD {edge_key: row.edge_key}]->(e) "
+            "SET r.key = row.key, "
+            "    r.value = row.value, "
+            "    r.confidence = row.confidence, "
+            "    r.chunk_id = row.chunk_id"
+        )
+        store.run_query(field_query, {"fields": fields})
+
+
+def _extract_evidence_span(text: str, name: str, window: int = 48) -> Optional[str]:
+    if not text or not name:
+        return None
+    lowered = text.lower()
+    needle = name.lower()
+    idx = lowered.find(needle)
+    if idx == -1:
+        return None
+    start = max(idx - window, 0)
+    end = min(idx + len(needle) + window, len(text))
+    return text[start:end].strip()
+
+
+def _extract_structured_fields(meta: Dict[str, Any]) -> List[tuple[str, Any]]:
+    candidates = []
+    for key in ("fields", "structured_fields", "extracted_fields"):
+        data = meta.get(key)
+        if isinstance(data, dict):
+            for field_key, value in data.items():
+                if value is None:
+                    continue
+                candidates.append((str(field_key), value))
+    return candidates
+
+
+def _graph_version(document_id: str, chunk_metadata: Iterable[Dict[str, Any]]) -> str:
+    hashes = []
+    for meta in chunk_metadata:
+        chunk_hash = meta.get("chunk_hash") or meta.get("chunk_id")
+        if chunk_hash:
+            hashes.append(str(chunk_hash))
+    seed = "|".join(sorted(hashes)) or str(document_id)
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _coerce_language(languages: Any) -> Optional[str]:
+    if isinstance(languages, list) and languages:
+        return str(languages[0])
+    if isinstance(languages, str):
+        return languages
+    return None
+
+
+__all__ = [
+    "GraphIngestPayload",
+    "GraphIngestQueue",
+    "build_graph_payload",
+    "get_graph_ingest_queue",
+    "ingest_graph_payload",
+]

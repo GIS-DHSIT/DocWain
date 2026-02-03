@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from src.agent.limits import check_and_count
 from src.agent.prompts import EXTRACTION_PROMPT, FINALIZER_PROMPT, VALIDATION_PROMPT
+from src.agent.graph_worker import GraphWorker
 from src.api.dw_chat import add_message_to_history
 from src.api.dw_newron import create_llm_client, get_redis_client
 from src.api.vector_store import build_collection_name
@@ -86,11 +87,17 @@ class AgentOrchestrator:
         backend_model = AgentOrchestrator._resolve_model(request.model_name)
         llm_client = create_llm_client(backend_model)
 
+        graph_worker = GraphWorker.from_config()
+        graph_result = None
+        if graph_worker:
+            graph_result = graph_worker.run(query_text, request.subscription_id, request.profile_id)
+
         documents, raw_chunks = AgentOrchestrator._retrieve_profile_context(
             subscription_id=request.subscription_id,
             profile_id=request.profile_id,
             query=effective_query,
             auto_scope=auto_scope,
+            graph_result=graph_result,
         )
 
         categories = [doc.category for doc in documents if doc.category]
@@ -191,6 +198,7 @@ class AgentOrchestrator:
         profile_id: str,
         query: str,
         auto_scope: bool,
+        graph_result: Optional[Any] = None,
     ) -> Tuple[List[DocumentContext], List[Dict[str, Any]]]:
         from src.api.dataHandler import encode_with_fallback, get_qdrant_client
 
@@ -204,10 +212,16 @@ class AgentOrchestrator:
         )
 
         chunks: List[Dict[str, Any]] = []
+        effective_query = query
+        if graph_result and getattr(graph_result, "graph_hints", None):
+            expansion_terms = graph_result.graph_hints.query_expansion_terms
+            if expansion_terms and not auto_scope:
+                effective_query = f"{query} {' '.join(expansion_terms)}"
+
         if auto_scope:
             chunks = AgentOrchestrator._scroll_sample(client, collection, query_filter)
         else:
-            query_vec = encode_with_fallback([query], normalize_embeddings=True, convert_to_numpy=False)[0]
+            query_vec = encode_with_fallback([effective_query], normalize_embeddings=True, convert_to_numpy=False)[0]
             results = client.search(
                 collection_name=collection,
                 query_vector=("content_vector", list(query_vec)),
@@ -216,6 +230,32 @@ class AgentOrchestrator:
                 with_payload=True,
                 with_vectors=False,
             )
+            if graph_result and graph_result.candidate_doc_ids:
+                candidate_filter = Filter(
+                    must=[
+                        FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
+                        FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
+                        FieldCondition(key="document_id", match=MatchAny(any=graph_result.candidate_doc_ids)),
+                    ]
+                )
+                candidate_results = client.search(
+                    collection_name=collection,
+                    query_vector=("content_vector", list(query_vec)),
+                    query_filter=candidate_filter,
+                    limit=40,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                combined = list(candidate_results or []) + list(results or [])
+                seen_ids = set()
+                deduped = []
+                for hit in combined:
+                    hit_id = getattr(hit, "id", None)
+                    if hit_id in seen_ids:
+                        continue
+                    seen_ids.add(hit_id)
+                    deduped.append(hit)
+                results = deduped
             for hit in results:
                 payload = hit.payload or {}
                 chunks.append({"payload": payload, "score": float(hit.score), "text": payload.get("text") or ""})
