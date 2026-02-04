@@ -155,7 +155,7 @@ class AgentOrchestrator:
     @staticmethod
     def _resolve_model(model_name: str) -> str:
         if str(model_name).strip().lower() == "docwain-agent":
-            return "gpt-oss"
+            return "gpt-oss:latest"
         return model_name
 
     @staticmethod
