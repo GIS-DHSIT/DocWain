@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
 from trl import SFTTrainer
 
 from docwain_ft.config import CONFIG
@@ -48,12 +48,30 @@ def main() -> None:
     use_qlora = CONFIG.use_qlora
     bnb_config = None
     if use_qlora:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
-            bnb_4bit_quant_type="nf4",
-        )
+        try:
+            base_config = AutoConfig.from_pretrained(CONFIG.hf_base_model)
+            quant_config = getattr(base_config, "quantization_config", None)
+            if quant_config is not None and not isinstance(quant_config, BitsAndBytesConfig):
+                logger.warning(
+                    "Base model quantization (%s) is incompatible with BitsAndBytes. Disabling QLoRA.",
+                    quant_config.__class__.__name__,
+                )
+                use_qlora = False
+            else:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+                    bnb_4bit_quant_type="nf4",
+                )
+        except Exception as exc:
+            logger.warning("Unable to inspect quantization config (%s); proceeding with QLoRA defaults.", exc)
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float16,
+                bnb_4bit_quant_type="nf4",
+            )
 
     logger.info("Loading base model %s", CONFIG.hf_base_model)
     model = AutoModelForCausalLM.from_pretrained(
