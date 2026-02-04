@@ -89,6 +89,116 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+STOP_TOKENS = {
+    "<|endoftext|>",
+    "<|eot_id|>",
+    "</s>",
+    "<|end|>",
+}
+
+
+def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
+    if not model_name:
+        return model_name
+    normalized = str(model_name).strip().lower()
+    if normalized == "docwain-agent":
+        return "gpt-oss:latest"
+    if normalized == "gpt-oss":
+        return "gpt-oss:latest"
+    return model_name
+
+
+def _is_generation_empty(text: Optional[str], stop_tokens: Optional[Set[str]] = None) -> bool:
+    if text is None:
+        return True
+    cleaned = str(text).strip()
+    if not cleaned:
+        return True
+    tokens = stop_tokens or STOP_TOKENS
+    if cleaned in tokens:
+        return True
+    for token in tokens:
+        if token and cleaned.replace(token, "").strip() == "":
+            return True
+    return False
+
+
+def _requires_detailed_summary(query: str) -> bool:
+    lowered = (query or "").lower()
+    summary_cues = ("summarize", "summary", "summarise", "overview", "key points", "recap", "compare")
+    return any(cue in lowered for cue in summary_cues)
+
+
+def _extract_requested_fields(query: str) -> List[str]:
+    if not query:
+        return []
+    lowered = query.lower()
+    patterns = [
+        r"fields?\s*[:\-]\s*(.+)",
+        r"extract\s+(.+)",
+        r"provide\s+(.+)",
+        r"include\s+(.+)",
+        r"list\s+(.+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            raw = match.group(1)
+            raw = re.split(r"\bfrom\b|\bin\b|\bfor\b|\busing\b|\bof\b", raw)[0]
+            parts = re.split(r",|/|;|\band\b", raw)
+            fields = []
+            for part in parts:
+                item = part.strip(" .:-\t\n")
+                if item and len(item) > 1:
+                    fields.append(item)
+            return fields
+    return []
+
+
+def _build_evidence_ledger(chunks: List[Any], max_snippet_chars: int = 240) -> List[Dict[str, str]]:
+    ledger = []
+    for chunk in chunks:
+        meta = getattr(chunk, "metadata", {}) or {}
+        doc_name = get_source_name(meta) or meta.get("source_name") or meta.get("file_name") or "Unknown"
+        chunk_id = str(meta.get("chunk_id") or meta.get("id") or meta.get("chunkId") or "unknown")
+        text = (getattr(chunk, "text", "") or "").strip()
+        snippet = text[:max_snippet_chars].strip()
+        ledger.append({"doc_name": doc_name, "chunk_id": chunk_id, "snippet": snippet})
+    return ledger
+
+
+def _find_field_value(field: str, ledger: List[Dict[str, str]]) -> Optional[str]:
+    if not field:
+        return None
+    pattern = re.compile(rf"{re.escape(field)}\s*[:\-]\s*([^\n\r;,.]+)", re.IGNORECASE)
+    for entry in ledger:
+        match = pattern.search(entry.get("snippet", ""))
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _format_evidence_fallback(query: str, ledger: List[Dict[str, str]]) -> str:
+    requested_fields = _extract_requested_fields(query)
+    lines = ["Here is what I can verify from the retrieved context."]
+    if requested_fields:
+        lines.append("Requested fields:")
+        for field in requested_fields:
+            value = _find_field_value(field, ledger)
+            if value:
+                lines.append(f"- {field}: {value}")
+            else:
+                lines.append(f"- {field}: Not available in retrieved context")
+    if ledger:
+        lines.append("Evidence ledger:")
+        for entry in ledger:
+            lines.append(
+                f"- {entry['doc_name']} (chunk {entry['chunk_id']}): {entry['snippet']}"
+            )
+    else:
+        lines.append("Not available in retrieved context.")
+    return "\n".join(lines).strip()
+
 
 class QdrantCollectionNotFoundError(ValueError):
     def __init__(self, collection_name: str, available_collections: Optional[List[str]] = None):
@@ -1024,17 +1134,19 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or os.getenv("OLLAMA_MODEL", "llama3.2")
+        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "llama3.2")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
 
-    def generate(
+    def generate_with_metadata(
         self,
         prompt: str,
-        max_retries: int = 3,
-        backoff: float = 1.0
-    ) -> str:
+        *,
+        options: Optional[Dict[str, Any]] = None,
+        max_retries: int = 1,
+        backoff: float = 0.5,
+    ) -> Tuple[str, Dict[str, Any]]:
         metrics_store = get_metrics_store()
         request_started = time.time()
         if metrics_store.available:
@@ -1043,29 +1155,27 @@ class OllamaClient:
                 distributions={"model_usage": {self.model_name: 1}},
                 model_id=self.model_name,
             )
-        temperature = getattr(Config.LLM, "TEMPERATURE", 0.2)
-        top_p = getattr(Config.LLM, "TOP_P", 0.85)
-        max_tokens = getattr(Config.LLM, "MAX_TOKENS", 2048)
+        generation_options = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.2),
+            "top_p": getattr(Config.LLM, "TOP_P", 0.85),
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "num_ctx": 4096,
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 2048),
+        }
+        if options:
+            generation_options.update({k: v for k, v in options.items() if v is not None})
+
+        last_response: Dict[str, Any] = {}
         for attempt in range(1, max_retries + 1):
             try:
                 response = ollama.generate(
                     model=self.model_name,
                     prompt=prompt,
-                    options={
-                        "temperature": temperature,   #  LOWER = less hallucination
-                        "top_p": top_p,
-                        "top_k": 40,
-                        "repeat_penalty": 1.1,
-                        "num_ctx": 4096,
-                        "num_predict": max_tokens,
-                    }
+                    options=generation_options,
                 )
-
-                text = (response.get("response") or "").strip()
-
-                if not text:
-                    logger.warning(f"Ollama returned empty response: {response}")
-                    return "I don’t have enough information in the documents to answer that."
+                last_response = response or {}
+                text = (last_response.get("response") or "").strip()
                 if metrics_store.available:
                     latency_ms = (time.time() - request_started) * 1000
                     metrics_store.record(
@@ -1078,14 +1188,13 @@ class OllamaClient:
                             counters={"llm_retry_count": attempt - 1},
                             model_id=self.model_name,
                         )
-                return text
-
-            except Exception as e:
-                logger.warning(f"Ollama attempt {attempt}/{max_retries} failed: {e}")
+                return text, last_response
+            except Exception as exc:
+                logger.warning(f"Ollama attempt {attempt}/{max_retries} failed: {exc}")
                 if attempt < max_retries:
                     time.sleep(backoff * attempt)
                 else:
-                    logger.error(f"All Ollama retries failed")
+                    logger.error("All Ollama retries failed")
                     if metrics_store.available:
                         latency_ms = (time.time() - request_started) * 1000
                         metrics_store.record(
@@ -1096,7 +1205,23 @@ class OllamaClient:
                         )
                     raise
 
-        return "I’m unable to answer that based on the available information."
+        return "", last_response
+
+    def generate(
+        self,
+        prompt: str,
+        max_retries: int = 3,
+        backoff: float = 1.0
+    ) -> str:
+        text, response = self.generate_with_metadata(
+            prompt,
+            max_retries=max_retries,
+            backoff=backoff,
+        )
+        if not text:
+            logger.warning(f"Ollama returned empty response: {response}")
+            return "I don’t have enough information in the documents to answer that."
+        return text
 
 
 class GeminiClient:
@@ -1112,6 +1237,16 @@ class GeminiClient:
             "max_output_tokens": getattr(Config.LLM, "MAX_TOKENS", 2048),
         }
         logger.info(f"Initialized GeminiClient with model: {self.model_name}")
+
+    def generate_with_metadata(
+            self,
+            prompt: str,
+            max_retries: int = 3,
+            backoff: float = 1.0,
+            options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
+        return text, {"response": text}
 
     def generate(
             self,
@@ -2210,8 +2345,31 @@ class PromptBuilder:
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
         kg_block = f"\nKG EVIDENCE PACK (use only if supported by Document Context):\n{kg_evidence}\n" if kg_evidence else ""
+        task_mode = _requires_detailed_summary(query) or bool(_extract_requested_fields(query))
+        extraction_mode = bool(_extract_requested_fields(query))
 
-        prompt = f"""You are a {persona}. Deliver a clear, reader-friendly answer that feels human and intentional, not robotic. Start with a tight summary, then unpack the best evidence.
+        task_style_block = ""
+        if task_mode:
+            task_style_block = (
+                "\nTASK MODE STYLE:\n"
+                "- Start with a 1–2 sentence direct answer.\n"
+                "- Then provide 4–6 crisp bullets with citations (only supported claims).\n"
+                "- Provide explanation only if necessary to clarify the bullets.\n"
+                "- End with a one-line “Next best action” question ONLY if it helps.\n"
+            )
+        extraction_block = ""
+        if extraction_mode:
+            extraction_block = (
+                "\nEXTRACTION MODE:\n"
+                "- Return a compact structured block using the requested field names.\n"
+                "- For any missing field, write exactly: Not available in retrieved context.\n"
+                "- Avoid vague phrases or filler.\n"
+            )
+
+        prompt = f"""You are DocWain-Agent, an analyst assistant. Be conversational, concise, and helpful.
+You MUST use the retrieved document context and never add DocWain product intro unless the user asks about DocWain.
+When information is missing, say so briefly and proceed with what is available.
+{task_style_block}{extraction_block}
 
 DOCUMENT CONTEXT:
 {context}
@@ -3237,7 +3395,104 @@ class EnterpriseRAGSystem:
                 redis_client=self.redis_client,
             )
 
-            answer = self.llm_client.generate(prompt)
+            def _generate_with_metadata(prompt_text: str, options: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+                if hasattr(self.llm_client, "generate_with_metadata"):
+                    return self.llm_client.generate_with_metadata(prompt_text, options=options)
+                text = self.llm_client.generate(prompt_text)
+                return text, {"response": text}
+
+            temperature = float(getattr(Config.LLM, "TEMPERATURE", 0.2))
+            top_p = float(getattr(Config.LLM, "TOP_P", 0.85))
+            num_predict = int(getattr(Config.LLM, "MAX_TOKENS", 2048))
+            base_options = {
+                "temperature": temperature,
+                "top_p": top_p,
+                "num_predict": num_predict,
+            }
+            answer, raw_response = _generate_with_metadata(prompt, options=base_options)
+            done_reason = raw_response.get("done_reason")
+            eval_count = raw_response.get("eval_count")
+            recovery_path_taken = "none"
+
+            if _is_generation_empty(answer):
+                if metrics_store.available:
+                    metrics_store.record(counters={"generation_empty": 1}, model_id=self.model_name)
+                if final_chunks:
+                    recovery_path_taken = "retry"
+                    retry_chunks = final_chunks
+                    retry_context = context
+                    retry_sources = context_sources
+                    if _requires_detailed_summary(query) and len(reranked_chunks) > len(final_chunks):
+                        expanded_limit = min(len(reranked_chunks), max(context_chunk_limit, context_chunk_limit * 2))
+                        if expanded_limit > len(final_chunks):
+                            retry_chunks = reranked_chunks[:expanded_limit]
+                            try:
+                                retry_dicts = [
+                                    {
+                                        "text": chunk.text,
+                                        "score": float(chunk.score),
+                                        "metadata": chunk.metadata or {},
+                                    }
+                                    for chunk in retry_chunks
+                                ]
+                                retry_context, retry_sources = self.intelligent_context_builder.build_context(
+                                    chunks=retry_dicts,
+                                    query=processed_query,
+                                    include_metadata=True,
+                                )
+                            except Exception as ctx_exc:
+                                logger.warning("Retry context rebuild failed; using fallback: %s", ctx_exc)
+                                retry_context = self.context_builder.build_context(
+                                    chunks=retry_chunks,
+                                    max_chunks=expanded_limit,
+                                )
+                                retry_sources = self.context_builder.extract_sources(retry_chunks)
+                            final_chunks = retry_chunks
+                            context_sources = retry_sources
+                            context = retry_context
+                            prompt = self.prompt_builder.build_qa_prompt(
+                                query=query,
+                                context=retry_context,
+                                persona=persona,
+                                conversation_summary=conversation_summary,
+                                domain_guidance=adapter_text,
+                                feedback_memory=feedback_text,
+                                retrieval_brief=retrieval_brief,
+                                kg_evidence=kg_evidence_pack,
+                                profile_id=profile_id,
+                                subscription_id=subscription_id,
+                                redis_client=self.redis_client,
+                            )
+
+                    retry_prompt = (
+                        f"{prompt}\n\n"
+                        "End your response with a single line starting with 'Takeaway:' "
+                        "and then output END_OF_ANSWER."
+                    )
+                    retry_options = {
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                        "num_predict": -1,
+                        "stop": ["END_OF_ANSWER"],
+                    }
+                    answer, raw_response = _generate_with_metadata(retry_prompt, options=retry_options)
+                    temperature = float(retry_options["temperature"])
+                    top_p = float(retry_options["top_p"])
+                    num_predict = int(retry_options["num_predict"])
+                    done_reason = raw_response.get("done_reason")
+                    eval_count = raw_response.get("eval_count")
+
+                if _is_generation_empty(answer):
+                    if final_chunks:
+                        recovery_path_taken = "evidence_fallback"
+                        ledger = _build_evidence_ledger(final_chunks)
+                        answer = _format_evidence_fallback(query, ledger)
+                    else:
+                        recovery_path_taken = "evidence_fallback"
+                        answer = (
+                            "I don’t have enough context or information to build a response from the documents."
+                        )
+
             if answer and answer.strip().lower().startswith(query.strip().lower()):
                 trimmed = answer[len(query):].lstrip(" :.-\n\t")
                 if trimmed:
@@ -3285,6 +3540,15 @@ class EnterpriseRAGSystem:
                 "retrieval_notes": retrieval_brief,
                 "model_name": self.model_name,
                 "persona": persona,
+                "generation": {
+                    "temperature": temperature,
+                    "top_p": top_p,
+                    "num_predict": num_predict,
+                    "done_reason": done_reason,
+                    "eval_count": eval_count,
+                    "recovery_path_taken": recovery_path_taken,
+                },
+                "recovery_path_taken": recovery_path_taken,
                 "cache_version": ANSWER_CACHE_VERSION,
                 "context_fingerprint": memory_fingerprint,
                 "profile_context_fingerprint": profile_context_fingerprint,
@@ -3296,6 +3560,22 @@ class EnterpriseRAGSystem:
                 "force_refresh": force_refresh,
                 "disable_answer_cache": disable_answer_cache,
             }
+
+            rerank_alpha = self.reranker.adjust_alpha(processed_query)
+            logger.info(
+                "[ASK] ctx_chunks=%s ctx_chars=%s top_k=%s rerank_alpha=%.2f model=%s temperature=%.2f num_predict=%s "
+                "done_reason=%s eval_count=%s recovery_path_taken=%s",
+                len(final_chunks),
+                len(context),
+                top_k_retrieval,
+                rerank_alpha,
+                self.model_name,
+                temperature,
+                num_predict,
+                done_reason,
+                eval_count,
+                recovery_path_taken,
+            )
 
             try:
                 metrics.record(
@@ -3423,6 +3703,7 @@ def create_llm_client(
     global _LLM_SEMAPHORE
     if _LLM_SEMAPHORE is None:
         _LLM_SEMAPHORE = threading.Semaphore(getattr(Config.LLM, "MAX_CONCURRENCY", 2))
+    model_name = _resolve_model_alias(model_name)
     name = (model_name or "").lower()
     backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
     resolved_backend = backend
