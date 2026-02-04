@@ -1023,6 +1023,10 @@ def _collect_available_models() -> List[ModelInfo]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to list Ollama models: %s", exc)
 
+    models.setdefault(
+        "DocWain-Agent",
+        ModelInfo(model="DocWain-Agent", source="docwain", backend="ollama"),
+    )
     models.setdefault("gemini-2.5-flash", ModelInfo(model="gemini-2.5-flash", source="gemini", backend="gemini"))
     return list(models.values())
 
