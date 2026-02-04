@@ -85,7 +85,7 @@ class RouterDecision(BaseModel):
     retrieval_plan: RetrievalPlan
     response_policy: ResponsePolicy
 
-    @root_validator
+    @root_validator(skip_on_failure=True)
     def _enforce_rules(cls, values: dict) -> dict:
         intent: Optional[IntentModel] = values.get("intent")
         retrieval: Optional[RetrievalPlan] = values.get("retrieval_plan")
