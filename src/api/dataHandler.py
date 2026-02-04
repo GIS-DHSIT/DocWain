@@ -36,9 +36,9 @@ from src.api.dw_document_extractor import DocumentExtractor
 from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
+from src.embedding.pipeline.chunk_integrity import clean_text_for_embedding
 from src.embedding.pipeline.embed_pipeline import prepare_embedding_chunks, normalize_chunk_chain
-from src.embedding.pipeline.payload_normalizer import normalize_payload
-from src.metadata.normalizer import normalize_ingestion_metadata
+from src.embedding.pipeline.payload_normalizer import build_qdrant_payload
 from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
 from src.embedding.model_loader import (
     encode_with_fallback as model_encode_with_fallback,
@@ -1283,7 +1283,6 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
 
             page_val = pages[idx] if idx < len(pages) else chunk_meta.get("page_number")
             section_val = chunk_meta.get("section_title", sections[idx] if idx < len(sections) else "")
-            summary_val = summaries[idx] if idx < len(summaries) else chunk_meta.get("summary")
             section_path = chunk_meta.get("section_path") or section_val or "Untitled Section"
             page_start = chunk_meta.get("page_start", page_val)
             page_end = chunk_meta.get("page_end", page_val)
@@ -1308,71 +1307,43 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
                 else:
                     chunk_kind = "section_text"
 
-            evidence_pointer = None
-            if section_val or page_start is not None or page_end is not None:
-                if page_start is None and page_end is None:
-                    page_range = "N/A"
-                elif page_end is None or page_end == page_start:
-                    page_range = str(page_start)
-                else:
-                    page_range = f"{page_start}-{page_end}"
-                evidence_pointer = f"Section: {section_val or 'Section'}, Page: {page_range}"
-
-            model_name, model_dim, _device = get_model_info()
-            payload = {
+            raw_payload = {
                 "subscription_id": str(subscription_id),
                 "profile_id": str(profile_id),
-                "profile_name": profile_name,
-                "text": text,
-                "text_raw": chunk_meta.get("text_raw"),
                 "document_id": str(doctag),
-                "source_name": filename or source_filename,
-                "source_uri": doc_metadata.get("source_uri"),
-                "chunk_index": idx,
-                "chunk_count": max_len,
-                "page": page_val,
-                "page_start": page_start,
-                "page_end": page_end,
+                "text": text,
+                "text_clean": chunk_meta.get("text_clean") or clean_text_for_embedding(text),
+                "text_data": {"clean": chunk_meta.get("text_clean")} if chunk_meta.get("text_clean") else {},
+                "source": {"name": filename or source_filename},
+                "document": {
+                    "type": chunk_meta.get("doc_type")
+                    or doc_type
+                    or doc_metadata.get("document_type")
+                    or doc_metadata.get("doc_type"),
+                    "ingestion_source": doc_metadata.get("ingestion_source") or doc_metadata.get("source_type"),
+                },
+                "section": {"title": section_val, "path": section_path},
                 "section_title": section_val or chunk_meta.get("section"),
                 "section_path": section_path,
-                "summary": summary_val,
-                "doc_type": chunk_meta.get("doc_type") or doc_type or doc_metadata.get("doc_type"),
-                "document_type": doc_metadata.get("document_type"),
-                "languages": chunk_meta.get("languages") or languages,
-                "products_name": chunk_meta.get("products_name") or products_name,
-                "description": chunk_meta.get("description") or description,
-                "ocr_confidence": chunk_meta.get("ocr_confidence") or ocr_confidence,
-                "chunk_char_len": chunk_meta.get("chunk_char_len") or chunk_char_len,
-                "chunk_hash": chunk_meta.get("chunk_hash") or chunk_hash,
-                "chunk_sentence_complete": bool(chunk_meta.get("sentence_complete", False)),
+                "page": page_val,
+                "page_start": page_start,
                 "chunk_id": chunk_id,
-                "prev_chunk_id": chunk_meta.get("prev_chunk_id"),
-                "next_chunk_id": chunk_meta.get("next_chunk_id"),
-                "chunk_type": chunk_meta.get("chunk_type", "text"),
+                "chunk_index": idx,
+                "chunk_count": max_len,
+                "chunk_role": chunk_meta.get("chunk_role") or chunk_meta.get("role"),
                 "chunk_kind": chunk_kind,
-                "section_id": chunk_meta.get("section_id"),
-                "evidence_pointer": evidence_pointer,
-                "embedding_model": model_name,
-                "embedding_dim": model_dim,
+                "chunk": {
+                    "id": chunk_id,
+                    "index": idx,
+                    "count": max_len,
+                    "type": chunk_kind,
+                    "role": chunk_meta.get("chunk_role") or chunk_meta.get("role"),
+                    "hash": chunk_meta.get("chunk_hash") or chunk_hash,
+                },
+                "hash": chunk_meta.get("chunk_hash") or chunk_hash,
             }
 
-            normalized_meta = normalize_ingestion_metadata(
-                {
-                    **doc_metadata,
-                    **chunk_meta,
-                    "subscription_id": subscription_id,
-                    "profile_id": profile_id,
-                    "document_id": doctag,
-                    "document_name": filename or source_filename,
-                    "chunk_id": chunk_id,
-                    "chunk_kind": chunk_kind,
-                    "doc_type": payload.get("doc_type"),
-                    "document_type": payload.get("document_type"),
-                }
-            )
-            payload.update({k: v for k, v in normalized_meta.items() if v is not None})
-
-            payload = normalize_payload(payload)
+            payload = build_qdrant_payload(raw_payload)
 
             records.append(
                 ChunkRecord(
