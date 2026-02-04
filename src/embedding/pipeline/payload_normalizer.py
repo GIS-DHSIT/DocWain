@@ -76,6 +76,74 @@ def _section_path_list(section_path: Optional[str]) -> Optional[list[str]]:
     return parts or None
 
 
+def normalize_content(text: str) -> str:
+    if not text:
+        return ""
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+    replacements = {
+        "Managingateamof": "Managing a team of",
+        "Developersacrossdifferentgloballocations": "Developers across different global locations",
+        "VicePresident": "Vice President",
+        "JPMorganChase": "JPMorgan Chase",
+    }
+    for needle, replacement in replacements.items():
+        normalized = re.sub(re.escape(needle), replacement, normalized, flags=re.IGNORECASE)
+
+    normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
+    normalized = re.sub(r"([A-Za-z])(\d)", r"\1 \2", normalized)
+    normalized = re.sub(r"(\d)([A-Za-z])", r"\1 \2", normalized)
+    normalized = re.sub(r"([A-Za-z])\(", r"\1 (", normalized)
+    normalized = re.sub(r"\s*&\s*", " & ", normalized)
+    normalized = re.sub(r"\s*—\s*", " — ", normalized)
+    normalized = re.sub(r"(?<=\w)-(?=\w)", " - ", normalized)
+
+    normalized = re.sub(r"(?<!^)(?<!\n)\s*([•●])", r"\n\1", normalized)
+    lines = []
+    for line in normalized.split("\n"):
+        compacted = re.sub(r"[ \t]+", " ", line).strip()
+        if compacted:
+            lines.append(compacted)
+    return "\n".join(lines).strip()
+
+
+def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    section_path = raw.get("section_path")
+    if not section_path:
+        section_path = (raw.get("section") or {}).get("path")
+    if isinstance(section_path, str):
+        section_path = [part.strip() for part in section_path.split(">") if part.strip()]
+        if not section_path:
+            section_path = None
+
+    content_source = raw.get("text_clean")
+    if not content_source:
+        content_source = (raw.get("text_data") or {}).get("clean")
+    if not content_source:
+        content_source = raw.get("text")
+
+    content = normalize_content(content_source or "")
+
+    return {
+        "subscription_id": raw.get("subscription_id"),
+        "profile_id": raw.get("profile_id"),
+        "document_id": raw.get("document_id"),
+        "source_name": (raw.get("source") or {}).get("name"),
+        "document_type": (raw.get("document") or {}).get("type"),
+        "ingestion_source": (raw.get("document") or {}).get("ingestion_source"),
+        "section_title": raw.get("section_title") or (raw.get("section") or {}).get("title"),
+        "section_path": section_path,
+        "page": raw.get("page") or raw.get("page_start"),
+        "chunk_id": raw.get("chunk_id") or (raw.get("chunk") or {}).get("id"),
+        "chunk_index": raw.get("chunk_index") or (raw.get("chunk") or {}).get("index"),
+        "chunk_count": raw.get("chunk_count") or (raw.get("chunk") or {}).get("count"),
+        "chunk_role": raw.get("chunk_role") or (raw.get("chunk") or {}).get("role"),
+        "chunk_kind": raw.get("chunk_kind") or (raw.get("chunk") or {}).get("type"),
+        "hash": (raw.get("chunk") or {}).get("hash") or raw.get("hash"),
+        "content": content,
+    }
+
+
 def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     clean_text = clean_text_for_embedding(payload.get("text") or "")
     raw_text = payload.get("text_raw") or payload.get("text") or ""
@@ -177,4 +245,4 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return cleaned
 
 
-__all__ = ["normalize_payload"]
+__all__ = ["build_qdrant_payload", "normalize_content", "normalize_payload"]
