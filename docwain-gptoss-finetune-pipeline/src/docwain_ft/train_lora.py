@@ -7,6 +7,7 @@ import torch
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+from transformers.configuration_utils import PretrainedConfig
 from trl import SFTTrainer
 
 from docwain_ft.config import CONFIG
@@ -14,6 +15,25 @@ from docwain_ft.utils import ensure_dir, read_jsonl, setup_logging
 
 
 TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def patch_quantization_config_serialization(logger: logging.Logger) -> None:
+    original_to_dict = PretrainedConfig.to_dict
+
+    def safe_to_dict(self: PretrainedConfig):  # type: ignore[override]
+        has_attr = hasattr(self, "quantization_config")
+        value = getattr(self, "quantization_config", None)
+        if has_attr and value is None:
+            delattr(self, "quantization_config")
+        try:
+            return original_to_dict(self)
+        finally:
+            if has_attr:
+                setattr(self, "quantization_config", value)
+
+    if PretrainedConfig.to_dict is not safe_to_dict:
+        logger.debug("Patching PretrainedConfig.to_dict to handle None quantization_config.")
+        PretrainedConfig.to_dict = safe_to_dict  # type: ignore[assignment]
 
 
 def load_dataset(path: str, tokenizer: AutoTokenizer) -> Dataset:
@@ -40,6 +60,7 @@ def main() -> None:
 
     setup_logging()
     logger = logging.getLogger("train_lora")
+    patch_quantization_config_serialization(logger)
 
     output_root = Path(args.out)
     lora_dir = ensure_dir(output_root / "lora")
