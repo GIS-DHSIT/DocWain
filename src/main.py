@@ -1003,16 +1003,23 @@ def _collect_available_models() -> List[ModelInfo]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to list managed models: %s", exc)
 
+    def _display_name(name: str) -> str:
+        normalized = name.lower()
+        if normalized == "gpt-oss" or normalized.startswith("gpt-oss:"):
+            return "DocWain-Agent"
+        return name
+
     try:
         raw = ollama.list().model_dump()
         for entry in raw.get("models", []):
             name = entry.get("model") or entry.get("name")
             if not name:
                 continue
+            display_name = _display_name(name)
             models.setdefault(
-                name,
+                display_name,
                 ModelInfo(
-                    model=name,
+                    model=display_name,
                     source="ollama",
                     backend="ollama",
                     size=entry.get("size"),

@@ -68,13 +68,14 @@ class Config:
     class Model:
         EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
         EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+        OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "bge-m3")
         SENTENCE_TRANSFORMERS = EMBEDDING_MODEL
         SENTENCE_TRANSFORMERS_FALLBACK = SENTENCE_TRANSFORMERS
         SENTENCE_TRANSFORMERS_CANDIDATES = [
             EMBEDDING_MODEL,
-            os.getenv("EMBEDDING_FALLBACK_MODEL", "sentence-transformers/all-mpnet-base-v2"),
+            os.getenv("EMBEDDING_FALLBACK_MODEL", "BAAI/bge-base-en-v1.5"),
         ]
-        RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
         OCR_ENGINE = os.getenv("OCR_ENGINE", "pytesseract")
         AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
         AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")

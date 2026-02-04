@@ -13,7 +13,8 @@ from src.api.config import Config
 from src.api.genai_client import generate_text
 from src.nlp.intent_rules import IntentRuleMatch, match_intent_rules
 from src.nlp.sentiment_rules import SentimentRuleMatch, match_sentiment_rules
-from src.prompting.persona import DOCWAIN_META_RESPONSE, enforce_docwain_identity, get_docwain_persona, sanitize_response
+from src.policy.response_policy import INFO_MODE, ResponseModeClassifier, build_docwain_intro
+from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
 
 logger = logging.getLogger(__name__)
 
@@ -187,38 +188,37 @@ def analyze_sentiment(text: str) -> SentimentResult:
     )
 
 
-def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentResult]) -> str:
+def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentResult], response_mode: str) -> str:
     if intent.intent == "GREETING":
-        response = "Hi! I’m DocWain, your intelligent document assistant. How can I help with your documents today?"
+        response = "Hi! How can I help with your documents today?"
     elif intent.intent == "THANKS_OR_PRAISE":
         response = (
-            "Thanks for the feedback! I’m DocWain, and I’m glad that helped. "
-            "I can summarize, extract key data, or compare documents—what would you like next?"
+            "Glad that helped. I can summarize, extract key data, or compare documents—what would you like next?"
         )
     elif intent.intent == "NEGATIVE_FEEDBACK":
         response = (
-            "I’m sorry about that—I’m DocWain and I’ll fix it. "
-            "I can retry with deeper retrieval or focus on a specific document/section. Which should I prioritize?"
+            "Sorry about that. I can retry with deeper retrieval or focus on a specific document/section. Which should I prioritize?"
         )
     elif intent.intent == "META":
-        response = DOCWAIN_META_RESPONSE
+        response = build_docwain_intro()
     elif intent.intent == "SMALL_TALK":
         response = (
-            "Hi! I’m DocWain, an intelligent document assistant. "
-            "If you have a document task, I’m ready to help."
+            "Hi! If you have a document task, I’m ready to help."
         )
     elif intent.intent == "CLARIFICATION":
         response = (
             "Happy to clarify. Tell me which part you want me to explain again, or paste the snippet to review."
         )
     else:
-        response = "I’m DocWain, your document assistant. How can I help with your documents?"
+        response = "How can I help with your documents?"
 
     if sentiment and sentiment.sentiment == "mixed" and intent.intent != "META":
         response = (
-            "I hear you. I’m DocWain and I can tighten the answer. "
-            "Want me to retry with deeper retrieval or focus on a specific document/section?"
+            "I hear you. Want me to retry with deeper retrieval or focus on a specific document/section?"
         )
+
+    if response_mode == INFO_MODE and intent.intent != "META":
+        return build_docwain_intro()
 
     return response
 
@@ -231,21 +231,25 @@ def route_message(user_text: str, state: Optional[dict] = None) -> RouteDecision
 
     intent = detect_intent(user_text)
     sentiment = analyze_sentiment(user_text) if sentiment_enabled else None
+    response_mode = ResponseModeClassifier.classify(user_text)
 
     direct_intents = {"GREETING", "THANKS_OR_PRAISE", "NEGATIVE_FEEDBACK", "SMALL_TALK", "CLARIFICATION", "META"}
     direct_response = intent.intent in direct_intents and intent.confidence >= threshold
+    if response_mode == INFO_MODE:
+        direct_response = True
+        intent = IntentResult(intent="META", confidence=1.0, method="policy", matched_rule="response_mode")
 
     response_text = None
     policy = "task"
     if direct_response:
-        response_text = _build_direct_response(intent, sentiment)
+        response_text = _build_direct_response(intent, sentiment, response_mode)
         if persona_enabled:
             persona_text = get_docwain_persona(
                 profile_id=state.get("profile_id"),
                 subscription_id=state.get("subscription_id"),
                 redis_client=state.get("redis_client"),
             )
-            response_text = enforce_docwain_identity(response_text, user_text, persona_text)
+            response_text = enforce_docwain_identity(response_text, user_text, persona_text, response_mode=response_mode)
         response_text = sanitize_response(response_text)
         policy = "smalltalk"
 

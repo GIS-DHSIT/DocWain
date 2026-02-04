@@ -17,6 +17,7 @@ from fastapi import HTTPException, status
 from qdrant_client.models import Distance, PointStruct, SparseVector, Range
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import ollama
+from src.runtime.model_alias import normalize_model_name
 import os
 import redis
 from urllib import request
@@ -76,6 +77,14 @@ from src.security.response_sanitizer import sanitize_user_payload
 from src.quality.bad_answer_evaluator import BadAnswerEvaluator, EvalConfig
 from src.quality.auto_repair import AutoRepairEngine, RepairConfig
 from src.quality.telemetry import emit_quality_telemetry
+from src.policy.response_policy import (
+    INFO_MODE,
+    TASK_MODE,
+    ResponseModeClassifier,
+    apply_evidence_gate,
+    build_docwain_intro,
+    build_evidence_ledger,
+)
 
 try:
     import torch
@@ -1024,10 +1033,65 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or os.getenv("OLLAMA_MODEL", "llama3.2")
+        requested = model_name or os.getenv("OLLAMA_MODEL", getattr(Config.Azure, "DEFAULT_MODEL", "llama3.2"))
+        requested = normalize_model_name(requested)
+        self.model_name = self._resolve_installed_model(requested)
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
+
+    @staticmethod
+    def _list_installed_models() -> list[str]:
+        try:
+            payload = ollama.list().model_dump()
+            models = payload.get("models") or []
+            names: list[str] = []
+            for m in models:
+                name = (m or {}).get("model")
+                if name:
+                    names.append(str(name))
+            return names
+        except Exception:
+            return []
+
+    @classmethod
+    def _resolve_installed_model(cls, requested: Optional[str]) -> str:
+        if not requested:
+            return ""
+        installed = cls._list_installed_models()
+        if not installed:
+            return requested
+        if requested in installed:
+            return requested
+
+        if ":" not in requested:
+            base = requested.strip()
+            candidates = [m for m in installed if m.split(":", 1)[0] == base]
+            if candidates:
+                latest = [m for m in candidates if m.endswith(":latest")]
+                return latest[0] if latest else candidates[0]
+
+        if requested.strip().lower() == "default":
+            requested = getattr(Config.Azure, "DEFAULT_MODEL", "llama3.2")
+
+        fallbacks = [
+            os.getenv("OLLAMA_FALLBACK_MODEL", "").strip(),
+            getattr(Config.Azure, "DEFAULT_MODEL", "").strip(),
+            "llama3.2",
+        ]
+        for fallback in fallbacks:
+            if not fallback:
+                continue
+            normalized = normalize_model_name(fallback)
+            if normalized in installed:
+                return normalized
+            if ":" not in normalized:
+                candidates = [m for m in installed if m.split(":", 1)[0] == normalized]
+                if candidates:
+                    latest = [m for m in candidates if m.endswith(":latest")]
+                    return latest[0] if latest else candidates[0]
+
+        return installed[0]
 
     def generate(
         self,
@@ -1848,8 +1912,13 @@ class HybridReranker:
             tokenized_corpus = [self.preprocessor.tokenize(text) for text in texts]
             tokenized_query = self.preprocessor.tokenize(query)
 
-            bm25 = BM25Okapi(tokenized_corpus)
-            bm25_scores = np.array(bm25.get_scores(tokenized_query), dtype=np.float64)
+            has_tokens = any(tokenized_corpus) and any(len(tokens) > 0 for tokens in tokenized_corpus)
+            if has_tokens and tokenized_query:
+                bm25 = BM25Okapi(tokenized_corpus)
+                bm25_scores = np.array(bm25.get_scores(tokenized_query), dtype=np.float64)
+            else:
+                # Avoid BM25 division-by-zero when the corpus/query has no tokens.
+                bm25_scores = np.zeros(len(chunks), dtype=np.float64)
 
             vector_scores = np.array([float(chunk.score) for chunk in chunks], dtype=np.float64)
 
@@ -2203,6 +2272,7 @@ class PromptBuilder:
             profile_id: Optional[str] = None,
             subscription_id: Optional[str] = None,
             redis_client: Optional[Any] = None,
+            response_mode: str = "TASK_MODE",
     ) -> str:
         """Build a structured QA prompt with grounding and citation requirements."""
         convo_block = f"\nPRIOR CONVERSATION SUMMARY:\n{conversation_summary}\n" if conversation_summary else ""
@@ -2210,6 +2280,12 @@ class PromptBuilder:
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
         kg_block = f"\nKG EVIDENCE PACK (use only if supported by Document Context):\n{kg_evidence}\n" if kg_evidence else ""
+
+        task_only_rule = ""
+        if response_mode == "TASK_MODE":
+            task_only_rule = "7) Do not mention DocWain, product intros, privacy, or system behavior unless the user explicitly asked about DocWain."
+
+        comparison_rule = "If comparing, prioritize explicitly named tools/platforms and treat repeated mentions as stronger evidence."
 
         prompt = f"""You are a {persona}. Deliver a clear, reader-friendly answer that feels human and intentional, not robotic. Start with a tight summary, then unpack the best evidence.
 
@@ -2230,11 +2306,14 @@ GROUNDING & CITATION RULES (MANDATORY):
 4) If sources disagree, briefly note the discrepancy with citations.
 5) If you use a KG fact, it MUST appear in the Document Context and be cited with [SOURCE-X].
 6) Do not invent, pad, or generalize beyond the provided text.
+{task_only_rule}
 
 ANSWER STYLE (MANDATORY):
 - Format: 1-2 sentence overview, then 3-6 concise bullet points with citations, then a one-line takeaway.
 - Tone: warm, confident colleague; vary sentence openings; avoid filler and repetition.
 - Bullets must be full sentences that stitch facts together (who/what/when/where/why/how) with inline citations.
+- Use "-" for bullets.
+- {comparison_rule}
 - If the question is about an entity not present, say so and list what the documents do cover (with citations), then stop.
 
 Provide the answer now with citations inline after each claim."""
@@ -2247,6 +2326,7 @@ Provide the answer now with citations inline after each claim."""
             profile_id=profile_id,
             subscription_id=subscription_id,
             redis_client=redis_client,
+            include_docwain_persona=(response_mode == "INFO_MODE"),
         )
 
 class ConversationSummarizer:
@@ -2726,8 +2806,7 @@ class EnterpriseRAGSystem:
 
             if self.greeting_handler.is_greeting(query):
                 greeting_response = (
-                    f"Hi! I'm your {persona}. I can search your documents and answer questions. "
-                    f"What would you like to explore?"
+                    "Hi! I can search your documents and answer questions. What would you like to explore?"
                 )
                 self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
@@ -2756,6 +2835,22 @@ class EnterpriseRAGSystem:
                     "index_version": index_version,
                     "context_found": True,
                     "query_type": "farewell",
+                    "grounded": True
+                }
+
+            response_mode = ResponseModeClassifier.classify(query, llm_client=self.llm_client)
+            if response_mode == INFO_MODE:
+                info_response = build_docwain_intro()
+                self.conversation_history.add_turn(namespace, user_id, query, info_response)
+                return {
+                    "response": info_response,
+                    "sources": [],
+                    "user_id": user_id,
+                    "collection": collection_name,
+                    "request_id": request_id,
+                    "index_version": index_version,
+                    "context_found": False,
+                    "query_type": "info",
                     "grounded": True
                 }
 
@@ -3235,6 +3330,7 @@ class EnterpriseRAGSystem:
                 profile_id=profile_id,
                 subscription_id=subscription_id,
                 redis_client=self.redis_client,
+                response_mode=response_mode,
             )
 
             answer = self.llm_client.generate(prompt)
@@ -3244,6 +3340,14 @@ class EnterpriseRAGSystem:
                     answer = trimmed
 
             sources = context_sources or self.context_builder.extract_sources(final_chunks)
+            evidence_ledger = build_evidence_ledger(final_chunks, sources)
+            if response_mode == TASK_MODE:
+                answer, evidence_meta = apply_evidence_gate(answer, evidence_ledger, response_mode=response_mode)
+                used_source_ids = set(evidence_meta.get("used_source_ids") or [])
+                if used_source_ids:
+                    sources = [src for src in sources if int(src.get("source_id") or 0) in used_source_ids]
+                else:
+                    sources = []
 
             self.conversation_history.add_turn(namespace, user_id, query, answer)
             final_doc_ids = [
@@ -3423,6 +3527,7 @@ def create_llm_client(
     global _LLM_SEMAPHORE
     if _LLM_SEMAPHORE is None:
         _LLM_SEMAPHORE = threading.Semaphore(getattr(Config.LLM, "MAX_CONCURRENCY", 2))
+    model_name = normalize_model_name(model_name)
     name = (model_name or "").lower()
     backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
     resolved_backend = backend

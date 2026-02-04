@@ -1183,7 +1183,7 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
         raise
 
 
-    def save_embeddings_to_qdrant(
+def save_embeddings_to_qdrant(
     embeddings: Dict,
     subscription_id: str,
     profile_id: str,

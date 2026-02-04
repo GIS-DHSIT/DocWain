@@ -24,7 +24,7 @@ PAYLOAD_INDEX_FIELDS = [
     "subscription_id",
     "profile_id",
     "profile_name",
-    "profileId",
+    "doc_type",
     "document_id",
     "source.name",
     "page",

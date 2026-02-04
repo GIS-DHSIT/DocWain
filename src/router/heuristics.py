@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from src.policy.response_policy import INFO_MODE, ResponseModeClassifier
 from src.prompting.persona import is_meta_question
 
 _META_HINTS = [
@@ -19,6 +20,8 @@ def is_meta_query(text: str) -> bool:
     normalized = (text or "").strip().lower()
     if not normalized:
         return False
+    if ResponseModeClassifier.classify(normalized) == INFO_MODE:
+        return True
     if is_meta_question(normalized):
         return True
     return any(pattern.search(normalized) for pattern in _META_HINTS)
