@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 def get_source_name(payload: Dict[str, Any]) -> Optional[str]:
     return (
         (payload.get("source") or {}).get("name")
+        or payload.get("source_name")
         or payload.get("source_file")
         or payload.get("filename")
         or payload.get("file_name")
