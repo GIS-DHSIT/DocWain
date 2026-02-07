@@ -9,10 +9,11 @@ import logging
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
-from src.utils.payload_utils import get_source_name
+from src.utils.payload_utils import get_content_text, get_source_name
 
 from src.api.config import Config
 from src.prompting.prompt_builder import inject_persona_prompt
+from src.embedding.pipeline.chunk_integrity import is_valid_chunk_text
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,34 @@ class IntelligentContextBuilder:
 
     def __init__(self, max_context_chunks: int = 7):
         self.max_context_chunks = max_context_chunks
+
+    @staticmethod
+    def _is_extraction_like_query(query: str) -> bool:
+        lowered = (query or "").lower()
+        if not lowered:
+            return False
+        cues = (
+            "extract",
+            "fields",
+            "list",
+            "provide",
+            "resume",
+            "linkedin",
+            "cv",
+            "candidate",
+            "skills",
+            "education",
+            "certification",
+            "experience",
+            "years of experience",
+            "name",
+            "email",
+            "phone",
+            "summary",
+            "achievements",
+            "awards",
+        )
+        return any(cue in lowered for cue in cues)
 
     def _deduplicate_by_chunk_id(self, chunks: List[Dict]) -> List[Dict]:
         """Keep highest scoring chunk per unique chunk_id or doc/index tuple."""
@@ -68,12 +97,15 @@ class IntelligentContextBuilder:
 
         for chunk in chunks:
             is_duplicate = False
-            chunk_text = chunk['text']
+            meta = chunk.get("metadata") or {}
+            chunk_text = get_content_text(meta) or chunk.get("text", "")
 
             for unique in unique_chunks:
+                unique_meta = unique.get("metadata") or {}
+                unique_text = get_content_text(unique_meta) or unique.get("text", "")
                 similarity = self._calculate_text_similarity(
                     chunk_text,
-                    unique['text']
+                    unique_text,
                 )
 
                 if similarity >= threshold:
@@ -173,6 +205,13 @@ class IntelligentContextBuilder:
                 conf_val = float(conf)
                 conf_norm = conf_val / 100.0 if conf_val > 1.0 else conf_val
                 boost *= max(0.6, min(1.15, conf_norm + 0.4))
+            except Exception:
+                pass
+        salience = meta.get("section_salience") or (meta.get("section") or {}).get("salience")
+        if salience is not None:
+            try:
+                salience_val = float(salience)
+                boost *= max(0.6, min(1.4, 0.6 + salience_val))
             except Exception:
                 pass
         return base * boost
@@ -370,7 +409,32 @@ class IntelligentContextBuilder:
         # Deduplicate exact chunk ids before text-level dedup
         min_conf = getattr(Config.Retrieval, "MIN_OCR_CONFIDENCE", None)
         min_conf = float(min_conf) / 100.0 if isinstance(min_conf, (int, float)) and min_conf > 1 else min_conf
-        filtered = self._filter_low_confidence(self._filter_low_signal(chunks), min_conf)
+        extraction_like = self._is_extraction_like_query(query)
+        min_len = 1 if extraction_like else 30
+        min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 50))
+        min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 10))
+        valid_chunks = [
+            chunk
+            for chunk in chunks
+            if is_valid_chunk_text(chunk.get("text"), min_chars=min_chars, min_tokens=min_tokens)
+        ]
+        if not valid_chunks:
+            logger.warning("Context builder: no valid chunks after integrity gate")
+            return "", []
+
+        filtered_signal = self._filter_low_signal(valid_chunks, min_len=min_len)
+        if not filtered_signal:
+            logger.warning("Context filter removed all chunks due to low signal; falling back to valid chunks")
+            filtered_signal = list(valid_chunks)
+
+        filtered = self._filter_low_confidence(filtered_signal, min_conf)
+        if not filtered:
+            logger.warning("Context filter removed all chunks due to low confidence; falling back to valid chunks")
+            filtered = list(valid_chunks)
+        elif extraction_like and len(filtered) < len(filtered_signal):
+            # Avoid dropping short fields (e.g., names/skills) during extraction queries.
+            logger.info("Relaxing OCR confidence filter for extraction-style query")
+            filtered = filtered_signal
         dedup_by_id = self._deduplicate_by_chunk_id(filtered)
 
         # Deduplicate similar chunks
@@ -441,6 +505,9 @@ class IntelligentContextBuilder:
         # Add query restatement for focus
         context_parts.append(f"[QUERY: {query}]\n")
 
+        max_chars = int(getattr(Config.Retrieval, "MAX_CONTEXT_CHARS", 6000))
+        current_chars = 0
+        truncated = False
         for i, chunk in enumerate(ordered_chunks, 1):
             metadata = chunk['metadata']
 
@@ -448,7 +515,6 @@ class IntelligentContextBuilder:
             source_name = get_source_name(metadata) or f"Document {i}"
             section = metadata.get('section_title', metadata.get('section', ''))
             page = metadata.get('page')
-            score = chunk['score']
             citation = self._format_citation(metadata, fallback_name=source_name)
 
             # Build source header
@@ -457,12 +523,11 @@ class IntelligentContextBuilder:
                 source_header_parts.append(f"Section: {section}")
             if page:
                 source_header_parts.append(f"Page: {page}")
-            source_header_parts.append(f"Relevance: {score:.3f}")
 
             source_header = " | ".join(source_header_parts)
 
             # Clean chunk text
-            chunk_text = chunk['text']
+            chunk_text = get_content_text(metadata) or chunk['text']
 
             # Remove context markers if present
             chunk_text = re.sub(r'\[SECTION:.*?\]', '', chunk_text)
@@ -470,24 +535,68 @@ class IntelligentContextBuilder:
             chunk_text = re.sub(r'\[CONTINUES:.*?\]', '', chunk_text)
             chunk_text = chunk_text.strip()
 
-            # Add to context
+            # Add to context with hard character cap
+            next_block = f"\n[{source_header}]\n{chunk_text}\n[/SOURCE]\n"
+            if max_chars and (current_chars + len(next_block)) > max_chars:
+                truncated = True
+                break
             context_parts.append(f"\n[{source_header}]")
             context_parts.append(chunk_text)
             context_parts.append("[/SOURCE]\n")
+            current_chars += len(next_block)
 
             # Add to sources list
             sources.append({
                 'source_id': i,
                 'source_name': source_name,
-                'section': section,
                 'page': page,
-                'relevance_score': round(score, 3),
-                'excerpt': chunk_text[:200] + "..." if len(chunk_text) > 200 else chunk_text,
-                'retrieval_methods': chunk.get('methods', [chunk.get('method', 'unknown')]),
                 'citation': citation,
             })
 
+        if truncated:
+            logger.info("Context exceeded max_chars; running second-pass reduction")
+            context_parts = [f"[QUERY: {query}]\n"]
+            sources = []
+            current_chars = 0
+            per_chunk_budget = max(200, max_chars // max(1, len(ordered_chunks)))
+            for i, chunk in enumerate(ordered_chunks, 1):
+                metadata = chunk['metadata']
+                source_name = get_source_name(metadata) or f"Document {i}"
+                section = metadata.get('section_title', metadata.get('section', ''))
+                page = metadata.get('page')
+                citation = self._format_citation(metadata, fallback_name=source_name)
+
+                source_header_parts = [f"SOURCE-{i}: {source_name}"]
+                if section:
+                    source_header_parts.append(f"Section: {section}")
+                if page:
+                    source_header_parts.append(f"Page: {page}")
+                source_header = " | ".join(source_header_parts)
+
+                chunk_text = get_content_text(metadata) or chunk['text']
+                chunk_text = re.sub(r'\[SECTION:.*?\]', '', chunk_text)
+                chunk_text = re.sub(r'\[CONTEXT:.*?\]', '', chunk_text)
+                chunk_text = re.sub(r'\[CONTINUES:.*?\]', '', chunk_text)
+                chunk_text = chunk_text.strip()
+                if len(chunk_text) > per_chunk_budget:
+                    chunk_text = chunk_text[:per_chunk_budget].rsplit(" ", 1)[0].strip()
+                next_block = f"\n[{source_header}]\n{chunk_text}\n[/SOURCE]\n"
+                if max_chars and (current_chars + len(next_block)) > max_chars:
+                    break
+                context_parts.append(f"\n[{source_header}]")
+                context_parts.append(chunk_text)
+                context_parts.append("[/SOURCE]\n")
+                current_chars += len(next_block)
+                sources.append({
+                    'source_id': i,
+                    'source_name': source_name,
+                    'page': page,
+                    'citation': citation,
+                })
+
         context_string = "\n".join(context_parts)
+        if max_chars and len(context_string) > max_chars:
+            context_string = context_string[:max_chars]
 
         logger.info(
             f"Built context: {len(ordered_chunks)} chunks, "
@@ -500,12 +609,12 @@ class IntelligentContextBuilder:
     def _format_citation(metadata: Dict[str, Any], *, fallback_name: str) -> str:
         name = get_source_name(metadata) or fallback_name
         name = str(name or "Document").strip()
-        section = str(metadata.get("section_title") or metadata.get("section") or "Section").strip()
         page = metadata.get("page") or metadata.get("page_start")
         if page is None:
             page = metadata.get("page_end")
-        page_text = f"Page {page}" if page else "Page N/A"
-        return f"{name}, {page_text}, Section: {section}"
+        if page:
+            return f"{name}, p. {page}"
+        return f"{name}"
 
 
 class AnswerGenerator:
@@ -529,7 +638,7 @@ class AnswerGenerator:
     ) -> str:
         """Build optimized prompt for answer generation"""
 
-        prompt = f"""You are a friendly, precise {persona}. Answer like a knowledgeable teammate: conversational, concise, and grounded in the provided sources.
+        prompt = f"""You are DocWain-Agent. Follow the system instructions exactly and stay grounded in the sources.
 
 SOURCES:
 {context}
@@ -540,10 +649,11 @@ RECENT CONVERSATION:
 USER QUESTION: {query}
 
 Answer requirements:
-- 3–6 sentences, flowing naturally (avoid bullet lists unless essential).
+- Follow the mandatory output shape (Understanding & Scope, Answer, Evidence & Gaps, Optional next-step hint).
+- Use domain-specific sections in the Answer.
 - Every factual claim must cite [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-2].
-- If the exact answer is missing, use the closest related evidence you do have and finish with: "Exact context not found in the documents."
-- If sources disagree, acknowledge briefly with citations.
+- If the exact answer is missing, say: Not found in the current profile documents, and list files searched.
+- No filler or raw extraction dumps.
 
 Answer:"""
 
@@ -629,7 +739,10 @@ Answer:"""
                     'information about',
                     'cannot answer',
                     'unclear',
-                    'conflicting'
+                    'conflicting',
+                    'understanding & scope',
+                    'evidence & gaps',
+                    'answer:',
                 ]
 
                 if not any(phrase in sentence.lower() for phrase in meta_phrases):

@@ -11,6 +11,9 @@ from src.api.config import Config
 logger = logging.getLogger(__name__)
 
 
+_MISSING = object()
+
+
 def get_documents_collection():
     from src.api.dataHandler import db
     return db[Config.MongoDB.DOCUMENTS]
@@ -92,13 +95,39 @@ def update_document_fields(document_id: str, fields: Dict[str, Any]):
     now = time.time()
     update = dict(fields)
     update["updated_at"] = now
+    unset_fields: Dict[str, Any] = {}
+
+    # Enforce: error is either missing or an object (never null).
+    error_value = update.pop("error", _MISSING)
+    if error_value is not _MISSING:
+        if error_value is None:
+            unset_fields["error"] = ""
+        elif isinstance(error_value, dict):
+            update["error"] = error_value
+        else:
+            update["error"] = {"message": str(error_value)}
+
+    for key, value in list(update.items()):
+        if not key.endswith(".error"):
+            continue
+        update.pop(key)
+        if value is None:
+            unset_fields[key] = ""
+        elif isinstance(value, dict):
+            update[key] = value
+        else:
+            update[key] = {"message": str(value)}
+
     collection = get_documents_collection()
+    update_ops: Dict[str, Any] = {
+        "$set": update,
+        "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id)},
+    }
+    if unset_fields:
+        update_ops["$unset"] = unset_fields
     return collection.find_one_and_update(
         _doc_filter(document_id),
-        {
-            "$set": update,
-            "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id)},
-        },
+        update_ops,
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
@@ -106,15 +135,32 @@ def update_document_fields(document_id: str, fields: Dict[str, Any]):
 
 def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
     now = time.time()
-    flat = _flatten(stage, patch)
+    patch_copy = dict(patch)
+    error_value = patch_copy.pop("error", _MISSING)
+    flat = _flatten(stage, patch_copy)
     flat["updated_at"] = now
+
+    set_error: Dict[str, Any] = {}
+    unset_error: Dict[str, Any] = {}
+    if error_value is not _MISSING:
+        error_path = f"{stage}.error"
+        if error_value is None:
+            unset_error[error_path] = ""
+        elif isinstance(error_value, dict):
+            set_error[error_path] = error_value
+        else:
+            set_error[error_path] = {"message": str(error_value)}
+
     collection = get_documents_collection()
+    update_ops: Dict[str, Any] = {
+        "$set": {**flat, **set_error},
+        "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id)},
+    }
+    if unset_error:
+        update_ops["$unset"] = unset_error
     return collection.find_one_and_update(
         _doc_filter(document_id),
-        {
-            "$set": flat,
-            "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id)},
-        },
+        update_ops,
         upsert=True,
         return_document=ReturnDocument.AFTER,
     )
@@ -170,3 +216,32 @@ def upsert_screening_report(
 def get_document_record(document_id: str) -> Optional[Dict[str, Any]]:
     collection = get_documents_collection()
     return collection.find_one(_doc_filter(document_id))
+
+
+_ERROR_NULL_PATHS = [
+    "error",
+    "embedding.error",
+    "extraction.error",
+    "understanding.error",
+    "screening.error",
+    "screening.security.error",
+    "cleanup.error",
+]
+
+
+def normalize_error_fields(collection=None) -> Dict[str, Any]:
+    """
+    Ensure error fields are either missing or objects (never null).
+
+    Choice: unset null error fields (do not replace with {}).
+    """
+    collection = collection or get_documents_collection()
+    if collection is None:
+        return {"updated": 0, "paths": list(_ERROR_NULL_PATHS), "skipped": True}
+
+    updated = 0
+    for path in _ERROR_NULL_PATHS:
+        result = collection.update_many({path: None}, {"$unset": {path: ""}})
+        updated += int(getattr(result, "modified_count", 0) or 0)
+
+    return {"updated": updated, "paths": list(_ERROR_NULL_PATHS), "skipped": False}

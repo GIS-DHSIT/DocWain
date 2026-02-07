@@ -1,0 +1,746 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+from src.api.config import Config
+from src.api import rag_state
+
+from .domain_router import DomainRouter
+from .extract import extract_schema
+from .judge import JudgeResult, judge
+from .renderers.router import render
+from .retrieve import retrieve
+from .rerank import rerank
+from .rewrite import rewrite_query
+from .sanitize import FALLBACK_ANSWER, sanitize
+from .types import (
+    Chunk,
+    EvidenceSpan,
+    FieldValue,
+    FieldValuesField,
+    GenericSchema,
+    HRSchema,
+    LLMBudget,
+    MISSING_REASON,
+    MultiEntitySchema,
+)
+
+logger = logging.getLogger(__name__)
+
+
+NO_CHUNKS_MESSAGE = "Not enough information in the documents to answer that."
+
+
+def run(
+    *,
+    query: str,
+    subscription_id: str,
+    profile_id: str,
+    document_id: Optional[str] = None,
+    tool_hint: Optional[str] = None,
+    session_id: Optional[str] = None,
+    user_id: str = "api",
+    request_id: Optional[str] = None,
+    llm_client: Optional[Any] = None,
+    qdrant_client: Optional[Any] = None,
+    redis_client: Optional[Any] = None,
+    embedder: Optional[Any] = None,
+    cross_encoder: Optional[Any] = None,
+) -> Dict[str, Any]:
+    correlation_id = request_id or str(uuid.uuid4())
+
+    if any(dep is None for dep in (qdrant_client, embedder)) or llm_client is None or redis_client is None or cross_encoder is None:
+        state = rag_state.get_app_state()
+        if state:
+            llm_client = llm_client or state.ollama_client
+            qdrant_client = qdrant_client or state.qdrant_client
+            redis_client = redis_client or state.redis_client
+            embedder = embedder or state.embedding_model
+            cross_encoder = cross_encoder or getattr(state.reranker, "cross_encoder", None) or state.reranker
+
+    if qdrant_client is None or embedder is None:
+        raise ValueError("RAG v3 dependencies missing: qdrant_client and embedder are required")
+
+    budget = LLMBudget(llm_client=llm_client, max_calls=2)
+    original_query = query or ""
+    intent_type = _infer_intent_type(original_query)
+    scope_document_id = _infer_scope_document_id(original_query, document_id)
+
+    stage_start = time.time()
+    rewritten = rewrite_query(
+        query=original_query,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        redis_client=redis_client,
+        llm_client=llm_client,
+        budget=budget,
+        correlation_id=correlation_id,
+    )
+    _log_stage("rewrite", stage_start, correlation_id)
+
+    stage_start = time.time()
+    retrieved = retrieve(
+        query=rewritten,
+        raw_query=original_query,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        qdrant_client=qdrant_client,
+        embedder=embedder,
+        document_id=scope_document_id,
+        correlation_id=correlation_id,
+        intent_type=intent_type,
+    )
+    _log_stage("retrieve", stage_start, correlation_id)
+
+    if not retrieved:
+        return _build_answer(
+            response_text=NO_CHUNKS_MESSAGE,
+            sources=[],
+            request_id=request_id,
+            metadata={
+                "domain": None,
+                "intent": None,
+                "intent_type": intent_type,
+                "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
+                "quality": "LOW",
+                "rag_v3": True,
+            },
+        )
+
+    retrieved_metadata = _collect_retrieved_metadata(retrieved)
+    domain = DomainRouter.resolve(original_query, tool_hint, retrieved_metadata)
+
+    stage_start = time.time()
+    reranked = rerank(
+        query=rewritten,
+        chunks=retrieved,
+        cross_encoder=cross_encoder,
+        top_k=8,
+        correlation_id=correlation_id,
+    )
+    _log_stage("rerank", stage_start, correlation_id)
+
+    if domain == "resume":
+        stage_start = time.time()
+        extraction = extract_schema(
+            "hr",
+            query=original_query,
+            chunks=reranked,
+            llm_client=llm_client,
+            budget=budget,
+            correlation_id=correlation_id,
+            scope_document_id=scope_document_id,
+        )
+        _log_stage("resume_extract_hr", stage_start, correlation_id)
+
+        _log_extraction_diagnostics(
+            extraction=extraction,
+            intent_type=intent_type,
+            chunks=reranked,
+            correlation_id=correlation_id,
+        )
+        _maybe_log_hr_schema(extraction, correlation_id)
+
+        stage_start = time.time()
+        rendered = render(domain="hr", intent=extraction.intent, schema=extraction.schema, strict=False)
+        _log_stage("resume_render_hr", stage_start, correlation_id)
+
+        stage_start = time.time()
+        sanitized = sanitize(rendered)
+        _log_stage("sanitize", stage_start, correlation_id)
+
+        stage_start = time.time()
+        verdict = judge(
+            answer=sanitized,
+            schema=extraction.schema,
+            intent=extraction.intent,
+            llm_client=llm_client,
+            budget=budget,
+            sources_present=bool(reranked),
+            correlation_id=correlation_id,
+        )
+        _log_stage("judge", stage_start, correlation_id)
+
+        final_answer = _apply_verdict(sanitized, verdict)
+        sources = _collect_sources(reranked)
+        metadata = {
+            "domain": "resume",
+            "intent": extraction.intent,
+            "intent_type": intent_type,
+            "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
+            "quality": "HIGH" if verdict.status == "pass" else "LOW",
+            "rag_v3": True,
+            "judge": {"status": verdict.status, "reason": verdict.reason},
+        }
+
+        return _build_answer(
+            response_text=final_answer,
+            sources=sources,
+            request_id=request_id,
+            metadata=metadata,
+        )
+
+    stage_start = time.time()
+    extraction = extract_schema(
+        None,
+        query=original_query,
+        chunks=reranked,
+        llm_client=llm_client,
+        budget=budget,
+        correlation_id=correlation_id,
+        scope_document_id=scope_document_id,
+    )
+    _log_stage("extract", stage_start, correlation_id)
+
+    if extraction.domain == "multi" and _query_is_hr(original_query):
+        stage_start = time.time()
+        extraction = extract_schema(
+            "hr",
+            query=original_query,
+            chunks=reranked,
+            llm_client=None,
+            budget=budget,
+            correlation_id=correlation_id,
+            scope_document_id=scope_document_id,
+        )
+        _log_stage("extract_hr_fallback", stage_start, correlation_id)
+
+    _log_extraction_diagnostics(
+        extraction=extraction,
+        intent_type=intent_type,
+        chunks=reranked,
+        correlation_id=correlation_id,
+    )
+    _maybe_log_hr_schema(extraction, correlation_id)
+
+    stage_start = time.time()
+    rendered = render(domain=extraction.domain, intent=extraction.intent, schema=extraction.schema, strict=False)
+    _log_stage("render", stage_start, correlation_id)
+
+    stage_start = time.time()
+    sanitized = sanitize(rendered)
+    _log_stage("sanitize", stage_start, correlation_id)
+
+    stage_start = time.time()
+    verdict = judge(
+        answer=sanitized,
+        schema=extraction.schema,
+        intent=extraction.intent,
+        llm_client=llm_client,
+        budget=budget,
+        sources_present=bool(reranked),
+        correlation_id=correlation_id,
+    )
+    _log_stage("judge", stage_start, correlation_id)
+
+    final_answer = sanitized
+    if verdict.status == "fail":
+        if verdict.reason in {"no_sources", "no_evidence_spans"}:
+            final_answer = NO_CHUNKS_MESSAGE
+            verdict = JudgeResult(status="fail", reason=verdict.reason)
+        else:
+            retry_answer = _retry_render(extraction, correlation_id)
+            retry_sanitized = sanitize(retry_answer)
+            retry_verdict = judge(
+                answer=retry_sanitized,
+                schema=extraction.schema,
+                intent=extraction.intent,
+                llm_client=None,
+                budget=budget,
+                sources_present=bool(reranked),
+                correlation_id=correlation_id,
+            )
+            if retry_verdict.status == "pass":
+                final_answer = retry_sanitized
+                verdict = retry_verdict
+            else:
+                final_answer = FALLBACK_ANSWER
+                verdict = JudgeResult(status="fail", reason="retry_failed")
+
+    sources = _collect_sources(reranked)
+    metadata = {
+        "domain": extraction.domain,
+        "intent": extraction.intent,
+        "intent_type": intent_type,
+        "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
+        "quality": "HIGH" if verdict.status == "pass" else "LOW",
+        "rag_v3": True,
+        "judge": {"status": verdict.status, "reason": verdict.reason},
+    }
+
+    return _build_answer(
+        response_text=final_answer,
+        sources=sources,
+        request_id=request_id,
+        metadata=metadata,
+    )
+
+
+def run_docwain_rag_v3(
+    *,
+    query: str,
+    subscription_id: str,
+    profile_id: str,
+    session_id: Optional[str],
+    user_id: str,
+    request_id: Optional[str],
+    llm_client: Optional[Any],
+    qdrant_client: Any,
+    redis_client: Optional[Any],
+    embedder: Any,
+    cross_encoder: Optional[Any] = None,
+    document_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    correlation_id = request_id
+    budget = LLMBudget(llm_client=llm_client, max_calls=2)
+    original_query = query or ""
+    intent_type = _infer_intent_type(original_query)
+    scope_document_id = _infer_scope_document_id(original_query, document_id)
+
+    stage_start = time.time()
+    rewritten = rewrite_query(
+        query=original_query,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        redis_client=redis_client,
+        llm_client=llm_client,
+        budget=budget,
+        correlation_id=correlation_id,
+    )
+    _log_stage("rewrite", stage_start, correlation_id)
+
+    stage_start = time.time()
+    retrieved = retrieve(
+        query=rewritten,
+        raw_query=original_query,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        qdrant_client=qdrant_client,
+        embedder=embedder,
+        document_id=scope_document_id,
+        correlation_id=correlation_id,
+        intent_type=intent_type,
+    )
+    _log_stage("retrieve", stage_start, correlation_id)
+
+    if not retrieved:
+        return _build_answer(
+            response_text=NO_CHUNKS_MESSAGE,
+            sources=[],
+            request_id=request_id,
+            metadata={
+                "domain": None,
+                "intent": None,
+                "intent_type": intent_type,
+                "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
+                "quality": "LOW",
+                "rag_v3": True,
+            },
+        )
+
+    stage_start = time.time()
+    reranked = rerank(
+        query=rewritten,
+        chunks=retrieved,
+        cross_encoder=cross_encoder,
+        top_k=8,
+        correlation_id=correlation_id,
+    )
+    _log_stage("rerank", stage_start, correlation_id)
+
+    stage_start = time.time()
+    extraction = extract_schema(
+        None,
+        query=original_query,
+        chunks=reranked,
+        llm_client=llm_client,
+        budget=budget,
+        correlation_id=correlation_id,
+        scope_document_id=scope_document_id,
+    )
+    _log_stage("extract", stage_start, correlation_id)
+
+    if extraction.domain == "multi" and _query_is_hr(original_query):
+        stage_start = time.time()
+        extraction = extract_schema(
+            "hr",
+            query=original_query,
+            chunks=reranked,
+            llm_client=None,
+            budget=budget,
+            correlation_id=correlation_id,
+            scope_document_id=scope_document_id,
+        )
+        _log_stage("extract_hr_fallback", stage_start, correlation_id)
+
+    _log_extraction_diagnostics(
+        extraction=extraction,
+        intent_type=intent_type,
+        chunks=reranked,
+        correlation_id=correlation_id,
+    )
+    _maybe_log_hr_schema(extraction, correlation_id)
+
+    stage_start = time.time()
+    rendered = render(domain=extraction.domain, intent=extraction.intent, schema=extraction.schema, strict=False)
+    _log_stage("render", stage_start, correlation_id)
+
+    stage_start = time.time()
+    sanitized = sanitize(rendered)
+    _log_stage("sanitize", stage_start, correlation_id)
+
+    stage_start = time.time()
+    verdict = judge(
+        answer=sanitized,
+        schema=extraction.schema,
+        intent=extraction.intent,
+        llm_client=llm_client,
+        budget=budget,
+        sources_present=bool(reranked),
+        correlation_id=correlation_id,
+    )
+    _log_stage("judge", stage_start, correlation_id)
+
+    final_answer = sanitized
+    if verdict.status == "fail":
+        if verdict.reason in {"no_sources", "no_evidence_spans"}:
+            final_answer = NO_CHUNKS_MESSAGE
+            verdict = JudgeResult(status="fail", reason=verdict.reason)
+        else:
+            retry_answer = _retry_render(extraction, correlation_id)
+            retry_sanitized = sanitize(retry_answer)
+            retry_verdict = judge(
+                answer=retry_sanitized,
+                schema=extraction.schema,
+                intent=extraction.intent,
+                llm_client=None,
+                budget=budget,
+                sources_present=bool(reranked),
+                correlation_id=correlation_id,
+            )
+            if retry_verdict.status == "pass":
+                final_answer = retry_sanitized
+                verdict = retry_verdict
+            else:
+                final_answer = FALLBACK_ANSWER
+                verdict = JudgeResult(status="fail", reason="retry_failed")
+
+    sources = _collect_sources(reranked)
+    metadata = {
+        "domain": extraction.domain,
+        "intent": extraction.intent,
+        "intent_type": intent_type,
+        "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
+        "quality": "HIGH" if verdict.status == "pass" else "LOW",
+        "rag_v3": True,
+        "judge": {"status": verdict.status, "reason": verdict.reason},
+    }
+
+    return _build_answer(
+        response_text=final_answer,
+        sources=sources,
+        request_id=request_id,
+        metadata=metadata,
+    )
+
+
+def _retry_render(extraction: Any, correlation_id: Optional[str]) -> str:
+    try:
+        return render(domain=extraction.domain, intent=extraction.intent, schema=extraction.schema, strict=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "RAG v3 retry render failed: %s",
+            exc,
+            extra={"stage": "render_retry", "correlation_id": correlation_id},
+        )
+        return ""
+
+
+def _apply_verdict(answer: str, verdict: JudgeResult) -> str:
+    if verdict.status == "fail":
+        if verdict.reason in {"no_sources", "no_evidence_spans"}:
+            return NO_CHUNKS_MESSAGE
+        return FALLBACK_ANSWER
+    return answer
+
+
+def _collect_retrieved_metadata(chunks: List[Chunk]) -> Dict[str, List[str]]:
+    doc_types = set()
+    doc_domains = set()
+    document_ids = set()
+    document_names = set()
+    for chunk in chunks or []:
+        meta = chunk.meta or {}
+        doc_type = meta.get("doc_type") or meta.get("document.type") or meta.get("document_type")
+        if doc_type:
+            doc_types.add(str(doc_type).lower())
+        doc_domain = meta.get("doc_domain") or meta.get("doc_type")
+        if doc_domain:
+            doc_domains.add(str(doc_domain).lower())
+        doc_id = meta.get("document_id") or meta.get("doc_id") or meta.get("docId")
+        if doc_id:
+            document_ids.add(str(doc_id))
+        doc_name = meta.get("source_name") or meta.get("document_name") or getattr(chunk.source, "document_name", None)
+        if doc_name:
+            document_names.add(str(doc_name))
+    return {
+        "doc_types": sorted(doc_types),
+        "doc_domains": sorted(doc_domains),
+        "document_ids": sorted(document_ids),
+        "document_names": sorted(document_names),
+    }
+
+
+def _log_extraction_diagnostics(
+    *,
+    extraction: Any,
+    intent_type: str,
+    chunks: List[Chunk],
+    correlation_id: Optional[str],
+) -> None:
+    if not Config.RagV3.DEBUG_LOGS:
+        return
+    domain = getattr(extraction, "domain", None)
+    intent = getattr(extraction, "intent", None)
+    schema = getattr(extraction, "schema", None)
+    candidate_count = 0
+    entity_count = 0
+    if isinstance(schema, HRSchema):
+        candidate_count = len((schema.candidates.items if schema.candidates else None) or [])
+    if isinstance(schema, MultiEntitySchema):
+        entity_count = len(schema.entities or [])
+    doc_ids = {str(_chunk_document_id(chunk)) for chunk in chunks if _chunk_document_id(chunk)}
+    logger.info(
+        "RAG v3 extraction summary",
+        extra={
+            "stage": "extract_summary",
+            "correlation_id": correlation_id,
+            "domain": domain,
+            "intent": intent,
+            "intent_type": intent_type,
+            "candidate_count": candidate_count,
+            "entity_count": entity_count,
+            "doc_count": len(doc_ids),
+        },
+    )
+    if isinstance(schema, HRSchema):
+        coverage = _hr_field_coverage(schema)
+        logger.info(
+            "RAG v3 HR field coverage",
+            extra={
+                "stage": "extract_hr_coverage",
+                "correlation_id": correlation_id,
+                "coverage": coverage,
+            },
+        )
+
+
+def _maybe_log_hr_schema(extraction: Any, correlation_id: Optional[str]) -> None:
+    if not Config.RagV3.DEBUG_SCHEMA:
+        return
+    schema = getattr(extraction, "schema", None)
+    if not isinstance(schema, HRSchema):
+        return
+    redacted = _redact_hr_schema(schema)
+    payload = json.dumps(redacted, ensure_ascii=True)
+    payload = _truncate(payload, 4000)
+    logger.info(
+        "RAG v3 HR schema (redacted): %s",
+        payload,
+        extra={"stage": "extract_hr_schema", "correlation_id": correlation_id},
+    )
+
+
+def _hr_field_coverage(schema: HRSchema) -> Dict[str, Dict[str, int]]:
+    fields = {
+        "name": lambda c: bool(c.name),
+        "total_years_experience": lambda c: bool(c.total_years_experience),
+        "experience_summary": lambda c: bool(c.experience_summary),
+        "technical_skills": lambda c: bool(c.technical_skills),
+        "functional_skills": lambda c: bool(c.functional_skills),
+        "certifications": lambda c: bool(c.certifications),
+        "education": lambda c: bool(c.education),
+        "achievements": lambda c: bool(c.achievements),
+        "source_type": lambda c: bool(c.source_type),
+    }
+    coverage: Dict[str, Dict[str, int]] = {key: {"present": 0, "missing": 0} for key in fields}
+    candidates = (schema.candidates.items if schema.candidates else None) or []
+    for cand in candidates:
+        for key, predicate in fields.items():
+            if predicate(cand):
+                coverage[key]["present"] += 1
+            else:
+                coverage[key]["missing"] += 1
+    return coverage
+
+
+def _redact_hr_schema(schema: HRSchema) -> Dict[str, Any]:
+    data = schema.model_dump()
+    candidates = ((data.get("candidates") or {}).get("items")) or []
+    for idx, cand in enumerate(candidates, start=1):
+        cand["name"] = f"Candidate {idx}"
+        for key in (
+            "role",
+            "details",
+            "total_years_experience",
+            "experience_summary",
+            "source_type",
+        ):
+            if cand.get(key):
+                cand[key] = _redact_text(cand[key])
+        for key in (
+            "technical_skills",
+            "functional_skills",
+            "certifications",
+            "education",
+            "achievements",
+        ):
+            items = cand.get(key) or []
+            cand[key] = [_redact_text(item) for item in items][:10]
+        cand["evidence_spans"] = []
+    return data
+
+
+def _redact_text(text: Any) -> str:
+    if text is None:
+        return ""
+    cleaned = str(text)
+    cleaned = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[email]", cleaned)
+    cleaned = re.sub(r"\\+?\\d[\\d\\-\\s().]{6,}\\d", "[phone]", cleaned)
+    cleaned = re.sub(r"\\b[A-Fa-f0-9]{8,}\\b", "[id]", cleaned)
+    return cleaned
+
+
+def _truncate(text: str, limit: int) -> str:
+    if not text or len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
+def _chunk_document_id(chunk: Chunk) -> Optional[str]:
+    meta = chunk.meta or {}
+    for key in ("document_id", "doc_id", "docId"):
+        value = meta.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _build_generic_schema_from_chunks(chunks: List[Chunk]) -> GenericSchema:
+    items: List[FieldValue] = []
+    for chunk in chunks or []:
+        snippet = _snippet(chunk.text)
+        if not snippet:
+            continue
+        items.append(
+            FieldValue(
+                label=None,
+                value=snippet,
+                evidence_spans=[EvidenceSpan(chunk_id=chunk.id, snippet=snippet)],
+            )
+        )
+    if not items:
+        return GenericSchema(facts=FieldValuesField(items=None, missing_reason=MISSING_REASON))
+    return GenericSchema(facts=FieldValuesField(items=items))
+
+
+def _collect_sources(chunks: List[Chunk]) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    seen = set()
+    for chunk in chunks:
+        doc = chunk.source.document_name
+        page = chunk.source.page
+        snippet = _snippet(chunk.text)
+        key = (doc, page, snippet)
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append({"file_name": doc, "page": page, "snippet": snippet})
+    return sources
+
+
+def _build_answer(response_text: str, sources: List[Dict[str, Any]], request_id: Optional[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "response": response_text,
+        "sources": sources,
+        "request_id": request_id,
+        "context_found": bool(sources),
+        "grounded": bool(sources),
+        "metadata": metadata,
+    }
+
+
+def _snippet(text: str, limit: int = 160) -> str:
+    if not text:
+        return ""
+    cleaned = " ".join(text.replace("\n", " ").split())
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip()
+
+
+def _log_stage(stage: str, start_time: float, correlation_id: Optional[str]) -> None:
+    elapsed_ms = (time.time() - start_time) * 1000
+    logger.info(
+        "RAG v3 stage %s completed in %.2f ms",
+        stage,
+        elapsed_ms,
+        extra={"stage": stage, "correlation_id": correlation_id, "latency_ms": elapsed_ms},
+    )
+
+
+def _infer_intent_type(query: str) -> str:
+    lowered = (query or "").lower()
+    if any(tok in lowered for tok in ("compare", "versus", "vs")):
+        return "compare"
+    if any(tok in lowered for tok in ("rank", "top ", "best ", "highest", "lowest")):
+        return "rank"
+    if any(tok in lowered for tok in ("summarize", "summary", "overview", "recap")):
+        return "summarize"
+    if any(tok in lowered for tok in ("extract", "list", "pull")):
+        return "extract"
+    return "answer"
+
+
+def _infer_scope_document_id(query: str, explicit_document_id: Optional[str]) -> Optional[str]:
+    if explicit_document_id:
+        return str(explicit_document_id)
+    if not query:
+        return None
+    patterns = [
+        r"document_id\s*[:=]\s*([A-Za-z0-9_-]+)",
+        r"doc_id\s*[:=]\s*([A-Za-z0-9_-]+)",
+        r"document\s+id\s*[:=]?\s*([A-Za-z0-9_-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _query_is_hr(query: str) -> bool:
+    lowered = (query or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "resume",
+            "cv",
+            "curriculum vitae",
+            "linkedin",
+            "candidate",
+            "experience",
+            "education",
+            "skills",
+            "certification",
+            "certifications",
+        )
+    )
+
+
+__all__ = ["run_docwain_rag_v3", "run"]

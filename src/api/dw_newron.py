@@ -11,8 +11,10 @@ from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass
 from collections import deque, Counter
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from rank_bm25 import BM25Okapi
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 from fastapi import HTTPException, status
 from qdrant_client.models import Distance, PointStruct, SparseVector, Range
 from sentence_transformers import SentenceTransformer, CrossEncoder
@@ -23,6 +25,8 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from src.api.config import Config
+from src.api.vector_store import QdrantVectorStore
+from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, autoheal_missing_index
 from src.api.enhanced_context_builder import IntelligentContextBuilder
 from src.api.query_intelligence import QueryIntelligence
 from src.api.enhanced_retrieval import GraphGuidedRetriever
@@ -38,8 +42,9 @@ from src.chat.opener_generator import contains_banned_opener, generate_opener
 from src.kg.neo4j_store import Neo4jStore
 from src.kg.retrieval import GraphAugmenter, GraphHints
 from src.kg.score import GraphSupportScorer
+from src.intelligence.retrieval import run_intelligent_pipeline
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
-from src.utils.payload_utils import get_source_name
+from src.utils.payload_utils import get_canonical_text, get_content_text, get_embedding_text, get_source_name
 from src.agentic.retriever_manager import RetrieverManager
 from src.agentic.verification_agent import VerificationAgent
 from src.services.retrieval import (
@@ -50,6 +55,7 @@ from src.services.retrieval import (
     RerankerConfig,
     RetrievalConfidenceScorer,
 )
+from src.services.retrieval.score_utils import RerankShapeError, normalize_scores, to_py_scalar
 from src.retrieval import (
     QueryAnalyzer,
     EvidenceConstraints,
@@ -59,23 +65,29 @@ from src.retrieval import (
     RetrievalQualityScorer,
     ContextAssembler,
     FallbackRepair,
+    EvidenceSynthesizer,
     extract_required_attributes,
     filter_chunks_by_intent,
     extract_answer_requirements,
     validate_answer_requirements,
     build_intent_miss_response,
 )
+from src.retrieval.errors import RetrievalFilterError
 from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue
 from sklearn.feature_extraction.text import HashingVectorizer
 from src.api.vector_store import build_collection_name
+from src.retrieval.filter_builder import build_qdrant_filter
 from src.api.genai_client import generate_text, get_genai_client
 from src.finetune import resolve_model_for_profile
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 from src.security.response_sanitizer import sanitize_user_payload
+from src.embedding.pipeline.chunk_integrity import is_valid_chunk_text
 from src.quality.bad_answer_evaluator import BadAnswerEvaluator, EvalConfig
 from src.quality.auto_repair import AutoRepairEngine, RepairConfig
 from src.quality.telemetry import emit_quality_telemetry
+from src.retrieval.profile_document_index import build_profile_document_index
+from src.retrieval.retrieval_planner import RetrievalPlanner
 
 try:
     import torch
@@ -123,6 +135,240 @@ def _is_generation_empty(text: Optional[str], stop_tokens: Optional[Set[str]] = 
     return False
 
 
+def _sanitize_snippet(text: Optional[str], limit: int = 80) -> str:
+    sample = re.sub(r"\s+", " ", (text or "").strip())
+    if len(sample) > limit:
+        sample = sample[:limit].rstrip() + "..."
+    return sample
+
+
+def _collect_documents_seen(chunks: List[Any]) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for chunk in chunks:
+        meta = getattr(chunk, "metadata", None) or {}
+        name = get_source_name(meta)
+        if not name:
+            continue
+        base = os.path.basename(str(name))
+        if base and base not in seen:
+            names.append(base)
+            seen.add(base)
+    return names
+
+
+def _coerce_page_number(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _build_evidence_packets_from_chunks(
+    chunks: List[Any],
+    *,
+    max_excerpts_per_file: Optional[int] = None,
+    excerpt_chars: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    if not chunks:
+        return []
+    if max_excerpts_per_file is None:
+        max_excerpts_per_file = int(getattr(Config.Retrieval, "EVIDENCE_SYNTHESIZER_MAX_EXCERPTS_PER_FILE", 6))
+    if excerpt_chars is None:
+        excerpt_chars = int(getattr(Config.Retrieval, "EVIDENCE_SYNTHESIZER_EXCERPT_CHARS", 800))
+
+    packets: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    seen: Set[Tuple[str, Optional[int], str]] = set()
+
+    for chunk in chunks:
+        meta = getattr(chunk, "metadata", None) or {}
+        source = get_source_name(meta) or getattr(chunk, "source", None) or meta.get("source") or meta.get("file_name")
+        if not source:
+            continue
+        file_name = os.path.basename(str(source))
+        if not file_name:
+            continue
+        if file_name not in packets:
+            packets[file_name] = {"file_name": file_name, "excerpts": []}
+            order.append(file_name)
+            doc_domain = meta.get("doc_domain") or meta.get("document_type") or meta.get("doc_type")
+            if doc_domain:
+                packets[file_name]["doc_domain"] = str(doc_domain)
+        if max_excerpts_per_file and len(packets[file_name]["excerpts"]) >= max_excerpts_per_file:
+            continue
+        text = get_content_text(meta) or getattr(chunk, "text", "") or ""
+        text = str(text or "").strip()
+        if not text:
+            continue
+        if excerpt_chars and len(text) > excerpt_chars:
+            text = text[:excerpt_chars].rstrip() + "..."
+        page = meta.get("page")
+        if page is None:
+            page = meta.get("page_start")
+        if page is None:
+            page = meta.get("page_end")
+        page = _coerce_page_number(page)
+        dedupe_key = (file_name, page, text)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        excerpt_payload = {"text": text}
+        if page is not None:
+            excerpt_payload["page"] = page
+        packets[file_name]["excerpts"].append(excerpt_payload)
+
+    return [packets[name] for name in order if packets[name]["excerpts"]]
+
+
+def _collect_profile_documents(
+    subscription_id: str,
+    profile_id: str,
+    redis_client: Optional[Any],
+    target_doc_ids: Optional[List[str]] = None,
+) -> List[str]:
+    try:
+        from src.intelligence.redis_intel_cache import RedisIntelCache
+
+        cache = RedisIntelCache(redis_client)
+        catalog = cache.get_json(cache.catalog_key(subscription_id, profile_id)) or {}
+        docs = catalog.get("documents") or []
+        if target_doc_ids:
+            target_set = {str(d) for d in target_doc_ids if d}
+            docs = [doc for doc in docs if str(doc.get("document_id")) in target_set]
+        docs = [doc.get("source_name") for doc in docs if doc.get("source_name")]
+        return [str(doc) for doc in docs if doc]
+    except Exception:
+        return []
+
+
+def _filter_invalid_retrieved_chunks(
+    chunks: List[Any],
+    *,
+    min_chars: int,
+    min_tokens: int,
+) -> Tuple[List[Any], List[Dict[str, Any]]]:
+    valid: List[Any] = []
+    invalid_samples: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        text = getattr(chunk, "text", "") or ""
+        if is_valid_chunk_text(text, min_chars=min_chars, min_tokens=min_tokens):
+            valid.append(chunk)
+        else:
+            meta = getattr(chunk, "metadata", None) or {}
+            invalid_samples.append(
+                {
+                    "chunk_id": meta.get("chunk_id") or getattr(chunk, "id", None),
+                    "length": len(text or ""),
+                    "sample": _sanitize_snippet(text),
+                }
+            )
+    return valid, invalid_samples
+
+
+def _build_retrieval_empty_text_response(
+    *,
+    query: str,
+    user_id: str,
+    collection_name: str,
+    request_id: Optional[str],
+    index_version: Optional[str],
+    preprocessing_metadata: Dict[str, Any],
+    retrieval_attempts: List[Dict[str, Any]],
+    selected_strategy: str,
+    profile_context_data: Dict[str, Any],
+    documents_seen: List[str],
+    processing_time: float,
+) -> Dict[str, Any]:
+    likely_causes = [
+        "OCR/extraction produced empty text",
+        "chunking produced empty payload.text",
+        "preprocessing removed all tokens",
+        "wrong payload key used for context",
+    ]
+    next_actions = [
+        "Verify extraction output contains resume body text (not only filename).",
+        "Verify Qdrant payload key is `text` and is populated.",
+        "Check chunking thresholds and ensure MIN_CHARS >= 50 for saved chunks.",
+        "Re-run extraction+embed for affected docs.",
+    ]
+    response_text = (
+        "I couldn’t access extracted content for these documents (retrieval returned empty text). "
+        "Diagnostic code: RETRIEVAL_EMPTY_TEXT. "
+        "Next steps: "
+        + " ".join(next_actions)
+    )
+    return {
+        "status": "RETRIEVAL_EMPTY_TEXT",
+        "response": response_text,
+        "sources": [],
+        "user_id": user_id,
+        "collection": collection_name,
+        "request_id": request_id,
+        "index_version": index_version,
+        "context_found": False,
+        "query_type": "retrieval_empty_text",
+        "preprocessing": preprocessing_metadata,
+        "retrieval_attempts": retrieval_attempts,
+        "selected_strategy": selected_strategy,
+        "profile_context": profile_context_data,
+        "grounded": False,
+        "processing_time": processing_time,
+        "likely_causes": likely_causes,
+        "next_actions": next_actions,
+        "documents_seen": documents_seen,
+        "retrieval_stats": {"initial_retrieved": 0, "final_context": 0},
+    }
+
+
+def _build_retrieval_filter_error_response(
+    *,
+    query: str,
+    user_id: str,
+    collection_name: str,
+    request_id: Optional[str],
+    index_version: Optional[str],
+    details: Optional[str],
+    error_code: str = "RETRIEVAL_FILTER_FAILED",
+    documents_searched: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    documents_searched = documents_searched or []
+    missing_field = None
+    if details and "missing_index=" in details:
+        try:
+            missing_field = details.split("missing_index=", 1)[1].split()[0].strip()
+        except Exception:
+            missing_field = None
+    if error_code == "RETRIEVAL_INDEX_MISSING":
+        field_label = missing_field or "required field"
+        message = (
+            f"I couldn’t retrieve evidence due to an indexing issue ({field_label} not indexed)."
+        )
+    elif error_code == "RETRIEVAL_QDRANT_UNAVAILABLE":
+        message = "I couldn’t retrieve evidence because the document index is unavailable."
+    else:
+        message = "Profile isolation enforced; cannot search outside profile."
+    return {
+        "ok": False,
+        "error_code": error_code,
+        "message": message,
+        "details": details or "",
+        "response": message,
+        "sources": [],
+        "user_id": user_id,
+        "collection": collection_name,
+        "request_id": request_id,
+        "correlation_id": request_id,
+        "index_version": index_version,
+        "context_found": False,
+        "query_type": "retrieval_filter_failed",
+        "grounded": False,
+        "documents_searched": documents_searched,
+    }
+
+
 def _requires_detailed_summary(query: str) -> bool:
     lowered = (query or "").lower()
     summary_cues = ("summarize", "summary", "summarise", "overview", "key points", "recap", "compare")
@@ -155,15 +401,150 @@ def _extract_requested_fields(query: str) -> List[str]:
     return []
 
 
+def build_summary_from_chunks(query: str, chunks: List[Any]) -> str:
+    if not chunks:
+        return "I couldn't find enough document context to summarize."
+
+    lowered = (query or "").lower()
+    name_match = re.search(r"\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2})'s\b", query or "")
+    target_name = name_match.group(1).strip() if name_match else None
+
+    filtered = list(chunks)
+    if target_name:
+        name_filtered = [
+            chunk
+            for chunk in filtered
+            if str((chunk.metadata or {}).get("candidate_name") or "").lower() == target_name.lower()
+            or target_name.lower() in (chunk.text or "").lower()
+        ]
+        if name_filtered:
+            filtered = name_filtered
+
+    if "profile" in lowered or "resume" in lowered or "candidate" in lowered:
+        resume_filtered = [
+            chunk
+            for chunk in filtered
+            if str((chunk.metadata or {}).get("doc_type") or "").lower() in {"resume", "cv"}
+            or str((chunk.metadata or {}).get("doc_domain") or "").lower() == "resume"
+            or "resume" in ((chunk.metadata or {}).get("source_name") or "").lower()
+        ]
+        if resume_filtered:
+            filtered = resume_filtered
+
+    if not filtered:
+        return "I couldn't find enough document context to summarize."
+
+    sentences: List[str] = []
+    seen = set()
+    for chunk in filtered:
+        text = get_content_text(chunk.metadata or {}) or chunk.text or ""
+        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+        for part in parts:
+            clean = part.strip()
+            if not clean or clean.lower() in seen:
+                continue
+            seen.add(clean.lower())
+            sentences.append(clean)
+            if len(sentences) >= 3:
+                break
+        if len(sentences) >= 3:
+            break
+
+    summary = " ".join(sentences).strip()
+    if target_name and target_name.lower() not in summary.lower():
+        summary = f"{target_name}: {summary}"
+    return summary or "I couldn't find enough document context to summarize."
+
+
+def sanitize_response_obj(response_obj: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = sanitize_user_payload(response_obj or {})
+    if not isinstance(cleaned, dict):
+        return response_obj
+
+    response_text = cleaned.get("response")
+    if isinstance(response_text, str):
+        response_text = re.sub(r"\[SOURCE[^\]]*\]", "", response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r"(?i)citations?:", "", response_text)
+        response_text = re.sub(r"/(?:[\w\-.]+/)+[\w\-.]+", "", response_text)
+        lines = response_text.splitlines()
+        cleaned_lines: List[str] = []
+        for line in lines:
+            cleaned_lines.append(re.sub(r"[ \t]+", " ", line).strip())
+        normalized: List[str] = []
+        blank = False
+        for line in cleaned_lines:
+            if line == "":
+                if normalized and not blank:
+                    normalized.append("")
+                blank = True
+                continue
+            blank = False
+            normalized.append(line)
+        response_text = "\n".join(normalized).strip()
+        cleaned["response"] = response_text
+
+    sources = cleaned.get("sources")
+    if isinstance(sources, list):
+        normalized_sources = []
+        for src in sources:
+            if not isinstance(src, dict):
+                continue
+            entry = {}
+            name = src.get("source_name") or src.get("source")
+            if name:
+                entry["source_name"] = os.path.basename(str(name))
+            page = src.get("page")
+            if page is not None:
+                entry["page"] = page
+            if entry:
+                normalized_sources.append(entry)
+        cleaned["sources"] = normalized_sources
+
+    for key in ("request_id", "collection", "user_id"):
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def render_source_citations(answer: str, sources: List[Dict[str, Any]]) -> str:
+    if not answer or not sources:
+        return answer
+    citation_map: Dict[int, str] = {}
+    for idx, src in enumerate(sources, start=1):
+        citation = src.get("citation")
+        if not citation:
+            name = src.get("source_name") or "Document"
+            name = os.path.basename(str(name))
+            page = src.get("page")
+            citation = f"{name}, p. {page}" if page else f"{name}"
+        citation_map[idx] = citation
+
+    def _replace(match: re.Match) -> str:
+        content = match.group(1)
+        ids = [int(val) for val in re.findall(r"SOURCE-(\d+)", content)]
+        citations = []
+        for ident in ids:
+            cite = citation_map.get(ident)
+            if cite:
+                citations.append(cite)
+        if not citations:
+            return ""
+        unique = list(dict.fromkeys(citations))
+        if len(unique) == 1:
+            return f"({unique[0]})"
+        return "(" + "; ".join(unique) + ")"
+
+    rendered = re.sub(r"\[(SOURCE-[^\]]+)\]", _replace, answer)
+    return rendered.strip()
+
+
 def _build_evidence_ledger(chunks: List[Any], max_snippet_chars: int = 240) -> List[Dict[str, str]]:
     ledger = []
     for chunk in chunks:
         meta = getattr(chunk, "metadata", {}) or {}
         doc_name = get_source_name(meta) or meta.get("source_name") or meta.get("file_name") or "Unknown"
-        chunk_id = str(meta.get("chunk_id") or meta.get("id") or meta.get("chunkId") or "unknown")
         text = (getattr(chunk, "text", "") or "").strip()
         snippet = text[:max_snippet_chars].strip()
-        ledger.append({"doc_name": doc_name, "chunk_id": chunk_id, "snippet": snippet})
+        ledger.append({"doc_name": doc_name, "snippet": snippet})
     return ledger
 
 
@@ -190,11 +571,9 @@ def _format_evidence_fallback(query: str, ledger: List[Dict[str, str]]) -> str:
             else:
                 lines.append(f"- {field}: Not available in retrieved context")
     if ledger:
-        lines.append("Evidence ledger:")
+        lines.append("Evidence snippets:")
         for entry in ledger:
-            lines.append(
-                f"- {entry['doc_name']} (chunk {entry['chunk_id']}): {entry['snippet']}"
-            )
+            lines.append(f"- {entry['doc_name']}: {entry['snippet']}")
     else:
         lines.append("Not available in retrieved context.")
     return "\n".join(lines).strip()
@@ -209,6 +588,28 @@ class QdrantCollectionNotFoundError(ValueError):
         super().__init__(detail)
         self.collection_name = collection_name
         self.available_collections = available
+
+
+_QDRANT_INDEX_CACHE: Set[str] = set()
+_COLLECTION_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
+_COLLECTION_COUNT_TTL_SEC = int(os.getenv("QDRANT_COUNT_TTL_SEC", "120"))
+
+
+def _ensure_qdrant_indexes(client: QdrantClient, collection_name: str) -> None:
+    if not collection_name:
+        return
+    if collection_name in _QDRANT_INDEX_CACHE:
+        return
+    store = QdrantVectorStore(client=client)
+    try:
+        store.ensure_payload_indexes(collection_name, REQUIRED_PAYLOAD_INDEX_FIELDS, create_missing=True)
+        _QDRANT_INDEX_CACHE.add(collection_name)
+    except Exception as exc:  # noqa: BLE001
+        raise RetrievalFilterError(
+            "Index bootstrap failed; cannot search within profile.",
+            code="RETRIEVAL_INDEX_BOOTSTRAP_FAILED",
+            details=str(exc),
+        ) from exc
 
 
 def _resolve_collection_name(
@@ -357,7 +758,7 @@ def _clean_password(password: Optional[str]) -> Optional[str]:
 
 def _configure_hf_env() -> None:
     """Set HuggingFace hub timeouts/retries to avoid default short timeouts."""
-    if getattr(Config.Model, "DISABLE_HF", False):
+    if getattr(Config.Model, "OFFLINE_ONLY", False) or getattr(Config.Model, "DISABLE_HF", False):
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
@@ -386,6 +787,13 @@ def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
 _METRICS_EMBED_SAMPLE_RATE = float(os.getenv("METRICS_EMBED_SAMPLE_RATE", "0.4"))
 _METRICS_EMBED_MAX_CHARS = int(os.getenv("METRICS_EMBED_MAX_CHARS", "1200"))
 _FIRST_METRICS_REQUEST = True
+
+def _is_gemini_backend(llm_client: Any) -> bool:
+    backend = getattr(llm_client, "backend", None)
+    if backend:
+        return str(backend).lower() == "gemini"
+    model_name = getattr(llm_client, "model_name", "") or ""
+    return str(model_name).lower().startswith("gemini")
 
 
 def _approx_token_count(text: Optional[str]) -> int:
@@ -455,10 +863,11 @@ def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransf
         candidates.append(getattr(Config.Model, "SENTENCE_TRANSFORMERS", "sentence-transformers/all-mpnet-base-v2"))
 
     last_error = None
+    _configure_hf_env()
     for name in candidates:
         try:
             logger.info(f"Loading sentence transformer model: {name}")
-            model = SentenceTransformer(name)
+            model = SentenceTransformer(name, local_files_only=True)
             dim = model.get_sentence_embedding_dimension()
             logger.info(f"Loaded model '{name}' with dim={dim}")
             if required_dim is None or dim == required_dim:
@@ -483,6 +892,14 @@ def resolve_embedding_model_for_generation(model_name: Optional[str]) -> Optiona
 def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> SentenceTransformer:
     """Load a specific embedding model by name with optional dimension enforcement."""
     _configure_hf_env()
+    try:
+        from src.api.rag_state import singleton_guard_active
+
+        if singleton_guard_active() and _MODEL is not None and model_name not in _MODEL_BY_NAME:
+            logger.error("Embedding model reinit requested (%s); reusing existing singleton", model_name)
+            return get_model(required_dim=required_dim)
+    except Exception:
+        pass
     if model_name in _MODEL_BY_NAME:
         model = _MODEL_BY_NAME[model_name]
     else:
@@ -493,7 +910,7 @@ def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> Se
                 model_name,
                 device=device,
                 model_kwargs=model_kwargs,
-                local_files_only=bool(getattr(Config.Model, "DISABLE_HF", False)),
+                local_files_only=True,
             )
             _MODEL_BY_NAME[model_name] = model
         except Exception as exc:  # noqa: BLE001
@@ -511,6 +928,13 @@ def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> Se
 def get_model(required_dim: Optional[int] = None):
     """Lazy load sentence transformer model."""
     global _MODEL
+    try:
+        from src.api.rag_state import singleton_guard_active
+
+        if singleton_guard_active() and _MODEL is None:
+            logger.error("Embedding model requested after startup; initializing lazily (bug)")
+    except Exception:
+        pass
     if _MODEL is None:
         _MODEL = _load_model_candidates()
 
@@ -553,6 +977,13 @@ class _FallbackEmbedder:
 def get_cross_encoder():
     """Lazy load cross encoder model."""
     global _CROSS_ENCODER
+    try:
+        from src.api.rag_state import singleton_guard_active
+
+        if singleton_guard_active() and _CROSS_ENCODER is None:
+            logger.error("Cross-encoder requested after startup; initializing lazily (bug)")
+    except Exception:
+        pass
     if _CROSS_ENCODER is None:
         if not getattr(Config.Retrieval, "RERANKER_ENABLED", True):
             logger.info("Cross-encoder reranker disabled via configuration")
@@ -562,7 +993,8 @@ def get_cross_encoder():
             logger.info("Cross-encoder reranker disabled via configuration")
             return None
         try:
-            _CROSS_ENCODER = CrossEncoder(model_name)
+            _configure_hf_env()
+            _CROSS_ENCODER = CrossEncoder(model_name, local_files_only=True)
             logger.info("Loaded cross-encoder model: %s", model_name)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to load cross-encoder '{model_name}', continuing without reranker: {e}")
@@ -573,6 +1005,13 @@ def get_cross_encoder():
 def get_qdrant_client():
     """Lazy load Qdrant client."""
     global _QDRANT_CLIENT
+    try:
+        from src.api.rag_state import singleton_guard_active
+
+        if singleton_guard_active() and _QDRANT_CLIENT is None:
+            logger.error("Qdrant client requested after startup; initializing lazily (bug)")
+    except Exception:
+        pass
     if _QDRANT_CLIENT is None:
         try:
             _QDRANT_CLIENT = QdrantClient(
@@ -590,6 +1029,13 @@ def get_qdrant_client():
 def get_redis_client():
     """Lazy init for Redis client with comprehensive error handling."""
     global _REDIS_CLIENT
+    try:
+        from src.api.rag_state import singleton_guard_active
+
+        if singleton_guard_active() and _REDIS_CLIENT is None:
+            logger.error("Redis client requested after startup; initializing lazily (bug)")
+    except Exception:
+        pass
     if _REDIS_CLIENT is None:
         try:
             raw_conn = (
@@ -1134,7 +1580,7 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "llama3.2")
+        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "gpt-oss:latest")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
@@ -1224,6 +1670,13 @@ class OllamaClient:
         return text
 
 
+class RateLimitCooldownError(RuntimeError):
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.code = 429
+        self.retry_after = retry_after
+
+
 class GeminiClient:
     def __init__(self, model_name: Optional[str] = None):
         self.api_key = configure_gemini()
@@ -1237,6 +1690,19 @@ class GeminiClient:
             "max_output_tokens": getattr(Config.LLM, "MAX_TOKENS", 2048),
         }
         logger.info(f"Initialized GeminiClient with model: {self.model_name}")
+        self._cache: Dict[str, Tuple[float, str]] = {}
+        self._cache_ttl = int(os.getenv("GEMINI_CACHE_TTL_SECONDS", "900"))
+        self._circuit_open_until = 0.0
+        self._circuit_failures = 0
+        self._circuit_threshold = int(os.getenv("GEMINI_CIRCUIT_BREAKER_THRESHOLD", "2"))
+        self._circuit_timeout = int(os.getenv("GEMINI_CIRCUIT_BREAKER_TIMEOUT", "60"))
+        self._rate_limit_window = int(os.getenv("GEMINI_RATE_LIMIT_WINDOW", "60"))
+        self._rate_limit_threshold = int(os.getenv("GEMINI_RATE_LIMIT_THRESHOLD", str(self._circuit_threshold)))
+        self._rate_limit_cooldown = int(os.getenv("GEMINI_RATE_LIMIT_COOLDOWN", str(self._circuit_timeout)))
+        self._rate_limit_hits = 0
+        self._rate_limit_last_ts = 0.0
+        self._redis_client = None
+        self._cooldown_key = f"llm:cooldown:gemini:{self.model_name}"
 
     def generate_with_metadata(
             self,
@@ -1248,6 +1714,112 @@ class GeminiClient:
         text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
         return text, {"response": text}
 
+    def _get_redis_client(self):
+        if self._redis_client is None:
+            try:
+                self._redis_client = get_redis_client()
+            except Exception:
+                self._redis_client = None
+        return self._redis_client
+
+    def _get_cooldown_until(self) -> Optional[float]:
+        redis_client = self._get_redis_client()
+        if not redis_client:
+            return None
+        try:
+            raw = redis_client.get(self._cooldown_key)
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            return float(raw)
+        except Exception:
+            return None
+
+    def in_cooldown(self) -> bool:
+        now = time.time()
+        if self._circuit_open_until and now < self._circuit_open_until:
+            return True
+        redis_until = self._get_cooldown_until()
+        if redis_until and redis_until > now:
+            self._circuit_open_until = max(self._circuit_open_until, redis_until)
+            return True
+        return False
+
+    def _set_cooldown(self, until_ts: float) -> None:
+        self._circuit_open_until = max(self._circuit_open_until, until_ts)
+        redis_client = self._get_redis_client()
+        if redis_client:
+            try:
+                ttl = max(1, int(until_ts - time.time()))
+                redis_client.setex(self._cooldown_key, ttl, str(int(until_ts)))
+            except Exception:
+                pass
+
+    def _record_rate_limit_hit(self) -> bool:
+        now = time.time()
+        if now - self._rate_limit_last_ts > self._rate_limit_window:
+            self._rate_limit_hits = 0
+        self._rate_limit_hits += 1
+        self._rate_limit_last_ts = now
+        if self._rate_limit_hits >= self._rate_limit_threshold:
+            self._set_cooldown(now + self._rate_limit_cooldown)
+            return True
+        return False
+
+    @staticmethod
+    def _extract_status(exc: Exception) -> Optional[int]:
+        for attr in ("code", "status", "status_code"):
+            value = getattr(exc, attr, None)
+            if callable(value):
+                try:
+                    value = value()
+                except Exception:
+                    value = None
+            if isinstance(value, int):
+                return value
+            try:
+                if hasattr(value, "value"):
+                    return int(value.value)
+            except Exception:
+                continue
+        msg = str(exc)
+        if "429" in msg or "too many requests" in msg.lower():
+            return 429
+        return None
+
+    @staticmethod
+    def _extract_retry_after(exc: Exception) -> Optional[float]:
+        response = getattr(exc, "response", None) or getattr(exc, "resp", None) or getattr(exc, "http_response", None)
+        headers = None
+        if response is not None:
+            headers = getattr(response, "headers", None) or getattr(response, "headers", None)
+        if headers and hasattr(headers, "get"):
+            retry_after = headers.get("Retry-After") or headers.get("retry-after")
+            if retry_after:
+                try:
+                    if isinstance(retry_after, (int, float)):
+                        return float(retry_after)
+                    retry_after = str(retry_after).strip()
+                    if retry_after.isdigit():
+                        return float(retry_after)
+                    parsed = parsedate_to_datetime(retry_after)
+                    if parsed:
+                        delta = (parsed - datetime.now(parsed.tzinfo)).total_seconds()
+                        return max(0.0, delta)
+                except Exception:
+                    return None
+        retry_delay = getattr(exc, "retry_delay", None)
+        try:
+            if retry_delay is not None:
+                return float(retry_delay)
+        except Exception:
+            pass
+        return None
+
     def generate(
             self,
             prompt: str,
@@ -1257,12 +1829,28 @@ class GeminiClient:
         """Generate response with retry logic and robust parsing."""
         metrics_store = get_metrics_store()
         request_started = time.time()
+        cache_key = hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()
+        cached = self._cache.get(cache_key)
+        if cached:
+            ts, text = cached
+            if (time.time() - ts) <= self._cache_ttl:
+                logger.info("Gemini cache hit")
+                return text
+            self._cache.pop(cache_key, None)
+        if self.in_cooldown():
+            raise RateLimitCooldownError("Gemini cooldown active; skipping request")
+
         if metrics_store.available:
             metrics_store.record(
                 counters={"llm_request_count": 1},
                 distributions={"model_usage": {self.model_name: 1}},
                 model_id=self.model_name,
             )
+        max_retries = max(1, min(int(max_retries or 1), 3))
+        total_sleep = 0.0
+        max_sleep = float(os.getenv("GEMINI_MAX_BACKOFF_SECONDS", "2.5"))
+        total_cap = float(os.getenv("GEMINI_TOTAL_BACKOFF_CAP_SECONDS", "3.5"))
+        rate_limit_seen = False
         for attempt in range(1, max_retries + 1):
             try:
                 text, response = generate_text(
@@ -1283,14 +1871,67 @@ class GeminiClient:
                             metrics_store.record(
                                 counters={"llm_retry_count": attempt - 1},
                                 model_id=self.model_name,
-                            )
+                        )
+                    self._circuit_failures = 0
+                    self._circuit_open_until = 0.0
+                    self._rate_limit_hits = 0
+                    self._cache[cache_key] = (time.time(), text)
                     return text
                 logger.warning(f"No text in response: {response}")
                 return "I apologize, but I couldn't generate a proper response."
             except Exception as e:
-                logger.warning(f"Gemini API attempt {attempt}/{max_retries} failed: {e}")
+                status = self._extract_status(e)
+                retry_after = self._extract_retry_after(e)
+                if status == 429 and not rate_limit_seen:
+                    rate_limit_seen = True
+                    triggered = self._record_rate_limit_hit()
+                    logger.warning(
+                        "Gemini rate limit encountered (attempt %s/%s)",
+                        attempt,
+                        max_retries,
+                        extra={
+                            "stage": "generate",
+                            "provider": "gemini",
+                            "model": self.model_name,
+                            "retry_after": retry_after,
+                        },
+                    )
+                    if triggered:
+                        raise RateLimitCooldownError("Gemini rate limit cooldown activated", retry_after=self._rate_limit_cooldown)
+                elif status is not None:
+                    logger.warning(
+                        "Gemini API attempt %s/%s failed (status=%s): %s",
+                        attempt,
+                        max_retries,
+                        status,
+                        e,
+                        extra={"stage": "generate", "provider": "gemini", "model": self.model_name},
+                    )
+                else:
+                    logger.warning(
+                        "Gemini API attempt %s/%s failed: %s",
+                        attempt,
+                        max_retries,
+                        e,
+                        extra={"stage": "generate", "provider": "gemini", "model": self.model_name},
+                    )
+                if status in {500, 502, 503, 504}:
+                    self._circuit_failures += 1
+                    if self._circuit_failures >= self._circuit_threshold:
+                        self._set_cooldown(time.time() + self._circuit_timeout)
                 if attempt < max_retries:
-                    time.sleep(backoff * attempt)
+                    sleep_for = None
+                    if retry_after is not None:
+                        sleep_for = min(max_sleep, max(0.0, float(retry_after)))
+                    else:
+                        base = max(0.1, float(backoff))
+                        sleep_for = min(max_sleep, base * (2 ** (attempt - 1)))
+                        sleep_for += random.uniform(0, sleep_for * 0.25)
+                    remaining = max(0.0, total_cap - total_sleep)
+                    if sleep_for and remaining > 0:
+                        sleep_for = min(sleep_for, remaining)
+                        time.sleep(sleep_for)
+                        total_sleep += sleep_for
                 else:
                     logger.error(f"All retry attempts failed: {e}")
                     if metrics_store.available:
@@ -1411,6 +2052,8 @@ class QueryReformulator:
         """Reformulate query using LLM to make it more search-friendly."""
         if len(query.split()) <= 5 and not conversation_context:
             return query
+        if _is_gemini_backend(self.llm_client):
+            return query
 
         prompt = f"""You are a query reformulation assistant. Convert the user's conversational question into a clear, concise search query optimized for semantic search.
 
@@ -1471,13 +2114,26 @@ class QdrantRetriever:
             raise ValueError("profile_id is required for retrieval to enforce isolation")
 
     def _build_filter(
-        self, profile_id: str, document_ids: Optional[List[str]] = None, source_files: Optional[List[str]] = None
+        self,
+        subscription_id: str,
+        profile_id: str,
+        document_ids: Optional[List[str]] = None,
+        source_files: Optional[List[str]] = None,
+        doc_domains: Optional[List[str]] = None,
+        section_kinds: Optional[List[str]] = None,
     ) -> Filter:
         self._ensure_profile(profile_id)
-        conditions = [
-            FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-        ]
-        should = []
+        if not subscription_id or not str(subscription_id).strip():
+            logger.error("Security: retrieval attempted without subscription_id filter")
+            raise ValueError("subscription_id is required for retrieval to enforce isolation")
+        base = build_qdrant_filter(
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            doc_domain=doc_domains,
+            section_kind=section_kinds,
+        )
+        conditions = list(getattr(base, "must", []) or [])
+        should = list(getattr(base, "should", []) or [])
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
@@ -1506,7 +2162,7 @@ class QdrantRetriever:
             chunks.append(
                 RetrievedChunk(
                     id=str(pt.id),
-                    text=payload.get("text", ""),
+                    text=get_embedding_text(payload),
                     score=float(pt.score),
                     metadata=payload,
                     source=source or None,
@@ -1536,7 +2192,7 @@ class QdrantRetriever:
                 chunk.score = score
                 scored[chunk.id] = chunk
 
-        return sorted(scored.values(), key=lambda c: float(c.score), reverse=True)
+        return sorted(scored.values(), key=lambda c: to_py_scalar(c.score), reverse=True)
 
     def run_search(
             self,
@@ -1545,7 +2201,9 @@ class QdrantRetriever:
             query_filter: Optional[dict] = None,
             limit: int = 50,
             vector_name: str = "content_vector",
-            score_threshold: Optional[float] = None
+            score_threshold: Optional[float] = None,
+            *,
+            _allow_retry: bool = True,
     ):
         """Execute a vector search against Qdrant using query_points."""
         try:
@@ -1567,9 +2225,42 @@ class QdrantRetriever:
 
             results = self.client.query_points(**kwargs)
             return results
+        except UnexpectedResponse as exc:
+            detail = getattr(exc, "content", None) or str(exc)
+            logger.error("Qdrant query_points error (%s): %s", exc.status_code, detail, exc_info=True)
+            missing_field = autoheal_missing_index(self.client, collection_name, detail)
+            if missing_field and _allow_retry:
+                logger.warning(
+                    "Retrying Qdrant query after auto-heal for missing index: %s",
+                    missing_field,
+                )
+                return self.run_search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                    vector_name=vector_name,
+                    score_threshold=score_threshold,
+                    _allow_retry=False,
+                )
+            if missing_field:
+                raise RetrievalFilterError(
+                    "Index required but not found; retrieval blocked.",
+                    code="RETRIEVAL_INDEX_MISSING",
+                    details=f"missing_index={missing_field}",
+                ) from exc
+            raise RetrievalFilterError(
+                "Profile isolation enforced; cannot search outside profile.",
+                code="RETRIEVAL_FILTER_FAILED",
+                details=str(detail),
+            ) from exc
         except Exception as e:
             logger.error("Qdrant query_points error: %s", e, exc_info=True)
-            return None
+            raise RetrievalFilterError(
+                "Qdrant unavailable; retrieval blocked.",
+                code="RETRIEVAL_QDRANT_UNAVAILABLE",
+                details=str(e),
+            ) from e
 
     def get_collection_vector_dim(self, collection_name: str) -> Optional[int]:
         """Fetch and cache the expected vector dimension for a collection."""
@@ -1609,6 +2300,7 @@ class QdrantRetriever:
             self,
             collection_name: str,
             query: str,
+            subscription_id: str,
             filter_profile: str = None,
             top_k: int = 50,
             score_threshold: float = 0.10  # ✅ CHANGED FROM 0.15
@@ -1634,7 +2326,7 @@ class QdrantRetriever:
 
         logger.info(f"Searching collection '{collection_name}' for query: {query[:100]}")
 
-        query_filter = self._build_filter(str(filter_profile))
+        query_filter = self._build_filter(subscription_id, str(filter_profile))
 
         results = self.run_search(
             collection_name=collection_name,
@@ -1656,8 +2348,8 @@ class QdrantRetriever:
         chunks: List[RetrievedChunk] = []
         for pt in points:
             payload = pt.payload or {}
-            text = payload.get("text", "")
-            snippet = text[:120].replace("\n", " ")
+            text = get_embedding_text(payload)
+            snippet = (get_content_text(payload) or text)[:120].replace("\n", " ")
             logger.debug("Hit score=%.4f snippet=%s", pt.score, snippet)
             source = get_source_name(payload) or payload.get("source") or "unknown"
             chunk = RetrievedChunk(
@@ -1675,15 +2367,25 @@ class QdrantRetriever:
             self,
             collection_name: str,
             query: str,
+            subscription_id: str,
             profile_id: str,
             top_k: int = 50,
             document_ids: Optional[List[str]] = None,
             source_files: Optional[List[str]] = None,
+            doc_domains: Optional[List[str]] = None,
+            section_kinds: Optional[List[str]] = None,
             score_threshold: float = 0.05,
     ) -> List[RetrievedChunk]:
         """Hybrid dense + sparse retrieval with reciprocal rank fusion."""
         self._ensure_profile(profile_id)
-        query_filter = self._build_filter(profile_id, document_ids=document_ids, source_files=source_files)
+        query_filter = self._build_filter(
+            subscription_id,
+            profile_id,
+            document_ids=document_ids,
+            source_files=source_files,
+            doc_domains=doc_domains,
+            section_kinds=section_kinds,
+        )
 
         target_dim = self.get_collection_vector_dim(collection_name)
         model = get_model(required_dim=target_dim)
@@ -1728,6 +2430,7 @@ class QdrantRetriever:
             self,
             collection_name: str,
             seed_chunks: List[RetrievedChunk],
+            subscription_id: str,
             profile_id: Optional[str],
             window: int = 1,
             max_new: int = 6
@@ -1766,13 +2469,11 @@ class QdrantRetriever:
                 if neighbor_val:
                     neighbor_ids.append(str(neighbor_val))
             if neighbor_ids:
-                must = [
-                    {"key": "document_id", "match": {"value": str(doc_id)}},
-                    {"key": "chunk_id", "match": {"any": neighbor_ids}},
-                ]
-                if profile_id is not None:
-                    must.append({"key": "profile_id", "match": {"value": str(profile_id)}})
-                neighbor_filters.append({"must": must})
+                base = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
+                must = list(getattr(base, "must", []) or [])
+                must.append(FieldCondition(key="document_id", match=MatchValue(value=str(doc_id))))
+                must.append(FieldCondition(key="chunk_id", match=MatchAny(any=neighbor_ids)))
+                neighbor_filters.append(Filter(must=must))
 
             # Fallback to chunk_index equality (not range) to avoid 400s when stored as keyword.
             try:
@@ -1792,13 +2493,11 @@ class QdrantRetriever:
                 seen_values = set()
                 neighbor_values = [v for v in neighbor_values if not (v in seen_values or seen_values.add(v))]
                 if neighbor_values:
-                    must = [
-                        {"key": "document_id", "match": {"value": str(doc_id)}},
-                        {"key": "chunk_index", "match": {"any": neighbor_values}},
-                    ]
-                    if profile_id is not None:
-                        must.append({"key": "profile_id", "match": {"value": str(profile_id)}})
-                    neighbor_filters.append({"must": must})
+                    base = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
+                    must = list(getattr(base, "must", []) or [])
+                    must.append(FieldCondition(key="document_id", match=MatchValue(value=str(doc_id))))
+                    must.append(FieldCondition(key="chunk_index", match=MatchAny(any=neighbor_values)))
+                    neighbor_filters.append(Filter(must=must))
 
             if not neighbor_filters:
                 continue
@@ -1830,7 +2529,7 @@ class QdrantRetriever:
                         neighbor_key = (str(payload.get("document_id", doc_id)), str(neighbor_idx))
                     if neighbor_key and neighbor_key in seen:
                         continue
-                    text = payload.get("text") or ""
+                    text = get_embedding_text(payload)
                     if not text:
                         continue
                     if neighbor_key:
@@ -1859,6 +2558,7 @@ class QdrantRetriever:
     def get_profile_context(
             self,
             collection_name: str,
+            subscription_id: str,
             profile_id: str,
             max_points: int = 400,
             refresh_seconds: int = 300
@@ -1870,7 +2570,7 @@ class QdrantRetriever:
         if cached and (now - cached.last_updated) < refresh_seconds:
             return cached
 
-        filter_ = {"must": [{"key": "profile_id", "match": {"value": str(profile_id)}}]}
+        filter_ = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
         collected_points = []
         next_offset = None
         batch_size = min(120, max_points)
@@ -1915,7 +2615,7 @@ class QdrantRetriever:
 
         for pt in collected_points:
             payload = pt.payload or {}
-            text = payload.get("text") or ""
+            text = get_embedding_text(payload)
             if text:
                 token_counts.update(self.preprocessor.tokenize(text))
 
@@ -1969,7 +2669,8 @@ class HybridReranker:
             chunks: List[RetrievedChunk],
             query: str,
             top_k: int = 10,
-            use_cross_encoder: bool = True
+            use_cross_encoder: bool = True,
+            diagnostics: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievedChunk]:
         """Rerank chunks using hybrid BM25 + vector scoring."""
         if not chunks:
@@ -1979,12 +2680,37 @@ class HybridReranker:
             alpha = self.adjust_alpha(query)
             logger.info(f"Using alpha={alpha:.2f} for reranking")
 
-            texts = [chunk.text for chunk in chunks]
-            tokenized_corpus = [self.preprocessor.tokenize(text) for text in texts]
-            tokenized_query = self.preprocessor.tokenize(query)
+            texts = [get_embedding_text(chunk.metadata or {}) or chunk.text for chunk in chunks]
+            normalized_texts = [self.preprocessor.normalize_text(text or "") for text in texts]
+            tokenized_corpus = [self.preprocessor.tokenize(text) for text in normalized_texts]
+            tokenized_query = self.preprocessor.tokenize(self.preprocessor.normalize_text(query))
 
-            bm25 = BM25Okapi(tokenized_corpus)
-            bm25_scores = np.array(bm25.get_scores(tokenized_query), dtype=np.float64)
+            if any(len(doc) > 0 for doc in tokenized_corpus):
+                bm25 = BM25Okapi(tokenized_corpus)
+                bm25_scores = np.array(bm25.get_scores(tokenized_query), dtype=np.float64)
+            else:
+                invalid_samples = [
+                    {
+                        "chunk_id": (chunk.metadata or {}).get("chunk_id") or chunk.id,
+                        "length": len(chunk.text or ""),
+                        "sample": _sanitize_snippet(chunk.text),
+                    }
+                    for chunk in chunks
+                ]
+                diag = diagnostics or {}
+                retrieved_count = int(diag.get("retrieved_count", len(chunks)))
+                dropped_invalid = int(diag.get("dropped_invalid_count", len(invalid_samples)))
+                remaining = int(diag.get("remaining_chunks", max(0, retrieved_count - dropped_invalid)))
+                samples = diag.get("invalid_samples") or invalid_samples
+                logger.warning(
+                    "BM25 skipped: all documents empty after tokenization | retrieved=%s "
+                    "dropped_invalid=%s remaining=%s samples=%s",
+                    retrieved_count,
+                    dropped_invalid,
+                    remaining,
+                    samples[:3],
+                )
+                bm25_scores = np.zeros(len(chunks), dtype=np.float64)
 
             vector_scores = np.array([float(chunk.score) for chunk in chunks], dtype=np.float64)
 
@@ -2016,12 +2742,27 @@ class HybridReranker:
                     pairs = [[query, chunk.text] for chunk in candidate_chunks]
                     ce_scores = self.cross_encoder.predict(pairs)
 
-                    for i, score in enumerate(ce_scores):
+                    normalized = normalize_scores(ce_scores, expected_k=len(candidate_chunks))
+                    for i, score in enumerate(normalized):
                         candidate_chunks[i].score = float(score)
 
-                    candidate_chunks.sort(key=lambda c: c.score, reverse=True)
+                    candidate_chunks.sort(key=lambda c: to_py_scalar(c.score), reverse=True)
                     logger.info(f"Applied CrossEncoder reranking to {len(candidate_chunks)} chunks")
 
+                except RerankShapeError as exc:
+                    logger.warning(
+                        "CrossEncoder rerank shape mismatch; falling back to hybrid scores: %s",
+                        exc,
+                        extra={
+                            "stage": "rerank",
+                            "provider": "cross_encoder",
+                            "expected_k": exc.expected_k,
+                            "actual_len": exc.actual_len,
+                            "score_shape": exc.score_shape,
+                        },
+                    )
+                    for i, chunk in enumerate(candidate_chunks):
+                        chunk.score = float(hybrid_scores[sorted_indices[i]])
                 except Exception as e:
                     logger.warning(f"CrossEncoder reranking failed: {e}")
                     for i, chunk in enumerate(candidate_chunks):
@@ -2051,15 +2792,11 @@ class ContextBuilder:
         lines = []
         for i, chunk in enumerate(chunks[:5], 1):
             meta = chunk.metadata or {}
-            source_name = chunk.source or get_source_name(meta) or f"doc_{chunk.id[:8]}"
-            page = meta.get('page')
-            section = meta.get('section')
-            score = round(float(chunk.score), 3)
-            parts = [f"{i}) {source_name}", f"score={score}"]
+            source_name = chunk.source or get_source_name(meta) or f"Document {i}"
+            page = meta.get('page') or meta.get('page_start') or meta.get('page_number')
+            parts = [f"{i}) {source_name}"]
             if page is not None:
                 parts.append(f"page={page}")
-            if section:
-                parts.append(f"section={section}")
             lines.append(" | ".join(parts))
         return "SOURCE MAP:\n" + "\n".join(lines) + "\n"
 
@@ -2072,7 +2809,8 @@ class ContextBuilder:
         seen_texts = set()
         unique_chunks = []
         for chunk in chunks:
-            normalized = ' '.join(chunk.text.split())
+            text_value = get_content_text(chunk.metadata or {}) or chunk.text
+            normalized = ' '.join((text_value or "").split())
             if normalized not in seen_texts and normalized.strip():
                 seen_texts.add(normalized)
                 unique_chunks.append(chunk)
@@ -2085,9 +2823,10 @@ class ContextBuilder:
             context_parts.append(source_map)
         for i, chunk in enumerate(selected_chunks, 1):
             # Use source_name directly from metadata as fallback
-            source_name = chunk.source or get_source_name(chunk.metadata or {}) or f"doc_{chunk.id[:8]}"
+            source_name = chunk.source or get_source_name(chunk.metadata or {}) or f"Document {i}"
+            content_text = get_content_text(chunk.metadata or {}) or chunk.text
             context_parts.append(
-                f"[SOURCE: {source_name}]\n{chunk.text}\n[/SOURCE]"
+                f"[SOURCE: {source_name}]\n{content_text}\n[/SOURCE]"
             )
 
         return "\n".join(context_parts)
@@ -2097,11 +2836,12 @@ class ContextBuilder:
         """Extract source information for response metadata."""
         sources = []
         for i, chunk in enumerate(chunks[:max_sources], 1):
+            meta = chunk.metadata or {}
+            page = meta.get("page") or meta.get("page_start") or meta.get("page_number")
             sources.append({
                 'source_id': i,
-                'source_name': chunk.source or f"Document {chunk.id[:8]}",
-                'excerpt': chunk.text[:200] + "..." if len(chunk.text) > 200 else chunk.text,
-                'relevance_score': round(float(chunk.score), 3)
+                'source_name': chunk.source or get_source_name(meta) or f"Document {i}",
+                'page': page,
             })
         return sources
 
@@ -2152,6 +2892,8 @@ class AnswerabilityDetector:
         """
         if has_chunks and context.strip():
             return True, "Context present from retrieved chunks"
+        if _is_gemini_backend(self.llm_client):
+            return True, "Gemini disabled for answerability checks"
 
         prompt = f"""You are an answerability classifier. Determine if the USER QUESTION can be answered using ONLY the information in the DOCUMENT CONTEXT.
 
@@ -2345,31 +3087,28 @@ class PromptBuilder:
         feedback_block = f"\nRECENT FEEDBACK:\n{feedback_memory}\n" if feedback_memory else ""
         retrieval_block = f"\nRETRIEVAL NOTES:\n{retrieval_brief}\n" if retrieval_brief else ""
         kg_block = f"\nKG EVIDENCE PACK (use only if supported by Document Context):\n{kg_evidence}\n" if kg_evidence else ""
-        task_mode = _requires_detailed_summary(query) or bool(_extract_requested_fields(query))
         extraction_mode = bool(_extract_requested_fields(query))
 
-        task_style_block = ""
-        if task_mode:
-            task_style_block = (
-                "\nTASK MODE STYLE:\n"
-                "- Start with a 1–2 sentence direct answer.\n"
-                "- Then provide 4–6 crisp bullets with citations (only supported claims).\n"
-                "- Provide explanation only if necessary to clarify the bullets.\n"
-                "- End with a one-line “Next best action” question ONLY if it helps.\n"
-            )
+        output_shape_block = (
+            "\nOUTPUT SHAPE (MANDATORY):\n"
+            "1) Understanding & Scope (1-2 lines): intent + scope + files used.\n"
+            "2) Answer: use domain-specific sections.\n"
+            "3) Evidence & Gaps: what is missing + where searched.\n"
+            "4) Optional next-step hint (no questions; only helpful suggestions).\n"
+        )
         extraction_block = ""
         if extraction_mode:
             extraction_block = (
-                "\nEXTRACTION MODE:\n"
-                "- Return a compact structured block using the requested field names.\n"
-                "- For any missing field, write exactly: Not available in retrieved context.\n"
-                "- Avoid vague phrases or filler.\n"
+                "\nFIELD REQUESTS:\n"
+                "- Use the requested field names inside the Answer section.\n"
+                "- If a field is missing, write: Not found in the current profile documents.\n"
+                "- Avoid raw extraction dumps and filler.\n"
             )
 
-        prompt = f"""You are DocWain-Agent, an analyst assistant. Be conversational, concise, and helpful.
-You MUST use the retrieved document context and never add DocWain product intro unless the user asks about DocWain.
+        prompt = f"""You are DocWain-Agent, a document intelligence model. Follow the system instructions exactly.
+Use ONLY the retrieved document context and never add DocWain product intro unless the user asks about DocWain.
 When information is missing, say so briefly and proceed with what is available.
-{task_style_block}{extraction_block}
+{output_shape_block}{extraction_block}
 
 DOCUMENT CONTEXT:
 {context}
@@ -2390,10 +3129,10 @@ GROUNDING & CITATION RULES (MANDATORY):
 6) Do not invent, pad, or generalize beyond the provided text.
 
 ANSWER STYLE (MANDATORY):
-- Format: 1-2 sentence overview, then 3-6 concise bullet points with citations, then a one-line takeaway.
-- Tone: warm, confident colleague; vary sentence openings; avoid filler and repetition.
-- Bullets must be full sentences that stitch facts together (who/what/when/where/why/how) with inline citations.
-- If the question is about an entity not present, say so and list what the documents do cover (with citations), then stop.
+- Follow the output shape above exactly.
+- No static filler like "Working on it".
+- No raw extraction dumps like "items:", "amounts:", "terms:".
+- If the question is about an entity not present, say so and list files searched, then stop.
 
 Provide the answer now with citations inline after each claim."""
 
@@ -2415,6 +3154,8 @@ class ConversationSummarizer:
 
     def summarize(self, conversation_text: str) -> str:
         if not conversation_text:
+            return ""
+        if _is_gemini_backend(self.llm_client):
             return ""
         prompt = f"""Summarize the following conversation turns into 3-5 concise bullets capturing user intent and assistant answers. Do NOT invent details.
 
@@ -2441,12 +3182,17 @@ class EnterpriseRAGSystem:
             model_name: Optional[str] = None,
             profile_id: Optional[str] = None,
             backend_override: Optional[str] = None,
-            model_path: Optional[str] = None
+            model_path: Optional[str] = None,
+            llm_client: Optional[Any] = None,
+            qdrant_client: Optional[QdrantClient] = None,
+            embedder: Optional[SentenceTransformer] = None,
+            cross_encoder: Optional[Any] = None,
+            redis_client: Optional[redis.Redis] = None,
     ):
         """Initialize the RAG system with lazy-loaded components."""
         try:
             # Initialize LLM client (Ollama by default, Gemini when requested)
-            self.llm_client = create_llm_client(
+            self.llm_client = llm_client or create_llm_client(
                 model_name,
                 backend_override=backend_override,
                 model_path=model_path
@@ -2454,9 +3200,9 @@ class EnterpriseRAGSystem:
             self.model_name = getattr(self.llm_client, "model_name", model_name or "default")
 
             # Initialize other components
-            qdrant_client = get_qdrant_client()
-            model = get_model()
-            cross_encoder = get_cross_encoder()
+            qdrant_client = qdrant_client or get_qdrant_client()
+            model = embedder or get_model()
+            cross_encoder = cross_encoder if cross_encoder is not None else get_cross_encoder()
 
             self.model = model
             self.client = qdrant_client
@@ -2470,8 +3216,10 @@ class EnterpriseRAGSystem:
             self.greeting_handler = GreetingHandler()
             self.query_reformulator = QueryReformulator(self.llm_client)
             self.answerability_detector = AnswerabilityDetector(self.llm_client)
+            self.retrieval_planner = RetrievalPlanner(self.llm_client)
+            self.evidence_synthesizer = EvidenceSynthesizer(self.llm_client)
             # Initialize Redis client for storing conversation history and feedback.
-            redis_client = get_redis_client()
+            redis_client = redis_client or get_redis_client()
             self.redis_client = redis_client
 
             # Initialize conversation history backed by Redis. Avoid instantiating
@@ -2622,7 +3370,11 @@ class EnterpriseRAGSystem:
             r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})[\'’]s\s+(?:education|skills?|experience)',
 
             # tell me about Name
-            r'\btell\s+me\s+about\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})'
+            r'\btell\s+me\s+about\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})',
+            # about Name / for Name / regarding Name
+            r'\b(?:about|for|regarding)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})',
+            # patient/vendor Name
+            r'\b(?:patient|vendor)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})',
         ]
 
         for pattern in patterns:
@@ -2632,12 +3384,138 @@ class EnterpriseRAGSystem:
 
         return None
 
-    def find_document_id_by_name(
+    @staticmethod
+    def _normalize_plan_domain(value: Optional[str]) -> str:
+        if not value:
+            return "generic"
+        cleaned = str(value).strip().lower().replace(" ", "_")
+        aliases = {
+            "bank": "bank_statement",
+            "bankstatement": "bank_statement",
+            "bank-statement": "bank_statement",
+            "purchaseorder": "purchase_order",
+            "purchase-order": "purchase_order",
+            "po": "purchase_order",
+            "cv": "resume",
+        }
+        cleaned = aliases.get(cleaned, cleaned)
+        if cleaned in {"resume", "medical", "invoice", "tax", "bank_statement", "purchase_order", "generic"}:
+            return cleaned
+        return "generic"
+
+    @staticmethod
+    def _normalize_filename(value: str) -> str:
+        base = os.path.basename(str(value or "")).lower()
+        base = re.sub(r"\.[a-z0-9]{2,5}$", "", base)
+        base = base.replace("_", " ").replace("-", " ")
+        return re.sub(r"\s+", " ", base).strip()
+
+    def _build_available_documents(
+        self,
+        subscription_id: str,
+        profile_id: str,
+    ) -> Tuple[List[Dict[str, Any]], Optional[Any]]:
+        try:
+            profile_index = build_profile_document_index(subscription_id, profile_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Failed to build profile document index: %s", exc)
+            return [], None
+
+        documents: List[Dict[str, Any]] = []
+        for entry in profile_index.documents.values():
+            if not entry.source_name:
+                continue
+            domain = self._normalize_plan_domain(entry.document_type)
+            doc_payload = {"file_name": entry.source_name}
+            if domain != "generic":
+                doc_payload["doc_domain"] = domain
+            documents.append(doc_payload)
+        return documents, profile_index
+
+    def _match_target_files(self, query: str, available_documents: List[Dict[str, Any]]) -> List[str]:
+        if not query or not available_documents:
+            return []
+        lowered = query.lower()
+        matches: List[str] = []
+        for doc in available_documents:
+            name = doc.get("file_name") or ""
+            if not name:
+                continue
+            base = os.path.basename(name).lower()
+            base_no_ext = re.sub(r"\.[a-z0-9]{2,5}$", "", base)
+            if base and base in lowered:
+                matches.append(os.path.basename(name))
+                continue
+            if base_no_ext and base_no_ext in lowered:
+                matches.append(os.path.basename(name))
+                continue
+        seen = set()
+        return [m for m in matches if not (m in seen or seen.add(m))]
+
+    def _resolve_doc_ids_for_files(self, profile_index: Optional[Any], target_files: List[str]) -> List[str]:
+        if not profile_index or not target_files:
+            return []
+        mapping: Dict[str, List[str]] = {}
+        for doc_id, entry in profile_index.documents.items():
+            name = entry.source_name or ""
+            if not name:
+                continue
+            base = os.path.basename(name).lower()
+            base_no_ext = re.sub(r"\.[a-z0-9]{2,5}$", "", base)
+            mapping.setdefault(base, []).append(str(doc_id))
+            if base_no_ext:
+                mapping.setdefault(base_no_ext, []).append(str(doc_id))
+
+        doc_ids: List[str] = []
+        for file_name in target_files:
+            base = os.path.basename(str(file_name)).lower()
+            base_no_ext = re.sub(r"\.[a-z0-9]{2,5}$", "", base)
+            for key in (base, base_no_ext):
+                doc_ids.extend(mapping.get(key, []))
+
+        seen = set()
+        return [doc_id for doc_id in doc_ids if not (doc_id in seen or seen.add(doc_id))]
+
+    def _filter_chunks_by_plan(
+        self,
+        chunks: List[RetrievedChunk],
+        *,
+        plan_domain: Optional[str],
+        target_files: Optional[List[str]],
+    ) -> List[RetrievedChunk]:
+        if not chunks:
+            return []
+        domain = self._normalize_plan_domain(plan_domain)
+        target_files = [os.path.basename(f) for f in (target_files or []) if f]
+        target_bases = {self._normalize_filename(f) for f in target_files}
+        filtered: List[RetrievedChunk] = []
+        for chunk in chunks:
+            meta = getattr(chunk, "metadata", {}) or {}
+            if domain and domain != "generic":
+                chunk_domain = self._normalize_plan_domain(
+                    meta.get("doc_domain")
+                    or meta.get("document_type")
+                    or meta.get("doc_type")
+                    or (meta.get("document") or {}).get("type")
+                )
+                if chunk_domain not in {"generic", domain}:
+                    continue
+            if target_files:
+                source = get_source_name(meta) or chunk.source or ""
+                source_base = os.path.basename(str(source)) if source else ""
+                source_norm = self._normalize_filename(source_base)
+                if source_base not in target_files and source_norm not in target_bases:
+                    continue
+            filtered.append(chunk)
+        return filtered
+
+    def find_document_ids_by_name(
             self,
             collection_name: str,
             person_name: str,
-            profile_id: str
-    ) -> str | None:
+            profile_id: str,
+            subscription_id: str,
+    ) -> List[str]:
         try:
             #  Encode name
             query_vector = self.model.encode(
@@ -2647,13 +3525,9 @@ class EnterpriseRAGSystem:
             ).astype(np.float32).tolist()
 
             #  Build filter (CORRECT way)
-            qdrant_filter = Filter(
-                must=[
-                    FieldCondition(
-                        key="profile_id",
-                        match=MatchValue(value=str(profile_id))
-                    )
-                ]
+            qdrant_filter = build_qdrant_filter(
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
             )
 
             #  Call Qdrant
@@ -2671,21 +3545,26 @@ class EnterpriseRAGSystem:
             if not results or not results.points:
                 return None
 
-            #  Extract matching document_id
+            #  Extract matching document_id(s)
+            doc_ids: List[str] = []
             for pt in results.points:
                 payload = pt.payload or {}
-                text = payload.get("text", "").lower()
+                text = (get_content_text(payload) or get_embedding_text(payload)).lower()
                 source = (get_source_name(payload) or "").lower()
 
                 for part in person_name.lower().split():
                     if part in text or part in source:
-                        return payload.get("document_id")
+                        doc_id = payload.get("document_id")
+                        if doc_id:
+                            doc_ids.append(str(doc_id))
+                        break
 
-            return None
+            seen = set()
+            return [doc_id for doc_id in doc_ids if not (doc_id in seen or seen.add(doc_id))]
 
         except Exception as e:
             logger.error(f"Error finding document by name '{person_name}': {e}")
-            return None
+            return []
 
     def retrieve_with_priorities(
             self,
@@ -2719,67 +3598,173 @@ class EnterpriseRAGSystem:
                 expansion = " ".join(graph_hints.query_expansion_terms)
                 retrieval_query = f"{primary_query} {expansion}"
 
-        profile_context = self.retriever.get_profile_context(collection_name, profile_id)
+        profile_context = self.retriever.get_profile_context(collection_name, subscription_id, profile_id)
         profile_context_data = {
             "keywords": profile_context.top_keywords[:12],
             "hints": profile_context.document_hints[:6],
             "sampled_chunks": profile_context.total_chunks
         }
 
-        person_name = self.extract_person_name_from_query(primary_query)
-        target_document_id = None
+        available_documents, profile_index = self._build_available_documents(subscription_id, profile_id)
+        explicit_target_files = self._match_target_files(primary_query, available_documents)
+        target_document_name = explicit_target_files[0] if len(explicit_target_files) == 1 else None
+        retrieval_plan = self.retrieval_planner.plan(
+            user_query=primary_query,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            target_document_name=target_document_name,
+            available_documents=available_documents,
+        )
 
-        if person_name:
-            logger.info(f" Detected person-specific query for: '{person_name}'")
-            target_document_id = self.find_document_id_by_name(collection_name, person_name, profile_id)
+        plan_scope = retrieval_plan.get("scope") or {}
+        plan_target_files = list(plan_scope.get("target_files") or [])
+        if explicit_target_files:
+            plan_target_files = list(dict.fromkeys(plan_target_files + explicit_target_files))
+        plan_target_files = [f for f in plan_target_files if f]
+        plan_domain = self._normalize_plan_domain(retrieval_plan.get("domain"))
+        plan_filters = (retrieval_plan.get("retrieval") or {}).get("filters") or {}
+        raw_doc_domain = plan_filters.get("doc_domain")
+        if isinstance(raw_doc_domain, list):
+            raw_doc_domain = raw_doc_domain[0] if raw_doc_domain else None
+        plan_doc_domain = self._normalize_plan_domain(raw_doc_domain)
+        doc_domain_filter = None
+        if plan_doc_domain and plan_doc_domain != "generic":
+            doc_domain_filter = [plan_doc_domain]
+        elif plan_domain and plan_domain != "generic":
+            doc_domain_filter = [plan_domain]
 
-            if target_document_id:
-                logger.info(f" Will filter results to document: {target_document_id}")
+        plan_top_k = (retrieval_plan.get("retrieval") or {}).get("top_k")
+        if isinstance(plan_top_k, int) and plan_top_k > 0:
+            top_k_retrieval = min(top_k_retrieval, plan_top_k)
+
+        plan_name_query = retrieval_plan.get("name_query") or {}
+        planner_name = plan_name_query.get("name")
+        person_name = planner_name or self.extract_person_name_from_query(primary_query)
+        name_scope_enabled = bool(plan_name_query.get("enabled")) or bool(person_name)
+
+        doc_ids_from_files = self._resolve_doc_ids_for_files(profile_index, plan_target_files)
+        target_document_ids: List[str] = []
+        document_filter_ids: Optional[List[str]] = doc_ids_from_files or None
+
+        if name_scope_enabled and person_name:
+            logger.info(" Detected person-specific query for: '%s'", person_name)
+            target_document_ids = self.find_document_ids_by_name(
+                collection_name, person_name, profile_id, subscription_id
+            )
+
+            if target_document_ids:
+                if document_filter_ids:
+                    document_filter_ids = [doc_id for doc_id in target_document_ids if doc_id in document_filter_ids]
+                else:
+                    document_filter_ids = target_document_ids
+                logger.info(" Will filter results to documents: %s", document_filter_ids)
             else:
-                logger.warning(f" Could not find document for '{person_name}' - will search all docs")
+                logger.warning(
+                    " Could not find documents for '%s' - enforcing name scope with no matches",
+                    person_name,
+                )
+        elif doc_ids_from_files:
+            target_document_ids = doc_ids_from_files
+
         primary_metadata["vague_query"] = is_vague
         primary_metadata["profile_context"] = profile_context_data
         primary_metadata["person_name"] = person_name
-        primary_metadata["target_document_id"] = target_document_id
+        primary_metadata["target_document_ids"] = document_filter_ids or []
+        primary_metadata["target_files"] = plan_target_files
+        primary_metadata["retrieval_plan"] = retrieval_plan
 
-        document_filter_ids = [target_document_id] if target_document_id else None
+        if name_scope_enabled and person_name and not document_filter_ids:
+            attempt_records.append(
+                {
+                    "label": "name_lookup",
+                    "query": person_name,
+                    "hits": 0,
+                    "top_score": 0.0,
+                    "document_filter": [],
+                }
+            )
+            return {
+                "chunks": [],
+                "query": primary_query,
+                "metadata": primary_metadata,
+                "attempts": attempt_records,
+                "selected_strategy": "name_lookup",
+                "profile_context": profile_context_data,
+                "graph_hints": graph_hints,
+            }
+
+        must_not_fallback = bool(
+            (retrieval_plan.get("retrieval") or {}).get("must_not_fallback_to_unfiltered", True)
+        )
         candidate_doc_ids = graph_hints.candidate_filters.get("document_ids") if graph_hints else None
+        if candidate_doc_ids and document_filter_ids:
+            candidate_doc_ids = [doc_id for doc_id in candidate_doc_ids if doc_id in document_filter_ids]
         kg_chunks: List[RetrievedChunk] = []
         if candidate_doc_ids:
             kg_chunks = self.retriever.hybrid_retrieve(
                 collection_name=collection_name,
                 query=retrieval_query,
+                subscription_id=subscription_id,
                 profile_id=profile_id,
                 top_k=min(top_k_retrieval, 60),
                 document_ids=candidate_doc_ids,
+                source_files=plan_target_files or None,
+                doc_domains=doc_domain_filter,
             )
         chunks = self.retriever.hybrid_retrieve(
             collection_name=collection_name,
             query=retrieval_query,
+            subscription_id=subscription_id,
             profile_id=profile_id,
             top_k=top_k_retrieval,
             document_ids=document_filter_ids,
+            source_files=plan_target_files or None,
+            doc_domains=doc_domain_filter,
         )
         if kg_chunks:
             chunks = self.retriever._rrf_merge(kg_chunks, chunks)
             chunks = chunks[:top_k_retrieval]
+        if doc_domain_filter or plan_target_files:
+            chunks = self._filter_chunks_by_plan(
+                chunks,
+                plan_domain=doc_domain_filter[0] if doc_domain_filter else plan_domain,
+                target_files=plan_target_files,
+            )
+        try:
+            intent_analysis = QueryAnalyzer().analyze(primary_query)
+            required_attrs = extract_required_attributes(primary_query, intent_analysis.intent_type)
+            chunks = filter_chunks_by_intent(
+                chunks,
+                required_attrs,
+                intent_analysis.entities,
+                intent_analysis.intent_type,
+            )
+            primary_metadata["intent_filter"] = {
+                "intent_type": intent_analysis.intent_type,
+                "required_attributes": required_attrs,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Intent filter skipped: %s", exc)
         attempt_records.append(
             {
                 "label": "hybrid",
                 "query": retrieval_query,
                 "hits": len(chunks),
                 "top_score": round(float(chunks[0].score), 4) if chunks else 0.0,
-                "document_filter": target_document_id,
+                "document_filter": document_filter_ids,
             }
         )
 
-        if not chunks and target_document_id:
+        if not chunks and document_filter_ids and not person_name and not must_not_fallback:
             chunks = self.retriever.hybrid_retrieve(
                 collection_name=collection_name,
                 query=retrieval_query,
+                subscription_id=subscription_id,
                 profile_id=profile_id,
                 top_k=top_k_retrieval,
                 document_ids=None,
+                source_files=None,
+                doc_domains=doc_domain_filter,
             )
             attempt_records.append(
                 {
@@ -2847,6 +3832,25 @@ class EnterpriseRAGSystem:
             if not profile_id:
                 raise ValueError("profile_id is required for retrieval")
             collection_name = build_collection_name(subscription_id)
+            try:
+                _ensure_qdrant_indexes(self.client, collection_name)
+            except RetrievalFilterError as exc:
+                logger.error("Qdrant index bootstrap failed: %s", exc)
+                documents_searched = _collect_profile_documents(
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    redis_client=self.redis_client,
+                )
+                return _build_retrieval_filter_error_response(
+                    query=query,
+                    user_id=user_id,
+                    collection_name=collection_name,
+                    request_id=request_id,
+                    index_version=index_version,
+                    details=getattr(exc, "details", str(exc)),
+                    error_code=getattr(exc, "code", "RETRIEVAL_INDEX_BOOTSTRAP_FAILED"),
+                    documents_searched=documents_searched,
+                )
             namespace = _build_namespace(subscription_id, profile_id, self.model_name, session_id)
             metrics = get_metrics_tracker()
 
@@ -2861,8 +3865,14 @@ class EnterpriseRAGSystem:
 
             # Quick collection diagnostics to avoid silent empty searches
             try:
-                stats = self.client.count(collection_name=collection_name, exact=False)
-                total_points = getattr(stats, "count", 0)
+                cached = _COLLECTION_COUNT_CACHE.get(collection_name)
+                now = time.time()
+                if cached and (now - cached[0]) < _COLLECTION_COUNT_TTL_SEC:
+                    total_points = cached[1]
+                else:
+                    stats = self.client.count(collection_name=collection_name, exact=False)
+                    total_points = int(getattr(stats, "count", 0) or 0)
+                    _COLLECTION_COUNT_CACHE[collection_name] = (now, total_points)
                 logger.info(f"Collection '{collection_name}' point count: {total_points}")
                 if total_points == 0:
                     logger.warning(f"Collection '{collection_name}' is empty; retrieval will return no results")
@@ -2883,10 +3893,14 @@ class EnterpriseRAGSystem:
                 }
 
             if self.greeting_handler.is_greeting(query):
-                greeting_response = (
-                    f"Hi! I'm your {persona}. I can search your documents and answer questions. "
-                    f"What would you like to explore?"
-                )
+                from src.intelligence.redis_intel_cache import RedisIntelCache
+                from src.intelligence.response_composer import build_greeting_response
+
+                catalog = {}
+                if self.redis_client:
+                    cache = RedisIntelCache(self.redis_client)
+                    catalog = cache.get_json(cache.catalog_key(subscription_id, profile_id)) or {}
+                greeting_response = build_greeting_response(catalog)
                 self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
                 return {
@@ -2917,18 +3931,130 @@ class EnterpriseRAGSystem:
                     "grounded": True
                 }
 
+            if getattr(Config, "RAGV3", None) and getattr(Config.RAGV3, "ENABLED", False):
+                try:
+                    from src.rag_v3.pipeline import run_docwain_rag_v3
+
+                    v3_answer = run_docwain_rag_v3(
+                        query=query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        session_id=session_id,
+                        user_id=user_id,
+                        request_id=request_id,
+                        llm_client=self.llm_client,
+                        qdrant_client=self.client,
+                        redis_client=self.redis_client,
+                        embedder=self.model,
+                        cross_encoder=getattr(self.reranker, "cross_encoder", None),
+                    )
+                    if v3_answer:
+                        return v3_answer
+                except Exception as exc:  # noqa: BLE001
+                    exc_lower = str(exc).lower()
+                    stage = "generate"
+                    if "rerank" in exc_lower:
+                        stage = "rerank"
+                    elif "retrieve" in exc_lower or "qdrant" in exc_lower:
+                        stage = "retrieve"
+                    logger.warning(
+                        "DocWain RAG v3 failed; falling back: %s",
+                        exc,
+                        extra={
+                            "stage": stage,
+                            "correlation_id": request_id,
+                            "session_id": session_id,
+                            "provider": "rag_v3",
+                        },
+                        exc_info=True,
+                    )
+
+            if getattr(Config, "RAGV2", None) and getattr(Config.RAGV2, "ENABLED", False):
+                try:
+                    from src.ask.pipeline import run_docwain_rag_v2
+
+                    v2_answer = run_docwain_rag_v2(
+                        query=query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        session_id=session_id,
+                        user_id=user_id,
+                        request_id=request_id,
+                        llm_client=self.llm_client,
+                        qdrant_client=self.client,
+                        redis_client=self.redis_client,
+                        embedder=self.model,
+                        cross_encoder=getattr(self.reranker, "cross_encoder", None),
+                    )
+                    if v2_answer:
+                        return v2_answer
+                except Exception as exc:  # noqa: BLE001
+                    exc_lower = str(exc).lower()
+                    stage = "generate"
+                    if isinstance(exc, RerankShapeError) or "rerank" in exc_lower:
+                        stage = "rerank"
+                    elif "retrieve" in exc_lower or "qdrant" in exc_lower:
+                        stage = "retrieve"
+                    logger.warning(
+                        "DocWain RAG v2 failed; falling back: %s",
+                        exc,
+                        extra={
+                            "stage": stage,
+                            "correlation_id": request_id,
+                            "session_id": session_id,
+                            "provider": "rag_v2",
+                        },
+                        exc_info=True,
+                    )
+
+            if getattr(Config.Intelligence, "ENABLED", True):
+                try:
+                    intelligent_answer = run_intelligent_pipeline(
+                        query=query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        session_id=session_id,
+                        user_id=user_id,
+                        request_id=request_id,
+                        redis_client=self.redis_client,
+                        qdrant_client=self.client,
+                        embedder=self.model,
+                    )
+                    if intelligent_answer:
+                        return intelligent_answer
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Intelligent pipeline failed, falling back: %s", exc)
+
             logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
 
             retrieval_start = time.time()
-            retrieval_plan = self.retrieve_with_priorities(
-                query=query,
-                user_id=user_id,
-                profile_id=profile_id,
-                subscription_id=subscription_id,
-                collection_name=collection_name,
-                namespace=namespace,
-                top_k_retrieval=top_k_retrieval
-            )
+            try:
+                retrieval_plan = self.retrieve_with_priorities(
+                    query=query,
+                    user_id=user_id,
+                    profile_id=profile_id,
+                    subscription_id=subscription_id,
+                    collection_name=collection_name,
+                    namespace=namespace,
+                    top_k_retrieval=top_k_retrieval
+                )
+            except RetrievalFilterError as exc:
+                logger.error("Retrieval filter failure: %s", exc)
+                documents_searched = _collect_profile_documents(
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    redis_client=self.redis_client,
+                )
+                return _build_retrieval_filter_error_response(
+                    query=query,
+                    user_id=user_id,
+                    collection_name=collection_name,
+                    request_id=request_id,
+                    index_version=index_version,
+                    details=getattr(exc, "details", str(exc)),
+                    error_code=getattr(exc, "code", "RETRIEVAL_FILTER_FAILED"),
+                    documents_searched=documents_searched,
+                )
 
             # Use the retrieval plan output directly to avoid diverging queries and
             # ensure reranking operates on the best available candidates.
@@ -2937,15 +4063,46 @@ class EnterpriseRAGSystem:
             retrieved_chunks = retrieval_plan.get("chunks") or []
             graph_hints = retrieval_plan.get("graph_hints")
 
+            if retrieved_chunks:
+                scoped = []
+                dropped = 0
+                for chunk in retrieved_chunks:
+                    meta = getattr(chunk, "metadata", None) or {}
+                    if str(meta.get("profile_id") or "") == str(profile_id):
+                        scoped.append(chunk)
+                    else:
+                        dropped += 1
+                if dropped:
+                    logger.warning("Dropped %s chunks outside profile scope", dropped)
+                retrieved_chunks = scoped
+
             retrieval_attempts = retrieval_plan.get("attempts", [])
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
             profile_context_data = retrieval_plan.get("profile_context", {})
+            documents_seen = _collect_documents_seen(retrieved_chunks)
+            min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 50))
+            min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 10))
+            valid_chunks, invalid_samples = _filter_invalid_retrieved_chunks(
+                retrieved_chunks,
+                min_chars=min_chars,
+                min_tokens=min_tokens,
+            )
+            dropped_invalid = max(0, len(retrieved_chunks) - len(valid_chunks))
+            retrieval_empty_text = bool(retrieved_chunks) and not valid_chunks
+            retrieval_diag = {
+                "retrieved_count": len(retrieved_chunks),
+                "dropped_invalid_count": dropped_invalid,
+                "invalid_samples": invalid_samples[:3],
+            }
+            retrieved_chunks = valid_chunks
             mrr_score = 0.0
-            target_doc_id = preprocessing_metadata.get("target_document_id")
-            if target_doc_id:
+            target_doc_ids = preprocessing_metadata.get("target_document_ids") or []
+            if not isinstance(target_doc_ids, list):
+                target_doc_ids = [target_doc_ids] if target_doc_ids else []
+            if target_doc_ids:
                 for rank, chunk in enumerate(retrieved_chunks, start=1):
                     doc_id = (chunk.metadata or {}).get("document_id")
-                    if doc_id and str(doc_id) == str(target_doc_id):
+                    if doc_id and str(doc_id) in {str(v) for v in target_doc_ids}:
                         mrr_score = 1.0 / rank
                         break
             retrieval_hits = 1.0 if retrieved_chunks else 0.0
@@ -3058,6 +4215,50 @@ class EnterpriseRAGSystem:
                 for doc_id in set(doc_ids):
                     telemetry.record_doc_metric(doc_id, "last_retrieval_time", time.time())
 
+            if retrieval_empty_text:
+                retrieval_response = _build_retrieval_empty_text_response(
+                    query=query,
+                    user_id=user_id,
+                    collection_name=collection_name,
+                    request_id=request_id,
+                    index_version=index_version,
+                    preprocessing_metadata=preprocessing_metadata,
+                    retrieval_attempts=retrieval_attempts,
+                    selected_strategy=selected_strategy,
+                    profile_context_data=profile_context_data,
+                    documents_seen=documents_seen,
+                    processing_time=time.time() - start_time,
+                )
+                self.conversation_history.add_turn(namespace, user_id, query, retrieval_response["response"])
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="retrieval_empty_text",
+                        context_found=False,
+                        grounded=False,
+                        cached=False,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats={"initial_retrieved": len(retrieval_plan.get("chunks") or []), "final_context": 0},
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (retrieval_empty_text) failed: %s", metric_exc)
+
+                _record_request_metrics(
+                    query_type="retrieval_empty_text",
+                    answer_text=retrieval_response["response"],
+                    context_text="",
+                    context_found=False,
+                    grounded=False,
+                    has_citations=False,
+                    processing_seconds=time.time() - start_time,
+                    prompt_text=processed_query,
+                )
+
+                return retrieval_response
+
             # Cache lookup (per subscription/profile/query + recent memory fingerprint)
             cache = get_redis_client() if (ENABLE_ANSWER_CACHE and not disable_answer_cache) else None
             cache_key = None
@@ -3098,9 +4299,21 @@ class EnterpriseRAGSystem:
             logger.info(f"Preprocessed query: {processed_query}")
 
             if not retrieved_chunks and not use_tooling:
+                target_doc_ids = preprocessing_metadata.get("target_document_ids") or []
+                documents_searched = _collect_profile_documents(
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    redis_client=self.redis_client,
+                    target_doc_ids=target_doc_ids,
+                )
+                preview = ", ".join(documents_searched[:8])
+                if documents_searched and len(documents_searched) > 8:
+                    preview += "..."
+                searched_line = f"\nDocuments searched: {preview}" if documents_searched else ""
                 no_results_response = (
                     f"I couldn't find anything in your documents that answers: '{query}'. "
                     "Try rephrasing or tell me which document or section to focus on."
+                    + searched_line
                 )
                 self.conversation_history.add_turn(namespace, user_id, query, no_results_response)
 
@@ -3143,6 +4356,7 @@ class EnterpriseRAGSystem:
                     "retrieval_attempts": retrieval_attempts,
                     "selected_strategy": selected_strategy,
                     "profile_context": profile_context_data,
+                    "documents_searched": documents_searched,
                     "grounded": True,
                     "processing_time": time.time() - start_time
                 }
@@ -3159,7 +4373,8 @@ class EnterpriseRAGSystem:
                 chunks=retrieved_chunks,
                 query=processed_query,
                 top_k=top_k_rerank,
-                use_cross_encoder=True
+                use_cross_encoder=True,
+                diagnostics=retrieval_diag,
             )
             reranked_chunks = self.graph_support_scorer.score_chunks(reranked_chunks, graph_hints)
 
@@ -3169,15 +4384,21 @@ class EnterpriseRAGSystem:
                 reranked_chunks = self.retriever.expand_with_neighbors(
                     collection_name=collection_name,
                     seed_chunks=reranked_chunks,
+                    subscription_id=subscription_id,
                     profile_id=profile_id,
                     window=int(neighbor_window),
                     max_new=int(neighbor_max_new)
                 )
-                reranked_chunks = sorted(reranked_chunks, key=lambda c: float(c.score), reverse=True)
+                reranked_chunks = sorted(reranked_chunks, key=lambda c: to_py_scalar(c.score), reverse=True)
 
             config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)  # ✅ default 7
             context_chunk_limit = max(final_k or 7, config_context_limit)  # ✅ default 7
             context_chunk_limit = min(context_chunk_limit, len(reranked_chunks))
+            extraction_mode = bool(_extract_requested_fields(processed_query))
+            if extraction_mode and len(reranked_chunks) > context_chunk_limit:
+                # Field extraction benefits from broader coverage (names/skills often in short chunks)
+                expanded_limit = max(context_chunk_limit + 4, int(context_chunk_limit * 2))
+                context_chunk_limit = min(len(reranked_chunks), expanded_limit)
             final_chunks = reranked_chunks[:context_chunk_limit]
 
             context_sources: List[Dict[str, Any]] = []
@@ -3206,6 +4427,50 @@ class EnterpriseRAGSystem:
                     context_sources = self.context_builder.extract_sources(final_chunks)
 
             logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
+
+            if not context.strip():
+                retrieval_response = _build_retrieval_empty_text_response(
+                    query=query,
+                    user_id=user_id,
+                    collection_name=collection_name,
+                    request_id=request_id,
+                    index_version=index_version,
+                    preprocessing_metadata=preprocessing_metadata,
+                    retrieval_attempts=retrieval_attempts,
+                    selected_strategy=selected_strategy,
+                    profile_context_data=profile_context_data,
+                    documents_seen=documents_seen,
+                    processing_time=time.time() - start_time,
+                )
+                self.conversation_history.add_turn(namespace, user_id, query, retrieval_response["response"])
+
+                try:
+                    metrics.record(
+                        model_name=self.model_name,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        query_type="retrieval_empty_text",
+                        context_found=False,
+                        grounded=False,
+                        cached=False,
+                        processing_time=time.time() - start_time,
+                        retrieval_stats={"initial_retrieved": len(retrieval_plan.get("chunks") or []), "final_context": 0},
+                    )
+                except Exception as metric_exc:
+                    logger.debug("Metrics record (retrieval_empty_text) failed: %s", metric_exc)
+
+                _record_request_metrics(
+                    query_type="retrieval_empty_text",
+                    answer_text=retrieval_response["response"],
+                    context_text="",
+                    context_found=False,
+                    grounded=False,
+                    has_citations=False,
+                    processing_seconds=time.time() - start_time,
+                    prompt_text=processed_query,
+                )
+
+                return retrieval_response
 
             kg_evidence_pack = ""
             if graph_hints and graph_hints.graph_snippets:
@@ -3301,6 +4566,19 @@ class EnterpriseRAGSystem:
             conversation_summary = self.conversation_summarizer.summarize(conversation_context)
             adapter_text = DomainPromptAdapter.build_adapter(profile_context_data, query)
             feedback_text = self.feedback_memory.build_feedback_context(namespace, user_id, limit=5)
+            evidence_synthesis = None
+            if getattr(Config.Retrieval, "EVIDENCE_SYNTHESIZER_ENABLED", False):
+                try:
+                    plan_json = preprocessing_metadata.get("retrieval_plan") or {}
+                    evidence_packets = _build_evidence_packets_from_chunks(final_chunks)
+                    if evidence_packets:
+                        evidence_synthesis = self.evidence_synthesizer.synthesize(
+                            user_query=query,
+                            plan_json=plan_json,
+                            evidence_packets=evidence_packets,
+                        )
+                except Exception as synth_exc:  # noqa: BLE001
+                    logger.debug("Evidence synthesis skipped: %s", synth_exc)
 
             # ✅ FIXED: Skip answerability check when we have retrieved chunks
             if final_chunks and context.strip():
@@ -3395,7 +4673,15 @@ class EnterpriseRAGSystem:
                 redis_client=self.redis_client,
             )
 
+            gemini_backend = _is_gemini_backend(self.llm_client)
+            gemini_used = False
+
             def _generate_with_metadata(prompt_text: str, options: Optional[Dict[str, Any]] = None) -> Tuple[str, Dict[str, Any]]:
+                nonlocal gemini_used
+                if gemini_backend:
+                    if gemini_used:
+                        raise RuntimeError("Gemini call budget exhausted for request")
+                    gemini_used = True
                 if hasattr(self.llm_client, "generate_with_metadata"):
                     return self.llm_client.generate_with_metadata(prompt_text, options=options)
                 text = self.llm_client.generate(prompt_text)
@@ -3409,7 +4695,16 @@ class EnterpriseRAGSystem:
                 "top_p": top_p,
                 "num_predict": num_predict,
             }
-            answer, raw_response = _generate_with_metadata(prompt, options=base_options)
+            try:
+                answer, raw_response = _generate_with_metadata(prompt, options=base_options)
+            except Exception as gen_exc:  # noqa: BLE001
+                logger.warning("Generation failed; falling back to evidence summary: %s", gen_exc)
+                raw_response = {"done_reason": "error", "error": str(gen_exc)}
+                if final_chunks:
+                    ledger = _build_evidence_ledger(final_chunks)
+                    answer = _format_evidence_fallback(query, ledger)
+                else:
+                    answer = "I don’t have enough context to answer that from this profile."
             done_reason = raw_response.get("done_reason")
             eval_count = raw_response.get("eval_count")
             recovery_path_taken = "none"
@@ -3417,7 +4712,14 @@ class EnterpriseRAGSystem:
             if _is_generation_empty(answer):
                 if metrics_store.available:
                     metrics_store.record(counters={"generation_empty": 1}, model_id=self.model_name)
-                if final_chunks:
+                if gemini_backend:
+                    recovery_path_taken = "evidence_fallback"
+                    if final_chunks:
+                        ledger = _build_evidence_ledger(final_chunks)
+                        answer = _format_evidence_fallback(query, ledger)
+                    else:
+                        answer = "I don’t have enough context or information to build a response from the documents."
+                elif final_chunks:
                     recovery_path_taken = "retry"
                     retry_chunks = final_chunks
                     retry_context = context
@@ -3499,6 +4801,7 @@ class EnterpriseRAGSystem:
                     answer = trimmed
 
             sources = context_sources or self.context_builder.extract_sources(final_chunks)
+            answer = render_source_citations(answer, sources)
 
             self.conversation_history.add_turn(namespace, user_id, query, answer)
             final_doc_ids = [
@@ -3527,6 +4830,7 @@ class EnterpriseRAGSystem:
                 "source_doc_ids": final_doc_ids,
                 "preprocessing": preprocessing_metadata,
                 "processed_query": processed_query,
+                "evidence_synthesis": evidence_synthesis,
                 "answerability": {
                     "is_answerable": is_answerable,
                     "reason": answerability_reason
@@ -3694,6 +4998,97 @@ class _LLMClientWrapper:
             return self._client.generate(*args, **kwargs)
 
 
+class ResilientLLMClient:
+    """Fallback to a secondary client when the primary fails with rate/timeout errors."""
+
+    def __init__(self, primary, fallback):
+        self.primary = primary
+        self.fallback = fallback
+        self.model_name = getattr(primary, "model_name", None) or getattr(fallback, "model_name", None)
+        self.backend = getattr(primary, "backend", None) or "gemini"
+
+    @staticmethod
+    def _should_fallback(exc: Exception) -> bool:
+        status = getattr(exc, "code", None) or getattr(exc, "status", None)
+        if status in {408, 429, 500, 502, 503, 504}:
+            return True
+        msg = str(exc).lower()
+        return "timeout" in msg or "timed out" in msg
+
+    def _primary_in_cooldown(self) -> bool:
+        primary = self.primary
+        if not primary:
+            return False
+        checker = getattr(primary, "in_cooldown", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
+
+    def generate(self, *args, **kwargs):
+        if self._primary_in_cooldown() and self.fallback:
+            logger.warning(
+                "Primary LLM in cooldown; using fallback",
+                extra={"stage": "generate", "provider": getattr(self.primary, "backend", "gemini")},
+            )
+            return self.fallback.generate(*args, **kwargs)
+        try:
+            return self.primary.generate(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            if self._should_fallback(exc) and self.fallback:
+                logger.warning(
+                    "Primary LLM failed; falling back to local generation: %s",
+                    exc,
+                    extra={"stage": "generate", "provider": getattr(self.primary, "backend", "gemini")},
+                )
+                return self.fallback.generate(*args, **kwargs)
+            raise
+
+    def generate_with_metadata(self, *args, **kwargs):
+        if self._primary_in_cooldown() and self.fallback:
+            logger.warning(
+                "Primary LLM in cooldown; using fallback",
+                extra={"stage": "generate", "provider": getattr(self.primary, "backend", "gemini")},
+            )
+            if hasattr(self.fallback, "generate_with_metadata"):
+                return self.fallback.generate_with_metadata(*args, **kwargs)
+            text = self.fallback.generate(*args, **kwargs)
+            return text, {"response": text}
+        try:
+            if hasattr(self.primary, "generate_with_metadata"):
+                return self.primary.generate_with_metadata(*args, **kwargs)
+            text = self.primary.generate(*args, **kwargs)
+            return text, {"response": text}
+        except Exception as exc:  # noqa: BLE001
+            if self._should_fallback(exc) and self.fallback:
+                logger.warning(
+                    "Primary LLM failed; falling back to local generation: %s",
+                    exc,
+                    extra={"stage": "generate", "provider": getattr(self.primary, "backend", "gemini")},
+                )
+                if hasattr(self.fallback, "generate_with_metadata"):
+                    return self.fallback.generate_with_metadata(*args, **kwargs)
+                text = self.fallback.generate(*args, **kwargs)
+                return text, {"response": text}
+            raise
+
+    def warm_up(self):
+        warm = getattr(self.primary, "warm_up", None)
+        if callable(warm):
+            try:
+                warm()
+            except Exception:
+                pass
+        warm_fb = getattr(self.fallback, "warm_up", None)
+        if callable(warm_fb):
+            try:
+                warm_fb()
+            except Exception:
+                pass
+
+
 def create_llm_client(
         model_name: Optional[str] = None,
         backend_override: Optional[str] = None,
@@ -3709,14 +5104,30 @@ def create_llm_client(
     resolved_backend = backend
     if not resolved_backend:
         resolved_backend = "gemini" if name.startswith("gemini") else "ollama"
+    if getattr(Config.LLM, "DISABLE_EXTERNAL", False) and resolved_backend in {"gemini", "openai", "openai_compatible", "local_http"}:
+        resolved_backend = "ollama"
     cache_key = (resolved_backend, model_name or "", model_path)
     if cache_key in _LLM_CLIENTS:
         return _LLM_CLIENTS[cache_key]
+    try:
+        from src.api.rag_state import singleton_guard_active
+
+        if singleton_guard_active() and _LLM_CLIENTS:
+            logger.error("LLM client reinit requested (%s); reusing existing singleton", cache_key)
+            return next(iter(_LLM_CLIENTS.values()))
+    except Exception:
+        pass
 
     if resolved_backend in {"openai", "openai_compatible", "local_http"}:
         client = OpenAICompatibleClient(model_name)
     elif resolved_backend == "gemini" or name.startswith("gemini"):
-        client = GeminiClient(model_name)
+        try:
+            primary = GeminiClient(model_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gemini init failed; using local LLM instead: %s", exc)
+            primary = None
+        fallback = OllamaClient(None)
+        client = ResilientLLMClient(primary, fallback) if primary else fallback
     elif resolved_backend == "unsloth" or model_path:
         from src.finetune.llm_client import UnslothLLMClient
 
@@ -3728,6 +5139,7 @@ def create_llm_client(
         client = OllamaClient(model_name)
 
     wrapped = _LLMClientWrapper(client, _LLM_SEMAPHORE)
+    setattr(wrapped, "backend", resolved_backend if resolved_backend != "gemini" else getattr(client, "backend", "gemini"))
     _LLM_CLIENTS[cache_key] = wrapped
     return wrapped
     # default to local Ollama for plug-and-play usage
@@ -3750,29 +5162,40 @@ def get_rag_system(
 ) -> EnterpriseRAGSystem:
     """Get or create the RAG system instance (singleton with lazy loading)."""
     global _RAG_SYSTEM, _RAG_MODEL, _RAG_PROFILE, _RAG_BACKEND, _RAG_MODEL_PATH
-    needs_new = (
-        _RAG_SYSTEM is None
-        or (model_name and model_name != _RAG_MODEL)
-        or (_RAG_PROFILE != profile_id)
-        or (_RAG_BACKEND != backend_override)
-        or (_RAG_MODEL_PATH != model_path)
-    )
-    if needs_new:
-        try:
-            _RAG_SYSTEM = EnterpriseRAGSystem(
-                model_name=model_name,
-                profile_id=profile_id,
-                backend_override=backend_override,
-                model_path=model_path
+    try:
+        from src.api.rag_state import get_app_state
+
+        app_state = get_app_state()
+        if app_state and app_state.rag_system:
+            return app_state.rag_system
+    except Exception:
+        pass
+
+    if _RAG_SYSTEM is not None:
+        if (model_name and model_name != _RAG_MODEL) or (_RAG_BACKEND != backend_override) or (_RAG_MODEL_PATH != model_path):
+            logger.error(
+                "RAG system already initialized (model=%s); refusing reinit request model=%s backend=%s",
+                _RAG_MODEL,
+                model_name,
+                backend_override,
             )
-            _RAG_MODEL = model_name
-            _RAG_PROFILE = profile_id
-            _RAG_BACKEND = backend_override
-            _RAG_MODEL_PATH = model_path
-            logger.info("RAG system initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize RAG system: {e}")
-            raise
+        return _RAG_SYSTEM
+
+    try:
+        _RAG_SYSTEM = EnterpriseRAGSystem(
+            model_name=model_name,
+            profile_id=profile_id,
+            backend_override=backend_override,
+            model_path=model_path
+        )
+        _RAG_MODEL = model_name
+        _RAG_PROFILE = profile_id
+        _RAG_BACKEND = backend_override
+        _RAG_MODEL_PATH = model_path
+        logger.info("RAG system initialized")
+    except Exception as e:
+        logger.error(f"Failed to initialize RAG system: {e}")
+        raise
     return _RAG_SYSTEM
 
 
@@ -3781,7 +5204,7 @@ def answer_question(
         user_id: str,
         profile_id: str,
         subscription_id: str = "default",
-        model_name: str = "llama3.2",
+        model_name: str = "DocWain-Agent",
         persona: str = "professional document analysis assistant",
         session_id: Optional[str] = None,
         new_session: bool = False,
@@ -3792,6 +5215,7 @@ def answer_question(
         tools: Optional[List[str]] = None,
         use_tools: bool = False,
         tool_inputs: Optional[Dict[str, Any]] = None,
+        rag_system: Optional[EnterpriseRAGSystem] = None,
 ) -> Dict[str, Any]:
     """
     Main entry point for answering questions with enhanced NLU.
@@ -3808,7 +5232,7 @@ def answer_question(
     """
     resolved_model = resolve_model_for_profile(profile_id, model_name)
     effective_model = resolved_model.model_name or model_name
-    rag_system = get_rag_system(
+    rag_system = rag_system or get_rag_system(
         effective_model,
         profile_id=profile_id,
         backend_override=resolved_model.backend,
@@ -3862,7 +5286,7 @@ def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[
                 sample_points = [
                     {
                         "id": str(p.id),
-                        "text_preview": p.payload.get('text', '')[:200] if p.payload else 'No text',
+                        "text_preview": (get_content_text(p.payload or {}) or get_embedding_text(p.payload or {}))[:200] if p.payload else 'No text',
                         "source": p.payload.get('source', 'unknown') if p.payload else 'unknown'
                     }
                     for p in points_list
@@ -3970,6 +5394,7 @@ class RAGEvaluator:
                 chunks = rag_system.retriever.retrieve(
                     collection_name=profile_id,
                     query=query,
+                    subscription_id="default",
                     top_k=10
                 )
 

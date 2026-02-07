@@ -45,7 +45,9 @@ class QdrantRetriever:
             query_vector=query_vector,
             limit=top_k
         )
-        return [hit.payload['text'] for hit in hits if 'text' in hit.payload]
+        from src.utils.payload_utils import get_canonical_text
+
+        return [get_canonical_text(hit.payload or {}) for hit in hits if get_canonical_text(hit.payload or {})]
 
 
 # RAGPipeline: integrates retriever + Gemini

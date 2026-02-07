@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .hybrid_retriever import RetrievalCandidate
+from .score_utils import RerankShapeError, describe_scores, normalize_scores, to_py_scalar
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,8 @@ class Reranker:
                 elif callable(self.cross_encoder):
                     scores = self.cross_encoder(pairs)
                 if scores is not None:
-                    scored = [(idx, chunk, float(score)) for idx, (chunk, score) in enumerate(zip(ordered, scores))]
+                    normalized = normalize_scores(scores, expected_k=len(ordered))
+                    scored = [(idx, chunk, float(score)) for idx, (chunk, score) in enumerate(zip(ordered, normalized))]
                     scored.sort(key=lambda x: (-x[2], x[0]))
                     reranked = []
                     for _, chunk, score in scored:
@@ -46,8 +48,23 @@ class Reranker:
                         reranked.append(chunk)
                     logger.info("Reranker used cross-encoder", extra={"reranker": "cross_encoder", "candidates": len(reranked)})
                     return reranked[:top_k]
+            except RerankShapeError as exc:
+                details = {
+                    "stage": "rerank",
+                    "provider": "cross_encoder",
+                    "expected_k": exc.expected_k,
+                    "actual_len": exc.actual_len,
+                    "score_type": exc.score_type,
+                    "score_shape": exc.score_shape,
+                }
+                details.update(describe_scores(scores))
+                logger.warning("Cross-encoder rerank shape mismatch; falling back: %s", exc, extra=details, exc_info=True)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Cross-encoder rerank failed: %s", exc)
+                logger.warning(
+                    "Cross-encoder rerank failed: %s",
+                    exc,
+                    extra={"stage": "rerank", "provider": "cross_encoder"},
+                )
 
         if self.llm_client and self.config.llm_fallback:
             llm_order = self._llm_rerank(query, ordered)
@@ -58,7 +75,7 @@ class Reranker:
 
         # Deterministic fallback: keep original order by score then index
         scored = list(enumerate(ordered))
-        scored.sort(key=lambda x: (-float(x[1].score), x[0]))
+        scored.sort(key=lambda x: (-to_py_scalar(x[1].score), x[0]))
         reranked = [item for _, item in scored]
         logger.info("Reranker used deterministic fallback", extra={"reranker": "score", "candidates": len(reranked)})
         return reranked[:top_k]

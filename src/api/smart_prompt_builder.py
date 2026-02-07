@@ -74,20 +74,11 @@ class SmartPromptBuilder:
         )
 
         lines = ["=" * 80]
-        lines.append("AVAILABLE SOURCES (ranked by relevance):")
+        lines.append("AVAILABLE SOURCES:")
         lines.append("=" * 80)
 
         for i, (source, info) in enumerate(sorted_docs[:max_sources], 1):
-            chunk_count = len(info['chunks'])
-            max_score = info['max_score']
-            doc_id = info['doc_id']
-
-            lines.append(
-                f"[SOURCE-{i}] {source}\n"
-                f"  Document ID: {doc_id[:12]}...\n"
-                f"  Chunks available: {chunk_count}\n"
-                f"  Best relevance: {max_score:.3f}\n"
-            )
+            lines.append(f"[SOURCE-{i}] {source}")
 
         lines.append("=" * 80)
         return "\n".join(lines)
@@ -119,7 +110,6 @@ class SmartPromptBuilder:
 
                 context_parts.append(f"\n{'=' * 80}")
                 context_parts.append(f"START OF NEW DOCUMENT: {source}")
-                context_parts.append(f"Document ID: {doc_id}")
                 context_parts.append(f"{'=' * 80}\n")
                 current_doc_id = doc_id
 
@@ -164,7 +154,7 @@ class SmartPromptBuilder:
             for c in chunks
         ]))
 
-        prompt = f"""You are a thoughtful, personable {persona}. Speak like a helpful colleague: clear, concise, and warm while staying 100% grounded in the documents below.
+        prompt = f"""You are DocWain-Agent. Follow the system instructions exactly and stay grounded in the documents below.
 
 Available documents: {', '.join(unique_docs)}
 
@@ -180,11 +170,11 @@ USER QUESTION: {query}
 
 Answering guidelines:
 - Use only information from the sources; if something is missing, say so plainly.
-- Keep the tone human and context-aware (no robotic bullet dumps).
 - Cite each factual claim with [SOURCE-X]; multiple sources -> [SOURCE-1, SOURCE-3].
-- If the question is about an entity not in the sources, say the docs cover someone/something else and stop.
-- 3–6 sentences max, flowing as a short narrative, not a list.
-- Note contradictions or gaps briefly with citations.
+- Follow the mandatory output shape (Understanding & Scope, Answer, Evidence & Gaps, Optional next-step hint).
+- Use domain-specific sections in the Answer.
+- If the question is about an entity not in the sources, say so and list files searched, then stop.
+- No filler or raw extraction dumps.
 
 Now provide the answer with citations:"""
 
@@ -406,11 +396,7 @@ def build_enhanced_answer_with_verification(
             sources.append({
                 'source_id': i,
                 'source_name': source_name,
-                'section': metadata.get('section_title', ''),
                 'page': metadata.get('page'),
-                'document_id': metadata.get('document_id', ''),
-                'relevance_score': round(chunk.get('score', 0), 3),
-                'excerpt': chunk.get('text', '')[:200] + "...",
             })
             seen_sources.add(source_name)
 

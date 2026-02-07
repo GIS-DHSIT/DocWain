@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from src.api.vector_store import build_qdrant_filter
 
 
 _PROFILE_ID_KEYS: Tuple[str, ...] = ("profile_id", "profileId", "profile", "candidate_id", "candidateId")
@@ -30,39 +30,12 @@ def get_all_profile_ids(
     batch_limit: int = 256,
 ) -> List[str]:
     """
-    Discover the candidate universe for a subscription by scrolling Qdrant with a subscription filter.
+    Cross-profile discovery is disabled to enforce strict profile isolation.
 
-    Returns sorted, unique profile ids.
+    Use the catalog index or explicit profile_ids instead.
     """
-    if not subscription_id:
-        raise ValueError("subscription_id is required")
-    if not collection:
-        raise ValueError("collection is required")
-
-    scroll_filter = Filter(
-        must=[FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id)))]
-    )
-
-    discovered: Set[str] = set()
-    offset = None
-    while True:
-        points, offset = client.scroll(
-            collection_name=collection,
-            scroll_filter=scroll_filter,
-            limit=int(batch_limit),
-            with_payload=True,
-            with_vectors=False,
-            offset=offset,
-        )
-        for pt in points or []:
-            payload = getattr(pt, "payload", None) or {}
-            profile_id = _extract_profile_id(payload)
-            if profile_id:
-                discovered.add(profile_id)
-        if not offset:
-            break
-
-    return sorted(discovered)
+    _ = (client, subscription_id, collection, batch_limit)
+    raise ValueError("Profile discovery across Qdrant is disabled; use catalog-indexed profile ids.")
 
 
 def get_profile_points(
@@ -85,36 +58,27 @@ def get_profile_points(
     if not collection:
         raise ValueError("collection is required")
 
-    def _scroll_all(profile_key: str) -> List[Dict[str, Any]]:
-        scroll_filter = Filter(
-            must=[
-                FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-                FieldCondition(key=profile_key, match=MatchValue(value=str(profile_id))),
-            ]
+    scroll_filter = build_qdrant_filter(
+        subscription_id=str(subscription_id),
+        profile_id=str(profile_id),
+    )
+    payloads: List[Dict[str, Any]] = []
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=collection,
+            scroll_filter=scroll_filter,
+            limit=int(batch_limit),
+            with_payload=True,
+            with_vectors=False,
+            offset=offset,
         )
-        payloads: List[Dict[str, Any]] = []
-        offset = None
-        while True:
-            points, offset = client.scroll(
-                collection_name=collection,
-                scroll_filter=scroll_filter,
-                limit=int(batch_limit),
-                with_payload=True,
-                with_vectors=False,
-                offset=offset,
-            )
-            for pt in points or []:
-                payload = getattr(pt, "payload", None) or {}
-                if isinstance(payload, dict):
-                    payloads.append(payload)
-            if not offset:
-                break
-        return payloads
-
-    # Prefer canonical payload key; fall back to legacy keys if necessary.
-    payloads = _scroll_all("profile_id")
-    if not payloads:
-        payloads = _scroll_all("profileId")
+        for pt in points or []:
+            payload = getattr(pt, "payload", None) or {}
+            if isinstance(payload, dict):
+                payloads.append(payload)
+        if not offset:
+            break
     return payloads
 
 

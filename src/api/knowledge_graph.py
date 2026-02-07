@@ -18,6 +18,8 @@ class KGUpdateRequest(BaseModel):
     max_points: int = Field(5000, ge=1, le=100000)
     state_name: str = Field("default", min_length=1)
     collection_name: Optional[str] = Field(None, description="Optional Qdrant collection override")
+    subscription_id: str = Field(..., description="Subscription identifier")
+    profile_id: str = Field(..., description="Profile identifier")
 
 
 class KGUpdateResponse(BaseModel):
@@ -53,6 +55,8 @@ def update_knowledge_graph(request: KGUpdateRequest = Body(...)):
             batch_size=request.batch_size,
             max_points=request.max_points,
             state_name=request.state_name,
+            subscription_id=request.subscription_id,
+            profile_id=request.profile_id,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))

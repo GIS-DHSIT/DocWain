@@ -11,6 +11,7 @@ from src.embedding.pipeline.chunk_integrity import (
     enforce_chunk_integrity,
     is_chunk_complete,
 )
+from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
 from src.embedding.pipeline.dedupe_gate import DedupeConfig, apply_dedupe_gate
 
 logger = logging.getLogger(__name__)
@@ -116,9 +117,13 @@ def prepare_embedding_chunks(
         m["chunk_kind"] = m.get("chunk_kind", "section_text")
         raw_text = chunk_text
         clean_text = clean_text_for_embedding(raw_text)
-        if raw_text != clean_text:
+        embedding_text = ensure_embedding_text(raw_text, m.get("doc_domain"), m.get("section_kind"))
+        m["content"] = raw_text
+        m["embedding_text"] = embedding_text
+        m["text_clean"] = embedding_text
+        if raw_text != embedding_text:
             m["text_raw"] = raw_text
-        prepared_chunks.append(clean_text)
+        prepared_chunks.append(embedding_text or clean_text)
         prepared_meta.append(m)
 
     prepared_chunks, prepared_meta, integrity_stats = enforce_chunk_integrity(

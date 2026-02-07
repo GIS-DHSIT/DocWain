@@ -62,7 +62,12 @@ DOC_CONTEXT_CUES = (
 
 
 DOCWAIN_INTRO_SHORT = (
-    "DocWain is a document-focused assistant that answers questions using the documents you provide."
+    "Understanding & Scope: Intent: info. Scope: no document retrieval. Files used: none.\n\n"
+    "Answer:\n"
+    "DocWain Summary:\n"
+    "DocWain-Agent is a document intelligence model that answers questions using the documents in your current profile.\n\n"
+    "Evidence & Gaps: No document retrieval performed. Files searched: none.\n\n"
+    "Next step: Ask a document question or upload documents for analysis."
 )
 
 # Phrases to drop from TASK_MODE outputs even if present in model text.

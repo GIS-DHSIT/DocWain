@@ -4,9 +4,34 @@ import hashlib
 import re
 from typing import Any, Dict, Iterable, Optional
 
+from src.embedding.pipeline import schema_normalizer as _schema_normalizer
 from src.embedding.pipeline.chunk_integrity import clean_text_for_embedding
+from src.utils.payload_utils import get_canonical_text, token_count
 
 _EVIDENCE_RE = re.compile(r"Section:\s*(.*?)(?:,|$)\s*Page:\s*(.*)$", re.IGNORECASE)
+
+_CANONICAL_REQUIRED_FIELDS = (
+    "subscription_id",
+    "profile_id",
+    "document_id",
+    "source_name",
+    "doc_domain",
+    "section_kind",
+    "section_id",
+    "chunk_id",
+    "page",
+    "canonical_text",
+)
+
+_CANONICAL_DEFAULTS = {
+    "source_name": "unknown",
+    "doc_domain": "unknown",
+    "section_kind": "unknown",
+    "section_id": "unknown",
+    "chunk_id": "unknown",
+    "page": 0,
+    "canonical_text": "",
+}
 
 
 def _drop_empty(value: Any) -> Optional[Any]:
@@ -22,6 +47,26 @@ def _drop_empty(value: Any) -> Optional[Any]:
         cleaned = {k: v for k, v in ((k, _drop_empty(v)) for k, v in value.items()) if v is not None}
         return cleaned or None
     return value
+
+
+def _ensure_canonical_payload_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    missing_required = [
+        field
+        for field in ("subscription_id", "profile_id", "document_id")
+        if not _stringify(payload.get(field))
+    ]
+    if missing_required:
+        raise ValueError(f"Missing required payload fields: {', '.join(missing_required)}")
+
+    for field in _CANONICAL_REQUIRED_FIELDS:
+        if field in payload and payload.get(field) not in (None, ""):
+            continue
+        fallback = _CANONICAL_DEFAULTS.get(field)
+        if fallback is None:
+            payload[field] = payload.get(field)
+        else:
+            payload[field] = fallback
+    return payload
 
 
 def _stringify(value: Any) -> Optional[str]:
@@ -77,71 +122,11 @@ def _section_path_list(section_path: Optional[str]) -> Optional[list[str]]:
 
 
 def normalize_content(text: str) -> str:
-    if not text:
-        return ""
-    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
-
-    replacements = {
-        "Managingateamof": "Managing a team of",
-        "Developersacrossdifferentgloballocations": "Developers across different global locations",
-        "VicePresident": "Vice President",
-        "JPMorganChase": "JPMorgan Chase",
-    }
-    for needle, replacement in replacements.items():
-        normalized = re.sub(re.escape(needle), replacement, normalized, flags=re.IGNORECASE)
-
-    normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
-    normalized = re.sub(r"([A-Za-z])(\d)", r"\1 \2", normalized)
-    normalized = re.sub(r"(\d)([A-Za-z])", r"\1 \2", normalized)
-    normalized = re.sub(r"([A-Za-z])\(", r"\1 (", normalized)
-    normalized = re.sub(r"\s*&\s*", " & ", normalized)
-    normalized = re.sub(r"\s*—\s*", " — ", normalized)
-    normalized = re.sub(r"(?<=\w)-(?=\w)", " - ", normalized)
-
-    normalized = re.sub(r"(?<!^)(?<!\n)\s*([•●])", r"\n\1", normalized)
-    lines = []
-    for line in normalized.split("\n"):
-        compacted = re.sub(r"[ \t]+", " ", line).strip()
-        if compacted:
-            lines.append(compacted)
-    return "\n".join(lines).strip()
+    return _schema_normalizer.normalize_content(text)
 
 
 def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
-    section_path = raw.get("section_path")
-    if not section_path:
-        section_path = (raw.get("section") or {}).get("path")
-    if isinstance(section_path, str):
-        section_path = [part.strip() for part in section_path.split(">") if part.strip()]
-        if not section_path:
-            section_path = None
-
-    content_source = raw.get("text_clean")
-    if not content_source:
-        content_source = (raw.get("text_data") or {}).get("clean")
-    if not content_source:
-        content_source = raw.get("text")
-
-    content = normalize_content(content_source or "")
-
-    return {
-        "subscription_id": raw.get("subscription_id"),
-        "profile_id": raw.get("profile_id"),
-        "document_id": raw.get("document_id"),
-        "source_name": (raw.get("source") or {}).get("name"),
-        "document_type": (raw.get("document") or {}).get("type"),
-        "ingestion_source": (raw.get("document") or {}).get("ingestion_source"),
-        "section_title": raw.get("section_title") or (raw.get("section") or {}).get("title"),
-        "section_path": section_path,
-        "page": raw.get("page") or raw.get("page_start"),
-        "chunk_id": raw.get("chunk_id") or (raw.get("chunk") or {}).get("id"),
-        "chunk_index": raw.get("chunk_index") or (raw.get("chunk") or {}).get("index"),
-        "chunk_count": raw.get("chunk_count") or (raw.get("chunk") or {}).get("count"),
-        "chunk_role": raw.get("chunk_role") or (raw.get("chunk") or {}).get("role"),
-        "chunk_kind": raw.get("chunk_kind") or (raw.get("chunk") or {}).get("type"),
-        "hash": (raw.get("chunk") or {}).get("hash") or raw.get("hash"),
-        "content": content,
-    }
+    return _schema_normalizer.build_qdrant_payload(raw)
 
 
 def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -152,6 +137,7 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     section_title = _stringify(payload.get("section_title") or payload.get("section"))
     section_path = _stringify(payload.get("section_path") or section_title)
     section_id = _stringify(payload.get("section_id"))
+    section_kind = _stringify(payload.get("section_kind"))
 
     page_start = _intify(payload.get("page_start") or payload.get("page"))
     page_end = _intify(payload.get("page_end") or payload.get("page"))
@@ -170,12 +156,16 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     chunk_type = _stringify(payload.get("chunk_type")) or "text"
     chunk_role = _stringify(payload.get("chunk_kind")) or "section_text"
 
+    canonical_text = get_canonical_text({"text": clean_text, "content": payload.get("content")})
     canonical: Dict[str, Any] = {
-        "subscription_id": _stringify(payload.get("subscription_id")),
-        "profile_id": _stringify(payload.get("profile_id")),
-        "document_id": _stringify(payload.get("document_id")),
+        "subscription_id": _stringify(payload.get("subscription_id") or payload.get("subscriptionId")),
+        "profile_id": _stringify(payload.get("profile_id") or payload.get("profileId")),
+        "document_id": _stringify(payload.get("document_id") or payload.get("documentId")),
         "profile_name": _stringify(payload.get("profile_name")),
         "text": clean_text,
+        "canonical_text": canonical_text,
+        "canonical_text_len": len(canonical_text) if canonical_text else 0,
+        "canonical_token_count": token_count(canonical_text) if canonical_text else 0,
         "text_data": {
             "clean": clean_text,
             "raw": raw_text if raw_text and raw_text != clean_text else None,
@@ -186,12 +176,14 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         },
         "document": {
             "type": _stringify(payload.get("document_type") or payload.get("doc_type")),
+            "domain": _stringify(payload.get("doc_domain")),
             "ingestion_source": _stringify(payload.get("ingestion_source") or payload.get("source_type")),
         },
         "section": {
             "id": section_id,
             "title": section_title,
             "path": _section_path_list(section_path),
+            "kind": section_kind,
         },
         "chunk": {
             "id": _stringify(payload.get("chunk_id")),
@@ -220,11 +212,15 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "document_id": canonical["document_id"],
         "profile_name": canonical["profile_name"],
         "text": canonical["text"],
+        "canonical_text": canonical["canonical_text"],
+        "canonical_text_len": canonical["canonical_text_len"],
+        "canonical_token_count": canonical["canonical_token_count"],
         "text_clean": clean_text,
         "text_raw": raw_text if raw_text and raw_text != clean_text else None,
         "section_title": section_title,
         "section_path": section_path,
         "section_id": section_id,
+        "section_kind": section_kind,
         "page_start": page_start,
         "page_end": page_end,
         "page": page_start,
@@ -235,14 +231,65 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "next_chunk_id": canonical["chunk"]["links"]["next"],
         "chunk_type": chunk_type,
         "chunk_kind": chunk_role,
+        "chunking_mode": _stringify(payload.get("chunking_mode")),
         "chunk_sentence_complete": canonical["chunk"]["sentence_complete"],
         "document_type": canonical["document"]["type"],
+        "doc_domain": canonical["document"].get("domain"),
         "ingestion_source": canonical["document"]["ingestion_source"],
     }
 
     canonical.update(flattened)
     cleaned = _drop_empty(canonical) or {}
-    return cleaned
+    return _ensure_canonical_payload_fields(cleaned)
 
 
-__all__ = ["build_qdrant_payload", "normalize_content", "normalize_payload"]
+def normalize_chunk_metadata(
+    chunk_metadata: Iterable[Dict[str, Any]],
+    *,
+    document_id: Optional[str] = None,
+    default_doc_type: Optional[str] = None,
+    default_chunking_mode: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for idx, meta in enumerate(chunk_metadata or []):
+        m = dict(meta) if meta else {}
+        section_title = _stringify(m.get("section_title") or m.get("section") or "Untitled Section") or "Untitled Section"
+        section_path = _stringify(m.get("section_path") or section_title) or section_title
+        page_start = _intify(m.get("page_start") or m.get("page_number") or m.get("page"))
+        page_end = _intify(m.get("page_end")) or page_start
+
+        chunk_type = _stringify(m.get("chunk_type")) or "text"
+        chunk_kind = _stringify(m.get("chunk_kind"))
+        if not chunk_kind:
+            if chunk_type in {"table", "table_row", "table_header"}:
+                chunk_kind = "table_text"
+            elif chunk_type == "image_caption":
+                chunk_kind = "image_caption"
+            elif chunk_type == "summary":
+                chunk_kind = "section_summary"
+            else:
+                chunk_kind = "section_text"
+
+        if document_id:
+            m["document_id"] = str(document_id)
+        if default_doc_type and not m.get("doc_type"):
+            m["doc_type"] = default_doc_type
+        if default_chunking_mode and not m.get("chunking_mode"):
+            m["chunking_mode"] = default_chunking_mode
+
+        m.update(
+            {
+                "section_title": section_title,
+                "section_path": section_path,
+                "page_start": page_start,
+                "page_end": page_end,
+                "page_number": page_start,
+                "chunk_index": int(m.get("chunk_index") or idx),
+                "chunk_kind": chunk_kind,
+            }
+        )
+        normalized.append(m)
+    return normalized
+
+
+__all__ = ["build_qdrant_payload", "normalize_content", "normalize_payload", "normalize_chunk_metadata"]

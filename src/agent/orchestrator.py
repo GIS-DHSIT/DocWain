@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 import logging
 import uuid
@@ -18,7 +19,8 @@ from src.api.dw_chat import add_message_to_history
 from src.api.dw_newron import create_llm_client, get_redis_client
 from src.api.vector_store import build_collection_name
 from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
-from src.utils.payload_utils import get_document_type, get_source_name
+from src.prompting.response_contract import format_docwain_response
+from src.utils.payload_utils import get_canonical_text, get_document_type, get_source_name
 
 logger = logging.getLogger(__name__)
 
@@ -113,13 +115,29 @@ class AgentOrchestrator:
             language=language,
             llm_client=llm_client,
         )
-
+        sources = AgentOrchestrator._build_sources(raw_chunks)
+        metadata_hint = {
+            "route_plan": {
+                "task_type": "summarize" if auto_scope else "qa",
+                "scope": "profile_all_docs",
+                "domain_hint": categories[0] if categories else "generic",
+            }
+        }
         persona_text = get_docwain_persona(request.profile_id, request.subscription_id, None)
-        final_answer = sanitize_response(enforce_docwain_identity(final_answer, request.query, persona_text))
+        final_answer = enforce_docwain_identity(final_answer, request.query, persona_text)
+        final_answer = format_docwain_response(
+            response_text=final_answer,
+            query=request.query,
+            sources=sources,
+            metadata=metadata_hint,
+            context_found=bool(raw_chunks),
+            grounded=bool(raw_chunks),
+        )
+        final_answer = sanitize_response(final_answer)
 
         answer_payload = {
             "response": final_answer,
-            "sources": AgentOrchestrator._build_sources(raw_chunks),
+            "sources": sources,
             "grounded": bool(raw_chunks),
             "context_found": bool(raw_chunks),
             "metadata": {
@@ -204,11 +222,11 @@ class AgentOrchestrator:
 
         client = get_qdrant_client()
         collection = build_collection_name(subscription_id)
-        query_filter = Filter(
-            must=[
-                FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-                FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-            ]
+        from src.api.vector_store import build_qdrant_filter
+
+        query_filter = build_qdrant_filter(
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
         )
 
         chunks: List[Dict[str, Any]] = []
@@ -231,13 +249,13 @@ class AgentOrchestrator:
                 with_vectors=False,
             )
             if graph_result and graph_result.candidate_doc_ids:
-                candidate_filter = Filter(
-                    must=[
-                        FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-                        FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-                        FieldCondition(key="document_id", match=MatchAny(any=graph_result.candidate_doc_ids)),
-                    ]
+                base = build_qdrant_filter(
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
                 )
+                must = list(getattr(base, "must", []) or [])
+                must.append(FieldCondition(key="document_id", match=MatchAny(any=graph_result.candidate_doc_ids)))
+                candidate_filter = Filter(must=must)
                 candidate_results = client.search(
                     collection_name=collection,
                     query_vector=("content_vector", list(query_vec)),
@@ -258,7 +276,7 @@ class AgentOrchestrator:
                 results = deduped
             for hit in results:
                 payload = hit.payload or {}
-                chunks.append({"payload": payload, "score": float(hit.score), "text": payload.get("text") or ""})
+                chunks.append({"payload": payload, "score": float(hit.score), "text": get_canonical_text(payload)})
 
         selected_chunks = AgentOrchestrator._select_per_document(chunks)
         documents = AgentOrchestrator._build_document_contexts(selected_chunks)
@@ -280,7 +298,7 @@ class AgentOrchestrator:
             )
             for pt in points:
                 payload = pt.payload or {}
-                chunks.append({"payload": payload, "score": 0.0, "text": payload.get("text") or ""})
+                chunks.append({"payload": payload, "score": 0.0, "text": get_canonical_text(payload)})
             if not next_offset:
                 break
             attempts += 1
@@ -569,23 +587,34 @@ class AgentOrchestrator:
         for chunk in chunks:
             payload = chunk.get("payload") or {}
             name = get_source_name(payload) or "Document"
+            name = os.path.basename(str(name))
             if name in seen:
                 continue
             seen.add(name)
+            page = payload.get("page") or payload.get("page_start") or payload.get("page_end")
             sources.append(
                 {
                     "source_name": name,
-                    "section_title": payload.get("section_title"),
-                    "page_start": payload.get("page_start"),
-                    "page_end": payload.get("page_end"),
+                    "page": page,
                 }
             )
         return sources
 
     @staticmethod
     def _deny_response(request: Any, message: str) -> Dict[str, Any]:
+        persona_text = get_docwain_persona(request.profile_id, request.subscription_id, None)
+        response_text = enforce_docwain_identity(message, request.query, persona_text)
+        response_text = format_docwain_response(
+            response_text=response_text,
+            query=request.query,
+            sources=[],
+            metadata={"route_plan": {"task_type": "info", "scope": "profile_all_docs"}},
+            context_found=False,
+            grounded=False,
+        )
+        response_text = sanitize_response(response_text)
         answer_payload = {
-            "response": message,
+            "response": response_text,
             "sources": [],
             "grounded": False,
             "context_found": False,

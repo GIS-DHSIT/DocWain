@@ -7,6 +7,7 @@ from src.api.schemas import DocumentListResponse
 from src.documents.document_store_adapter import list_documents
 from src.api.blob_store import BlobConfigurationError
 from src.api.embedding_service import embed_documents, embedding_integrity_report
+from src.api.statuses import STATUS_EXTRACTION_OR_CHUNKING_FAILED
 from src.security.response_sanitizer import sanitize_user_payload
 
 documents_router = APIRouter()
@@ -77,7 +78,28 @@ def embed_document(request: DocumentEmbedRequest = Body(...)):
             doc_type=request.doc_type,
             max_blobs=request.max_blobs,
         )
-        return sanitize_user_payload(result)
+        sanitized = sanitize_user_payload(result)
+        if request.document_id and not request.document_ids:
+            documents = sanitized.get("documents") or []
+            if documents:
+                doc_result = documents[0]
+                if doc_result.get("failed_reason") == "extraction_or_chunking_failed":
+                    diagnostics = doc_result.get("diagnostics") or {}
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "status": STATUS_EXTRACTION_OR_CHUNKING_FAILED,
+                            "document_id": doc_result.get("document_id"),
+                            "error": {
+                                "code": "extraction_or_chunking_failed",
+                                "message": doc_result.get("error_message") or "chunking failed",
+                            },
+                            "diagnostics": diagnostics,
+                        },
+                    )
+        return sanitized
+    except HTTPException:
+        raise
     except BlobConfigurationError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:  # noqa: BLE001

@@ -129,11 +129,18 @@ def _fetch_chunks_from_qdrant(
     if not subscription_id or str(subscription_id).strip().lower() == "default":
         logger.warning("Qdrant lookup unavailable for doc_id=%s: subscription_id missing", doc_id)
         return []
+    if not profile_id:
+        logger.warning("Qdrant lookup unavailable for doc_id=%s: profile_id missing", doc_id)
+        return []
     client = client or get_qdrant_client()
     collection_name = build_collection_name(subscription_id)
-    scroll_filter: Dict[str, Any] = {"must": [{"key": "document_id", "match": {"value": str(doc_id)}}]}
-    if profile_id:
-        scroll_filter["must"].append({"key": "profile_id", "match": {"value": str(profile_id)}})
+    from src.api.vector_store import build_qdrant_filter
+
+    scroll_filter = build_qdrant_filter(
+        subscription_id=str(subscription_id),
+        profile_id=str(profile_id),
+        document_id=str(doc_id),
+    )
 
     offset = None
     payloads: List[Dict[str, Any]] = []
@@ -230,8 +237,8 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
         if texts:
             return "\n\n".join(texts)
         logger.warning("Extracted pickle for doc_id=%s had no text; falling back", doc_id)
-    except ValueError as exc:
-        if "not found" in str(exc).lower():
+    except Exception as exc:  # noqa: BLE001
+        if allow_fallback:
             logger.warning("Blob pickle unavailable for doc_id=%s: %s", doc_id, exc)
         else:
             raise

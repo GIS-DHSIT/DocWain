@@ -10,7 +10,13 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import (
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceNotFoundError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
 from azure.storage.blob import ContentSettings
 
 from src.storage.azure_blob_client import get_document_container_client, normalize_blob_name
@@ -172,29 +178,66 @@ def _write_versioned_blob(
 def load_pickle(blob_name: str) -> Optional[bytes]:
     container_client = get_document_container_client()
     normalized = normalize_blob_name(blob_name)
+    max_attempts = int(os.getenv("DOCWAIN_BLOB_DOWNLOAD_RETRIES", "3"))
+    base_delay = float(os.getenv("DOCWAIN_BLOB_DOWNLOAD_RETRY_SECONDS", "0.5"))
     blob_client = container_client.get_blob_client(normalized)
-    try:
-        return blob_client.download_blob().readall()
-    except ResourceNotFoundError:
-        document_id = _document_id_from_blob_name(normalized)
-        pointer_blob = _pointer_blob_name(document_id)
-        pointer_client = container_client.get_blob_client(pointer_blob)
+    for attempt in range(max_attempts):
         try:
-            pointer_payload = pointer_client.download_blob().readall()
+            return blob_client.download_blob().readall()
         except ResourceNotFoundError:
-            return None
-        try:
-            pointer_info = json.loads(pointer_payload.decode("utf-8"))
-        except Exception:  # noqa: BLE001
-            return None
-        versioned_blob = pointer_info.get("blob_name")
-        if not versioned_blob:
-            return None
-        versioned_client = container_client.get_blob_client(versioned_blob)
+            break
+        except (ServiceResponseError, ServiceRequestError, HttpResponseError) as exc:
+            if attempt >= max_attempts - 1:
+                raise
+            delay = base_delay * (attempt + 1) + random.random() * 0.2
+            logger.warning(
+                "Blob download transient error blob=%s attempt=%s/%s err=%s; retrying in %.2fs",
+                normalized,
+                attempt + 1,
+                max_attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+            blob_client = container_client.get_blob_client(normalized)
+
+    document_id = _document_id_from_blob_name(normalized)
+    pointer_blob = _pointer_blob_name(document_id)
+    pointer_client = container_client.get_blob_client(pointer_blob)
+    try:
+        pointer_payload = pointer_client.download_blob().readall()
+    except ResourceNotFoundError:
+        return None
+    except (ServiceResponseError, ServiceRequestError, HttpResponseError) as exc:
+        logger.warning("Pointer blob download failed for %s: %s", pointer_blob, exc)
+        return None
+    try:
+        pointer_info = json.loads(pointer_payload.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    versioned_blob = pointer_info.get("blob_name")
+    if not versioned_blob:
+        return None
+    versioned_client = container_client.get_blob_client(versioned_blob)
+    for attempt in range(max_attempts):
         try:
             return versioned_client.download_blob().readall()
         except ResourceNotFoundError:
             return None
+        except (ServiceResponseError, ServiceRequestError, HttpResponseError) as exc:
+            if attempt >= max_attempts - 1:
+                raise
+            delay = base_delay * (attempt + 1) + random.random() * 0.2
+            logger.warning(
+                "Versioned blob download transient error blob=%s attempt=%s/%s err=%s; retrying in %.2fs",
+                versioned_blob,
+                attempt + 1,
+                max_attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+            versioned_client = container_client.get_blob_client(versioned_blob)
 
 
 def save_pickle_atomic(

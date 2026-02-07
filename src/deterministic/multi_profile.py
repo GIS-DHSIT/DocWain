@@ -5,11 +5,9 @@ from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
-
 from src.deterministic.contacts import ContactInfo, extract_contacts
-from src.deterministic.scoring import ProfileSignals, compute_profile_signals, score_profile
-from src.retrieval.profile_corpus import get_all_profile_ids, get_profile_points
+from src.retrieval.profile_corpus import get_profile_points
+from src.api.vector_store import build_qdrant_filter
 
 
 _CONTACT_QUERY_RE = re.compile(r"(?i)\b(contact|phone|mobile|email|e-mail|linkedin)\b")
@@ -50,12 +48,7 @@ def _get_profile_name_hint(
     profile_id: str,
     collection: str,
 ) -> Optional[str]:
-    filt = Filter(
-        must=[
-            FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-            FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-        ]
-    )
+    filt = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
     try:
         points, _ = client.scroll(
             collection_name=collection,
@@ -195,6 +188,7 @@ def maybe_answer_multi_profile_deterministic(
     subscription_id: str,
     collection: str,
     query: str,
+    profile_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Handle certain multi-profile tasks deterministically (no LLM extraction).
@@ -210,15 +204,9 @@ def maybe_answer_multi_profile_deterministic(
     if not (wants_contacts or wants_rank):
         return None
 
-    all_profile_ids = get_all_profile_ids(client=client, subscription_id=subscription_id, collection=collection)
-    if not all_profile_ids:
-        return {
-            "response": "No relevant information was found in the provided documents.",
-            "sources": [],
-            "grounded": True,
-            "deterministic": True,
-            "candidate_universe": [],
-        }
+    if not profile_id:
+        return None
+    all_profile_ids = [str(profile_id)]
 
     # Build lightweight name hints for routing (avoid full-corpus loads unless needed).
     profile_id_to_name: Dict[str, str] = {}
@@ -227,9 +215,7 @@ def maybe_answer_multi_profile_deterministic(
         if name:
             profile_id_to_name[pid] = name
 
-    scope_profile_ids = _select_scope_profile_ids(
-        query=query, all_profile_ids=all_profile_ids, profile_id_to_name=profile_id_to_name
-    )
+    scope_profile_ids = list(all_profile_ids)
 
     if wants_contacts:
         reports: List[Dict[str, Any]] = []
@@ -262,41 +248,8 @@ def maybe_answer_multi_profile_deterministic(
             "candidate_scope": list(scope_profile_ids),
         }
 
-    # Ranking / compare / top-N.
-    top_n = _parse_top_n(query)
-    ranked: List[Dict[str, Any]] = []
-    for pid in (all_profile_ids if scope_profile_ids == list(all_profile_ids) else scope_profile_ids):
-        payloads = get_profile_points(client=client, subscription_id=subscription_id, profile_id=pid, collection=collection)
-        texts = [_payload_to_text(p) for p in payloads]
-        signals: ProfileSignals = compute_profile_signals(texts)
-        ranked.append(
-            {
-                "profile_id": pid,
-                "profile_name": profile_id_to_name.get(pid, ""),
-                "score": score_profile(signals),
-                "signals": {
-                    "skills_count": signals.skills_count,
-                    "experience_markers": signals.experience_markers,
-                    "date_presence": signals.date_presence,
-                    "total_chars": signals.total_chars,
-                    "contact_presence": signals.contact_presence,
-                },
-            }
-        )
-
-    # Stable ordering: score desc, then profile_id asc.
-    ranked.sort(key=lambda r: (-float(r.get("score", 0.0)), str(r.get("profile_id") or "")))
-    response = build_ranking_answer(ranked, top_n=top_n)
-    return {
-        "response": response,
-        "sources": [],
-        "grounded": True,
-        "deterministic": True,
-        "candidate_universe": list(all_profile_ids),
-        "candidate_scope": list(scope_profile_ids),
-        "top_n": top_n,
-        "ranked_profiles": ranked[: min(top_n, len(ranked))],
-    }
+    # Ranking is handled by the main retrieval pipeline within the active profile scope.
+    return None
 
 
 __all__ = [

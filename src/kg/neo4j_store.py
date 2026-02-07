@@ -109,17 +109,28 @@ class Neo4jStore:
                 last_sync_at=record.get("last_sync_at"),
             )
 
-    def fetch_existing_hashes(self, chunk_ids: Iterable[str]) -> Dict[str, Optional[str]]:
+    def fetch_existing_hashes(
+        self,
+        chunk_ids: Iterable[str],
+        *,
+        subscription_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
         ids = [str(cid) for cid in chunk_ids if cid is not None]
         if not ids:
             return {}
         query = (
             "UNWIND $chunk_ids AS id "
-            "OPTIONAL MATCH (c:Chunk {chunk_id: id}) "
+            "OPTIONAL MATCH (c:Chunk {chunk_id: id, subscription_id: $subscription_id, profile_id: $profile_id}) "
             "RETURN id AS chunk_id, c.chunk_hash AS chunk_hash"
         )
         with self._session() as session:
-            result = session.run(query, chunk_ids=ids)
+            result = session.run(
+                query,
+                chunk_ids=ids,
+                subscription_id=str(subscription_id) if subscription_id else "",
+                profile_id=str(profile_id) if profile_id else "",
+            )
             return {record["chunk_id"]: record.get("chunk_hash") for record in result}
 
     def upsert_batch(self, rows: List[Dict[str, Any]]) -> None:
@@ -127,32 +138,40 @@ class Neo4jStore:
             return
         query = (
             "UNWIND $rows AS row "
-            "MERGE (d:Document {document_id: row.document_id}) "
+            "MERGE (d:Document {document_id: row.document_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "SET d.filename = coalesce(row.filename, d.filename), "
             "    d.source_file = coalesce(row.source_file, d.source_file), "
             "    d.doc_type = coalesce(row.doc_type, d.doc_type), "
-            "    d.document_type = coalesce(row.document_type, d.document_type) "
-            "MERGE (s:Section {section_key: row.section_key}) "
+            "    d.document_type = coalesce(row.document_type, d.document_type), "
+            "    d.subscription_id = row.subscription_id, "
+            "    d.profile_id = row.profile_id "
+            "MERGE (s:Section {section_key: row.section_key, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "SET s.document_id = row.document_id, "
             "    s.section_title = coalesce(row.section_title, s.section_title), "
-            "    s.section_path = coalesce(row.section_path, s.section_path) "
+            "    s.section_path = coalesce(row.section_path, s.section_path), "
+            "    s.subscription_id = row.subscription_id, "
+            "    s.profile_id = row.profile_id "
             "MERGE (d)-[:HAS_SECTION]->(s) "
-            "MERGE (c:Chunk {chunk_id: row.chunk_id}) "
+            "MERGE (c:Chunk {chunk_id: row.chunk_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "ON CREATE SET c.chunk_hash = row.chunk_hash "
             "SET c.document_id = row.document_id, "
             "    c.chunk_index = coalesce(row.chunk_index, c.chunk_index), "
             "    c.page_start = coalesce(row.page_start, c.page_start), "
             "    c.page_end = coalesce(row.page_end, c.page_end), "
             "    c.chunk_hash = coalesce(row.chunk_hash, c.chunk_hash), "
-            "    c.chunk_char_len = coalesce(row.chunk_char_len, c.chunk_char_len) "
+            "    c.chunk_char_len = coalesce(row.chunk_char_len, c.chunk_char_len), "
+            "    c.subscription_id = row.subscription_id, "
+            "    c.profile_id = row.profile_id "
             "MERGE (s)-[:HAS_CHUNK]->(c) "
             "WITH row, c "
             "OPTIONAL MATCH (c)-[r:MENTIONS]->() "
             "DELETE r "
             "WITH row, c "
             "UNWIND coalesce(row.entities, []) AS ent "
-            "MERGE (e:Entity {entity_id: ent.entity_id}) "
-            "SET e.name = ent.name, e.type = ent.type "
+            "MERGE (e:Entity {entity_id: ent.entity_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
+            "SET e.name = ent.name, e.type = ent.type, "
+            "    e.subscription_id = row.subscription_id, "
+            "    e.profile_id = row.profile_id "
             "MERGE (c)-[:MENTIONS]->(e)"
         )
         with self._session() as session:
@@ -181,25 +200,38 @@ class Neo4jStore:
             },
         }
 
-    def replace_mentions(self, chunk_ids: List[str], mentions: List[Dict[str, Any]]) -> None:
+    def replace_mentions(
+        self,
+        chunk_ids: List[str],
+        mentions: List[Dict[str, Any]],
+        *,
+        subscription_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+    ) -> None:
         if chunk_ids:
             delete_query = (
                 "UNWIND $chunk_ids AS chunk_id "
-                "MATCH (c:Chunk {chunk_id: chunk_id})-[r:MENTIONS]->() "
+                "MATCH (c:Chunk {chunk_id: chunk_id, subscription_id: $subscription_id, profile_id: $profile_id})-[r:MENTIONS]->() "
                 "DELETE r"
             )
             with self._session() as session:
-                session.run(delete_query, chunk_ids=chunk_ids)
+                session.run(
+                    delete_query,
+                    chunk_ids=chunk_ids,
+                    subscription_id=str(subscription_id) if subscription_id else "",
+                    profile_id=str(profile_id) if profile_id else "",
+                )
 
         if not mentions:
             return
 
         insert_query = (
             "UNWIND $mentions AS row "
-            "MERGE (e:Entity {entity_id: row.entity_id}) "
-            "SET e.name = row.name, e.type = row.type "
+            "MERGE (e:Entity {entity_id: row.entity_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
+            "SET e.name = row.name, e.type = row.type, "
+            "    e.subscription_id = row.subscription_id, e.profile_id = row.profile_id "
             "WITH row "
-            "MATCH (c:Chunk {chunk_id: row.chunk_id}) "
+            "MATCH (c:Chunk {chunk_id: row.chunk_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "MERGE (c)-[:MENTIONS]->(e)"
         )
         with self._session() as session:
@@ -210,8 +242,8 @@ class Neo4jStore:
             return
         query = (
             "UNWIND $links AS row "
-            "MATCH (c1:Chunk {chunk_id: row.from_chunk_id}) "
-            "MATCH (c2:Chunk {chunk_id: row.to_chunk_id}) "
+            "MATCH (c1:Chunk {chunk_id: row.from_chunk_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
+            "MATCH (c2:Chunk {chunk_id: row.to_chunk_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "MERGE (c1)-[:NEXT]->(c2)"
         )
         with self._session() as session:
@@ -221,6 +253,8 @@ class Neo4jStore:
         self,
         *,
         entity_ids: List[str],
+        subscription_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
         limit: int = 20,
         timeout_ms: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
@@ -228,13 +262,18 @@ class Neo4jStore:
             return []
         query = (
             "UNWIND $entity_ids AS eid "
-            "MATCH (e:Entity {entity_id: eid})<-[:MENTIONS]-(c:Chunk) "
-            "<-[:HAS_CHUNK]-(s:Section)<-[:HAS_SECTION]-(d:Document) "
+            "MATCH (e:Entity {entity_id: eid, subscription_id: $subscription_id, profile_id: $profile_id})<-[:MENTIONS]-(c:Chunk) "
+            "<-[:HAS_CHUNK]-(s:Section)<-[:HAS_SECTION]-(d:Document {subscription_id: $subscription_id, profile_id: $profile_id}) "
             "RETURN d.document_id AS document_id, s.section_path AS section_path, count(*) AS hits "
             "ORDER BY hits DESC "
             "LIMIT $limit"
         )
-        params = {"entity_ids": entity_ids, "limit": int(limit)}
+        params = {
+            "entity_ids": entity_ids,
+            "limit": int(limit),
+            "subscription_id": str(subscription_id) if subscription_id else "",
+            "profile_id": str(profile_id) if profile_id else "",
+        }
         with self._session() as session:
             try:
                 result = session.run(query, **params, timeout=(timeout_ms / 1000.0) if timeout_ms else None)

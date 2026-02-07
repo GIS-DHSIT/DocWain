@@ -14,6 +14,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from qdrant_client import QdrantClient
 from qdrant_client.models import SparseVector, Filter, FieldCondition, MatchValue, MatchAny
+from src.api.vector_store import build_qdrant_filter
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
@@ -21,7 +22,7 @@ from src.embedding.pipeline.embed_pipeline import compute_stable_chunk_id
 from src.kg.entity_extractor import EntityExtractor
 from src.kg.neo4j_store import Neo4jStore
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
-from src.utils.payload_utils import get_source_name
+from src.utils.payload_utils import get_canonical_text, get_source_name
 
 logger = logging.getLogger(__name__)
 
@@ -322,6 +323,7 @@ class AdaptiveRetriever:
 
     def _build_filter(
             self,
+            subscription_id: str,
             profile_id: str,
             document_ids: Optional[List[str]] = None,
             source_files: Optional[List[str]] = None
@@ -329,17 +331,9 @@ class AdaptiveRetriever:
         """
         FIXED: Use MatchAny for OR logic with multiple documents
         """
-        conditions = []
-        should = []
-
-        # Profile filter (always required)
-        if profile_id:
-            conditions.append(
-                FieldCondition(
-                    key="profile_id",
-                    match=MatchValue(value=str(profile_id))
-                )
-            )
+        base = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
+        conditions = list(getattr(base, "must", []) or [])
+        should = list(getattr(base, "should", []) or [])
 
         # FIXED: Use MatchAny for document filtering (OR logic)
         if document_ids and len(document_ids) > 0:
@@ -374,6 +368,7 @@ class AdaptiveRetriever:
             self,
             collection_name: str,
             query: str,
+            subscription_id: str,
             profile_id: str,
             top_k: int,
             document_ids: Optional[List[str]] = None,
@@ -390,7 +385,7 @@ class AdaptiveRetriever:
             ).astype(np.float32).tolist()
 
             # Build filter with OR logic
-            query_filter = self._build_filter(profile_id, document_ids, source_files)
+            query_filter = self._build_filter(subscription_id, profile_id, document_ids, source_files)
 
             # Log filter for debugging
             if query_filter:
@@ -419,7 +414,7 @@ class AdaptiveRetriever:
                 payload = pt.payload or {}
                 chunks.append({
                     'id': str(pt.id),
-                    'text': payload.get('text', ''),
+                    'text': get_canonical_text(payload),
                     'score': float(pt.score),
                     'metadata': payload,
                     'method': 'dense'
@@ -620,6 +615,8 @@ class GraphGuidedRetriever:
             self,
             collection_name: str,
             chunks: List[Dict],
+            subscription_id: str,
+            profile_id: str,
             max_adjacent: int = 1
     ) -> List[Dict]:
         """
@@ -654,18 +651,14 @@ class GraphGuidedRetriever:
                 for adj_id in adjacent_ids[:max_adjacent]:
                     try:
                         # FIXED: Filter by both chunk_id AND document_id
-                        scroll_filter = Filter(
-                            must=[
-                                FieldCondition(
-                                    key="chunk_id",
-                                    match=MatchValue(value=adj_id)
-                                ),
-                                FieldCondition(
-                                    key="document_id",
-                                    match=MatchValue(value=current_doc_id)  # ADDED
-                                )
-                            ]
+                        base = build_qdrant_filter(
+                            subscription_id=str(subscription_id),
+                            profile_id=str(profile_id),
+                            document_id=str(current_doc_id),
                         )
+                        must = list(getattr(base, "must", []) or [])
+                        must.append(FieldCondition(key="chunk_id", match=MatchValue(value=adj_id)))
+                        scroll_filter = Filter(must=must)
 
                         results = self.client.scroll(
                             collection_name=collection_name,
@@ -690,7 +683,7 @@ class GraphGuidedRetriever:
                                 if adj_doc_id == current_doc_id:  # ADDED CHECK
                                     expanded.append({
                                         'id': str(pt.id),
-                                        'text': payload.get('text', ''),
+                                        'text': get_canonical_text(payload),
                                         'score': chunk['score'] * 0.95,
                                         'metadata': payload,
                                         'method': f"{chunk['method']}_adjacent"
@@ -714,6 +707,7 @@ class GraphGuidedRetriever:
             self,
             collection_name: str,
             query: str,
+            subscription_id: str,
             profile_id: str,
             top_k: int = 30,
             document_ids: Optional[List[str]] = None,
@@ -732,7 +726,7 @@ class GraphGuidedRetriever:
 
         # Strategy 1: Dense search with moderate threshold
         chunks = self._dense_search(
-            collection_name, query, profile_id, top_k,
+            collection_name, query, subscription_id, profile_id, top_k,
             document_ids=document_ids,
             source_files=source_files,
             score_threshold=0.15
@@ -742,7 +736,7 @@ class GraphGuidedRetriever:
         if not chunks:
             logger.warning("No results with threshold, retrying without")
             chunks = self._dense_search(
-                collection_name, query, profile_id, top_k,
+                collection_name, query, subscription_id, profile_id, top_k,
                 document_ids=document_ids,
                 source_files=source_files,
                 score_threshold=None
@@ -752,7 +746,7 @@ class GraphGuidedRetriever:
         if not chunks and (document_ids or source_files):
             logger.warning("No results with document filter, retrying without filter")
             chunks = self._dense_search(
-                collection_name, query, profile_id, top_k * 2,
+                collection_name, query, subscription_id, profile_id, top_k * 2,
                 score_threshold=None
             )
 
@@ -766,7 +760,13 @@ class GraphGuidedRetriever:
 
         # Adjacent chunk expansion (FIXED: same-document only)
         if use_expansion and len(chunks) > 0:
-            chunks = self._expand_with_adjacent_chunks(collection_name, chunks, max_adjacent=1)
+            chunks = self._expand_with_adjacent_chunks(
+                collection_name,
+                chunks,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                max_adjacent=1,
+            )
 
         # Add methods metadata
         for chunk in chunks:

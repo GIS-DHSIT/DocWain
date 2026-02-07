@@ -17,6 +17,7 @@ _HEADING_RE = re.compile(
 _ALL_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9\s,:\-]{4,}$")
 _PAGE_MARKER_RE = re.compile(r"^\s*-+\s*page\s*\d+\s*-+\s*$", re.IGNORECASE)
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", re.IGNORECASE)
+_ONLY_PUNCT_RE = re.compile(r"^[\W_]+$")
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,46 @@ def _is_heading_line(line: str) -> bool:
 
 def _token_count(text: str) -> int:
     return len(text.split())
+
+
+def _lex_token_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+", text or ""))
+
+
+def is_valid_chunk_text(
+    text: Optional[str],
+    *,
+    min_chars: Optional[int] = None,
+    min_tokens: Optional[int] = None,
+) -> bool:
+    if text is None:
+        return False
+    stripped = str(text).strip()
+    if not stripped:
+        return False
+    if min_chars is None or min_tokens is None:
+        try:
+            from src.api.config import Config
+            if min_chars is None:
+                min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 50))
+            if min_tokens is None:
+                min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 10))
+        except Exception:
+            min_chars = min_chars or 50
+            min_tokens = min_tokens or 10
+    if len(stripped) < int(min_chars or 0):
+        return False
+    if _lex_token_count(stripped) < int(min_tokens or 0):
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    if lines and all(_PAGE_MARKER_RE.match(line) or _PAGE_NUMBER_RE.match(line) for line in lines):
+        return False
+    if _ONLY_PUNCT_RE.match(stripped):
+        return False
+    alnum_ratio = len(re.findall(r"[A-Za-z0-9]", stripped)) / max(1, len(stripped))
+    if alnum_ratio < 0.2:
+        return False
+    return True
 
 
 def _split_bullets(lines: List[str], page_start: Optional[int], page_end: Optional[int]) -> List[AtomicUnit]:
@@ -308,4 +349,5 @@ __all__ = [
     "clean_text_for_embedding",
     "enforce_chunk_integrity",
     "is_chunk_complete",
+    "is_valid_chunk_text",
 ]
