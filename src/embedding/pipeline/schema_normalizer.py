@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
+from src.metadata.normalizer import normalize_chunk_kind
 from src.utils.payload_utils import token_count
 
 
@@ -139,7 +140,13 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     chunk_id = _stringify(raw.get("chunk_id") or (raw.get("chunk") or {}).get("id")) or "unknown"
     chunk_index = _intify(raw.get("chunk_index") or (raw.get("chunk") or {}).get("index") or 0) or 0
     chunk_count = _intify(raw.get("chunk_count") or (raw.get("chunk") or {}).get("count")) or 1
-    chunk_kind = _stringify(raw.get("chunk_kind") or (raw.get("chunk") or {}).get("type")) or "section_text"
+    chunk_kind = normalize_chunk_kind(
+        {
+            "chunk_kind": raw.get("chunk_kind") or (raw.get("chunk") or {}).get("type"),
+            "chunk_type": raw.get("chunk_type") or (raw.get("chunk") or {}).get("type"),
+        },
+        strict=False,
+    )
     chunking_mode = _stringify(raw.get("chunking_mode"))
 
     raw_content = raw.get("content")

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import FieldCondition, Filter, MatchValue
+from qdrant_client.models import Filter
 
 from src.api.config import Config
 from src.api.vector_store import build_collection_name, build_qdrant_filter
@@ -92,15 +92,19 @@ def _summarize_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional
     return source_name, document_type, ingestion_source, chunk_kind, payload.get("document_id"), chunk_count
 
 
+def get_redis_client():
+    try:
+        from src.api.dw_newron import get_redis_client as _get_redis_client
+
+        return _get_redis_client()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_profile_document_index(subscription_id: str, profile_id: str) -> ProfileDocumentIndex:
     cache_key = f"docwain:pdi:v1:{subscription_id}:{profile_id}"
     redis_client = None
-    try:
-        from src.api.dw_newron import get_redis_client
-
-        redis_client = get_redis_client()
-    except Exception:  # noqa: BLE001
-        redis_client = None
+    redis_client = get_redis_client()
     cache = RedisJsonCache(redis_client, default_ttl=300)
     cached = cache.get_json(cache_key, feature="profile_document_index")
     if cached:
@@ -163,4 +167,4 @@ def build_profile_document_index(subscription_id: str, profile_id: str) -> Profi
     return index
 
 
-__all__ = ["ProfileDocumentIndex", "DocumentIndexEntry", "build_profile_document_index"]
+__all__ = ["ProfileDocumentIndex", "DocumentIndexEntry", "build_profile_document_index", "get_redis_client"]

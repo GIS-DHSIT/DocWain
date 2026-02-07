@@ -4,8 +4,7 @@ import hashlib
 import logging
 import math
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from src.api.pipeline_models import ExtractedDocument, Table
 from src.embedding.chunking.section_chunker import normalize_text

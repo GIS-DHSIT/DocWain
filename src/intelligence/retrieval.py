@@ -23,7 +23,7 @@ from src.intelligence.response_composer import compose_task_response, generate_a
 from src.intelligence.facts_store import FactsStore
 from src.intelligence.kg_updater import KGUpdater
 from src.services.retrieval.hybrid_retriever import HybridRetriever, HybridRetrieverConfig, RetrievalCandidate
-from src.utils.payload_utils import get_canonical_text, get_content_text
+from src.utils.payload_utils import get_content_text
 
 logger = logging.getLogger(__name__)
 
@@ -737,6 +737,8 @@ def _is_filter_failure(exc: Exception) -> bool:
             "payload index",
             "payload indexes",
             "missing required qdrant payload",
+            "query_points",
+            "has no attribute 'query_points'",
             "filter",
         )
     )
@@ -958,7 +960,7 @@ def run_intelligent_pipeline(
                     target_doc_ids=route_plan.target_document_ids or None,
                 ),
                 details=str(exc),
-                error_code="RETRIEVAL_INDEX_BOOTSTRAP_FAILED",
+                error_code="RETRIEVAL_FILTER_FAILED",
             )
     else:
         logger.debug("Skipping payload index validation for lightweight Qdrant client")

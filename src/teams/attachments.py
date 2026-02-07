@@ -149,7 +149,8 @@ async def _resolve_auth_token(turn_context, provided_token: Optional[str]) -> st
     fallback = getattr(Config.Teams, "BOT_ACCESS_TOKEN", "") or ""
     if fallback:
         return fallback
-    raise AttachmentIngestError("Missing connector token for secure file download.")
+    logger.warning("No connector token available for Teams attachment download; proceeding without auth header.")
+    return ""
 
 
 def _resolve_doc_tag(attachment: Dict[str, Any], filename: str) -> str:
@@ -262,7 +263,7 @@ async def ingest_attachments(
     timeout = float(getattr(Config.Teams, "HTTP_TIMEOUT_SEC", 20))
     retries = int(getattr(Config.Teams, "HTTP_RETRIES", 2))
     max_bytes = int(getattr(Config.Teams, "MAX_ATTACHMENT_MB", 50)) * 1024 * 1024
-    token = await _resolve_auth_token(turn_context, connector_token)
+    token: Optional[str] = None
 
     outcomes: List[AttachmentOutcome] = []
     errors: List[str] = []
@@ -270,7 +271,13 @@ async def ingest_attachments(
     for attachment in attachments:
         content_type = _attachment_type(attachment)
         try:
-            if "file.download.info" in content_type or (attachment.get("content") or {}).get("downloadUrl"):
+            if "file.download.info" in content_type or (attachment.get("content") or {}).get("downloadUrl") or (attachment.get("content") or {}).get("download_url"):
+                content = attachment.get("content") or {}
+                download_url = content.get("downloadUrl") or content.get("download_url")
+                if not download_url:
+                    raise AttachmentIngestError("Attachment missing a secure download URL.")
+                if token is None:
+                    token = await _resolve_auth_token(turn_context, connector_token)
                 outcome = await _process_file_download(
                     attachment,
                     context,
@@ -281,6 +288,8 @@ async def ingest_attachments(
                     max_bytes=max_bytes,
                 )
             elif content_type.startswith("image/") or attachment.get("contentUrl"):
+                if token is None:
+                    token = await _resolve_auth_token(turn_context, connector_token)
                 outcome = await _process_inline_image(
                     attachment,
                     context,

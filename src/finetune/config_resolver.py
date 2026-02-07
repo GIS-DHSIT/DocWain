@@ -1,7 +1,7 @@
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 from src.api.config import Config
 
@@ -161,4 +161,3 @@ def apply_numeric_config_to_request(request) -> Tuple[Any, Dict[str, ResolvedFie
             updates[req_key] = resolved[resolved_key].value
     updated = request.model_copy(update=updates)
     return updated, resolved
-

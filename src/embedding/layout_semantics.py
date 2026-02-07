@@ -4,12 +4,11 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.config import Config
 from src.embedding.chunking.section_chunker import normalize_text
 from src.embedding.layout_graph import build_layout_graph
-from src.utils.payload_utils import token_count
 
 logger = logging.getLogger(__name__)
 

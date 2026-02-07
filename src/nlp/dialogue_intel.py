@@ -5,14 +5,14 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import ollama
 
 from src.api.config import Config
 from src.api.genai_client import generate_text
-from src.nlp.intent_rules import IntentRuleMatch, match_intent_rules
-from src.nlp.sentiment_rules import SentimentRuleMatch, match_sentiment_rules
+from src.nlp.intent_rules import match_intent_rules
+from src.nlp.sentiment_rules import match_sentiment_rules
 from src.policy.response_policy import INFO_MODE, ResponseModeClassifier, build_docwain_intro
 from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
 

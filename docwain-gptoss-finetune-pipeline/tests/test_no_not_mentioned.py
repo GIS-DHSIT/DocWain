@@ -1,4 +1,4 @@
-from tests.conftest import load_eval_outputs
+from docwain_ft.eval_harness import load_eval_outputs
 
 
 def test_no_not_mentioned():

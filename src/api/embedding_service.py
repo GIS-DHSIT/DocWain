@@ -22,23 +22,46 @@ from src.api.blob_store import (
 )
 from src.api.config import Config
 from src.api.content_store import build_pickle_path, delete_extracted_pickle, load_extracted_pickle, save_extracted_pickle
-from src.api.dataHandler import (
-    ChunkingDiagnosticError,
-    db,
-    decrypt_data,
-    fileProcessor,
-    get_azure_docs,
-    get_qdrant_client,
-    get_s3_client,
-    get_subscription_pii_setting,
-    get_model,
-    read_s3_file,
-    resolve_profile_id,
-    resolve_subscription_id,
-    train_on_document,
-    update_extraction_metadata,
-    update_pii_stats,
-)
+try:
+    from src.api.dataHandler import (
+        ChunkingDiagnosticError,
+        db,
+        decrypt_data,
+        fileProcessor,
+        get_azure_docs,
+        get_qdrant_client,
+        get_s3_client,
+        get_subscription_pii_setting,
+        get_model,
+        read_s3_file,
+        resolve_profile_id,
+        resolve_subscription_id,
+        train_on_document,
+        update_extraction_metadata,
+        update_pii_stats,
+    )
+except Exception as _datahandler_exc:  # noqa: BLE001
+    class ChunkingDiagnosticError(RuntimeError):
+        pass
+
+    db = None
+
+    def _datahandler_unavailable(*_args, **_kwargs):
+        raise RuntimeError("dataHandler unavailable") from _datahandler_exc
+
+    decrypt_data = _datahandler_unavailable
+    fileProcessor = _datahandler_unavailable
+    get_azure_docs = _datahandler_unavailable
+    get_qdrant_client = _datahandler_unavailable
+    get_s3_client = _datahandler_unavailable
+    get_subscription_pii_setting = _datahandler_unavailable
+    get_model = _datahandler_unavailable
+    read_s3_file = _datahandler_unavailable
+    resolve_profile_id = _datahandler_unavailable
+    resolve_subscription_id = _datahandler_unavailable
+    train_on_document = _datahandler_unavailable
+    update_extraction_metadata = _datahandler_unavailable
+    update_pii_stats = _datahandler_unavailable
 from src.api.document_status import get_document_record, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
 from src.api.pii_masking import mask_document_content

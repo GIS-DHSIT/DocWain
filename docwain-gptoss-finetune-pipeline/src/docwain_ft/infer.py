@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -43,6 +44,18 @@ def _ollama_cli(prompt: str) -> str:
         text=True,
     )
     return result.stdout
+
+
+def ollama_ready() -> bool:
+    if shutil.which("ollama") is None:
+        return False
+    result = subprocess.run(
+        ["ollama", "show", CONFIG.ollama_model_name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def run_one(prompt: str) -> str:

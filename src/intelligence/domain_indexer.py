@@ -4,9 +4,8 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
-from src.api.config import Config
 from src.intelligence.redis_intel_cache import RedisIntelCache
 from src.kg.entity_extractor import EntityExtractor, ExtractedEntity, normalize_entity_name
 from src.utils.payload_utils import token_count

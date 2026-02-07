@@ -5,7 +5,7 @@ import math
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from qdrant_client.http.exceptions import UnexpectedResponse
@@ -13,7 +13,7 @@ from qdrant_client.models import Filter, FieldCondition, MatchAny, Range
 from src.api.qdrant_indexes import autoheal_missing_index
 from src.retrieval.filter_builder import build_qdrant_filter
 from src.retrieval.errors import RetrievalFilterError
-from src.utils.payload_utils import get_canonical_text, get_content_text, get_document_type, get_embedding_text, get_source_name
+from src.utils.payload_utils import get_content_text, get_document_type, get_embedding_text, get_source_name
 
 try:
     from rank_bm25 import BM25Okapi
@@ -275,7 +275,7 @@ class HybridRetriever:
         }
         use_strict = bool(strict_filters)
 
-        effective_subscription = subscription_id or filters.get("subscription_id")
+        effective_subscription = subscription_id or filters.get("subscription_id") or collection_name
         query_filter = self._build_filter(
             profile_id,
             collection_name=collection_name,

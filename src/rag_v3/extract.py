@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from src.api.config import Config
 from .types import (
     Candidate,
     CandidateField,
@@ -85,6 +86,8 @@ def schema_extract(
 
 
 def _infer_domain_intent(query: str, chunks: List[Any], domain_hint: Optional[str] = None) -> Tuple[str, str]:
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        return "generic", "facts"
     combined = " ".join([query] + [getattr(c, "text", "") or "" for c in chunks]).lower()
     query_lower = (query or "").lower()
     domain = (domain_hint or "").strip().lower()
@@ -144,6 +147,8 @@ def _looks_like_hr_total(text: str) -> bool:
 
 
 def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[Any]):
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        return _extract_generic(query, chunks)
     if domain == "invoice":
         return _extract_invoice(chunks)
     if domain == "hr":

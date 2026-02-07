@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from qdrant_client import QdrantClient
 from src.deterministic.contacts import ContactInfo, extract_contacts

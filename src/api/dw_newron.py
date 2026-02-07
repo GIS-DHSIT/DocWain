@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from src.api.config import Config
 from src.api.vector_store import QdrantVectorStore
-from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, autoheal_missing_index
+from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, autoheal_missing_index, ensure_payload_indexes
 from src.api.enhanced_context_builder import IntelligentContextBuilder
 from src.api.query_intelligence import QueryIntelligence
 from src.api.enhanced_retrieval import GraphGuidedRetriever
@@ -591,6 +591,7 @@ class QdrantCollectionNotFoundError(ValueError):
 
 
 _QDRANT_INDEX_CACHE: Set[str] = set()
+_QDRANT_FILTER_INDEX_CACHE: Set[Tuple[str, str]] = set()
 _COLLECTION_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
 _COLLECTION_COUNT_TTL_SEC = int(os.getenv("QDRANT_COUNT_TTL_SEC", "120"))
 
@@ -2147,6 +2148,20 @@ class QdrantRetriever:
         coo = matrix.tocoo()
         return SparseVector(indices=coo.col.tolist(), values=coo.data.astype(np.float32).tolist())
 
+    def ensure_collection_exists(self, collection_name: str) -> None:
+        if not collection_name:
+            raise QdrantCollectionNotFoundError(collection_name or "")
+        try:
+            self.client.get_collection(collection_name)
+            return
+        except Exception:  # noqa: BLE001
+            try:
+                collections = self.client.get_collections()
+                available = [c.name for c in getattr(collections, "collections", []) if getattr(c, "name", None)]
+            except Exception:  # noqa: BLE001
+                available = []
+            raise QdrantCollectionNotFoundError(collection_name, available_collections=available)
+
     @staticmethod
     def _points_to_chunks(results, method: str) -> List[RetrievedChunk]:
         chunks: List[RetrievedChunk] = []
@@ -2207,6 +2222,32 @@ class QdrantRetriever:
     ):
         """Execute a vector search against Qdrant using query_points."""
         try:
+            if query_filter is not None:
+                try:
+                    filter_fields: List[str] = []
+                    stack = [query_filter]
+                    while stack:
+                        node = stack.pop()
+                        if hasattr(node, "must") or hasattr(node, "should") or hasattr(node, "must_not"):
+                            for key in ("must", "should", "must_not"):
+                                children = getattr(node, key, None) or []
+                                stack.extend(children)
+                        if hasattr(node, "key"):
+                            filter_fields.append(getattr(node, "key"))
+                    if "doc_type" in filter_fields:
+                        cache_key = (collection_name, "doc_type")
+                        if cache_key not in _QDRANT_FILTER_INDEX_CACHE:
+                            try:
+                                ensure_payload_indexes(
+                                    client=self.client,
+                                    collection_name=collection_name,
+                                    required_fields=["doc_type"],
+                                    create_missing=True,
+                                )
+                            finally:
+                                _QDRANT_FILTER_INDEX_CACHE.add(cache_key)
+                except Exception:
+                    pass
             kwargs = dict(
                 collection_name=collection_name,
                 query=query_vector,
@@ -3971,6 +4012,8 @@ class EnterpriseRAGSystem:
 
             if getattr(Config, "RAGV2", None) and getattr(Config.RAGV2, "ENABLED", False):
                 try:
+                    if not hasattr(self.model, "encode"):
+                        raise RuntimeError("Embedder missing encode")
                     from src.ask.pipeline import run_docwain_rag_v2
 
                     v2_answer = run_docwain_rag_v2(
@@ -3987,7 +4030,10 @@ class EnterpriseRAGSystem:
                         cross_encoder=getattr(self.reranker, "cross_encoder", None),
                     )
                     if v2_answer:
-                        return v2_answer
+                        if v2_answer.get("context_found") or (v2_answer.get("sources") or []):
+                            return v2_answer
+                        if (v2_answer.get("metadata") or {}).get("intent") == "greet":
+                            return v2_answer
                 except Exception as exc:  # noqa: BLE001
                     exc_lower = str(exc).lower()
                     stage = "generate"

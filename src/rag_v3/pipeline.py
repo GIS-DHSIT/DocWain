@@ -113,7 +113,11 @@ def run(
         )
 
     retrieved_metadata = _collect_retrieved_metadata(retrieved)
-    domain = DomainRouter.resolve(original_query, tool_hint, retrieved_metadata)
+    domain = (
+        DomainRouter.resolve(original_query, tool_hint, retrieved_metadata)
+        if Config.Features.DOMAIN_SPECIFIC_ENABLED
+        else "generic"
+    )
 
     stage_start = time.time()
     reranked = rerank(
@@ -125,7 +129,7 @@ def run(
     )
     _log_stage("rerank", stage_start, correlation_id)
 
-    if domain == "resume":
+    if Config.Features.DOMAIN_SPECIFIC_ENABLED and domain == "resume":
         stage_start = time.time()
         extraction = extract_schema(
             "hr",
@@ -197,7 +201,7 @@ def run(
     )
     _log_stage("extract", stage_start, correlation_id)
 
-    if extraction.domain == "multi" and _query_is_hr(original_query):
+    if Config.Features.DOMAIN_SPECIFIC_ENABLED and extraction.domain == "multi" and _query_is_hr(original_query):
         stage_start = time.time()
         extraction = extract_schema(
             "hr",
@@ -365,7 +369,7 @@ def run_docwain_rag_v3(
     )
     _log_stage("extract", stage_start, correlation_id)
 
-    if extraction.domain == "multi" and _query_is_hr(original_query):
+    if Config.Features.DOMAIN_SPECIFIC_ENABLED and extraction.domain == "multi" and _query_is_hr(original_query):
         stage_start = time.time()
         extraction = extract_schema(
             "hr",

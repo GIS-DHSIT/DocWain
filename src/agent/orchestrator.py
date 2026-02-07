@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+from qdrant_client.models import FieldCondition, Filter, MatchAny
 
 from src.agent.limits import check_and_count
 from src.agent.prompts import EXTRACTION_PROMPT, FINALIZER_PROMPT, VALIDATION_PROMPT

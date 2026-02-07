@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from src.intelligence.kg_builder import KGStoreBase, MemoryKGStore, Neo4jKGStore, get_kg_store
-from src.kg.entity_extractor import EntityExtractor, ExtractedEntity, normalize_entity_name
+from src.kg.entity_extractor import EntityExtractor, normalize_entity_name
 
 logger = logging.getLogger(__name__)
 

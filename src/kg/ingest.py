@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from src.api.config import Config
-from src.kg.entity_extractor import EntityExtractor, ExtractedEntity, normalize_entity_name
+from src.kg.entity_extractor import EntityExtractor, normalize_entity_name
 from src.kg.neo4j_store import Neo4jStore
 
 logger = logging.getLogger(__name__)

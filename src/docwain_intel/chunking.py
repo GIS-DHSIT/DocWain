@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .metadata_normalizer import normalize_chunk_payload
 from .models import Block, DocumentManifest, EntityFactBundle, ExtractedDocumentJSON
@@ -75,7 +75,7 @@ def build_answerable_chunks(
                     "filename": manifest.filename,
                     "source_type": manifest.source_type,
                     "domain": "generic",
-                    "chunk_kind": "section_chunk",
+                    "chunk_kind": "section_text",
                     "section_path": section.section_path,
                     "page_range": section.page_range,
                     "block_ids": block_ids,
@@ -110,11 +110,11 @@ def build_answerable_chunks(
             "ingest_timestamp": manifest.ingested_at,
         }
         if block.type == "key_value" and block.key and block.value:
-            base["chunk_kind"] = "kv_chunk"
+            base["chunk_kind"] = "structured_field"
             base["text"] = f"{block.key}: {block.value}"
             chunk_payloads.append(base)
         elif block.type == "list_item":
-            base["chunk_kind"] = "list_item_chunk"
+            base["chunk_kind"] = "structured_field"
             chunk_payloads.append(base)
 
     # Table row chunks
@@ -138,7 +138,7 @@ def build_answerable_chunks(
                     "filename": manifest.filename,
                     "source_type": manifest.source_type,
                     "domain": "generic",
-                    "chunk_kind": "table_row_chunk",
+                    "chunk_kind": "table_text",
                     "section_path": [],
                     "page_range": [table.page_number or 1, table.page_number or 1],
                     "block_ids": [],
@@ -165,7 +165,7 @@ def build_answerable_chunks(
                     "filename": manifest.filename,
                     "source_type": manifest.source_type,
                     "domain": "generic",
-                    "chunk_kind": "entity_fact_chunk",
+                    "chunk_kind": "structured_field",
                     "section_path": fact.evidence.get("section_path") if isinstance(fact.evidence, dict) else [],
                     "page_range": fact.evidence.get("page_range") if isinstance(fact.evidence, dict) else None,
                     "block_ids": fact.evidence.get("block_ids") if isinstance(fact.evidence, dict) else [],

@@ -20,22 +20,27 @@ from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.api.app_lifespan import lifespan
-from src.api.dataHandler import (
-    db,
-    clear_legacy_vetting_metadata,
-    delete_embeddings,
-    get_subscription_pii_setting,
-    trainData,
-    train_single_document,
-)
-from src.api.dw_chat import (
-    add_message_to_history,
-    delete_chat_history,
-    delete_session,
-    get_chat_history,
-    get_session_by_id,
-    get_session_list,
-)
+try:
+    from src.api.dataHandler import (
+        db,
+        clear_legacy_vetting_metadata,
+        delete_embeddings,
+        get_subscription_pii_setting,
+        trainData,
+        train_single_document,
+    )
+except Exception as _datahandler_exc:  # noqa: BLE001
+    db = None
+
+    def _datahandler_unavailable(*_args, **_kwargs):
+        raise RuntimeError("dataHandler unavailable") from _datahandler_exc
+
+    clear_legacy_vetting_metadata = _datahandler_unavailable
+    delete_embeddings = _datahandler_unavailable
+    get_subscription_pii_setting = _datahandler_unavailable
+    trainData = _datahandler_unavailable
+    train_single_document = _datahandler_unavailable
+from src.api.dw_chat import delete_chat_history, delete_session, get_chat_history, get_session_by_id, get_session_list
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
 from src.api.debug import debug_router
@@ -58,23 +63,20 @@ from src.metrics.aggregation import (
 )
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.repository import MetricsRepository
-from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
+from src.mode.execution_mode import resolve_execution_mode
 from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
-from src.execution.common import normalize_answer, chunk_text_stream
+from src.execution.common import normalize_answer
 from src.intelligence.redis_intel_cache import RedisIntelCache
-from src.intelligence.response_composer import generate_ack
 from src.api.learning_signals import LearningSignalStore
 from src import rag_v3
 from src.api import rag_state
-from src.api.ask_handler import apply_error_contract, get_rag_system_from_app, should_return_503
 from src.screening.api import screening_router
 from src.screening.config import log_legacy_vetting_notice_if_missing
 from src.storage.azure_blob_client import validate_containers_once, validate_storage_configured_once
 from botbuilder.schema import Activity
 from src.nlp.dialogue_intel import route_message
-from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
-from src.prompting.response_contract import format_docwain_response
+from src.prompting.persona import sanitize_response
 
 from src.teams import adapter as teams_adapter
 from src.teams.bot_app import (
@@ -719,7 +721,7 @@ def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool
     return session_id, session_state, mode, ctx
 
 
-@api_router.post("/ask", tags=["Default"], response_model=AskLiteResponse)
+@api_router.post("/ask", tags=["Default"], response_model=AskResponse)
 def ask_question_api(
     request: QuestionRequest,
     agent_mode: Optional[bool] = Query(None),
@@ -746,7 +748,7 @@ def ask_question_api(
         )
     object.__setattr__(request, "profile_id", resolved_profile_id)
 
-    if not request.tool_hint:
+    if request.tool_hint == "dialogue_intel":
         route_state = {
             "profile_id": request.profile_id,
             "subscription_id": request.subscription_id,
@@ -755,36 +757,24 @@ def ask_question_api(
         if getattr(decision, "direct_response", False):
             response_text = decision.response_text or ""
             response_text = sanitize_response(response_text)
-            return AskLiteResponse(answer=response_text, sources=[])
+            answer_payload = AnswerPayload(response=response_text, sources=[], grounded=True, context_found=False)
+            return AskResponse(answer=answer_payload, current_session_id=session_id, debug={})
 
-    state = getattr(http_request.app.state, "rag_state", None) if http_request is not None else None
-    if state is None:
-        state = rag_state.get_app_state()
-    if state is None or state.qdrant_client is None or state.embedding_model is None:
-        raise HTTPException(
-            status_code=503,
-            detail=_error("RAG_UNAVAILABLE", "RAG system not initialized", {"correlation_id": correlation_id}),
-        )
+    session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
+    want_stream = bool(getattr(request, "stream", False) or stream)
+    result = execute_request(request, session_state, ctx, stream=want_stream, debug=bool(request.debug))
 
-    result = rag_v3.run(
-        query=request.query,
-        subscription_id=request.subscription_id,
-        profile_id=resolved_profile_id,
-        document_id=request.document_id,
-        tool_hint=request.tool_hint,
-        session_id=session_id,
-        user_id=request.user_id,
-        request_id=correlation_id,
-        llm_client=state.ollama_client,
-        qdrant_client=state.qdrant_client,
-        redis_client=state.redis_client,
-        embedder=state.embedding_model,
-        cross_encoder=getattr(state.reranker, "cross_encoder", None) or state.reranker,
+    if want_stream:
+        stream_iter = result.stream or []
+        return StreamingResponse(stream_iter, media_type="text/plain")
+
+    normalized = normalize_answer(result.answer)
+    answer_payload = AnswerPayload(**normalized)
+    return AskResponse(
+        answer=answer_payload,
+        current_session_id=session_id,
+        debug=result.debug or {},
     )
-
-    final_text = str(result.get("response") or "")
-    sources = _minimize_sources(result.get("sources") or [])
-    return AskLiteResponse(answer=final_text, sources=sources)
 
 
 @api_router.post("/askStream", tags=["Default"], deprecated=True)

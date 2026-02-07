@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from src.api.vector_store import build_collection_name
 from src.ask.models import EvidenceChunk
 from src.ask.retriever import DocWainRetriever
+from src.metadata.normalizer import ALLOWED_CHUNK_KINDS
 from src.services.retrieval.reranker import Reranker, RerankerConfig
 from src.utils.redis_cache import RedisJsonCache, hash_query
 
@@ -209,7 +210,7 @@ def run_agentic_rag(
 
     field_chunks: Dict[str, List[EvidenceChunk]] = {}
     for field, q in plan.retrieval_plan["field_queries"].items():
-        chunk_kinds = ["kv_chunk", "list_item_chunk", "section_chunk", "entity_fact_chunk"]
+        chunk_kinds = list(ALLOWED_CHUNK_KINDS)
         key = f"field:{field}:{subscription_id}:{profile_id}:{document_id}:{hash_query(q)}"
         field_chunks[field] = _cached_retrieve(key, q, chunk_kinds)
 

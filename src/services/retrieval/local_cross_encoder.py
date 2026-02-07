@@ -3,9 +3,8 @@ from __future__ import annotations
 import logging
 import math
 import re
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence
 
-import numpy as np
 from sklearn.feature_extraction.text import HashingVectorizer
 
 logger = logging.getLogger(__name__)

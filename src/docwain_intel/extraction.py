@@ -4,7 +4,7 @@ import hashlib
 import logging
 import re
 import time
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.pipeline_models import ExtractedDocument
