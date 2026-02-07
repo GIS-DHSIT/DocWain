@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
 from src.api.content_store import save_extracted_pickle
+from src.api.blob_store import blob_storage_configured
 from src.api.dataHandler import (
     extract_document_info,
     decrypt_data,
@@ -16,8 +17,10 @@ from src.api.dataHandler import (
     read_s3_file,
     resolve_subscription_id,
     update_extraction_metadata,
+    update_layout_graph_metadata,
     update_pii_stats,
 )
+from src.api.layout_graph_store import save_layout_graph, save_layout_graph_local
 from src.api.document_status import init_document_record, set_error, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
 from src.api.statuses import (
@@ -26,10 +29,46 @@ from src.api.statuses import (
     STATUS_EXTRACTION_FAILED,
     STATUS_UNDER_REVIEW,
 )
+from src.embedding.pipeline.payload_normalizer import normalize_chunk_metadata
 from src.storage.azure_blob_client import BlobDownloadError, CredentialError, normalize_blob_name
 from src.utils.idempotency import acquire_lock, release_lock
+from src.embedding.layout_graph import build_layout_graph
 
 logger = logging.getLogger(__name__)
+
+
+def _persist_layout_graph(
+    *,
+    document_id: str,
+    subscription_id: Optional[str],
+    profile_id: Optional[str],
+    extracted_docs: Any,
+) -> Optional[Dict[str, Any]]:
+    try:
+        file_name = "document"
+        content = extracted_docs
+        if isinstance(extracted_docs, dict) and extracted_docs:
+            file_name, content = next(iter(extracted_docs.items()))
+        layout_graph = build_layout_graph(content, document_id=document_id, file_name=file_name)
+        if blob_storage_configured():
+            info = save_layout_graph(
+                document_id=document_id,
+                layout_graph=layout_graph,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+            )
+        else:
+            info = save_layout_graph_local(document_id=document_id, layout_graph=layout_graph)
+        update_layout_graph_metadata(
+            document_id,
+            layout_latest_path=info.get("latest_path"),
+            layout_versioned_path=info.get("versioned_path"),
+            layout_hash=info.get("sha256"),
+        )
+        return info
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LayoutGraph persistence skipped for %s: %s", document_id, exc)
+        return None
 
 
 def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
@@ -72,6 +111,27 @@ def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
         "chars": total_chars,
         "language": None,
     }
+
+
+def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> Any:
+    if isinstance(extracted_docs, dict):
+        normalized: Dict[str, Any] = {}
+        for name, content in extracted_docs.items():
+            if isinstance(content, dict):
+                content = dict(content)
+                if isinstance(content.get("chunk_metadata"), list):
+                    content["chunk_metadata"] = normalize_chunk_metadata(
+                        content.get("chunk_metadata") or [],
+                        document_id=str(document_id),
+                    )
+                if content.get("document") is not None:
+                    content["document"] = _normalize_extracted_metadata(
+                        content.get("document"),
+                        document_id=document_id,
+                    )
+            normalized[name] = content
+        return normalized
+    return extracted_docs
 
 
 def _set_document_status(
@@ -214,6 +274,15 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                         )
                     masked_docs[fname] = content
 
+        masked_docs = _normalize_extracted_metadata(masked_docs, document_id=doc_id)
+
+        _persist_layout_graph(
+            document_id=doc_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            extracted_docs=masked_docs,
+        )
+
         try:
             save_info = save_extracted_pickle(doc_id, masked_docs)
             update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
@@ -324,6 +393,15 @@ def extract_uploaded_document(
         set_error(document_id, "extraction", exc)
         _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
         raise
+
+    extracted = _normalize_extracted_metadata(extracted, document_id=document_id)
+
+    _persist_layout_graph(
+        document_id=document_id,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        extracted_docs=extracted,
+    )
 
     try:
         save_info = save_extracted_pickle(document_id, extracted)

@@ -11,6 +11,7 @@ from qdrant_client.http.models import Filter
 logger = logging.getLogger(__name__)
 
 TEXT_FIELD_CANDIDATES = [
+    "canonical_text",
     "text",
     "content",
     "page_content",

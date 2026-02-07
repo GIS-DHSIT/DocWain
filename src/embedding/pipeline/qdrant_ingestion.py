@@ -9,6 +9,8 @@ from qdrant_client import QdrantClient
 from src.api.config import Config
 from src.api.pipeline_models import ChunkRecord
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
+from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
+from src.utils.payload_utils import get_canonical_text, token_count
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,9 @@ def _first_present(*values: Any) -> Optional[str]:
 
 def _merge_texts(raw_data: Dict[str, Any]) -> str:
     candidates = [
+        raw_data.get("canonical_text"),
         raw_data.get("text"),
+        raw_data.get("content"),
         (raw_data.get("text_data") or {}).get("clean"),
         raw_data.get("text_clean"),
     ]
@@ -82,7 +86,11 @@ def transform_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
         raw_data.get("docId"),
     )
 
-    content = _merge_texts(raw_data)
+    content = raw_data.get("content") or _merge_texts(raw_data)
+    canonical_text = get_canonical_text({"text": raw_data.get("text"), "content": content})
+    canonical_len = len(canonical_text) if canonical_text else 0
+    canonical_tokens = token_count(canonical_text) if canonical_text else 0
+    embedding_text = raw_data.get("embedding_text") or ensure_embedding_text(content or "", raw_data.get("doc_domain"), raw_data.get("section_kind"))
 
     source_file = _first_present(
         (raw_data.get("source") or {}).get("name"),
@@ -117,12 +125,34 @@ def transform_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     skills = extract_skills_stub(content)
 
+    chunk_id = raw_data.get("chunk_id") or (raw_data.get("chunk") or {}).get("id")
+    if not chunk_id and subscription_id and profile_id and document_id:
+        chunk_id = compute_chunk_id(
+            str(subscription_id),
+            str(profile_id),
+            str(document_id),
+            source_file or "unknown",
+            int(chunk_index or 0),
+            content or "",
+        )
+
     payload: Dict[str, Any] = {
         "subscription_id": subscription_id,
         "profile_id": profile_id,
         "document_id": document_id,
         "doc_id": document_id,
+        "source_name": source_file or "unknown",
+        "doc_domain": raw_data.get("doc_domain") or (raw_data.get("document") or {}).get("domain") or "unknown",
+        "section_kind": raw_data.get("section_kind") or "unknown",
+        "section_id": raw_data.get("section_id") or "unknown",
+        "chunk_id": chunk_id or "unknown",
+        "page": raw_data.get("page") or raw_data.get("page_start") or 0,
         "content": content,
+        "canonical_text": canonical_text,
+        "embedding_text": embedding_text,
+        "canonical_text_len": canonical_len,
+        "canonical_token_count": canonical_tokens,
+        "chunking_mode": raw_data.get("chunking_mode") or "external",
         "doc_type": doc_type,
         "metadata": {
             "source_file": source_file,
@@ -168,7 +198,7 @@ def ingest_payloads(
     transformed: List[Dict[str, Any]] = []
     for raw in raw_payloads:
         payload = transform_payload(raw)
-        if not payload.get("content"):
+        if not payload.get("canonical_text") and not payload.get("content"):
             logger.warning("Skipping payload without content (document_id=%s)", payload.get("document_id"))
             continue
         if not payload.get("subscription_id"):
@@ -182,7 +212,7 @@ def ingest_payloads(
     results: Dict[str, int] = {}
     for subscription_id, payloads in grouped.items():
         collection_name = build_collection_name(subscription_id)
-        contents = [p["content"] for p in payloads]
+        contents = [p.get("embedding_text") or p.get("canonical_text") or p.get("content") or "" for p in payloads]
         vectors = _ollama_embed(contents)
         vector_size = len(next((v for v in vectors if v), []))
         if not vector_size:
@@ -206,7 +236,7 @@ def ingest_payloads(
                 payload.get("document_id"),
                 source_file,
                 chunk_index_val,
-                payload.get("content") or "",
+                payload.get("canonical_text") or payload.get("content") or "",
             )
             payload["chunk_id"] = payload.get("chunk_id") or chunk_id
             records.append(

@@ -4,16 +4,17 @@ from qdrant_client.models import Filter
 
 from src.doc_understanding.identify import classify_document_type
 from src.retrieval.intent_router import IntentResult
-from src.retrieval.profile_query import build_grounded_answer, build_profile_filter
+from src.retrieval.profile_query import build_grounded_answer
+from src.api.vector_store import build_qdrant_filter
 
 
 def test_profile_filter_includes_subscription_and_profile():
-    filt = build_profile_filter("sub-1", "profile-1", ["invoice"])
+    filt = build_qdrant_filter("sub-1", "profile-1", doc_domain=["invoice"])
     assert isinstance(filt, Filter)
     keys = {condition.key for condition in filt.must}
     assert "subscription_id" in keys
     assert "profile_id" in keys
-    assert "document_type" in keys
+    assert "doc_domain" in keys
 
 
 def test_document_type_classification_invoice():

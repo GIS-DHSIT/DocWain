@@ -120,9 +120,10 @@ class GraphAugmenter:
             "UNWIND $names AS name "
             "MATCH (d:Document {profile_id: $profile_id, subscription_id: $subscription_id})"
             "-[:MENTIONS|HAS_FIELD]->(e:Entity) "
-            "WHERE e.normalized_name = name "
+            "WHERE e.subscription_id = $subscription_id AND e.profile_id = $profile_id "
+            "  AND (e.normalized_name = name "
             "   OR e.normalized_name CONTAINS name "
-            "   OR name CONTAINS e.normalized_name "
+            "   OR name CONTAINS e.normalized_name) "
             "RETURN e.entity_id AS entity_id, e.name AS name, e.type AS type, "
             "       collect(DISTINCT d.doc_id) AS doc_ids"
         )
@@ -164,7 +165,7 @@ class GraphAugmenter:
         one_hop_query = (
             "MATCH (d:Document {profile_id: $profile_id, subscription_id: $subscription_id})"
             "-[r:MENTIONS|HAS_FIELD]->(e:Entity) "
-            "WHERE e.entity_id IN $entity_ids "
+            "WHERE e.entity_id IN $entity_ids AND e.subscription_id = $subscription_id AND e.profile_id = $profile_id "
             "MATCH (d)-[r2:MENTIONS|HAS_FIELD]->(rel:Entity) "
             "RETURN rel.entity_id AS entity_id, rel.name AS name, rel.type AS type, "
             "       r2.chunk_id AS chunk_id, d.doc_id AS doc_id, d.doc_name AS doc_name, type(r2) AS relation "
@@ -191,7 +192,7 @@ class GraphAugmenter:
             two_hop_query = (
                 "MATCH (d1:Document {profile_id: $profile_id, subscription_id: $subscription_id})"
                 "-[:MENTIONS|HAS_FIELD]->(e:Entity) "
-                "WHERE e.entity_id IN $entity_ids "
+                "WHERE e.entity_id IN $entity_ids AND e.subscription_id = $subscription_id AND e.profile_id = $profile_id "
                 "MATCH (d1)-[:MENTIONS|HAS_FIELD]->(mid:Entity) "
                 "MATCH (d2:Document {profile_id: $profile_id, subscription_id: $subscription_id})"
                 "-[:MENTIONS|HAS_FIELD]->(mid) "

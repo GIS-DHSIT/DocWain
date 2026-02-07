@@ -45,21 +45,46 @@ class DummyQdrantClient:
     def _apply_filter(points: List[DummyPoint], scroll_filter: Any) -> List[DummyPoint]:
         if scroll_filter is None:
             return list(points)
+        def payload_lookup(payload: Dict[str, Any], key: str) -> Optional[str]:
+            parts = (key or "").split(".")
+            current: Any = payload
+            for part in parts:
+                if not isinstance(current, dict):
+                    return None
+                current = current.get(part)
+            return None if current is None else str(current)
 
-        must = getattr(scroll_filter, "must", None) or []
-        constraints = {}
-        for cond in must:
+        def match_condition(payload: Dict[str, Any], cond: Any) -> bool:
+            if cond is None:
+                return True
+            if hasattr(cond, "must") or hasattr(cond, "should"):
+                must = getattr(cond, "must", []) or []
+                should = getattr(cond, "should", []) or []
+                min_should = getattr(cond, "min_should", None)
+                if must and not all(match_condition(payload, item) for item in must):
+                    return False
+                if should:
+                    matched = sum(1 for item in should if match_condition(payload, item))
+                    required = getattr(min_should, "min_count", None)
+                    required = int(required) if required is not None else 1
+                    return matched >= required
+                return True
             key = getattr(cond, "key", None)
             match = getattr(cond, "match", None)
-            value = getattr(match, "value", None)
-            if key and value is not None:
-                constraints[str(key)] = str(value)
+            if not key or match is None:
+                return True
+            value = payload_lookup(payload, key)
+            if hasattr(match, "value"):
+                return value == str(getattr(match, "value"))
+            if hasattr(match, "any"):
+                return value in [str(v) for v in (getattr(match, "any") or [])]
+            return True
+
+        must = getattr(scroll_filter, "must", None) or []
 
         def ok(pt: DummyPoint) -> bool:
-            for key, value in constraints.items():
-                if str((pt.payload or {}).get(key) or "") != value:
-                    return False
-            return True
+            payload = pt.payload or {}
+            return all(match_condition(payload, cond) for cond in must)
 
         return [pt for pt in points if ok(pt)]
 
@@ -76,8 +101,12 @@ def test_get_all_profile_ids_returns_full_unique_sorted_universe():
         DummyPoint({"subscription_id": "sub-2", "profile_id": "other", "text": "x"}),  # other sub
     ]
     client = DummyQdrantClient(points)
-    profile_ids = get_all_profile_ids(client=client, subscription_id="sub-1", collection="sub-1")
-    assert profile_ids == ["p1", "p2", "p3", "p4", "p5", "p6"]
+    try:
+        get_all_profile_ids(client=client, subscription_id="sub-1", collection="sub-1")
+    except ValueError as exc:
+        assert "disabled" in str(exc).lower()
+    else:
+        raise AssertionError("Expected cross-profile discovery to be disabled")
 
 
 def test_extract_contacts_handles_separators_and_linkedin():
@@ -107,6 +136,7 @@ def test_contact_response_never_marks_present_fields_as_not_mentioned():
         subscription_id="sub-1",
         collection="sub-1",
         query="provide contact information of each candidate",
+        profile_id="p-dev",
     )
     assert resp is not None
     answer = resp.get("response") or ""
@@ -135,10 +165,10 @@ def test_rank_top_3_considers_full_universe():
         )
     client = DummyQdrantClient(points)
     resp = maybe_answer_multi_profile_deterministic(
-        client=client, subscription_id="sub-1", collection="sub-1", query="rank top 3 profiles"
+        client=client,
+        subscription_id="sub-1",
+        collection="sub-1",
+        query="rank top 3 profiles",
+        profile_id="p1",
     )
-    assert resp is not None
-    assert len(resp.get("candidate_universe") or []) == 6
-    answer = resp.get("response") or ""
-    assert "Top 3 profiles" in answer
-    assert answer.count(") ") >= 3
+    assert resp is None

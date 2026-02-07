@@ -8,9 +8,9 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from src.api.config import Config
-from src.api.vector_store import build_collection_name
+from src.api.vector_store import build_collection_name, build_qdrant_filter
 from src.retrieval.profile_document_index import ProfileDocumentIndex
-from src.utils.payload_utils import get_source_name
+from src.utils.payload_utils import get_canonical_text, get_source_name
 
 
 @dataclass
@@ -108,11 +108,9 @@ def _find_docs_with_identifiers(pdi: ProfileDocumentIndex, identifiers: Iterable
         return []
     client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
     collection = build_collection_name(pdi.subscription_id)
-    scroll_filter = Filter(
-        must=[
-            FieldCondition(key="subscription_id", match=MatchValue(value=str(pdi.subscription_id))),
-            FieldCondition(key="profile_id", match=MatchValue(value=str(pdi.profile_id))),
-        ]
+    scroll_filter = build_qdrant_filter(
+        subscription_id=str(pdi.subscription_id),
+        profile_id=str(pdi.profile_id),
     )
     offset: Optional[Any] = None
     matched_docs: set[str] = set()
@@ -127,12 +125,7 @@ def _find_docs_with_identifiers(pdi: ProfileDocumentIndex, identifiers: Iterable
         )
         for point in points:
             payload = point.payload or {}
-            text = (
-                payload.get("text_clean")
-                or (payload.get("text_data") or {}).get("clean")
-                or payload.get("text")
-                or ""
-            )
+            text = get_canonical_text(payload)
             lowered = text.lower()
             if any(token in lowered for token in identifiers_lower):
                 doc_id = payload.get("document_id")
@@ -147,12 +140,10 @@ def _find_docs_with_identifiers(pdi: ProfileDocumentIndex, identifiers: Iterable
 def fetch_document_corpus(subscription_id: str, profile_id: str, document_id: str) -> List[Dict[str, Any]]:
     client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
     collection = build_collection_name(subscription_id)
-    scroll_filter = Filter(
-        must=[
-            FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-            FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-            FieldCondition(key="document_id", match=MatchValue(value=str(document_id))),
-        ],
+    scroll_filter = build_qdrant_filter(
+        subscription_id=str(subscription_id),
+        profile_id=str(profile_id),
+        document_id=str(document_id),
     )
     offset: Optional[Any] = None
     corpus: List[Dict[str, Any]] = []
@@ -167,12 +158,7 @@ def fetch_document_corpus(subscription_id: str, profile_id: str, document_id: st
         )
         for point in points:
             payload = point.payload or {}
-            text = (
-                payload.get("text_clean")
-                or (payload.get("text_data") or {}).get("clean")
-                or payload.get("text")
-                or ""
-            )
+            text = get_canonical_text(payload)
             corpus.append(
                 {
                     "document_id": str(document_id),

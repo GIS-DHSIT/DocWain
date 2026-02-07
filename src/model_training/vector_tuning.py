@@ -27,7 +27,10 @@ def retrieve_embeddings_from_qdrant(tag):
             logging.warning("No relevant data found in Qdrant.")
             return None
 
-        texts = [point.payload["text"] for point in search_result[0] if "text" in point.payload]
+        from src.utils.payload_utils import get_canonical_text
+
+        texts = [get_canonical_text(point.payload or {}) for point in search_result[0]]
+        texts = [text for text in texts if text]
         embeddings = np.array([point.vector for point in search_result[0] if point.vector], dtype=np.float32)
 
         if embeddings.size == 0:

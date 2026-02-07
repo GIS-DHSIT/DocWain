@@ -8,8 +8,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
 from src.api.config import Config
-from src.api.dw_newron import get_redis_client
-from src.api.vector_store import build_collection_name
+from src.api.vector_store import build_collection_name, build_qdrant_filter
 from src.utils.payload_utils import get_document_type, get_source_name
 from src.utils.redis_cache import RedisJsonCache, stamp_cache_payload
 
@@ -81,12 +80,7 @@ class ProfileDocumentIndex:
 
 
 def _build_profile_filter(subscription_id: str, profile_id: str) -> Filter:
-    return Filter(
-        must=[
-            FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-            FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-        ],
-    )
+    return build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
 
 
 def _summarize_payload(payload: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]]:
@@ -102,6 +96,8 @@ def build_profile_document_index(subscription_id: str, profile_id: str) -> Profi
     cache_key = f"docwain:pdi:v1:{subscription_id}:{profile_id}"
     redis_client = None
     try:
+        from src.api.dw_newron import get_redis_client
+
         redis_client = get_redis_client()
     except Exception:  # noqa: BLE001
         redis_client = None

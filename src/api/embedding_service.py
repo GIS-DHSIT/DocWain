@@ -1,11 +1,12 @@
 import logging
 import os
 import pickle
+import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from qdrant_client.models import FieldCondition, Filter, MatchValue
 try:
     from bson import ObjectId
 except Exception:  # noqa: BLE001
@@ -22,6 +23,7 @@ from src.api.blob_store import (
 from src.api.config import Config
 from src.api.content_store import build_pickle_path, delete_extracted_pickle, load_extracted_pickle, save_extracted_pickle
 from src.api.dataHandler import (
+    ChunkingDiagnosticError,
     db,
     decrypt_data,
     fileProcessor,
@@ -42,14 +44,17 @@ from src.api.pipeline_models import ExtractedDocument
 from src.api.pii_masking import mask_document_content
 from src.api.statuses import (
     STATUS_EMBEDDING_COMPLETED,
+    STATUS_EXTRACTION_OR_CHUNKING_FAILED,
     STATUS_SCREENING_COMPLETED,
     STATUS_TRAINING_FAILED,
     STATUS_TRAINING_STARTED,
     STATUS_TRAINING_COMPLETED,
     STATUS_TRAINING_PARTIALLY_COMPLETED,
 )
-from src.api.vector_store import build_collection_name
+from src.api.vector_store import build_collection_name, build_qdrant_filter
 from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
+from src.embedding.model_loader import embed_request_context
+from src.embedding.pipeline.payload_normalizer import normalize_chunk_metadata
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
 from src.storage.azure_blob_client import normalize_blob_name
@@ -74,6 +79,92 @@ def _metrics_store():
     return get_metrics_store()
 
 
+def _truncate_error_message(message: Optional[str], limit: int = 500) -> str:
+    if not message:
+        return ""
+    text = str(message)
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 3)]}..."
+
+
+def _build_error_payload(
+    *,
+    stage: str,
+    message: str,
+    exc: Optional[Exception] = None,
+    details: Optional[Dict[str, Any]] = None,
+    run_id: Optional[str] = None,
+    code: Optional[Any] = None,
+) -> Dict[str, Any]:
+    error: Dict[str, Any] = {
+        "stage": stage,
+        "message": _truncate_error_message(message),
+        "code": code or getattr(exc, "code", None) or getattr(exc, "status_code", None),
+        "details": details or getattr(exc, "details", None),
+        "at": time.time(),
+        "run_id": run_id,
+    }
+    return {k: v for k, v in error.items() if v is not None}
+
+
+def _safe_update_stage(
+    document_id: str,
+    stage: str,
+    patch: Dict[str, Any],
+    *,
+    cause: Optional[Exception] = None,
+) -> None:
+    try:
+        update_stage(document_id, stage, patch)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to update stage %s for %s: %s", stage, document_id, exc, exc_info=True)
+        if cause:
+            logger.error("Original error for %s stage %s: %s", document_id, stage, cause, exc_info=True)
+
+
+def _safe_set_document_status(
+    document_id: str,
+    status: str,
+    error_msg: Optional[str] = None,
+    *,
+    error_summary: Optional[str] = None,
+    extra_fields: Optional[Dict[str, Any]] = None,
+    cause: Optional[Exception] = None,
+) -> None:
+    try:
+        _set_document_status(
+            document_id,
+            status,
+            error_msg,
+            error_summary=error_summary,
+            extra_fields=extra_fields,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to update document status for %s: %s", document_id, exc, exc_info=True)
+        if cause:
+            logger.error("Original error for %s status update: %s", document_id, cause, exc_info=True)
+
+
+def _build_failed_result(
+    *,
+    document_id: Optional[str],
+    blob_name: Optional[str],
+    error_message: str,
+    failed_reason: str = "training_failed",
+) -> Dict[str, Any]:
+    return {
+        "blob_name": blob_name,
+        "document_id": document_id,
+        "status": "FAILED",
+        "chunks_count": 0,
+        "points_upserted": 0,
+        "error": failed_reason,
+        "error_message": error_message,
+        "failed_reason": failed_reason,
+    }
+
+
 def _set_document_status(
     document_id: str,
     status: str,
@@ -86,6 +177,7 @@ def _set_document_status(
     if status == STATUS_TRAINING_STARTED:
         fields["training_started_at"] = now
     if error_msg:
+        error_msg = _truncate_error_message(error_msg)
         fields["training_error"] = error_msg
         fields["training_failed_at"] = now
     else:
@@ -435,6 +527,22 @@ def _normalize_content_in_place(content: Any) -> Any:
     return content
 
 
+def _normalize_metadata_in_place(content: Any, *, document_id: Optional[str]) -> Any:
+    if isinstance(content, dict):
+        if isinstance(content.get("chunk_metadata"), list):
+            content["chunk_metadata"] = normalize_chunk_metadata(
+                content.get("chunk_metadata") or [],
+                document_id=str(document_id) if document_id else None,
+            )
+        if content.get("document") is not None:
+            content["document"] = _normalize_metadata_in_place(
+                content.get("document"),
+                document_id=document_id,
+            )
+        return content
+    return content
+
+
 def _assess_extracted_docs(extracted_docs: Dict[str, Any]) -> Dict[str, Any]:
     total_chars = 0
     coverage_values: List[float] = []
@@ -587,6 +695,10 @@ def _prepare_extracted_docs(
     extracted_docs = _normalize_extracted_docs(extracted)
     for doc_name, content in list(extracted_docs.items()):
         extracted_docs[doc_name] = _normalize_content_in_place(content)
+        extracted_docs[doc_name] = _normalize_metadata_in_place(
+            extracted_docs[doc_name],
+            document_id=document_id,
+        )
 
     invalid_docs = [doc_name for doc_name, content in extracted_docs.items() if not _payload_has_required_schema(content)]
     if invalid_docs:
@@ -744,6 +856,33 @@ def _build_chunks_for_extracted_doc(
         except Exception:  # noqa: BLE001
             doc_ocr_confidence = None
 
+    try:
+        from src.embedding.layout_semantics import build_semantic_payloads
+        from src.api.layout_graph_store import load_layout_graph
+
+        layout_graph = load_layout_graph(document_id)
+        semantic = build_semantic_payloads(
+            layout_graph=layout_graph,
+            extracted=extracted,
+            document_id=str(document_id),
+            source_name=doc_name,
+        )
+        chunks = [normalize_text(chunk) for chunk in semantic.chunks if normalize_text(chunk)]
+        chunk_metadata = normalize_chunk_metadata(
+            list(semantic.chunk_metadata),
+            document_id=str(document_id),
+            default_doc_type=doc_type,
+            default_chunking_mode="layout_semantics",
+        )
+        dropped = max(0, len(semantic.chunks) - len(chunks))
+        full_text = normalize_text(extracted.full_text or "")
+        coverage_ratio = None
+        if full_text:
+            coverage_ratio = len("".join(chunks)) / max(1, len(full_text))
+        return chunks, chunk_metadata, coverage_ratio, dropped
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("LayoutGraph chunk preview failed for %s: %s", doc_name, exc)
+
     chunker = SectionChunker()
     try:
         section_chunks = chunker.chunk_document(extracted, doc_internal_id=document_id, source_filename=doc_name)
@@ -781,6 +920,13 @@ def _build_chunks_for_extracted_doc(
 
     if not chunks:
         raise ValueError(f"No chunk candidates extracted for {doc_name}")
+
+    chunk_metadata = normalize_chunk_metadata(
+        chunk_metadata,
+        document_id=str(document_id),
+        default_doc_type=doc_type,
+        default_chunking_mode="section_aware",
+    )
 
     full_text = normalize_text(extracted.full_text or "")
     coverage_ratio = None
@@ -824,6 +970,12 @@ def _build_chunks_for_extracted_doc(
                     }
                 )
             coverage_ratio = len("".join(chunks)) / max(1, len(full_text))
+            chunk_metadata = normalize_chunk_metadata(
+                chunk_metadata,
+                document_id=str(document_id),
+                default_doc_type=doc_type,
+                default_chunking_mode="section_aware",
+            )
 
     return chunks, chunk_metadata, coverage_ratio, dropped
 
@@ -931,11 +1083,10 @@ def _screen_payload(extracted_docs: Dict[str, Any], document_id: str) -> Tuple[i
 def _count_qdrant_points(subscription_id: str, profile_id: str, document_id: str, *, exact: bool = False) -> int:
     client = get_qdrant_client()
     collection_name = build_collection_name(subscription_id)
-    count_filter = Filter(
-        must=[
-            FieldCondition(key="document_id", match=MatchValue(value=str(document_id))),
-            FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-        ]
+    count_filter = build_qdrant_filter(
+        subscription_id=str(subscription_id),
+        profile_id=str(profile_id),
+        document_id=str(document_id),
     )
     result = client.count(collection_name=collection_name, count_filter=count_filter, exact=bool(exact))
     return int(getattr(result, "count", 0) or 0)
@@ -1001,6 +1152,7 @@ def _process_blob(
     subscription_id: Optional[str],
     profile_id: Optional[str],
     doc_type: Optional[str],
+    embed_request_id: Optional[str],
 ) -> Dict[str, Any]:
     telemetry = _telemetry()
     result = {
@@ -1013,6 +1165,15 @@ def _process_blob(
         "error": None,
         "failed_reason": None,
     }
+
+    request_ctx = embed_request_context(embed_request_id)
+    request_ctx.__enter__()
+    logger.info(
+        "embed_request_id=%s doc=%s embedding start blob=%s",
+        embed_request_id,
+        result.get("document_id"),
+        blob.name,
+    )
 
     lease_id = None
     lock = None
@@ -1033,11 +1194,18 @@ def _process_blob(
         except Exception as exc:  # noqa: BLE001
             if telemetry:
                 telemetry.increment("embed_pickles_download_fail_total")
+            error_message = _truncate_error_message(str(exc) or repr(exc))
             result["error"] = "blob_read_failed"
             result["failed_reason"] = "blob_read_failed"
             doc_id_hint = result.get("document_id")
             if doc_id_hint:
-                _set_document_status(doc_id_hint, STATUS_TRAINING_FAILED, str(exc), error_summary="blob_read_failed")
+                _safe_set_document_status(
+                    doc_id_hint,
+                    STATUS_TRAINING_FAILED,
+                    error_message,
+                    error_summary="blob_read_failed",
+                    cause=exc,
+                )
             return result
         logger.info("Downloaded pickle blob %s (bytes=%s)", blob.name, len(payload or b""))
 
@@ -1050,11 +1218,12 @@ def _process_blob(
             result["failed_reason"] = "blob_read_failed"
             doc_id_hint = result.get("document_id")
             if doc_id_hint:
-                _set_document_status(
+                _safe_set_document_status(
                     doc_id_hint,
                     STATUS_TRAINING_FAILED,
                     f"pickle_deserialize_failed: {exc}",
                     error_summary="blob_read_failed",
+                    cause=exc,
                 )
             return result
 
@@ -1088,7 +1257,14 @@ def _process_blob(
                 or record.get("profile"),
             )
         except Exception as exc:  # noqa: BLE001
-            _set_document_status(doc_id, STATUS_TRAINING_FAILED, str(exc), error_summary="resolve_ids_failed")
+            error_message = _truncate_error_message(str(exc) or repr(exc))
+            _safe_set_document_status(
+                doc_id,
+                STATUS_TRAINING_FAILED,
+                error_message,
+                error_summary="resolve_ids_failed",
+                cause=exc,
+            )
             result["error"] = "resolve_ids_failed"
             result["failed_reason"] = "resolve_ids_failed"
             return result
@@ -1137,17 +1313,28 @@ def _process_blob(
                 "empty_extraction": "empty extraction",
                 "chunking_failed": "chunking failed",
             }.get(reason, "embedding preparation failed")
-            update_stage(
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=message,
+                run_id=embed_request_id,
+                code=reason,
+            )
+            _safe_update_stage(
                 doc_id,
                 "embedding",
                 {
                     "status": "FAILED",
                     "completed_at": time.time(),
                     "reason": reason,
-                    "error": {"message": message},
+                    "error": error_payload,
                 },
             )
-            _set_document_status(doc_id, STATUS_TRAINING_FAILED, message, error_summary=reason)
+            _safe_set_document_status(
+                doc_id,
+                STATUS_TRAINING_FAILED,
+                message,
+                error_summary=reason,
+            )
             result["error"] = reason
             result["error_message"] = message
             result["failed_reason"] = reason
@@ -1179,17 +1366,33 @@ def _process_blob(
                 },
             )
             _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
-            deleted = store.delete_blob(blob.name, lease=lease_id)
+            deleted = False
+            try:
+                deleted = store.delete_blob(blob.name, lease=lease_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embed_request_id=%s doc=%s blob delete failed: %s",
+                    embed_request_id,
+                    doc_id,
+                    exc,
+                )
             if telemetry:
                 telemetry.increment("embed_pickles_deleted_total" if deleted else "embed_pickles_delete_fail_total")
-            update_stage(
+            _safe_update_stage(
                 doc_id,
                 "cleanup",
                 {
                     "pickle_deleted": deleted,
                     "deleted_at": time.time() if deleted else None,
                     "cleanup_pending": not deleted,
-                    "error": None if deleted else {"message": "blob_delete_failed"},
+                    "error": None
+                    if deleted
+                    else _build_error_payload(
+                        stage="cleanup",
+                        message="blob_delete_failed",
+                        run_id=embed_request_id,
+                        details={"message": "blob_delete_failed"},
+                    ),
                 },
             )
             result["status"] = "SKIPPED"
@@ -1220,12 +1423,25 @@ def _process_blob(
                 except Exception as exc:  # noqa: BLE001
                     if _is_meta_tensor_error(exc):
                         logger.warning(
-                            "Meta tensor error during training for %s; forcing CPU reload and retrying once",
+                            "embed_request_id=%s doc=%s meta tensor error; retrying on cpu",
+                            embed_request_id,
                             doc_id,
                         )
                         try:
                             get_model(reload=True, device="cpu")
-                            embed_result = train_on_document(content, subscription_id, profile_id, doc_id, file_name)
+                            embed_result = train_on_document(
+                                content,
+                                subscription_id,
+                                profile_id,
+                                doc_id,
+                                file_name,
+                                device="cpu",
+                            )
+                            logger.info(
+                                "embed_request_id=%s doc=%s cpu fallback succeeded",
+                                embed_request_id,
+                                doc_id,
+                            )
                         except Exception as retry_exc:  # noqa: BLE001
                             raise retry_exc from exc
                     else:
@@ -1236,17 +1452,81 @@ def _process_blob(
                 ratio = embed_result.get("coverage_ratio")
                 if isinstance(ratio, (int, float)):
                     coverage_values.append(float(ratio))
-        except Exception as exc:  # noqa: BLE001
-            if telemetry:
-                telemetry.increment("embed_qdrant_upsert_fail_total")
-            update_stage(
+        except ChunkingDiagnosticError as exc:
+            error_message = _truncate_error_message(str(exc) or repr(exc))
+            diagnostics = exc.diagnostics or {}
+            logger.error(
+                "embed_request_id=%s doc=%s chunking diagnostics failed: %s",
+                embed_request_id,
+                doc_id,
+                exc,
+                exc_info=True,
+            )
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_message,
+                exc=exc,
+                details=diagnostics,
+                run_id=embed_request_id,
+                code="extraction_or_chunking_failed",
+            )
+            _safe_update_stage(
                 doc_id,
                 "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
+                {
+                    "status": "FAILED",
+                    "completed_at": time.time(),
+                    "reason": "extraction_or_chunking_failed",
+                    "error": error_payload,
+                    "diagnostics": diagnostics,
+                },
+                cause=exc,
             )
-            _set_document_status(doc_id, STATUS_TRAINING_FAILED, str(exc), error_summary="training_failed")
+            _safe_set_document_status(
+                doc_id,
+                STATUS_EXTRACTION_OR_CHUNKING_FAILED,
+                error_message,
+                error_summary="extraction_or_chunking_failed",
+                cause=exc,
+            )
+            result["error"] = "extraction_or_chunking_failed"
+            result["error_message"] = error_message
+            result["failed_reason"] = "extraction_or_chunking_failed"
+            result["diagnostics"] = diagnostics
+            return result
+        except Exception as exc:  # noqa: BLE001
+            error_message = _truncate_error_message(str(exc) or repr(exc))
+            if telemetry:
+                telemetry.increment("embed_qdrant_upsert_fail_total")
+            logger.error(
+                "embed_request_id=%s doc=%s embedding failed: %s",
+                embed_request_id,
+                doc_id,
+                exc,
+                exc_info=True,
+            )
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_message,
+                exc=exc,
+                run_id=embed_request_id,
+                code="training_failed",
+            )
+            _safe_update_stage(
+                doc_id,
+                "embedding",
+                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
+                cause=exc,
+            )
+            _safe_set_document_status(
+                doc_id,
+                STATUS_TRAINING_FAILED,
+                error_message,
+                error_summary="training_failed",
+                cause=exc,
+            )
             result["error"] = "training_failed"
-            result["error_message"] = str(exc)
+            result["error_message"] = error_message
             result["failed_reason"] = "training_failed"
             return result
 
@@ -1254,12 +1534,23 @@ def _process_blob(
             error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
             if telemetry:
                 telemetry.increment("embed_qdrant_upsert_fail_total")
-            update_stage(
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_msg,
+                run_id=embed_request_id,
+                code="qdrant_upsert_failed",
+            )
+            _safe_update_stage(
                 doc_id,
                 "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": {"message": error_msg}},
+                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
             )
-            _set_document_status(doc_id, STATUS_TRAINING_FAILED, error_msg, error_summary="qdrant_upsert_failed")
+            _safe_set_document_status(
+                doc_id,
+                STATUS_TRAINING_FAILED,
+                error_msg,
+                error_summary="qdrant_upsert_failed",
+            )
             result["error"] = "qdrant_upsert_failed"
             result["error_message"] = error_msg
             result["failed_reason"] = "qdrant_upsert_failed"
@@ -1298,46 +1589,74 @@ def _process_blob(
         cleanup_allowed = True
         cleanup_error: Optional[Dict[str, Any]] = None
         if subscription_id and profile_id:
-            post_count, cleanup_allowed = _verify_post_upsert_count(
-                subscription_id=subscription_id,
-                profile_id=profile_id,
-                document_id=doc_id,
-                expected_chunks=total_chunks,
-            )
-            if post_count is not None:
-                logger.info("Post-upsert Qdrant points for %s: %s", doc_id, post_count)
-            if not cleanup_allowed:
-                cleanup_error = (
-                    {"message": "post_upsert_count_unavailable"}
-                    if post_count is None
-                    else {
-                        "message": "post_upsert_count_mismatch",
-                        "post_count": post_count,
-                        "expected": total_chunks,
-                    }
+            try:
+                post_count, cleanup_allowed = _verify_post_upsert_count(
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    document_id=doc_id,
+                    expected_chunks=total_chunks,
                 )
+                if post_count is not None:
+                    logger.info("Post-upsert Qdrant points for %s: %s", doc_id, post_count)
+                if not cleanup_allowed:
+                    cleanup_error = (
+                        {"message": "post_upsert_count_unavailable"}
+                        if post_count is None
+                        else {
+                            "message": "post_upsert_count_mismatch",
+                            "post_count": post_count,
+                            "expected": total_chunks,
+                        }
+                    )
+                    logger.warning(
+                        "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
+                        doc_id,
+                        post_count,
+                        total_chunks,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_allowed = False
+                cleanup_error = {"message": "post_upsert_count_failed"}
                 logger.warning(
-                    "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
+                    "embed_request_id=%s doc=%s post-upsert count failed: %s",
+                    embed_request_id,
                     doc_id,
-                    post_count,
-                    total_chunks,
+                    exc,
                 )
 
         deleted = False
         if cleanup_allowed:
-            deleted = store.delete_blob(blob.name, lease=lease_id)
+            try:
+                deleted = store.delete_blob(blob.name, lease=lease_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embed_request_id=%s doc=%s blob delete failed: %s",
+                    embed_request_id,
+                    doc_id,
+                    exc,
+                )
+                deleted = False
             if telemetry:
                 telemetry.increment("embed_pickles_deleted_total" if deleted else "embed_pickles_delete_fail_total")
             if not deleted:
                 cleanup_error = {"message": "blob_delete_failed"}
-        update_stage(
+        cleanup_payload = None
+        if not deleted:
+            cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
+            cleanup_payload = _build_error_payload(
+                stage="cleanup",
+                message=cleanup_details.get("message", "cleanup_deferred"),
+                run_id=embed_request_id,
+                details=cleanup_details,
+            )
+        _safe_update_stage(
             doc_id,
             "cleanup",
             {
                 "pickle_deleted": deleted,
                 "deleted_at": time.time() if deleted else None,
                 "cleanup_pending": not deleted,
-                "error": None if deleted else cleanup_error or {"message": "cleanup_deferred"},
+                "error": cleanup_payload,
             },
         )
 
@@ -1347,11 +1666,56 @@ def _process_blob(
         result["points_upserted"] = total_upserted
         result["failed_reason"] = None
         return result
+    except Exception as exc:  # noqa: BLE001
+        error_message = _truncate_error_message(str(exc) or repr(exc))
+        logger.error(
+            "embed_request_id=%s doc=%s embedding failed: %s",
+            embed_request_id,
+            result.get("document_id"),
+            exc,
+            exc_info=True,
+        )
+        result["error"] = "training_failed"
+        result["error_message"] = error_message
+        result["failed_reason"] = "training_failed"
+        doc_id_hint = result.get("document_id")
+        if doc_id_hint:
+            _safe_set_document_status(
+                doc_id_hint,
+                STATUS_TRAINING_FAILED,
+                error_message,
+                error_summary="training_failed",
+                cause=exc,
+            )
+        return result
     finally:
         if lease_id:
-            store.release_lease(blob.name, lease_id)
+            try:
+                store.release_lease(blob.name, lease_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embed_request_id=%s doc=%s lease release failed: %s",
+                    embed_request_id,
+                    result.get("document_id"),
+                    exc,
+                )
         if lock and lock.acquired:
-            release_lock(lock)
+            try:
+                release_lock(lock)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embed_request_id=%s doc=%s lock release failed: %s",
+                    embed_request_id,
+                    result.get("document_id"),
+                    exc,
+                )
+        logger.info(
+            "embed_request_id=%s doc=%s embedding end status=%s",
+            embed_request_id,
+            result.get("document_id"),
+            result.get("status"),
+        )
+        request_ctx.__exit__(*sys.exc_info())
 
 
 def _process_local_document(
@@ -1360,6 +1724,7 @@ def _process_local_document(
     subscription_id: Optional[str],
     profile_id: Optional[str],
     doc_type: Optional[str],
+    embed_request_id: Optional[str],
 ) -> Dict[str, Any]:
     result = {
         "blob_name": f"{document_id}.pkl",
@@ -1371,17 +1736,42 @@ def _process_local_document(
         "failed_reason": None,
     }
 
-    record = get_document_record(document_id) or {}
+    request_ctx = embed_request_context(embed_request_id)
+    request_ctx.__enter__()
+    logger.info(
+        "embed_request_id=%s doc=%s embedding start local",
+        embed_request_id,
+        document_id,
+    )
+
+    def _early_return(res: Dict[str, Any]) -> Dict[str, Any]:
+        logger.info(
+            "embed_request_id=%s doc=%s embedding end status=%s",
+            embed_request_id,
+            document_id,
+            res.get("status"),
+        )
+        request_ctx.__exit__(None, None, None)
+        return res
+
+    try:
+        record = get_document_record(document_id) or {}
+    except Exception as exc:  # noqa: BLE001
+        error_message = _truncate_error_message(str(exc) or repr(exc))
+        result["error"] = "document_record_failed"
+        result["error_message"] = error_message
+        result["failed_reason"] = "document_record_failed"
+        return _early_return(result)
     current_status = record.get("status")
     if current_status in COMPLETED_STATUSES:
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
-        return result
+        return _early_return(result)
     if current_status != STATUS_SCREENING_COMPLETED:
         result["status"] = "SKIPPED"
         result["error"] = "screening_not_completed"
         result["failed_reason"] = "screening_not_completed"
-        return result
+        return _early_return(result)
 
     try:
         subscription_id = resolve_subscription_id(
@@ -1396,11 +1786,18 @@ def _process_local_document(
             profile_id or record.get("profile_id") or record.get("profileId") or record.get("profile"),
         )
     except Exception as exc:  # noqa: BLE001
-        _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="resolve_ids_failed")
+        error_message = _truncate_error_message(str(exc) or repr(exc))
+        _safe_set_document_status(
+            document_id,
+            STATUS_TRAINING_FAILED,
+            error_message,
+            error_summary="resolve_ids_failed",
+            cause=exc,
+        )
         result["error"] = "resolve_ids_failed"
-        result["error_message"] = str(exc)
+        result["error_message"] = error_message
         result["failed_reason"] = "resolve_ids_failed"
-        return result
+        return _early_return(result)
 
     lock = acquire_lock(stage="embedding", document_id=document_id, subscription_id=subscription_id)
     if not lock.acquired:
@@ -1408,7 +1805,7 @@ def _process_local_document(
         result["status"] = "SKIPPED"
         result["error"] = "duplicate_embedding_in_progress"
         result["failed_reason"] = "duplicate_embedding_in_progress"
-        return result
+        return _early_return(result)
 
     _set_document_status(document_id, STATUS_TRAINING_STARTED)
 
@@ -1422,14 +1819,36 @@ def _process_local_document(
         try:
             extracted = load_extracted_pickle(document_id)
         except Exception as exc:  # noqa: BLE001
-            update_stage(
+            error_message = _truncate_error_message(str(exc) or repr(exc))
+            logger.error(
+                "embed_request_id=%s doc=%s load pickle failed: %s",
+                embed_request_id,
+                document_id,
+                exc,
+                exc_info=True,
+            )
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_message,
+                exc=exc,
+                run_id=embed_request_id,
+                code="blob_read_failed",
+            )
+            _safe_update_stage(
                 document_id,
                 "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
+                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
+                cause=exc,
             )
-            _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="blob_read_failed")
+            _safe_set_document_status(
+                document_id,
+                STATUS_TRAINING_FAILED,
+                error_message,
+                error_summary="blob_read_failed",
+                cause=exc,
+            )
             result["error"] = "blob_read_failed"
-            result["error_message"] = str(exc)
+            result["error_message"] = error_message
             result["failed_reason"] = "blob_read_failed"
             return result
 
@@ -1445,17 +1864,28 @@ def _process_local_document(
                 "empty_extraction": "empty extraction",
                 "chunking_failed": "chunking failed",
             }.get(reason, "embedding preparation failed")
-            update_stage(
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=message,
+                run_id=embed_request_id,
+                code=reason,
+            )
+            _safe_update_stage(
                 document_id,
                 "embedding",
                 {
                     "status": "FAILED",
                     "completed_at": time.time(),
                     "reason": reason,
-                    "error": {"message": message},
+                    "error": error_payload,
                 },
             )
-            _set_document_status(document_id, STATUS_TRAINING_FAILED, message, error_summary=reason)
+            _safe_set_document_status(
+                document_id,
+                STATUS_TRAINING_FAILED,
+                message,
+                error_summary=reason,
+            )
             result["error"] = reason
             result["error_message"] = message
             result["failed_reason"] = reason
@@ -1475,12 +1905,25 @@ def _process_local_document(
                 except Exception as exc:  # noqa: BLE001
                     if _is_meta_tensor_error(exc):
                         logger.warning(
-                            "Meta tensor error during training for %s; forcing CPU reload and retrying once",
+                            "embed_request_id=%s doc=%s meta tensor error; retrying on cpu",
+                            embed_request_id,
                             document_id,
                         )
                         try:
                             get_model(reload=True, device="cpu")
-                            embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
+                            embed_result = train_on_document(
+                                content,
+                                subscription_id,
+                                profile_id,
+                                document_id,
+                                file_name,
+                                device="cpu",
+                            )
+                            logger.info(
+                                "embed_request_id=%s doc=%s cpu fallback succeeded",
+                                embed_request_id,
+                                document_id,
+                            )
                         except Exception as retry_exc:  # noqa: BLE001
                             raise retry_exc from exc
                     else:
@@ -1491,26 +1934,101 @@ def _process_local_document(
                 ratio = embed_result.get("coverage_ratio")
                 if isinstance(ratio, (int, float)):
                     coverage_values.append(float(ratio))
-        except Exception as exc:  # noqa: BLE001
-            update_stage(
+        except ChunkingDiagnosticError as exc:
+            error_message = _truncate_error_message(str(exc) or repr(exc))
+            diagnostics = exc.diagnostics or {}
+            logger.error(
+                "embed_request_id=%s doc=%s chunking diagnostics failed: %s",
+                embed_request_id,
+                document_id,
+                exc,
+                exc_info=True,
+            )
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_message,
+                exc=exc,
+                details=diagnostics,
+                run_id=embed_request_id,
+                code="extraction_or_chunking_failed",
+            )
+            _safe_update_stage(
                 document_id,
                 "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": {"message": str(exc)}},
+                {
+                    "status": "FAILED",
+                    "completed_at": time.time(),
+                    "reason": "extraction_or_chunking_failed",
+                    "error": error_payload,
+                    "diagnostics": diagnostics,
+                },
+                cause=exc,
             )
-            _set_document_status(document_id, STATUS_TRAINING_FAILED, str(exc), error_summary="training_failed")
+            _safe_set_document_status(
+                document_id,
+                STATUS_EXTRACTION_OR_CHUNKING_FAILED,
+                error_message,
+                error_summary="extraction_or_chunking_failed",
+                cause=exc,
+            )
+            result["error"] = "extraction_or_chunking_failed"
+            result["error_message"] = error_message
+            result["failed_reason"] = "extraction_or_chunking_failed"
+            result["diagnostics"] = diagnostics
+            return result
+        except Exception as exc:  # noqa: BLE001
+            error_message = _truncate_error_message(str(exc) or repr(exc))
+            logger.error(
+                "embed_request_id=%s doc=%s embedding failed: %s",
+                embed_request_id,
+                document_id,
+                exc,
+                exc_info=True,
+            )
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_message,
+                exc=exc,
+                run_id=embed_request_id,
+                code="training_failed",
+            )
+            _safe_update_stage(
+                document_id,
+                "embedding",
+                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
+                cause=exc,
+            )
+            _safe_set_document_status(
+                document_id,
+                STATUS_TRAINING_FAILED,
+                error_message,
+                error_summary="training_failed",
+                cause=exc,
+            )
             result["error"] = "training_failed"
-            result["error_message"] = str(exc)
+            result["error_message"] = error_message
             result["failed_reason"] = "training_failed"
             return result
 
         if total_chunks != total_upserted:
             error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
-            update_stage(
+            error_payload = _build_error_payload(
+                stage="embedding",
+                message=error_msg,
+                run_id=embed_request_id,
+                code="qdrant_upsert_failed",
+            )
+            _safe_update_stage(
                 document_id,
                 "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": {"message": error_msg}},
+                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
             )
-            _set_document_status(document_id, STATUS_TRAINING_FAILED, error_msg, error_summary="qdrant_upsert_failed")
+            _safe_set_document_status(
+                document_id,
+                STATUS_TRAINING_FAILED,
+                error_msg,
+                error_summary="qdrant_upsert_failed",
+            )
             result["error"] = "qdrant_upsert_failed"
             result["error_message"] = error_msg
             result["failed_reason"] = "qdrant_upsert_failed"
@@ -1549,44 +2067,72 @@ def _process_local_document(
         cleanup_allowed = True
         cleanup_error: Optional[Dict[str, Any]] = None
         if subscription_id and profile_id:
-            post_count, cleanup_allowed = _verify_post_upsert_count(
-                subscription_id=subscription_id,
-                profile_id=profile_id,
-                document_id=document_id,
-                expected_chunks=total_chunks,
-            )
-            if post_count is not None:
-                logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
-            if not cleanup_allowed:
-                cleanup_error = (
-                    {"message": "post_upsert_count_unavailable"}
-                    if post_count is None
-                    else {
-                        "message": "post_upsert_count_mismatch",
-                        "post_count": post_count,
-                        "expected": total_chunks,
-                    }
+            try:
+                post_count, cleanup_allowed = _verify_post_upsert_count(
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    document_id=document_id,
+                    expected_chunks=total_chunks,
                 )
+                if post_count is not None:
+                    logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
+                if not cleanup_allowed:
+                    cleanup_error = (
+                        {"message": "post_upsert_count_unavailable"}
+                        if post_count is None
+                        else {
+                            "message": "post_upsert_count_mismatch",
+                            "post_count": post_count,
+                            "expected": total_chunks,
+                        }
+                    )
+                    logger.warning(
+                        "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
+                        document_id,
+                        post_count,
+                        total_chunks,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                cleanup_allowed = False
+                cleanup_error = {"message": "post_upsert_count_failed"}
                 logger.warning(
-                    "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
+                    "embed_request_id=%s doc=%s post-upsert count failed: %s",
+                    embed_request_id,
                     document_id,
-                    post_count,
-                    total_chunks,
+                    exc,
                 )
 
         deleted = False
         if cleanup_allowed:
-            deleted = delete_extracted_pickle(document_id)
+            try:
+                deleted = delete_extracted_pickle(document_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embed_request_id=%s doc=%s local pickle delete failed: %s",
+                    embed_request_id,
+                    document_id,
+                    exc,
+                )
+                deleted = False
             if not deleted:
                 cleanup_error = {"message": "local_pickle_delete_failed"}
-        update_stage(
+        cleanup_payload = None
+        if not deleted:
+            cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
+            cleanup_payload = _build_error_payload(
+                stage="cleanup",
+                message=cleanup_details.get("message", "cleanup_deferred"),
+                run_id=embed_request_id,
+                details=cleanup_details,
+            )
+        _safe_update_stage(
             document_id,
             "cleanup",
             {
                 "pickle_deleted": deleted,
                 "deleted_at": time.time() if deleted else None,
                 "cleanup_pending": not deleted,
-                "error": None if deleted else cleanup_error or {"message": "cleanup_deferred"},
+                "error": cleanup_payload,
             },
         )
 
@@ -1596,9 +2142,44 @@ def _process_local_document(
         result["points_upserted"] = total_upserted
         result["failed_reason"] = None
         return result
+    except Exception as exc:  # noqa: BLE001
+        error_message = _truncate_error_message(str(exc) or repr(exc))
+        logger.error(
+            "embed_request_id=%s doc=%s embedding failed: %s",
+            embed_request_id,
+            document_id,
+            exc,
+            exc_info=True,
+        )
+        result["error"] = "training_failed"
+        result["error_message"] = error_message
+        result["failed_reason"] = "training_failed"
+        _safe_set_document_status(
+            document_id,
+            STATUS_TRAINING_FAILED,
+            error_message,
+            error_summary="training_failed",
+            cause=exc,
+        )
+        return result
     finally:
         if lock and lock.acquired:
-            release_lock(lock)
+            try:
+                release_lock(lock)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "embed_request_id=%s doc=%s lock release failed: %s",
+                    embed_request_id,
+                    document_id,
+                    exc,
+                )
+        logger.info(
+            "embed_request_id=%s doc=%s embedding end status=%s",
+            embed_request_id,
+            document_id,
+            result.get("status"),
+        )
+        request_ctx.__exit__(*sys.exc_info())
 
 
 def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1613,13 +2194,24 @@ def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         reason = str(entry.get("failed_reason") or entry.get("error") or "unknown_failure")
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
 
+    if not results:
+        overall_status = "EMPTY"
+    elif succeeded and not failed:
+        overall_status = "COMPLETED"
+    elif failed and not succeeded:
+        overall_status = "FAILED"
+    else:
+        overall_status = "PARTIAL"
+
     return {
+        "overall_status": overall_status,
         "documents_processed": processed,
         "documents_succeeded": len(succeeded),
         "documents_failed": len(failed),
         "total_chunks": total_chunks,
         "total_points_upserted": total_points,
         "failure_reasons": reason_counts,
+        "documents": results,
     }
 
 
@@ -1631,6 +2223,7 @@ def _embed_from_local_pickles(
     profile_id: Optional[str],
     doc_type: Optional[str],
     max_blobs: Optional[int],
+    embed_request_id: Optional[str],
 ) -> Dict[str, Any]:
     logger.warning("Blob storage not configured; using local pickles (deprecated).")
     requested_ids = _normalize_requested_ids(document_id, document_ids)
@@ -1655,19 +2248,45 @@ def _embed_from_local_pickles(
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(ordered_ids))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(
+        future_map = {}
+        for index, doc_id in enumerate(ordered_ids):
+            future = executor.submit(
                 _process_local_document,
                 document_id=doc_id,
                 subscription_id=subscription_id,
                 profile_id=profile_id,
                 doc_type=doc_type,
-            ): index
-            for index, doc_id in enumerate(ordered_ids)
-        }
+                embed_request_id=embed_request_id,
+            )
+            future_map[future] = {"index": index, "document_id": doc_id}
         for future in as_completed(future_map):
-            index = future_map[future]
-            results_by_index[index] = future.result()
+            info = future_map[future]
+            index = info["index"]
+            doc_id = info["document_id"]
+            try:
+                results_by_index[index] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                error_message = _truncate_error_message(str(exc) or repr(exc))
+                logger.error(
+                    "embed_request_id=%s doc=%s embedding failed: %s",
+                    embed_request_id,
+                    doc_id,
+                    exc,
+                    exc_info=True,
+                )
+                if doc_id:
+                    _safe_set_document_status(
+                        doc_id,
+                        STATUS_TRAINING_FAILED,
+                        error_message,
+                        error_summary="training_failed",
+                        cause=exc,
+                    )
+                results_by_index[index] = _build_failed_result(
+                    document_id=doc_id,
+                    blob_name=f"{doc_id}.pkl",
+                    error_message=error_message,
+                )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     return _build_embed_summary(results)
@@ -1682,6 +2301,8 @@ def embed_documents(
     doc_type: Optional[str] = None,
     max_blobs: Optional[int] = None,
 ) -> Dict[str, Any]:
+    embed_request_id = str(uuid.uuid4())
+    logger.info("embed_request_id=%s embedding request received", embed_request_id)
     if not blob_storage_configured():
         return _embed_from_local_pickles(
             document_id=document_id,
@@ -1690,6 +2311,7 @@ def embed_documents(
             profile_id=profile_id,
             doc_type=doc_type,
             max_blobs=max_blobs,
+            embed_request_id=embed_request_id,
         )
 
     requested_ids = _normalize_requested_ids(document_id, document_ids)
@@ -1720,20 +2342,48 @@ def embed_documents(
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(blob_candidates))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(
+        future_map = {}
+        for index, blob in enumerate(blob_candidates):
+            future = executor.submit(
                 _process_blob,
                 store=store,
                 blob=blob,
                 subscription_id=subscription_id,
                 profile_id=profile_id,
                 doc_type=doc_type,
-            ): index
-            for index, blob in enumerate(blob_candidates)
-        }
+                embed_request_id=embed_request_id,
+            )
+            doc_id_hint = (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=store.prefix)
+            future_map[future] = {"index": index, "blob": blob, "document_id": doc_id_hint}
         for future in as_completed(future_map):
-            index = future_map[future]
-            results_by_index[index] = future.result()
+            info = future_map[future]
+            index = info["index"]
+            doc_id = info["document_id"]
+            blob = info["blob"]
+            try:
+                results_by_index[index] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                error_message = _truncate_error_message(str(exc) or repr(exc))
+                logger.error(
+                    "embed_request_id=%s doc=%s embedding failed: %s",
+                    embed_request_id,
+                    doc_id,
+                    exc,
+                    exc_info=True,
+                )
+                if doc_id:
+                    _safe_set_document_status(
+                        doc_id,
+                        STATUS_TRAINING_FAILED,
+                        error_message,
+                        error_summary="training_failed",
+                        cause=exc,
+                    )
+                results_by_index[index] = _build_failed_result(
+                    document_id=doc_id,
+                    blob_name=getattr(blob, "name", None),
+                    error_message=error_message,
+                )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     for _entry in results:

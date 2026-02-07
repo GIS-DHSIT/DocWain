@@ -212,6 +212,8 @@ class DocumentExtractor:
         tables: List[Table],
         figures: List[Figure],
         chunk_candidates: List[ChunkCandidate],
+        layout_blocks: Optional[List[Dict[str, Any]]] = None,
+        page_dims: Optional[Dict[int, Dict[str, float]]] = None,
     ) -> Dict[str, Any]:
         key_values: List[Dict[str, Any]] = []
         for section in sections:
@@ -236,7 +238,7 @@ class DocumentExtractor:
             for cand in chunk_candidates
             if cand.text
         ]
-        return {
+        payload: Dict[str, Any] = {
             "pages": pages,
             "sections": [
                 {
@@ -258,6 +260,11 @@ class DocumentExtractor:
             "key_value_pairs": key_values,
             "layout_spans": layout_spans,
         }
+        if layout_blocks:
+            payload["layout_blocks"] = layout_blocks
+        if page_dims:
+            payload["page_dims"] = page_dims
+        return payload
 
     @staticmethod
     def _dedupe_page_lines(pages: Dict[int, List[str]]) -> Tuple[Dict[int, List[str]], List[str], List[str]]:
@@ -300,6 +307,8 @@ class DocumentExtractor:
         ocr_confidences: List[float] = []
         pages_map: Dict[int, List[str]] = {}
         ocr_targets: List[Dict[str, Any]] = []
+        layout_blocks: List[Dict[str, Any]] = []
+        page_dims: Dict[int, Dict[str, float]] = {}
 
         current_title = "Introduction"
         current_section_id = self._make_section_id(current_title, 1)
@@ -312,6 +321,10 @@ class DocumentExtractor:
                 with fitz.open(stream=pdf_content, filetype="pdf") as doc:
                     for page_index, page in enumerate(doc, start=1):
                         last_page = page_index
+                        try:
+                            page_dims[page_index] = {"width": float(page.rect.width), "height": float(page.rect.height)}
+                        except Exception:
+                            page_dims[page_index] = {}
                         blocks = page.get_text("blocks") or []
                         page_text_parts: List[str] = []
 
@@ -347,6 +360,52 @@ class DocumentExtractor:
                             page_text_parts.append(block_text)
                             if chunk_type == "table":
                                 tables.append(Table(page=page_index, text=block_text))
+
+                        # Capture layout blocks with geometry + typography when available.
+                        try:
+                            layout_dict = page.get_text("dict")
+                            for block in layout_dict.get("blocks", []) or []:
+                                block_bbox = block.get("bbox")
+                                block_type = "image" if block.get("type") == 1 else "text"
+                                text_parts: List[str] = []
+                                font_sizes: List[float] = []
+                                bold = False
+                                line_count = 0
+                                if block_type == "text":
+                                    for line in block.get("lines", []) or []:
+                                        line_count += 1
+                                        for span in line.get("spans", []) or []:
+                                            span_text = str(span.get("text") or "")
+                                            if span_text:
+                                                text_parts.append(span_text)
+                                            size_val = span.get("size")
+                                            if isinstance(size_val, (int, float)):
+                                                font_sizes.append(float(size_val))
+                                            font_name = str(span.get("font") or "").lower()
+                                            if "bold" in font_name or "black" in font_name:
+                                                bold = True
+                                text_value = " ".join(text_parts).strip()
+                                if not text_value and block_type != "image":
+                                    continue
+                                first_line = text_value.splitlines()[0].strip() if text_value else ""
+                                layout_blocks.append(
+                                    {
+                                        "page": page_index,
+                                        "bbox": block_bbox or [0, 0, 0, 0],
+                                        "text": text_value,
+                                        "block_type": "table"
+                                        if self._looks_like_table(first_line)
+                                        else ("list" if re.match(r"^\s*(?:[-*•]|\d+[\.)])\s+", first_line) else block_type),
+                                        "style": {
+                                            "font_size": (sum(font_sizes) / len(font_sizes)) if font_sizes else None,
+                                            "font_weight": "bold" if bold else "normal",
+                                            "is_all_caps": bool(text_value) and text_value.isupper(),
+                                            "line_count": line_count or None,
+                                        },
+                                    }
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append(f"pdf_layout_blocks_failed: page={page_index} err={exc}")
 
                         images = page.get_images(full=True)
                         page_text = "\n".join(page_text_parts).strip()
@@ -525,6 +584,8 @@ class DocumentExtractor:
             tables=tables,
             figures=figures,
             chunk_candidates=chunk_candidates,
+            layout_blocks=layout_blocks,
+            page_dims=page_dims,
         )
         return ExtractedDocument(
             full_text=full_text,

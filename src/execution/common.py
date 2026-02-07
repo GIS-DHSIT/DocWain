@@ -17,13 +17,21 @@ class ExecutionResult:
 def normalize_answer(answer: Any) -> Dict[str, Any]:
     """Ensure downstream consumers get a consistent answer structure."""
     if isinstance(answer, dict):
+        meta = {}
+        raw_meta = answer.get("metadata")
+        if isinstance(raw_meta, dict):
+            meta.update(raw_meta)
         structured = {
             "response": answer.get("response") or answer.get("answer"),
             "sources": answer.get("sources", []),
             "grounded": answer.get("grounded", False),
             "context_found": answer.get("context_found", False),
-            "metadata": {k: v for k, v in answer.items() if k not in {"response", "answer", "sources"}},
+            "metadata": meta,
         }
+        for k, v in answer.items():
+            if k in {"response", "answer", "sources", "metadata"}:
+                continue
+            structured["metadata"][k] = v
         structured["metadata"] = structured.get("metadata") or {}
         return structured
     return {

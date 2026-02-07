@@ -6,6 +6,7 @@ from .hybrid_ranker import HybridRanker, HybridRankerConfig
 from .retrieval_quality import RetrievalQualityScorer, RetrievalQualityResult
 from .context_assembler import ContextAssembler, ContextBuildResult
 from .fallback_repair import FallbackRepair, FallbackResult
+from .evidence_synthesizer import EvidenceSynthesizer
 from .intent_filter import (
     extract_required_attributes,
     filter_chunks_by_intent,
@@ -28,6 +29,7 @@ __all__ = [
     "ContextBuildResult",
     "FallbackRepair",
     "FallbackResult",
+    "EvidenceSynthesizer",
     "extract_required_attributes",
     "filter_chunks_by_intent",
     "extract_answer_requirements",

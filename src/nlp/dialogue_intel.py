@@ -190,7 +190,7 @@ def analyze_sentiment(text: str) -> SentimentResult:
 
 def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentResult], response_mode: str) -> str:
     if intent.intent == "GREETING":
-        response = "Hi! How can I help with your documents today?"
+        response = build_docwain_intro()
     elif intent.intent == "THANKS_OR_PRAISE":
         response = (
             "Glad that helped. I can summarize, extract key data, or compare documents—what would you like next?"

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Optional
 
 DOCWAIN_AGENT_ALIAS = "DocWain-Agent"
-DOCWAIN_AGENT_TARGET = "gpt-oss"
+DOCWAIN_AGENT_TARGET = "gpt-oss:latest"
 
 
 def normalize_model_name(model_name: Optional[str]) -> Optional[str]:

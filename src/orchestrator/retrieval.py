@@ -7,9 +7,9 @@ from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
 from src.api.config import Config
 from src.api.dataHandler import encode_with_fallback
-from src.api.vector_store import build_collection_name
+from src.api.vector_store import build_collection_name, build_qdrant_filter
 from src.router.schema import DocumentFilters
-from src.utils.payload_utils import get_source_name
+from src.utils.payload_utils import get_canonical_text, get_source_name
 
 
 def _build_filter(
@@ -19,11 +19,9 @@ def _build_filter(
     filters: DocumentFilters,
     chunk_kind: Optional[str],
 ) -> Filter:
-    must = [
-        FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-        FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
-    ]
-    should = []
+    base = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
+    must = list(getattr(base, "must", []) or [])
+    should = list(getattr(base, "should", []) or [])
     if filters.document_type_hints:
         values = filters.document_type_hints
         should.append(FieldCondition(key="document.type", match=MatchAny(any=values)))
@@ -42,7 +40,7 @@ def _build_filter(
 def _map_hit(hit: Any) -> Dict[str, Any]:
     payload = hit.payload or {}
     return {
-        "text": payload.get("text") or "",
+        "text": get_canonical_text(payload),
         "file_name": get_source_name(payload) or payload.get("file_name"),
         "section_title": payload.get("section_title") or "",
         "page_start": payload.get("page_start"),

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.kg.entity_extractor import EntityExtractor
+from src.api.vector_store import build_qdrant_filter
 from src.kg.qdrant_reader import QdrantChunk, QdrantKGReader
 from src.kg.neo4j_store import Neo4jStore
 
@@ -47,9 +48,11 @@ class KGSyncService:
 
     def _build_rows(self, chunks: List[QdrantChunk]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         rows: List[Dict[str, Any]] = []
-        links: Set[Tuple[str, str]] = set()
+        links: Set[Tuple[str, str, str, str]] = set()
 
         for chunk in chunks:
+            if not chunk.subscription_id or not chunk.profile_id:
+                continue
             section_key = self._normalize_section_key(chunk.document_id, chunk.section_path, chunk.section_title)
             rows.append(
                 {
@@ -67,13 +70,15 @@ class KGSyncService:
                     "page_end": chunk.page_end,
                     "chunk_hash": chunk.chunk_hash or f"nohash:{chunk.chunk_id}",
                     "chunk_char_len": chunk.chunk_char_len,
+                    "subscription_id": chunk.subscription_id,
+                    "profile_id": chunk.profile_id,
                 }
             )
 
             if chunk.prev_chunk_id:
-                links.add((str(chunk.prev_chunk_id), chunk.chunk_id))
+                links.add((str(chunk.prev_chunk_id), chunk.chunk_id, str(chunk.subscription_id), str(chunk.profile_id)))
             if chunk.next_chunk_id:
-                links.add((chunk.chunk_id, str(chunk.next_chunk_id)))
+                links.add((chunk.chunk_id, str(chunk.next_chunk_id), str(chunk.subscription_id), str(chunk.profile_id)))
 
             if chunk.text:
                 extracted = self.entity_extractor.extract(chunk.text)
@@ -82,16 +87,25 @@ class KGSyncService:
 
             row_entities = []
             for entity in extracted:
+                tenant_entity_id = f"{chunk.subscription_id}::{chunk.profile_id}::{entity.entity_id}"
                 row_entities.append(
                     {
-                        "entity_id": entity.entity_id,
+                        "entity_id": tenant_entity_id,
                         "name": entity.name,
                         "type": entity.type,
                     }
                 )
             rows[-1]["entities"] = row_entities
 
-        link_rows = [{"from_chunk_id": a, "to_chunk_id": b} for a, b in sorted(links)]
+        link_rows = [
+            {
+                "from_chunk_id": a,
+                "to_chunk_id": b,
+                "subscription_id": sub,
+                "profile_id": prof,
+            }
+            for a, b, sub, prof in sorted(links)
+        ]
         return rows, link_rows
 
     def run(
@@ -100,6 +114,8 @@ class KGSyncService:
         batch_size: int,
         max_points: int,
         state_name: str,
+        subscription_id: str,
+        profile_id: str,
     ) -> KGSyncStats:
         self.neo4j_store.ensure_constraints()
         state = self.neo4j_store.get_state(state_name)
@@ -108,10 +124,15 @@ class KGSyncService:
         stats = KGSyncStats()
         current_offset = offset
 
+        scroll_filter = build_qdrant_filter(
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+        )
         for batch in self.qdrant_reader.scroll_batches(
             batch_size=batch_size,
             offset=current_offset,
             max_points=max_points,
+            scroll_filter=scroll_filter,
         ):
             stats.last_qdrant_offset = batch.next_offset
             current_offset = batch.next_offset
@@ -121,7 +142,11 @@ class KGSyncService:
                 continue
 
             chunk_ids = [chunk.chunk_id for chunk in batch.points]
-            existing_hashes = self.neo4j_store.fetch_existing_hashes(chunk_ids)
+            existing_hashes = self.neo4j_store.fetch_existing_hashes(
+                chunk_ids,
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+            )
 
             to_process: List[QdrantChunk] = []
             for chunk in batch.points:

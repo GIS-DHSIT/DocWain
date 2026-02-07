@@ -61,6 +61,19 @@ class Config:
         GRAPH_SCORE_ALPHA = float(os.getenv("KG_GRAPH_SCORE_ALPHA", "0.7"))
         MAX_GRAPH_RESULTS = int(os.getenv("KG_MAX_GRAPH_RESULTS", "200"))
 
+    class Intelligence:
+        ENABLED = os.getenv("DWX_INTEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SESSION_TTL_SECONDS = int(os.getenv("DWX_SESSION_TTL_SECONDS", "604800"))
+        CATALOG_TTL_SECONDS = int(os.getenv("DWX_CATALOG_TTL_SECONDS", "2592000"))
+        SUMMARY_TTL_SECONDS = int(os.getenv("DWX_SUMMARY_TTL_SECONDS", "2592000"))
+        ENTITIES_TTL_SECONDS = int(os.getenv("DWX_ENTITIES_TTL_SECONDS", "2592000"))
+        ROUTE_HISTORY_MAX = int(os.getenv("DWX_ROUTE_HISTORY_MAX", "20"))
+        ENTITY_HISTORY_MAX = int(os.getenv("DWX_ENTITY_HISTORY_MAX", "50"))
+        SECTION_SUMMARY_VECTORS_ENABLED = os.getenv("DWX_SECTION_SUMMARY_VECTORS", "true").lower() in {"1", "true", "yes", "on"}
+        SECTION_SUMMARY_MAX_CHARS = int(os.getenv("DWX_SECTION_SUMMARY_MAX_CHARS", "700"))
+        SECTION_SUMMARY_TOPK = int(os.getenv("DWX_SECTION_SUMMARY_TOPK", "6"))
+        SECTION_RETRIEVAL_ENABLED = os.getenv("DWX_SECTION_RETRIEVAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
     class Gemini:
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta
@@ -91,6 +104,7 @@ class Config:
         HF_DISABLE_TELEMETRY = os.getenv("HF_HUB_DISABLE_TELEMETRY", "false").lower() in {"1", "true", "yes", "on"}
         TRANSFORMERS_OFFLINE = os.getenv("TRANSFORMERS_OFFLINE", "false").lower() in {"1", "true", "yes", "on"}
         DISABLE_HF = os.getenv("DISABLE_HF", "false").lower() in {"1", "true", "yes", "on"}
+        OFFLINE_ONLY = os.getenv("DOCWAIN_OFFLINE_ONLY", "true").lower() in {"1", "true", "yes", "on"}
 
     class Azure:
         AZURE_SUBSCRIPTION_ID = "249bb11f-9b6e-4c0e-a844-500d627b80b3"
@@ -151,6 +165,10 @@ class Config:
         DB = 0
         SSL = True
         ABORT_CONNECT = False
+        CLEAR_UNSAFE_ON_STARTUP = os.getenv("REDIS_CLEAR_UNSAFE_ON_STARTUP", "true").lower() in {"1", "true", "yes", "on"}
+        UNSAFE_KEY_PATTERNS = os.getenv("REDIS_UNSAFE_KEY_PATTERNS", "dw:plan:*,rag:*").strip()
+        CLEAR_SCAN_COUNT = int(os.getenv("REDIS_CLEAR_SCAN_COUNT", "200"))
+        CLEAR_MAX_KEYS = int(os.getenv("REDIS_CLEAR_MAX_KEYS", "5000"))
 
     class Teams:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
@@ -180,6 +198,18 @@ class Config:
         CHUNK_OVERLAP = int(os.getenv("RETRIEVAL_CHUNK_OVERLAP", "200"))
         MIN_CHUNK_SIZE = int(os.getenv("RETRIEVAL_MIN_CHUNK_SIZE", "150"))
         MIN_CHUNK_CHARS = int(os.getenv("RETRIEVAL_MIN_CHUNK_CHARS", "40"))
+
+    class RagV3:
+        DEBUG_LOGS = os.getenv("DOCWAIN_RAG_V3_DEBUG_LOGS", "false").lower() in {"1", "true", "yes", "on"}
+        DEBUG_SCHEMA = os.getenv("DOCWAIN_RAG_V3_DEBUG_SCHEMA", "false").lower() in {"1", "true", "yes", "on"}
+        MIN_CHARS = int(os.getenv("RETRIEVAL_MIN_CHARS", "80"))
+        MIN_TOKENS = int(os.getenv("RETRIEVAL_MIN_TOKENS", "15"))
+        MIN_REQUIRED_CHUNKS = int(
+            os.getenv("RETRIEVAL_MIN_REQUIRED_CHUNKS", os.getenv("RETRIEVAL_MIN_VALID_CHUNKS_PER_DOC", "3"))
+        )
+        MIN_VALID_CHUNKS_PER_DOC = MIN_REQUIRED_CHUNKS
+        FALLBACK_CHUNK_SIZE = int(os.getenv("RETRIEVAL_FALLBACK_CHUNK_SIZE", "600"))
+        FALLBACK_OVERLAP = int(os.getenv("RETRIEVAL_FALLBACK_CHUNK_OVERLAP", "80"))
         MIN_CHUNK_QUALITY = float(os.getenv("RETRIEVAL_MIN_CHUNK_QUALITY", "0.2"))
         MAX_SYMBOL_RATIO = float(os.getenv("RETRIEVAL_MAX_SYMBOL_RATIO", "0.6"))
         CHUNK_COVERAGE_THRESHOLD = float(os.getenv("CHUNK_COVERAGE_THRESHOLD", "0.98"))
@@ -191,10 +221,14 @@ class Config:
         DEDUP_THRESHOLD = float(os.getenv("RETRIEVAL_DEDUP_THRESHOLD", "0.92"))
         MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2048"))
         MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
+        MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
         SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
         USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
         USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"
         NEIGHBOR_WINDOW = int(os.getenv("RETRIEVAL_NEIGHBOR_WINDOW", "2"))
+        RETRIEVAL_PLANNER_ENABLED = os.getenv("RETRIEVAL_PLANNER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        RETRIEVAL_PLANNER_MAX_RETRIES = int(os.getenv("RETRIEVAL_PLANNER_MAX_RETRIES", "2"))
+        RETRIEVAL_PLANNER_BACKOFF = float(os.getenv("RETRIEVAL_PLANNER_BACKOFF", "0.4"))
         NEIGHBOR_MAX_NEW = int(os.getenv("RETRIEVAL_NEIGHBOR_MAX_NEW", "10"))
         BROAD_RECALL_MULTIPLIER = float(os.getenv("RETRIEVAL_BROAD_RECALL_MULTIPLIER", "1.5"))
         BROAD_RECALL_THRESHOLD = float(os.getenv("RETRIEVAL_BROAD_RECALL_THRESHOLD", "0.02"))
@@ -212,6 +246,11 @@ class Config:
         }
         RERANKER_ENABLED = os.getenv("RETRIEVAL_RERANKER_ENABLED", "true").lower() == "true"
         METADATA_FALLBACK_LIMIT = int(os.getenv("RETRIEVAL_METADATA_FALLBACK_LIMIT", "200"))
+        EVIDENCE_SYNTHESIZER_ENABLED = os.getenv("EVIDENCE_SYNTHESIZER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        EVIDENCE_SYNTHESIZER_MAX_RETRIES = int(os.getenv("EVIDENCE_SYNTHESIZER_MAX_RETRIES", "1"))
+        EVIDENCE_SYNTHESIZER_BACKOFF = float(os.getenv("EVIDENCE_SYNTHESIZER_BACKOFF", "0.3"))
+        EVIDENCE_SYNTHESIZER_MAX_EXCERPTS_PER_FILE = int(os.getenv("EVIDENCE_SYNTHESIZER_MAX_EXCERPTS_PER_FILE", "6"))
+        EVIDENCE_SYNTHESIZER_EXCERPT_CHARS = int(os.getenv("EVIDENCE_SYNTHESIZER_EXCERPT_CHARS", "800"))
         METADATA_FALLBACK_MIN_SCORE = float(os.getenv("RETRIEVAL_METADATA_FALLBACK_MIN_SCORE", "0.02"))
         MIN_QUERY_OVERLAP = float(os.getenv("RETRIEVAL_MIN_QUERY_OVERLAP", "0.06"))
         RELEVANCE_KEEP_TOP_K = int(os.getenv("RETRIEVAL_RELEVANCE_KEEP_TOP_K", "12"))
@@ -259,6 +298,7 @@ class Config:
         TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
         MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
         MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
+        DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
 
     class ModelArbitration:
         ENABLED = os.getenv("MODEL_ARBITRATION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
@@ -284,6 +324,12 @@ class Config:
                 INDEX_SUFFIX_MAP = json.loads(INDEX_SUFFIX_MAP_RAW)
             except Exception:
                 INDEX_SUFFIX_MAP = {}
+
+    class RAGV2:
+        ENABLED = os.getenv("DOCWAIN_RAG_V2_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
+    class RAGV3:
+        ENABLED = os.getenv("RAG_V3_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
     class Finetune:
         AUTO_ENABLED = os.getenv("FINETUNE_AUTO_ENABLED", "false").lower() == "true"

@@ -8,8 +8,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 import numpy as np
-from qdrant_client.models import Filter, FieldCondition, MatchAny, MatchValue, Range
-from src.utils.payload_utils import get_document_type, get_source_name
+from qdrant_client.http.exceptions import UnexpectedResponse
+from qdrant_client.models import Filter, FieldCondition, MatchAny, Range
+from src.api.qdrant_indexes import autoheal_missing_index
+from src.retrieval.filter_builder import build_qdrant_filter
+from src.retrieval.errors import RetrievalFilterError
+from src.utils.payload_utils import get_canonical_text, get_content_text, get_document_type, get_embedding_text, get_source_name
 
 try:
     from rank_bm25 import BM25Okapi
@@ -66,128 +70,20 @@ class HybridRetriever:
         return variants
 
     def _resolve_profile_key(self, collection_name: Optional[str], profile_id: str) -> Optional[str]:
-        if not collection_name:
-            return None
-        cache_key = (collection_name, str(profile_id))
-        if cache_key in self._profile_key_cache:
-            return self._profile_key_cache[cache_key]
-        candidates = ("profile_id", "profileId", "profile")
-        values = self._profile_value_variants(profile_id)
-        for key in candidates:
-            try:
-                count = self.client.count(
-                    collection_name=collection_name,
-                    exact=False,
-                    count_filter=Filter(must=[FieldCondition(key=key, match=MatchAny(any=values))]),
-                )
-                if getattr(count, "count", 0) > 0:
-                    self._profile_key_cache[cache_key] = key
-                    logger.info("Resolved profile key '%s' for collection '%s'", key, collection_name)
-                    return key
-            except Exception:
-                continue
-        logger.warning(
-            "No profile key matched for collection '%s' and profile_id '%s'",
-            collection_name,
-            profile_id,
-        )
-        self._profile_key_cache[cache_key] = None
+        _ = collection_name, profile_id
+        logger.debug("Profile key inference disabled; enforcing strict profile filters.")
         return None
 
     def _infer_single_profile(self, collection_name: str, max_points: int = 200) -> Optional[Tuple[str, str]]:
-        if not collection_name:
-            return None
-        if collection_name in self._inferred_profile_cache:
-            return self._inferred_profile_cache[collection_name]
-        try:
-            scroll = self.client.scroll(
-                collection_name=collection_name,
-                scroll_filter=None,
-                with_payload=True,
-                with_vectors=False,
-                limit=max_points,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Profile inference scroll failed for %s: %s", collection_name, exc)
-            self._inferred_profile_cache[collection_name] = None
-            return None
-
-        points = []
-        if hasattr(scroll, "points"):
-            points = scroll.points or []
-        elif isinstance(scroll, tuple) and scroll:
-            points = scroll[0] or []
-        if not points:
-            self._inferred_profile_cache[collection_name] = None
-            return None
-
-        value_counts: Dict[str, int] = {}
-        key_counts: Dict[Tuple[str, str], int] = {}
-        for pt in points:
-            payload = getattr(pt, "payload", {}) or {}
-            for key in ("profile_id", "profileId", "profile"):
-                value = payload.get(key)
-                if value is None:
-                    continue
-                value_str = str(value)
-                value_counts[value_str] = value_counts.get(value_str, 0) + 1
-                key_counts[(key, value_str)] = key_counts.get((key, value_str), 0) + 1
-
-        if len(value_counts) != 1:
-            self._inferred_profile_cache[collection_name] = None
-            return None
-
-        inferred_value = next(iter(value_counts.keys()))
-        best_key = None
-        best_count = 0
-        for (key, val), count in key_counts.items():
-            if val != inferred_value:
-                continue
-            if count > best_count:
-                best_key = key
-                best_count = count
-
-        if not best_key:
-            self._inferred_profile_cache[collection_name] = None
-            return None
-
-        inferred = (best_key, inferred_value)
-        self._inferred_profile_cache[collection_name] = inferred
-        logger.warning(
-            "Inferred single profile for collection '%s' using key '%s'",
-            collection_name,
-            best_key,
-        )
-        return inferred
+        _ = collection_name, max_points
+        logger.debug("Profile inference disabled; enforcing strict profile filters.")
+        return None
 
     def _resolve_profile_identity(
         self, collection_name: Optional[str], profile_id: str
     ) -> Optional[Tuple[str, List[Any]]]:
-        if not collection_name:
-            return None
-        cache_key = (collection_name, str(profile_id))
-        if cache_key in self._profile_identity_cache:
-            return self._profile_identity_cache[cache_key]
-
-        key = self._resolve_profile_key(collection_name, profile_id)
-        if key:
-            identity = (key, self._profile_value_variants(profile_id))
-            self._profile_identity_cache[cache_key] = identity
-            return identity
-
-        inferred = self._infer_single_profile(collection_name)
-        if inferred:
-            inferred_key, inferred_value = inferred
-            logger.warning(
-                "Profile id '%s' not found in collection '%s'; using sole profile value",
-                profile_id,
-                collection_name,
-            )
-            identity = (inferred_key, [inferred_value])
-            self._profile_identity_cache[cache_key] = identity
-            return identity
-
-        self._profile_identity_cache[cache_key] = None
+        _ = collection_name, profile_id
+        logger.debug("Profile identity inference disabled; enforcing strict profile filters.")
         return None
 
     @staticmethod
@@ -209,6 +105,8 @@ class HybridRetriever:
         if not texts:
             return []
         tokens = [self._tokenize(text) for text in texts]
+        if not any(tokens):
+            return [0.0 for _ in texts]
         if BM25Okapi:
             bm25 = BM25Okapi(tokens)
             scores = bm25.get_scores(self._tokenize(query)).tolist()
@@ -228,24 +126,26 @@ class HybridRetriever:
         self,
         profile_id: str,
         collection_name: Optional[str] = None,
+        subscription_id: Optional[str] = None,
         document_ids: Optional[List[str]] = None,
         source_files: Optional[List[str]] = None,
         doc_types: Optional[List[str]] = None,
+        doc_domains: Optional[List[str]] = None,
+        section_ids: Optional[List[str]] = None,
         section_titles: Optional[List[str]] = None,
+        section_kinds: Optional[List[str]] = None,
+        chunk_kinds: Optional[List[str]] = None,
         page_numbers: Optional[List[int]] = None,
         min_confidence: Optional[float] = None,
     ) -> Filter:
         if not profile_id:
             raise ValueError("profile_id is required for retrieval")
+        if not subscription_id:
+            raise ValueError("subscription_id is required for retrieval")
         profile_value = str(profile_id)
-        conditions: List[FieldCondition] = []
-        should: List[FieldCondition] = []
-        identity = self._resolve_profile_identity(collection_name, profile_value)
-        if identity:
-            profile_key, profile_values = identity
-            conditions.append(FieldCondition(key=profile_key, match=MatchAny(any=profile_values)))
-        else:
-            conditions.append(FieldCondition(key="profile_id", match=MatchValue(value=profile_value)))
+        base = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=profile_value)
+        conditions: List[Any] = list(getattr(base, "must", []) or [])
+        should: List[FieldCondition] = list(getattr(base, "should", []) or [])
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(d) for d in document_ids])))
         if source_files:
@@ -256,8 +156,34 @@ class HybridRetriever:
             values = [str(d) for d in doc_types]
             should.append(FieldCondition(key="document.type", match=MatchAny(any=values)))
             should.append(FieldCondition(key="doc_type", match=MatchAny(any=values)))
+        if doc_domains:
+            values = [str(d) for d in doc_domains]
+            conditions.append(FieldCondition(key="doc_domain", match=MatchAny(any=values)))
+        if section_ids:
+            values = [str(s) for s in section_ids]
+            conditions.append(
+                Filter(
+                    should=[
+                        FieldCondition(key="section_id", match=MatchAny(any=values)),
+                        FieldCondition(key="section.id", match=MatchAny(any=values)),
+                    ],
+                )
+            )
         if section_titles:
             conditions.append(FieldCondition(key="section_title", match=MatchAny(any=[str(s) for s in section_titles])))
+        if section_kinds:
+            values = [str(k) for k in section_kinds]
+            conditions.append(
+                Filter(
+                    should=[
+                        FieldCondition(key="section_kind", match=MatchAny(any=values)),
+                        FieldCondition(key="section.kind", match=MatchAny(any=values)),
+                    ],
+                )
+            )
+        if chunk_kinds:
+            values = [str(k) for k in chunk_kinds]
+            conditions.append(FieldCondition(key="chunk_kind", match=MatchAny(any=values)))
         if page_numbers:
             values = []
             for page in page_numbers:
@@ -304,6 +230,14 @@ class HybridRetriever:
             source_name = get_source_name(payload) or ""
             if hint and hint.lower() in source_name.lower():
                 boosts["document_hint"] = self.config.metadata_boost * 0.6
+        for hint in hints.get("document_ids", []) or []:
+            doc_id = payload.get("document_id")
+            if doc_id and str(doc_id) == str(hint):
+                boosts["document_id"] = self.config.metadata_boost * 0.8
+        for hint in hints.get("chunk_ids", []) or []:
+            chunk_id = payload.get("chunk_id")
+            if chunk_id and str(chunk_id) == str(hint):
+                boosts["chunk_id"] = self.config.metadata_boost
         return boosts
 
     def retrieve(
@@ -316,6 +250,7 @@ class HybridRetriever:
         top_k: Optional[int] = None,
         filters: Optional[Dict[str, Any]] = None,
         explicit_hints: Optional[Dict[str, List[str]]] = None,
+        subscription_id: Optional[str] = None,
     ) -> List[RetrievalCandidate]:
         start = time.time()
         filters = filters or {}
@@ -324,18 +259,35 @@ class HybridRetriever:
 
         strict_filters = {
             key: filters.get(key)
-            for key in ("document_ids", "source_files", "doc_types", "section_titles", "page_numbers", "min_confidence")
+            for key in (
+                "document_ids",
+                "source_files",
+                "doc_types",
+                "doc_domains",
+                "section_ids",
+                "section_titles",
+                "section_kinds",
+                "chunk_kinds",
+                "page_numbers",
+                "min_confidence",
+            )
             if filters.get(key)
         }
-        use_strict = bool(explicit_hints) or bool(strict_filters)
+        use_strict = bool(strict_filters)
 
+        effective_subscription = subscription_id or filters.get("subscription_id")
         query_filter = self._build_filter(
             profile_id,
             collection_name=collection_name,
+            subscription_id=effective_subscription,
             document_ids=strict_filters.get("document_ids") if use_strict else None,
             source_files=strict_filters.get("source_files") if use_strict else None,
             doc_types=strict_filters.get("doc_types") if use_strict else None,
+            doc_domains=strict_filters.get("doc_domains") if use_strict else None,
+            section_ids=strict_filters.get("section_ids") if use_strict else None,
             section_titles=strict_filters.get("section_titles") if use_strict else None,
+            section_kinds=strict_filters.get("section_kinds") if use_strict else None,
+            chunk_kinds=strict_filters.get("chunk_kinds") if use_strict else None,
             page_numbers=strict_filters.get("page_numbers") if use_strict else None,
             min_confidence=strict_filters.get("min_confidence") if use_strict else None,
         )
@@ -372,7 +324,28 @@ class HybridRetriever:
         )
         if self.config.score_threshold is not None:
             kwargs["score_threshold"] = self.config.score_threshold
-        results = self.client.query_points(**kwargs)
+        try:
+            results = self.client.query_points(**kwargs)
+        except UnexpectedResponse as exc:
+            detail = getattr(exc, "content", None) or str(exc)
+            missing_field = autoheal_missing_index(self.client, collection_name, detail)
+            if missing_field:
+                logger.warning("Retrying hybrid retrieval after auto-heal for %s", missing_field)
+                try:
+                    results = self.client.query_points(**kwargs)
+                except UnexpectedResponse as retry_exc:
+                    retry_detail = getattr(retry_exc, "content", None) or str(retry_exc)
+                    raise RetrievalFilterError(
+                        "Index required but not found; retrieval blocked.",
+                        code="RETRIEVAL_INDEX_MISSING",
+                        details=f"missing_index={missing_field}; {retry_detail}",
+                    ) from retry_exc
+            else:
+                raise RetrievalFilterError(
+                    "Profile isolation enforced; cannot search outside profile.",
+                    code="RETRIEVAL_FILTER_FAILED",
+                    details=str(detail),
+                ) from exc
 
         points = []
         if hasattr(results, "points"):
@@ -381,7 +354,7 @@ class HybridRetriever:
             points = results[0] or []
 
         texts = [getattr(pt, "payload", {}) or {} for pt in points]
-        text_values = [payload.get("text", "") for payload in texts]
+        text_values = [get_embedding_text(payload) or get_content_text(payload) for payload in texts]
         vector_scores = [float(getattr(pt, "score", 0.0)) for pt in points]
         lexical_scores = self._lexical_scores(query, text_values)
 
@@ -391,14 +364,15 @@ class HybridRetriever:
 
         for idx, pt in enumerate(points):
             payload = getattr(pt, "payload", {}) or {}
-            text = payload.get("text", "") or ""
-            if not text.strip():
+            text = get_embedding_text(payload) or get_content_text(payload) or payload.get("text") or payload.get("content") or ""
+            if not str(text).strip():
                 continue
             vector_score = vector_norm[idx] if idx < len(vector_norm) else 0.0
             lexical_score = lexical_norm[idx] if idx < len(lexical_norm) else 0.0
             hybrid = (self.config.hybrid_alpha * vector_score) + ((1 - self.config.hybrid_alpha) * lexical_score)
 
-            boosts = self._metadata_boost(query, payload, filters)
+            boost_hints = {**filters, **explicit_hints}
+            boosts = self._metadata_boost(query, payload, boost_hints)
             boost_value = sum(boosts.values())
             if use_strict and boost_value > 0:
                 boost_value += self.config.strict_filter_boost
@@ -467,7 +441,7 @@ class HybridRetriever:
             return []
 
         payloads = [getattr(pt, "payload", {}) or {} for pt in points]
-        texts = [payload.get("text", "") for payload in payloads]
+        texts = [get_embedding_text(payload) for payload in payloads]
         lexical_scores = self._lexical_scores(query, texts)
         if any(score > 0 for score in lexical_scores):
             lexical_norm = self._normalize_scores(lexical_scores)
@@ -477,7 +451,7 @@ class HybridRetriever:
         candidates: List[RetrievalCandidate] = []
         for idx, pt in enumerate(points):
             payload = getattr(pt, "payload", {}) or {}
-            text = payload.get("text", "") or ""
+            text = get_embedding_text(payload)
             if not text.strip():
                 continue
             lexical_score = lexical_norm[idx] if idx < len(lexical_norm) else 0.0

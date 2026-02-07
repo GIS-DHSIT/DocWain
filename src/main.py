@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import ollama
 import uvicorn
@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, constr
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
+from src.api.app_lifespan import lifespan
 from src.api.dataHandler import (
     db,
     clear_legacy_vetting_metadata,
@@ -37,6 +38,8 @@ from src.api.dw_chat import (
 )
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
+from src.api.debug import debug_router
+from src.api.health_endpoints import health_router
 from src.api.profile_documents_api import profile_docs_router
 from src.api.profiles_api import profiles_router
 from src.api.knowledge_graph import knowledge_graph_router
@@ -59,13 +62,19 @@ from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
 from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
 from src.execution.common import normalize_answer, chunk_text_stream
+from src.intelligence.redis_intel_cache import RedisIntelCache
+from src.intelligence.response_composer import generate_ack
 from src.api.learning_signals import LearningSignalStore
+from src import rag_v3
+from src.api import rag_state
+from src.api.ask_handler import apply_error_contract, get_rag_system_from_app, should_return_503
 from src.screening.api import screening_router
 from src.screening.config import log_legacy_vetting_notice_if_missing
 from src.storage.azure_blob_client import validate_containers_once, validate_storage_configured_once
 from botbuilder.schema import Activity
 from src.nlp.dialogue_intel import route_message
 from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
+from src.prompting.response_contract import format_docwain_response
 
 from src.teams import adapter as teams_adapter
 from src.teams.bot_app import (
@@ -98,7 +107,7 @@ def _get_dw_newron():
     return dw_newron
 
 
-app = FastAPI(title="DocWain API")
+app = FastAPI(title="DocWain API", lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
 
 app.add_middleware(
@@ -114,6 +123,8 @@ api_router.include_router(documents_router, tags=["Documents"])
 api_router.include_router(profiles_router)
 api_router.include_router(profile_docs_router)
 api_router.include_router(tools_router, tags=["Tools"])
+api_router.include_router(debug_router, tags=["Debug"])
+api_router.include_router(health_router)
 
 
 class FeedbackRequest(BaseModel):
@@ -144,6 +155,7 @@ async def _startup_checks() -> None:
         log_legacy_vetting_notice_if_missing()
     except Exception as exc:  # noqa: BLE001
         logger.warning("Legacy config notice skipped: %s", exc)
+    logger.info("Startup checks completed")
 
 
 @app.exception_handler(HTTPException)
@@ -167,16 +179,18 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 class QuestionRequest(BaseModel):
     query: constr(min_length=1)
     user_id: str = "someone@email.com"
-    profile_id: constr(min_length=1) = "67ac62ddfaa3aee44d38f4a5"
-    subscription_id: str = "default"
-    model_name: str = "llama3.2"
+    profile_id: str
+    subscription_id: str
+    document_id: Optional[str] = None
+    tool_hint: Optional[str] = None
+    model_name: str = "DocWain-Agent"
     persona: str = "DocWain"
     session_id: Optional[str] = None
     new_session: bool = False  # Frontend sends flag here
     agent_mode: Optional[bool] = None
     stream: bool = False  # When true, /ask returns a streaming response instead of JSON.
     debug: bool = False
-    tools: Optional[List[str]] = None
+    tools: Optional[str] = None
     tool_inputs: Optional[Dict[str, Any]] = None
     use_tools: bool = False
 
@@ -187,12 +201,18 @@ class AnswerPayload(BaseModel):
     grounded: bool = False
     context_found: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    ok: bool = True
 
 
 class AskResponse(BaseModel):
     answer: AnswerPayload
     current_session_id: Optional[str]
     debug: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AskLiteResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
@@ -209,6 +229,60 @@ def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
     return None
 
 
+def _latest_profile_from_catalog(cache: RedisIntelCache, subscription_id: str) -> Optional[str]:
+    prefix = f"{cache.prefix}:catalog:{subscription_id}:"
+    keys = cache.scan_prefix(prefix)
+    best_profile = None
+    best_ts = -1.0
+    for key in keys:
+        payload = cache.get_json(key) or {}
+        ts = float(payload.get("updated_at") or payload.get("last_updated") or 0.0)
+        profile_id = payload.get("profile_id")
+        if not profile_id:
+            parts = key.split(":")
+            if len(parts) >= 4:
+                profile_id = parts[-1]
+        if not profile_id:
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best_profile = str(profile_id)
+    return best_profile
+
+
+def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Optional[str]) -> Tuple[Optional[str], str]:
+    explicit = (request.profile_id or "").strip()
+    if explicit:
+        return explicit, "explicit"
+
+    subscription_id = request.subscription_id or "default"
+    session_key = session_id or "default"
+    redis_client = None
+    try:
+        from src.api.dw_newron import get_redis_client
+
+        redis_client = get_redis_client()
+    except Exception:
+        redis_client = None
+
+    cache = RedisIntelCache(redis_client)
+    try:
+        state = cache.get_session_state(subscription_id, session_key)
+        if state.active_profile_id:
+            return str(state.active_profile_id), "session"
+    except Exception:
+        pass
+
+    try:
+        latest = _latest_profile_from_catalog(cache, subscription_id)
+        if latest:
+            return latest, "catalog"
+    except Exception:
+        pass
+
+    return None, "missing"
+
+
 def _normalize_answer(answer):
     """Backward-compatible wrapper around the shared normalizer."""
     return normalize_answer(answer)
@@ -220,6 +294,23 @@ def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "…"
+
+
+def _minimize_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    minimal: List[Dict[str, Any]] = []
+    for src in sources or []:
+        if not isinstance(src, dict):
+            continue
+        name = src.get("file_name") or src.get("source_name") or src.get("document_name") or src.get("source")
+        page = src.get("page")
+        entry: Dict[str, Any] = {}
+        if name:
+            entry["file_name"] = str(name)
+        if page is not None:
+            entry["page"] = page
+        if entry:
+            minimal.append(entry)
+    return minimal
 
 
 def _resolve_output_root(path_str: str) -> Path:
@@ -628,111 +719,72 @@ def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool
     return session_id, session_state, mode, ctx
 
 
-@api_router.post("/ask", tags=["Default"], response_model=AskResponse)
+@api_router.post("/ask", tags=["Default"], response_model=AskLiteResponse)
 def ask_question_api(
     request: QuestionRequest,
     agent_mode: Optional[bool] = Query(None),
     stream: Optional[bool] = Query(None),
+    http_request: Request = None,
 ):
     """
     Unified /ask handler. Toggle `stream=true` to receive a streamed response instead of JSON.
     """
-    streaming = bool(stream if stream is not None else request.stream)
-    if request.agent_mode is True:
-        from src.agent.orchestrator import AgentOrchestrator
+    _ = (agent_mode, stream)
+    session_id = _resolve_session_id(request)
+    correlation_id = str(uuid.uuid4())
+    request.session_id = session_id
 
-        return AgentOrchestrator.run(request)
-    session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
-    logger.info(
-        "[ASK%s] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s stream(body)=%s stream(query)=%s query_snippet=%s",
-        "_STREAM" if streaming else "",
-        request.user_id,
-        session_id,
-        request.new_session,
-        request.agent_mode,
-        agent_mode,
-        request.stream,
-        stream,
-        _safe_snippet(request.query),
-    )
-
-    route_state = {
-        "profile_id": request.profile_id,
-        "subscription_id": request.subscription_id,
-    }
-    decision = route_message(request.query, route_state)
-    if decision.direct_response:
-        response_text = decision.response_text or ""
-        response_text = sanitize_response(response_text)
-        if streaming:
-            return StreamingResponse(chunk_text_stream(response_text), media_type="text/plain")
-
-        answer_payload = AnswerPayload(
-            response=response_text,
-            sources=[],
-            grounded=False,
-            context_found=False,
-            metadata={
-                "routing": {
-                    "intent": decision.intent.intent,
-                    "intent_confidence": decision.intent.confidence,
-                    "policy": decision.policy,
-                    "sentiment": decision.sentiment.sentiment if decision.sentiment else None,
-                }
-            },
+    resolved_profile_id, profile_source = _resolve_profile_id_for_request(request, session_id)
+    if not resolved_profile_id:
+        raise HTTPException(
+            status_code=400,
+            detail=_error(
+                "MISSING_PROFILE_SCOPE",
+                "profile_id is required to answer this request.",
+                {"resolution": profile_source, "correlation_id": correlation_id},
+            ),
         )
-        _, active_session_id = add_message_to_history(
-            request.user_id,
-            request.query,
-            answer_payload.model_dump(),
-            session_id=session_id,
-            new_session=request.new_session,
-        )
-        return AskResponse(answer=answer_payload, current_session_id=active_session_id, debug={})
+    object.__setattr__(request, "profile_id", resolved_profile_id)
 
-    result = execute_request(request, session_state=session_state, ctx=ctx, stream=streaming, debug=bool(request.debug))
+    if not request.tool_hint:
+        route_state = {
+            "profile_id": request.profile_id,
+            "subscription_id": request.subscription_id,
+        }
+        decision = route_message(request.query, route_state)
+        if getattr(decision, "direct_response", False):
+            response_text = decision.response_text or ""
+            response_text = sanitize_response(response_text)
+            return AskLiteResponse(answer=response_text, sources=[])
 
-    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
-    if explicit_toggle is not None:
-        session_state_store.set_preferred_mode(
-            session_id,
-            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
+    state = getattr(http_request.app.state, "rag_state", None) if http_request is not None else None
+    if state is None:
+        state = rag_state.get_app_state()
+    if state is None or state.qdrant_client is None or state.embedding_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail=_error("RAG_UNAVAILABLE", "RAG system not initialized", {"correlation_id": correlation_id}),
         )
 
-    if streaming:
-        def _stream():
-            try:
-                normalized_answer = _normalize_answer(result.answer)
-                persona_text = get_docwain_persona(request.profile_id, request.subscription_id, None)
-                response_text = normalized_answer.get("response") or ""
-                response_text = enforce_docwain_identity(response_text, request.query, persona_text)
-                response_text = sanitize_response(response_text)
-                stream_iterable = result.stream or chunk_text_stream(response_text)
-                logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
-                for chunk in stream_iterable:
-                    yield chunk
-            except Exception as exc:
-                logger.error("[ASK_STREAM] Streaming failed for session=%s: %s", session_id, exc, exc_info=True)
-                yield "[error] Unable to stream response right now."
-
-        return StreamingResponse(_stream(), media_type="text/plain")
-
-    answer = AnswerPayload.model_validate(result.answer)
-    persona_text = get_docwain_persona(request.profile_id, request.subscription_id, None)
-    answer.response = sanitize_response(enforce_docwain_identity(str(answer.response), request.query, persona_text))
-
-    _, active_session_id = add_message_to_history(
-        request.user_id,
-        request.query,
-        answer.model_dump(),
+    result = rag_v3.run(
+        query=request.query,
+        subscription_id=request.subscription_id,
+        profile_id=resolved_profile_id,
+        document_id=request.document_id,
+        tool_hint=request.tool_hint,
         session_id=session_id,
-        new_session=request.new_session,
+        user_id=request.user_id,
+        request_id=correlation_id,
+        llm_client=state.ollama_client,
+        qdrant_client=state.qdrant_client,
+        redis_client=state.redis_client,
+        embedder=state.embedding_model,
+        cross_encoder=getattr(state.reranker, "cross_encoder", None) or state.reranker,
     )
 
-    logger.info("[ASK] completed session_id=%s mode=%s stream=%s", active_session_id, result.mode.value, streaming)
-
-    enriched_debug = {**(result.debug or {}), "request_id": ctx.request_id}
-    return AskResponse(answer=answer, current_session_id=active_session_id, debug=enriched_debug)
+    final_text = str(result.get("response") or "")
+    sources = _minimize_sources(result.get("sources") or [])
+    return AskLiteResponse(answer=final_text, sources=sources)
 
 
 @api_router.post("/askStream", tags=["Default"], deprecated=True)

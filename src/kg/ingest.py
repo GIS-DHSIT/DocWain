@@ -23,6 +23,8 @@ class GraphEntity:
     name: str
     type: str
     normalized_name: str
+    subscription_id: str = ""
+    profile_id: str = ""
 
 
 @dataclass
@@ -33,6 +35,8 @@ class GraphMention:
     evidence_span: Optional[str]
     confidence: float
     edge_key: str
+    subscription_id: str = ""
+    profile_id: str = ""
 
 
 @dataclass
@@ -44,6 +48,8 @@ class GraphField:
     value: str
     confidence: float
     edge_key: str
+    subscription_id: str = ""
+    profile_id: str = ""
 
 
 @dataclass
@@ -65,11 +71,30 @@ class GraphIngestPayload:
 
     @staticmethod
     def from_dict(payload: Dict[str, Any]) -> "GraphIngestPayload":
+        document = payload.get("document") or {}
+        sub = document.get("subscription_id") or ""
+        prof = document.get("profile_id") or ""
+
+        def _coerce_entity(entity: Dict[str, Any]) -> GraphEntity:
+            entity.setdefault("subscription_id", sub)
+            entity.setdefault("profile_id", prof)
+            return GraphEntity(**entity)
+
+        def _coerce_mention(mention: Dict[str, Any]) -> GraphMention:
+            mention.setdefault("subscription_id", sub)
+            mention.setdefault("profile_id", prof)
+            return GraphMention(**mention)
+
+        def _coerce_field(field: Dict[str, Any]) -> GraphField:
+            field.setdefault("subscription_id", sub)
+            field.setdefault("profile_id", prof)
+            return GraphField(**field)
+
         return GraphIngestPayload(
-            document=payload.get("document") or {},
-            entities=[GraphEntity(**entity) for entity in payload.get("entities", [])],
-            mentions=[GraphMention(**mention) for mention in payload.get("mentions", [])],
-            fields=[GraphField(**field) for field in payload.get("fields", [])],
+            document=document,
+            entities=[_coerce_entity(entity) for entity in payload.get("entities", [])],
+            mentions=[_coerce_mention(mention) for mention in payload.get("mentions", [])],
+            fields=[_coerce_field(field) for field in payload.get("fields", [])],
             attempts=int(payload.get("attempts", 0)),
         )
 
@@ -213,6 +238,7 @@ def build_graph_payload(
     document_category = doc_metadata.get("document_type") or doc_metadata.get("doc_type") or "generic"
 
     graph_version = _graph_version(document_id, chunk_metadata)
+    tenant_prefix = f"{subscription_id}::{profile_id}::"
 
     document = {
         "doc_id": str(document_id),
@@ -238,24 +264,28 @@ def build_graph_payload(
         extracted = extractor.extract_with_metadata(text)
         for ent in extracted:
             entities.setdefault(
-                ent.entity_id,
+                f"{tenant_prefix}{ent.entity_id}",
                 GraphEntity(
-                    entity_id=ent.entity_id,
+                    entity_id=f"{tenant_prefix}{ent.entity_id}",
                     name=ent.name,
                     type=ent.type,
                     normalized_name=ent.normalized_name,
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
                 ),
             )
             evidence_span = _extract_evidence_span(text, ent.name)
-            edge_key = f"mentions::{document_id}::{ent.entity_id}::{chunk_id}"
+            edge_key = f"mentions::{document_id}::{tenant_prefix}{ent.entity_id}::{chunk_id}"
             mentions.append(
                 GraphMention(
                     doc_id=str(document_id),
-                    entity_id=ent.entity_id,
+                    entity_id=f"{tenant_prefix}{ent.entity_id}",
                     chunk_id=str(chunk_id),
                     evidence_span=evidence_span,
                     confidence=ent.confidence,
                     edge_key=edge_key,
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
                 )
             )
 
@@ -263,7 +293,7 @@ def build_graph_payload(
         if field_map:
             for key, value in field_map:
                 normalized_value = normalize_entity_name(str(value))
-                entity_id = f"FIELD::{key.lower()}::{normalized_value}"
+                entity_id = f"{tenant_prefix}FIELD::{key.lower()}::{normalized_value}"
                 entities.setdefault(
                     entity_id,
                     GraphEntity(
@@ -271,6 +301,8 @@ def build_graph_payload(
                         name=str(value),
                         type="FIELD",
                         normalized_name=normalized_value,
+                        subscription_id=str(subscription_id),
+                        profile_id=str(profile_id),
                     ),
                 )
                 edge_key = f"field::{document_id}::{entity_id}::{chunk_id}"
@@ -283,6 +315,8 @@ def build_graph_payload(
                         value=str(value),
                         confidence=0.85,
                         edge_key=edge_key,
+                        subscription_id=str(subscription_id),
+                        profile_id=str(profile_id),
                     )
                 )
 
@@ -302,9 +336,24 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
         return
 
     documents = [payload.document]
+    doc_sub = payload.document.get("subscription_id")
+    doc_prof = payload.document.get("profile_id")
+
     entities = [entity.__dict__ for entity in payload.entities]
-    mentions = [mention.__dict__ for mention in payload.mentions]
-    fields = [field.__dict__ for field in payload.fields]
+    mentions = [
+        mention.__dict__
+        for mention in payload.mentions
+        if mention.subscription_id == doc_sub and mention.profile_id == doc_prof
+    ]
+    fields = [
+        field.__dict__
+        for field in payload.fields
+        if field.subscription_id == doc_sub and field.profile_id == doc_prof
+    ]
+    if payload.mentions and not mentions:
+        logger.warning("KG Guard: dropped mentions with cross-profile scope for doc_id=%s", payload.document.get("doc_id"))
+    if payload.fields and not fields:
+        logger.warning("KG Guard: dropped fields with cross-profile scope for doc_id=%s", payload.document.get("doc_id"))
 
     store.ensure_graph_constraints()
 
@@ -325,7 +374,8 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
         entity_query = (
             "UNWIND $entities AS ent "
             "MERGE (e:Entity {entity_id: ent.entity_id}) "
-            "SET e.name = ent.name, e.type = ent.type, e.normalized_name = ent.normalized_name "
+            "SET e.name = ent.name, e.type = ent.type, e.normalized_name = ent.normalized_name, "
+            "    e.subscription_id = ent.subscription_id, e.profile_id = ent.profile_id "
             "WITH e, ent "
             "FOREACH (_ IN CASE WHEN ent.type = 'PERSON' THEN [1] ELSE [] END | SET e:Person) "
             "FOREACH (_ IN CASE WHEN ent.type = 'ORGANIZATION' THEN [1] ELSE [] END | SET e:Organization) "
@@ -340,8 +390,8 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
     if mentions:
         mention_query = (
             "UNWIND $mentions AS row "
-            "MATCH (d:Document {doc_id: row.doc_id}) "
-            "MATCH (e:Entity {entity_id: row.entity_id}) "
+            "MATCH (d:Document {doc_id: row.doc_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
+            "MATCH (e:Entity {entity_id: row.entity_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "MERGE (d)-[r:MENTIONS {edge_key: row.edge_key}]->(e) "
             "SET r.chunk_id = row.chunk_id, "
             "    r.evidence_span = row.evidence_span, "
@@ -352,8 +402,8 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
     if fields:
         field_query = (
             "UNWIND $fields AS row "
-            "MATCH (d:Document {doc_id: row.doc_id}) "
-            "MATCH (e:Entity {entity_id: row.entity_id}) "
+            "MATCH (d:Document {doc_id: row.doc_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
+            "MATCH (e:Entity {entity_id: row.entity_id, subscription_id: row.subscription_id, profile_id: row.profile_id}) "
             "MERGE (d)-[r:HAS_FIELD {edge_key: row.edge_key}]->(e) "
             "SET r.key = row.key, "
             "    r.value = row.value, "

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -36,9 +37,10 @@ from src.api.dw_document_extractor import DocumentExtractor
 from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
 from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
-from src.embedding.pipeline.chunk_integrity import clean_text_for_embedding
-from src.embedding.pipeline.embed_pipeline import prepare_embedding_chunks, normalize_chunk_chain
-from src.embedding.pipeline.payload_normalizer import build_qdrant_payload
+from src.embedding.pipeline.chunk_integrity import clean_text_for_embedding, is_valid_chunk_text
+from src.embedding.pipeline.embed_pipeline import ChunkPrepStats, prepare_embedding_chunks, normalize_chunk_chain
+from src.embedding.pipeline.payload_normalizer import build_qdrant_payload, normalize_chunk_metadata
+from src.embedding.pipeline.schema_normalizer import EMBED_PIPELINE_VERSION
 from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
 from src.embedding.model_loader import (
     encode_with_fallback as model_encode_with_fallback,
@@ -48,6 +50,7 @@ from src.embedding.model_loader import (
 from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
+from src.utils.payload_utils import is_valid_text, token_count
 from azure.core.exceptions import ResourceNotFoundError
 
 from src.storage.azure_blob_client import (
@@ -72,6 +75,12 @@ logger = logging.getLogger(__name__)
 
 '-------------------------------modified by maha/maria-----------------------'
 '---------------------------------new function for checking PII status in mongodb--------------------'
+
+
+class ChunkingDiagnosticError(RuntimeError):
+    def __init__(self, message: str, diagnostics: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 def get_subscription_pii_setting(subscription_id: str) -> bool:
@@ -332,7 +341,10 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
     logging.info("Loading sentence transformer model: %s (device=%s)", name, device)
     model_kwargs = _model_kwargs_for_device(device)
     try:
-        return SentenceTransformer(name, device=device, model_kwargs=model_kwargs)
+        if getattr(Config.Model, "OFFLINE_ONLY", True):
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        return SentenceTransformer(name, device=device, model_kwargs=model_kwargs, local_files_only=True)
     except Exception as exc:  # noqa: BLE001
         if device != "cpu" and (_is_meta_tensor_error(exc) or _is_cuda_oom(exc)):
             logging.warning(
@@ -341,14 +353,14 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
                 exc,
             )
             cpu_kwargs = _model_kwargs_for_device("cpu")
-            return SentenceTransformer(name, device="cpu", model_kwargs=cpu_kwargs)
+            return SentenceTransformer(name, device="cpu", model_kwargs=cpu_kwargs, local_files_only=True)
         raise
 
 
 def get_model(*, reload: bool = False, device: Optional[str] = None):
     """Lazy init for sentence transformer model with robust device fallback."""
     global _MODEL, _MODEL_DEVICE
-    model = get_embedding_model(reload=reload, device=device)
+    model, _dim = get_embedding_model(reload=reload, device=device)
     _MODEL = model
     _MODEL_DEVICE = getattr(model, "_target_device", None) or _MODEL_DEVICE
     return model
@@ -368,6 +380,7 @@ def encode_with_fallback(
     normalize_embeddings: bool = False,
     convert_to_numpy: bool = True,
     batch_size: Optional[int] = None,
+    device: Optional[str] = None,
 ):
     """Encode with recovery from meta-device and CUDA OOM failures."""
     effective_batch_size = batch_size or _embedding_batch_size()
@@ -376,6 +389,7 @@ def encode_with_fallback(
         normalize_embeddings=normalize_embeddings,
         convert_to_numpy=convert_to_numpy,
         batch_size=effective_batch_size,
+        device=device,
     )
 
 
@@ -576,6 +590,33 @@ def update_extraction_metadata(
         collection.update_one(filter_criteria, {"$set": update_data})
     except Exception as exc:  # noqa: BLE001
         logging.error(f"Error updating extraction metadata for {document_id}: {exc}")
+
+
+def update_layout_graph_metadata(
+    document_id: str,
+    *,
+    layout_latest_path: Optional[str],
+    layout_versioned_path: Optional[str],
+    layout_hash: Optional[str],
+) -> None:
+    """Persist layout graph pointers without storing the full graph in Mongo."""
+    try:
+        if ObjectId.is_valid(str(document_id)):
+            filter_criteria = {"_id": ObjectId(str(document_id))}
+        else:
+            filter_criteria = {"_id": str(document_id)}
+
+        update_data = {
+            "layout_graph_latest_path": layout_latest_path,
+            "layout_graph_versioned_path": layout_versioned_path,
+            "layout_graph_hash": layout_hash,
+            "layout_graph_updated_at": time.time(),
+            "updated_at": time.time(),
+        }
+        collection = db[Config.MongoDB.DOCUMENTS]
+        collection.update_one(filter_criteria, {"$set": update_data})
+    except Exception as exc:  # noqa: BLE001
+        logging.error(f"Error updating layout graph metadata for {document_id}: {exc}")
 
 
 def update_security_screening(document_id: str, report: Dict[str, Any], status: str) -> None:
@@ -1239,6 +1280,94 @@ def save_embeddings_to_qdrant(
         profile_name = doc_metadata.get("profile_name")
         description = doc_metadata.get("description")
 
+        doc_domain = embeddings.get("doc_domain")
+        full_text_seed = (
+            embeddings.get("full_text")
+            or doc_metadata.get("full_text")
+            or " ".join([t for t in texts if t])
+        )
+        try:
+            from src.utils.language import detect_language
+
+            if not languages:
+                lang, confidence = detect_language(full_text_seed or "")
+                if lang and lang != "unknown":
+                    languages = [lang]
+                doc_metadata["detected_language"] = lang
+                doc_metadata["language_confidence"] = confidence
+        except Exception:  # noqa: BLE001
+            pass
+        if languages:
+            doc_metadata["languages"] = languages
+        if doc_metadata.get("detected_language"):
+            embeddings["detected_language"] = doc_metadata.get("detected_language")
+        if doc_metadata.get("language_confidence") is not None:
+            embeddings["language_confidence"] = doc_metadata.get("language_confidence")
+        if languages:
+            embeddings["languages"] = languages
+        doc_version_hash = (
+            embeddings.get("doc_version_hash")
+            or doc_metadata.get("doc_version_hash")
+            or hashlib.sha1((full_text_seed or "").encode("utf-8")).hexdigest()[:12]
+        )
+        embeddings["doc_version_hash"] = doc_version_hash
+        section_intel_result = None
+        section_intel_payload = embeddings.get("section_intelligence")
+        if isinstance(section_intel_payload, dict) and section_intel_payload.get("sections"):
+            section_intel_result = section_intel_payload
+            doc_domain = section_intel_payload.get("doc_domain") or doc_domain
+            embeddings["doc_domain"] = doc_domain
+        elif texts:
+            try:
+                from src.intelligence.section_intelligence_builder import SectionIntelligenceBuilder
+
+                telemetry = telemetry_store() if METRICS_V2_ENABLED else None
+                section_start = time.time()
+                full_text = embeddings.get("full_text") or " ".join([t for t in texts if t])
+                builder = SectionIntelligenceBuilder()
+                section_intel_result = builder.build(
+                    document_id=str(doctag),
+                    document_text=full_text,
+                    chunk_texts=list(texts),
+                    chunk_metadata=chunk_metadata,
+                    metadata={
+                        "doc_type": doc_type or document_type,
+                        "source_name": filename or source_filename,
+                    },
+                )
+                if telemetry:
+                    telemetry.observe("section_build_time_ms", (time.time() - section_start) * 1000)
+                doc_domain = section_intel_result.doc_domain or doc_domain
+                embeddings["section_intelligence"] = section_intel_result.to_dict()
+                embeddings["doc_domain"] = doc_domain
+            except Exception as exc:  # noqa: BLE001
+                logging.debug("Section intelligence build skipped for %s: %s", doctag, exc)
+                if not doc_domain:
+                    try:
+                        from src.intelligence.domain_indexer import infer_domain
+
+                        sample_text = " ".join([t for t in texts[:5] if t])
+                        doc_domain = infer_domain(
+                            sample_text,
+                            doc_type=doc_type or document_type,
+                            source_name=filename or source_filename,
+                        )
+                    except Exception:
+                        doc_domain = None
+
+        if not doc_domain or str(doc_domain).strip().lower() in {"unknown", "generic"}:
+            try:
+                from src.intelligence.domain_indexer import infer_domain
+
+                doc_domain = infer_domain(
+                    full_text_seed or " ".join([t for t in texts if t]),
+                    doc_type=doc_type or document_type,
+                    source_name=filename or source_filename,
+                )
+            except Exception:
+                doc_domain = doc_domain or "unknown"
+        embeddings["doc_domain"] = doc_domain
+
         if not texts:
             raise ValueError(f"No texts found for document {doctag}")
 
@@ -1265,10 +1394,23 @@ def save_embeddings_to_qdrant(
         ensure_qdrant_collection(collection_name, vector_size)
 
         records: List[ChunkRecord] = []
+        invalid_samples: List[Dict[str, Any]] = []
+        min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 50))
+        min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 10))
         for idx in range(max_len):
             vector = normalized_vectors[idx]
             text = texts[idx]
             if not vector:
+                continue
+            if not is_valid_chunk_text(text, min_chars=min_chars, min_tokens=min_tokens):
+                chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
+                invalid_samples.append(
+                    {
+                        "chunk_id": (chunk_meta or {}).get("chunk_id"),
+                        "length": len(text or ""),
+                        "sample": _sanitize_text_sample(text),
+                    }
+                )
                 continue
 
             chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
@@ -1284,6 +1426,8 @@ def save_embeddings_to_qdrant(
             page_val = pages[idx] if idx < len(pages) else chunk_meta.get("page_number")
             section_val = chunk_meta.get("section_title", sections[idx] if idx < len(sections) else "")
             section_path = chunk_meta.get("section_path") or section_val or "Untitled Section"
+            section_id = chunk_meta.get("section_id")
+            section_kind = chunk_meta.get("section_kind") or "misc"
             page_start = chunk_meta.get("page_start", page_val)
             page_end = chunk_meta.get("page_end", page_val)
             chunk_char_len = len(text)
@@ -1307,22 +1451,35 @@ def save_embeddings_to_qdrant(
                 else:
                     chunk_kind = "section_text"
 
+            embedding_text = chunk_meta.get("embedding_text") or chunk_meta.get("text_clean") or text
+            content_text = chunk_meta.get("content") or chunk_meta.get("text_raw") or chunk_meta.get("text_clean") or text
             raw_payload = {
                 "subscription_id": str(subscription_id),
                 "profile_id": str(profile_id),
                 "document_id": str(doctag),
-                "text": text,
-                "text_clean": chunk_meta.get("text_clean") or clean_text_for_embedding(text),
-                "text_data": {"clean": chunk_meta.get("text_clean")} if chunk_meta.get("text_clean") else {},
+                "content": content_text,
+                "embedding_text": embedding_text,
+                "text_clean": embedding_text,
+                "text_data": {"clean": embedding_text} if embedding_text else {},
                 "source": {"name": filename or source_filename},
+                "anchors": chunk_meta.get("anchors"),
+                "file_type": doc_metadata.get("file_type") or _safe_basename(filename or source_filename).split(".")[-1],
+                "mime_type": doc_metadata.get("mime_type"),
+                "connector_type": doc_metadata.get("ingestion_source") or doc_metadata.get("source_type"),
                 "document": {
                     "type": chunk_meta.get("doc_type")
                     or doc_type
                     or doc_metadata.get("document_type")
                     or doc_metadata.get("doc_type"),
+                    "domain": doc_domain,
                     "ingestion_source": doc_metadata.get("ingestion_source") or doc_metadata.get("source_type"),
                 },
-                "section": {"title": section_val, "path": section_path},
+                "doc_domain": doc_domain,
+                "section": {"id": section_id, "title": section_val, "path": section_path, "kind": section_kind},
+                "section_id": section_id,
+                "section_kind": section_kind,
+                "section_confidence": chunk_meta.get("section_confidence"),
+                "section_salience": chunk_meta.get("section_salience"),
                 "section_title": section_val or chunk_meta.get("section"),
                 "section_path": section_path,
                 "page": page_val,
@@ -1332,6 +1489,10 @@ def save_embeddings_to_qdrant(
                 "chunk_count": max_len,
                 "chunk_role": chunk_meta.get("chunk_role") or chunk_meta.get("role"),
                 "chunk_kind": chunk_kind,
+                "chunking_mode": chunk_meta.get("chunking_mode"),
+                "detected_language": doc_metadata.get("detected_language") or (languages[0] if languages else None),
+                "language_confidence": doc_metadata.get("language_confidence"),
+                "languages": languages,
                 "chunk": {
                     "id": chunk_id,
                     "index": idx,
@@ -1341,6 +1502,8 @@ def save_embeddings_to_qdrant(
                     "hash": chunk_meta.get("chunk_hash") or chunk_hash,
                 },
                 "hash": chunk_meta.get("chunk_hash") or chunk_hash,
+                "doc_version_hash": doc_version_hash,
+                "embed_pipeline_version": EMBED_PIPELINE_VERSION,
             }
 
             payload = build_qdrant_payload(raw_payload)
@@ -1361,6 +1524,14 @@ def save_embeddings_to_qdrant(
         logging.info(
             f"Saved {saved} embeddings for document {doctag} in collection {collection_name} (profile={profile_id})"
         )
+        if invalid_samples:
+            logging.warning(
+                "Skipped %s invalid chunks during embedding for %s (min_chars=%s min_tokens=%s)",
+                len(invalid_samples),
+                doctag,
+                min_chars,
+                min_tokens,
+            )
 
         try:
             from src.api.dw_newron import get_redis_client
@@ -1386,7 +1557,93 @@ def save_embeddings_to_qdrant(
             queue = get_graph_ingest_queue(redis_client)
             queue.enqueue(graph_payload)
 
-        return {"status": "success", "points_saved": saved}
+        try:
+            from src.intelligence.facts_store import FactsStore
+            from src.intelligence.kg_updater import KGUpdater
+            from src.intelligence.domain_indexer import DomainIndexer
+            from src.intelligence.redis_intel_cache import RedisIntelCache
+
+            facts_store = FactsStore(redis_client=redis_client, db=db)
+            if section_intel_result:
+                if isinstance(section_intel_result, dict):
+                    sections_payload = section_intel_result.get("sections") or []
+                    facts_payload = section_intel_result.get("section_facts") or []
+                    summaries_payload = section_intel_result.get("section_summaries") or {}
+                else:
+                    sections_payload = [sec.__dict__ for sec in section_intel_result.sections]
+                    facts_payload = section_intel_result.section_facts
+                    summaries_payload = section_intel_result.section_summaries
+                facts_store.persist_document_sections(
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    document_id=str(doctag),
+                    source_name=filename or source_filename,
+                    doc_domain=doc_domain or "generic",
+                    doc_version_hash=doc_version_hash,
+                    sections=sections_payload,
+                    section_facts=facts_payload,
+                    section_summaries=summaries_payload,
+                )
+                kg_updater = KGUpdater(redis_client=redis_client)
+                kg_updater.update(
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    document_id=str(doctag),
+                    source_name=filename or source_filename,
+                    doc_domain=doc_domain or "generic",
+                    sections=sections_payload,
+                    chunk_metadata=chunk_metadata,
+                    section_facts=facts_payload,
+                )
+                if redis_client:
+                    cache = RedisIntelCache(redis_client)
+                    DomainIndexer(redis_cache=cache).update_entities_only(
+                        subscription_id=str(subscription_id),
+                        profile_id=str(profile_id),
+                        document_id=str(doctag),
+                        chunk_texts=list(texts),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("DWX section intelligence/KG update skipped: %s", exc)
+
+        try:
+            from src.embed.embed_pipeline import update_profile_indexes_from_embeddings
+            from src.kg.kg_store import KGStore
+
+            if redis_client:
+                update_profile_indexes_from_embeddings(
+                    embeddings_payload=embeddings,
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    document_id=str(doctag),
+                    file_name=filename or source_filename,
+                    redis_client=redis_client,
+                    kg_store=KGStore(),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("DocWain profile index update skipped: %s", exc)
+
+        try:
+            if doc_domain:
+                collection = db[Config.MongoDB.DOCUMENTS]
+                filter_criteria = {"_id": ObjectId(str(doctag))} if ObjectId.is_valid(str(doctag)) else {"_id": str(doctag)}
+                update_fields = {"doc_domain": doc_domain, "updated_at": time.time()}
+                if languages:
+                    update_fields["languages"] = languages
+                if doc_metadata.get("detected_language"):
+                    update_fields["detected_language"] = doc_metadata.get("detected_language")
+                if doc_metadata.get("language_confidence") is not None:
+                    update_fields["language_confidence"] = doc_metadata.get("language_confidence")
+                collection.update_one(filter_criteria, {"$set": update_fields})
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Failed to update doc_domain metadata for %s: %s", doctag, exc)
+
+        return {
+            "status": "success",
+            "points_saved": saved,
+            "dropped_invalid": len(invalid_samples),
+            "invalid_samples": invalid_samples[:5],
+        }
 
     except Exception as e:
         logging.error(f"Error saving embeddings to Qdrant for document {doctag}, file {source_filename}: {e}")
@@ -1616,6 +1873,87 @@ def _apply_chunk_quality_filter(
     return filtered_chunks, filtered_meta, dropped
 
 
+def _sanitize_text_sample(text: Optional[str], limit: int = 80) -> str:
+    sample = re.sub(r"\s+", " ", (text or "").strip())
+    if len(sample) > limit:
+        sample = sample[:limit].rstrip() + "..."
+    return sample
+
+
+def _filter_invalid_chunk_texts(
+    chunks: List[str],
+    metadata: List[Dict[str, Any]],
+    *,
+    min_chars: int,
+    min_tokens: int,
+) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, Any], List[int]]:
+    valid_chunks: List[str] = []
+    valid_meta: List[Dict[str, Any]] = []
+    valid_indices: List[int] = []
+    invalid_samples: List[Dict[str, Any]] = []
+    invalid_lengths: List[int] = []
+
+    for idx, (text, meta) in enumerate(zip(chunks, metadata)):
+        if is_valid_chunk_text(text, min_chars=min_chars, min_tokens=min_tokens):
+            valid_chunks.append(text)
+            valid_meta.append(meta)
+            valid_indices.append(idx)
+        else:
+            invalid_lengths.append(len(text or ""))
+            invalid_samples.append(
+                {
+                    "chunk_id": (meta or {}).get("chunk_id"),
+                    "length": len(text or ""),
+                    "sample": _sanitize_text_sample(text),
+                }
+            )
+
+    length_stats = {}
+    if invalid_lengths:
+        length_stats = {
+            "min": min(invalid_lengths),
+            "max": max(invalid_lengths),
+            "avg": float(sum(invalid_lengths) / max(1, len(invalid_lengths))),
+        }
+
+    diagnostics = {
+        "min_chars": int(min_chars),
+        "min_tokens": int(min_tokens),
+        "total_chunks": len(chunks),
+        "valid_chunks": len(valid_chunks),
+        "invalid_chunks": len(invalid_samples),
+        "invalid_length_stats": length_stats,
+        "invalid_samples": invalid_samples[:5],
+    }
+
+    return valid_chunks, valid_meta, diagnostics, valid_indices
+
+
+def _mark_chunking_failed(doc_tag: str, doc_name: str, diagnostics: Dict[str, Any]) -> None:
+    try:
+        from src.api.document_status import update_stage, update_document_fields
+
+        update_stage(
+            doc_tag,
+            "chunking",
+            {
+                "status": "EXTRACTION_OR_CHUNKING_FAILED",
+                "completed_at": time.time(),
+                "diagnostics": diagnostics,
+                "doc_name": doc_name,
+            },
+        )
+        update_document_fields(
+            doc_tag,
+            {
+                "chunking_status": "EXTRACTION_OR_CHUNKING_FAILED",
+                "chunking_failed_at": time.time(),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Failed to record chunking diagnostics for %s: %s", doc_tag, exc)
+
+
 def _extract_facts(text: str) -> List[str]:
     facts: List[str] = []
     for line in text.splitlines():
@@ -1653,6 +1991,7 @@ def _build_chunk_metadata_from_section_chunks(
     doc_tag: str,
     doc_type: Optional[str],
     doc_ocr_confidence: Optional[float],
+    chunking_mode: str = "section_aware",
 ) -> List[Dict[str, Any]]:
     metadata: List[Dict[str, Any]] = []
     for chunk in section_chunks:
@@ -1675,6 +2014,7 @@ def _build_chunk_metadata_from_section_chunks(
                 "doc_type": doc_type,
                 "ocr_confidence": doc_ocr_confidence,
                 "sentence_complete": sentence_complete,
+                "chunking_mode": chunking_mode,
             }
         )
     return metadata
@@ -1687,6 +2027,7 @@ def _chunk_with_section_chunker(
     doc_name: str,
     doc_type: Optional[str],
     doc_ocr_confidence: Optional[float],
+    chunking_mode: str = "section_aware",
 ) -> Tuple[List[str], List[Dict[str, Any]], Optional[float]]:
     chunker = SectionChunker()
     section_chunks = chunker.chunk_document(content, doc_internal_id=doc_tag, source_filename=doc_name)
@@ -1695,6 +2036,7 @@ def _chunk_with_section_chunker(
         doc_tag=doc_tag,
         doc_type=doc_type,
         doc_ocr_confidence=doc_ocr_confidence,
+        chunking_mode=chunking_mode,
     )
     aligned_chunks: List[str] = []
     aligned_meta: List[Dict[str, Any]] = []
@@ -1716,7 +2058,142 @@ def _chunk_with_section_chunker(
     return aligned_chunks, aligned_meta, coverage_ratio
 
 
-def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
+def _fallback_chunk_text_sliding_window(
+    text: str,
+    *,
+    min_required: int,
+    min_chars: int,
+    min_tokens: int,
+    chunk_size_tokens: int,
+    overlap_tokens: int,
+) -> List[str]:
+    if not text or not str(text).strip():
+        return []
+    normalized = normalize_text(text)
+    tokens = list(re.finditer(r"\S+", normalized))
+    if not tokens:
+        return []
+
+    total_tokens = len(tokens)
+    total_chars = len(normalized.strip())
+    if total_tokens < min_required * min_tokens or total_chars < min_required * min_chars:
+        return [normalized.strip()]
+
+    chunk_size_tokens = max(min_tokens, int(chunk_size_tokens or 0))
+    if total_tokens < chunk_size_tokens:
+        chunk_size_tokens = max(min_tokens, int(math.ceil(total_tokens / max(1, min_required))))
+
+    overlap_tokens = max(0, int(overlap_tokens or 0))
+    if overlap_tokens >= chunk_size_tokens:
+        overlap_tokens = max(0, chunk_size_tokens // 4)
+    step = max(1, chunk_size_tokens - overlap_tokens)
+
+    def _slice_chunks(size_tokens: int) -> List[str]:
+        local_chunks: List[str] = []
+        start = 0
+        while start < total_tokens:
+            end = min(total_tokens, start + size_tokens)
+            start_char = tokens[start].start()
+            end_char = tokens[end - 1].end()
+            chunk_text = normalized[start_char:end_char].strip()
+            if chunk_text:
+                local_chunks.append(chunk_text)
+            if end >= total_tokens:
+                break
+            start += step
+        return local_chunks
+
+    chunks = _slice_chunks(chunk_size_tokens)
+    if len(chunks) < min_required:
+        target_size = max(min_tokens, int(math.ceil(total_tokens / max(1, min_required))))
+        if target_size < chunk_size_tokens:
+            chunk_size_tokens = target_size
+            overlap_tokens = min(overlap_tokens, max(0, chunk_size_tokens // 4))
+            step = max(1, chunk_size_tokens - overlap_tokens)
+            chunks = _slice_chunks(chunk_size_tokens)
+
+    return chunks
+
+
+def _build_fallback_metadata(
+    chunks: List[str],
+    *,
+    doc_tag: str,
+    doc_type: Optional[str],
+    doc_ocr_confidence: Optional[float],
+) -> List[Dict[str, Any]]:
+    metadata: List[Dict[str, Any]] = []
+    for idx, text in enumerate(chunks):
+        section_path = f"Full Document > Chunk {idx + 1}"
+        metadata.append(
+            {
+                "document_id": doc_tag,
+                "section_title": "Full Document",
+                "section_path": section_path,
+                "page_start": None,
+                "page_end": None,
+                "page_number": None,
+                "chunk_index": idx,
+                "chunk_type": "text",
+                "chunk_kind": "section_text",
+                "doc_type": doc_type,
+                "ocr_confidence": doc_ocr_confidence,
+                "sentence_complete": str(text).strip().endswith((".", "?", "!")),
+                "chunking_mode": "sliding_window_fallback",
+            }
+        )
+    return metadata
+
+
+def _fallback_chunks_for_full_text(
+    full_text: str,
+    *,
+    doc_tag: str,
+    doc_name: str,
+    subscription_id: str,
+    profile_id: str,
+    doc_type: Optional[str],
+    doc_ocr_confidence: Optional[float],
+    min_required: int,
+    min_chars: int,
+    min_tokens: int,
+) -> Tuple[List[str], List[Dict[str, Any]], Optional[ChunkPrepStats], Dict[str, Any], List[int]]:
+    fallback_chunks = _fallback_chunk_text_sliding_window(
+        full_text,
+        min_required=min_required,
+        min_chars=min_chars,
+        min_tokens=min_tokens,
+        chunk_size_tokens=int(getattr(Config.Retrieval, "FALLBACK_CHUNK_SIZE", 600)),
+        overlap_tokens=int(getattr(Config.Retrieval, "FALLBACK_OVERLAP", 80)),
+    )
+    if not fallback_chunks:
+        return [], [], None, {}, []
+
+    fallback_meta = _build_fallback_metadata(
+        fallback_chunks,
+        doc_tag=doc_tag,
+        doc_type=doc_type,
+        doc_ocr_confidence=doc_ocr_confidence,
+    )
+    fallback_chunks, fallback_meta, prep_stats = prepare_embedding_chunks(
+        fallback_chunks,
+        fallback_meta,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        document_id=doc_tag,
+        doc_name=doc_name,
+        quality_filter=_apply_chunk_quality_filter,
+    )
+    fallback_chunks, fallback_meta, validity_diag, valid_indices = _filter_invalid_chunk_texts(
+        fallback_chunks,
+        fallback_meta,
+        min_chars=min_chars,
+        min_tokens=min_tokens,
+    )
+    return fallback_chunks, fallback_meta, prep_stats, validity_diag, valid_indices
+
+
+def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, device: Optional[str] = None):
     """
      COMPLETELY FIXED: Trains and stores embeddings with strict document_id verification
 
@@ -1817,26 +2294,14 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             elif len(chunk_metadata) > len(texts):
                 chunk_metadata = chunk_metadata[: len(texts)]
 
+            chunk_metadata = normalize_chunk_metadata(
+                chunk_metadata,
+                document_id=doc_tag,
+                default_doc_type=doc_type,
+                default_chunking_mode="section_aware",
+            )
             for idx, meta in enumerate(chunk_metadata):
-                section_title = (meta.get("section_title") or meta.get("section") or "Untitled Section").strip()
-                if not section_title:
-                    section_title = "Untitled Section"
-                section_path = (meta.get("section_path") or section_title).strip() or section_title
-                page_start = meta.get("page_start", meta.get("page_number"))
-                page_end = meta.get("page_end", page_start)
-                meta.update(
-                    {
-                        "document_id": doc_tag,
-                        "section_title": section_title,
-                        "section_path": section_path,
-                        "page_start": page_start,
-                        "page_end": page_end,
-                        "page_number": page_start,
-                        "chunk_index": idx,
-                        "doc_type": meta.get("doc_type") or doc_type,
-                        "chunk_kind": meta.get("chunk_kind", "section_text"),
-                    }
-                )
+                meta["chunk_index"] = idx
                 if "sentence_complete" not in meta:
                     meta["sentence_complete"] = str(texts[idx]).strip().endswith((".", "?", "!"))
 
@@ -1853,6 +2318,133 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             if not texts:
                 raise ValueError(f"Chunk preparation removed all chunks for document {doc_tag}")
 
+            min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 80))
+            min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 15))
+            min_valid = int(getattr(Config.Retrieval, "MIN_REQUIRED_CHUNKS", 3))
+            texts, chunk_metadata, validity_diag, valid_indices = _filter_invalid_chunk_texts(
+                texts,
+                chunk_metadata,
+                min_chars=min_chars,
+                min_tokens=min_tokens,
+            )
+            dropped_chunks += int(validity_diag.get("invalid_chunks", 0))
+            force_reembed = False
+            if len(texts) < min_valid:
+                full_text = text.get("full_text") or text.get("text") or text.get("content")
+                fallback_used = False
+                if is_valid_text(full_text, min_chars=min_chars, min_tokens=min_tokens):
+                    fallback_chunks, fallback_meta, fallback_prep, fallback_diag, fallback_indices = (
+                        _fallback_chunks_for_full_text(
+                            str(full_text),
+                            doc_tag=doc_tag,
+                            doc_name=doc_name,
+                            subscription_id=subscription_id,
+                            profile_id=profile_id,
+                            doc_type=doc_type,
+                            doc_ocr_confidence=None,
+                            min_required=min_valid,
+                            min_chars=min_chars,
+                            min_tokens=min_tokens,
+                        )
+                    )
+                    if len(fallback_chunks) >= min_valid:
+                        texts = fallback_chunks
+                        chunk_metadata = fallback_meta
+                        validity_diag = fallback_diag or validity_diag
+                        valid_indices = fallback_indices
+                        dropped_chunks = (
+                            int((fallback_prep or ChunkPrepStats()).dropped_quality)
+                            + int((fallback_prep or ChunkPrepStats()).dropped_dedupe)
+                            + int(validity_diag.get("invalid_chunks", 0))
+                        )
+                        fallback_used = True
+                        force_reembed = True
+
+                if len(texts) < min_valid:
+                    extracted_chars = len(str(full_text or "").strip())
+                    diagnostics = {
+                        **(validity_diag or {}),
+                        "reason": "insufficient_valid_chunks",
+                        "extracted_chars": extracted_chars,
+                        "expected_chunks": int(validity_diag.get("total_chunks", 0)),
+                        "prepared_chunks": int(validity_diag.get("total_chunks", 0)),
+                        "valid_chunks": len(texts),
+                        "min_required": min_valid,
+                        "chunking_mode": "sliding_window_fallback" if fallback_used else "section_aware",
+                        "fallback_used": fallback_used,
+                    }
+                    _mark_chunking_failed(doc_tag, doc_name, diagnostics)
+                    raise ChunkingDiagnosticError(
+                        f"EXTRACTION_OR_CHUNKING_FAILED: valid_chunks={len(texts)} "
+                        f"min_required={min_valid} for document {doc_tag}",
+                        diagnostics=diagnostics,
+                    )
+            section_intel_result = None
+            if texts:
+                try:
+                    from src.intelligence.section_intelligence_builder import SectionIntelligenceBuilder
+
+                    full_text = text.get("full_text") or text.get("text") or text.get("content")
+                    full_text = full_text if isinstance(full_text, str) else " ".join(texts)
+                    builder = SectionIntelligenceBuilder()
+                    section_intel_result = builder.build(
+                        document_id=str(doc_tag),
+                        document_text=full_text or " ".join(texts),
+                        chunk_texts=list(texts),
+                        chunk_metadata=chunk_metadata,
+                        metadata={
+                            "doc_type": doc_type,
+                            "source_name": doc_metadata.get("filename") or doc_name,
+                        },
+                    )
+                    text["section_intelligence"] = section_intel_result.to_dict()
+                    if section_intel_result.doc_domain:
+                        text["doc_domain"] = section_intel_result.doc_domain
+                    if getattr(Config.Intelligence, "SECTION_SUMMARY_VECTORS_ENABLED", False):
+                        max_chars = int(getattr(Config.Intelligence, "SECTION_SUMMARY_MAX_CHARS", 700))
+                        added = 0
+                        for section in section_intel_result.sections:
+                            summary_text = section_intel_result.section_summaries.get(section.section_id)
+                            if not summary_text:
+                                continue
+                            summary_text = summary_text[:max_chars].strip()
+                            if not summary_text or len(summary_text.split()) < 6:
+                                continue
+                            page_start = None
+                            page_end = None
+                            if section.page_range:
+                                page_start, page_end = section.page_range
+                            chunk_metadata.append(
+                                {
+                                    "document_id": doc_tag,
+                                    "section_id": section.section_id,
+                                    "section_title": section.section_title,
+                                    "section_path": section.section_path,
+                                    "section_kind": section.section_kind,
+                                    "page_start": page_start,
+                                    "page_end": page_end,
+                                    "page_number": page_start,
+                                    "chunk_type": "summary",
+                                    "chunk_kind": "section_summary",
+                                    "chunking_mode": "section_summary",
+                                    "doc_type": doc_type,
+                                    "sentence_complete": True,
+                                }
+                            )
+                            texts.append(summary_text)
+                            added += 1
+                        if added:
+                            force_reembed = True
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("Section intelligence build skipped for %s: %s", doc_tag, exc)
+            chunk_metadata = normalize_chunk_chain(
+                chunk_metadata,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_tag,
+                chunks=texts,
+            )
+
             chunk_lengths = [len(t) for t in texts]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
             _record_chunking_metrics(
@@ -1862,7 +2454,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 sentence_complete_flags=sentence_flags,
             )
 
-            if isinstance(text.get("embeddings"), (list, tuple)) and len(text.get("embeddings") or []) != len(texts):
+            if force_reembed or (
+                isinstance(text.get("embeddings"), (list, tuple))
+                and len(text.get("embeddings") or []) != len(texts)
+            ):
                 logging.info(
                     "Re-embedding structured chunks after integrity/dedupe: %s -> %s",
                     len(text.get("embeddings") or []),
@@ -1872,8 +2467,20 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     texts,
                     convert_to_numpy=True,
                     normalize_embeddings=True,
+                    device=device,
                 )
                 text["sparse_vectors"] = build_sparse_vectors(texts)
+            else:
+                if isinstance(text.get("embeddings"), (list, tuple)) and len(text.get("embeddings") or []) == len(valid_indices):
+                    text["embeddings"] = [text["embeddings"][i] for i in valid_indices]
+                if isinstance(text.get("sparse_vectors"), (list, tuple)) and len(text.get("sparse_vectors") or []) == len(valid_indices):
+                    text["sparse_vectors"] = [text["sparse_vectors"][i] for i in valid_indices]
+                if isinstance(text.get("summaries"), (list, tuple)) and len(text.get("summaries") or []) == len(valid_indices):
+                    text["summaries"] = [text["summaries"][i] for i in valid_indices]
+                if isinstance(text.get("pages"), (list, tuple)) and len(text.get("pages") or []) == len(valid_indices):
+                    text["pages"] = [text["pages"][i] for i in valid_indices]
+                if isinstance(text.get("sections"), (list, tuple)) and len(text.get("sections") or []) == len(valid_indices):
+                    text["sections"] = [text["sections"][i] for i in valid_indices]
 
             text["texts"] = texts
             text["chunk_metadata"] = chunk_metadata
@@ -1883,6 +2490,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             expected_points = len(texts)
             result = save_embeddings_to_qdrant(text, subscription_id, profile_id, doc_tag, doc_name)
             saved = result.get("points_saved", 0)
+            dropped_chunks += int(result.get("dropped_invalid", 0))
             if expected_points and saved != expected_points:
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
@@ -1944,13 +2552,72 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             doc_metadata = _fetch_document_metadata(doc_tag, doc_name, doc_type)
             doc_type = doc_metadata.get("doc_type") or doc_type
 
-            chunks, chunk_metadata, coverage_ratio = _chunk_with_section_chunker(
-                text,
-                doc_tag=doc_tag,
-                doc_name=doc_name,
-                doc_type=doc_type,
-                doc_ocr_confidence=doc_ocr_confidence,
-            )
+            layout_used = False
+            section_intel_result = None
+            doc_domain = None
+            layout_graph_cache = None
+            chunking_mode = "layout_graph"
+            coverage_ratio = None
+            try:
+                from src.embedding.layout_semantics import build_semantic_payloads
+                from src.api.layout_graph_store import load_layout_graph
+
+                layout_graph = load_layout_graph(doc_tag)
+                layout_graph_cache = layout_graph
+                semantic = build_semantic_payloads(
+                    layout_graph=layout_graph,
+                    extracted=text,
+                    document_id=str(doc_tag),
+                    source_name=doc_name,
+                )
+                chunks = semantic.chunks
+                chunk_metadata = semantic.chunk_metadata
+                doc_domain = semantic.doc_domain
+                section_intel_result = {
+                    "doc_domain": doc_domain,
+                    "sections": semantic.sections,
+                    "section_facts": semantic.entity_facts,
+                    "section_summaries": semantic.section_summaries,
+                    "doc_summary": semantic.doc_summary,
+                }
+                layout_used = True
+                full_text = normalize_text(text.full_text or "")
+                if full_text:
+                    coverage_ratio = len("".join([normalize_text(c) for c in chunks if c])) / max(1, len(full_text))
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("LayoutGraph chunking failed for %s; falling back: %s", doc_name, exc)
+                chunking_mode = "section_aware"
+                chunks, chunk_metadata, coverage_ratio = _chunk_with_section_chunker(
+                    text,
+                    doc_tag=doc_tag,
+                    doc_name=doc_name,
+                    doc_type=doc_type,
+                    doc_ocr_confidence=doc_ocr_confidence,
+                    chunking_mode=chunking_mode,
+                )
+
+            if layout_used and section_intel_result:
+                try:
+                    from src.api.dw_newron import get_redis_client
+                    from src.intelligence.redis_intel_cache import RedisIntelCache
+
+                    redis_client = get_redis_client()
+                    cache = RedisIntelCache(redis_client)
+                    cache.set_json(
+                        cache.layout_key(str(subscription_id), str(profile_id), str(doc_tag)),
+                        {
+                            "document_id": str(doc_tag),
+                            "subscription_id": str(subscription_id),
+                            "profile_id": str(profile_id),
+                            "layout_graph": layout_graph_cache,
+                            "section_summaries": section_intel_result.get("section_summaries") or {},
+                            "doc_summary": section_intel_result.get("doc_summary") or "",
+                            "updated_at": time.time(),
+                        },
+                        ttl_seconds=cache.summary_ttl,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logging.debug("LayoutGraph cache skipped for %s: %s", doc_tag, exc)
 
             full_text = normalize_text(text.full_text or "")
             coverage_threshold = float(getattr(Config.Retrieval, "CHUNK_COVERAGE_THRESHOLD", 0.98))
@@ -1967,6 +2634,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     doc_name=doc_name,
                     doc_type=doc_type,
                     doc_ocr_confidence=doc_ocr_confidence,
+                    chunking_mode=chunking_mode,
                 )
                 coverage_ratio = len("".join(chunks)) / max(1, len(full_text)) if full_text else coverage_ratio
 
@@ -1974,7 +2642,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 raise ValueError(f"No valid chunks extracted for {doc_name}")
 
             for meta in chunk_metadata:
-                meta.setdefault("chunk_kind", "section_text")
+                meta.setdefault("chunk_kind", meta.get("chunk_type") or "section_text")
 
             chunks, chunk_metadata, prep_stats = prepare_embedding_chunks(
                 chunks,
@@ -1988,6 +2656,66 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             dropped_chunks = prep_stats.dropped_quality + prep_stats.dropped_dedupe
             if not chunks:
                 raise ValueError(f"Chunk preparation removed all chunks for {doc_name}")
+
+            min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 80))
+            min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 15))
+            min_valid = int(getattr(Config.Retrieval, "MIN_REQUIRED_CHUNKS", 3))
+            chunks, chunk_metadata, validity_diag, _valid_indices = _filter_invalid_chunk_texts(
+                chunks,
+                chunk_metadata,
+                min_chars=min_chars,
+                min_tokens=min_tokens,
+            )
+            dropped_chunks += int(validity_diag.get("invalid_chunks", 0))
+            fallback_used = False
+            if len(chunks) < min_valid:
+                full_text = normalize_text(text.full_text or "")
+                if is_valid_text(full_text, min_chars=min_chars, min_tokens=min_tokens):
+                    fallback_chunks, fallback_meta, fallback_prep, fallback_diag, _fallback_indices = (
+                        _fallback_chunks_for_full_text(
+                            full_text,
+                            doc_tag=doc_tag,
+                            doc_name=doc_name,
+                            subscription_id=subscription_id,
+                            profile_id=profile_id,
+                            doc_type=doc_type,
+                            doc_ocr_confidence=doc_ocr_confidence,
+                            min_required=min_valid,
+                            min_chars=min_chars,
+                            min_tokens=min_tokens,
+                        )
+                    )
+                    if len(fallback_chunks) >= min_valid:
+                        chunks = fallback_chunks
+                        chunk_metadata = fallback_meta
+                        validity_diag = fallback_diag or validity_diag
+                        dropped_chunks = (
+                            int((fallback_prep or ChunkPrepStats()).dropped_quality)
+                            + int((fallback_prep or ChunkPrepStats()).dropped_dedupe)
+                            + int(validity_diag.get("invalid_chunks", 0))
+                        )
+                        chunking_mode = "sliding_window_fallback"
+                        fallback_used = True
+
+                if len(chunks) < min_valid:
+                    extracted_chars = len(full_text or "")
+                    diagnostics = {
+                        **(validity_diag or {}),
+                        "reason": "insufficient_valid_chunks",
+                        "extracted_chars": extracted_chars,
+                        "expected_chunks": int(validity_diag.get("total_chunks", 0)),
+                        "prepared_chunks": int(validity_diag.get("total_chunks", 0)),
+                        "valid_chunks": len(chunks),
+                        "min_required": min_valid,
+                        "chunking_mode": "sliding_window_fallback" if fallback_used else "section_aware",
+                        "fallback_used": fallback_used,
+                    }
+                    _mark_chunking_failed(doc_tag, doc_name, diagnostics)
+                    raise ChunkingDiagnosticError(
+                        f"EXTRACTION_OR_CHUNKING_FAILED: valid_chunks={len(chunks)} "
+                        f"min_required={min_valid} for document {doc_tag}",
+                        diagnostics=diagnostics,
+                    )
 
             chunk_lengths = [len(chunk) for chunk in chunks]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
@@ -2005,6 +2733,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 chunks,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
+                device=device,
             )
             embed_latency_ms = (time.time() - embed_start) * 1000
             if telemetry:
@@ -2028,12 +2757,26 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     document_id=doc_tag,
                 )
             sparse_vectors = build_sparse_vectors(chunks)
-            summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
+            try:
+                summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Section summaries skipped for %s: %s", doc_tag, exc)
+                summaries = [None for _ in chunks]
 
             ctx = ContextUnderstanding()
-            doc_summary_bundle = ctx.summarize_document(text)
-            doc_summary_text = (doc_summary_bundle.get("abstract") or "").strip()
-            section_summary_map = doc_summary_bundle.get("section_summaries") or {}
+            doc_summary_text = ""
+            section_summary_map: Dict[str, str] = {}
+            if section_intel_result and isinstance(section_intel_result, dict):
+                doc_summary_text = (section_intel_result.get("doc_summary") or "").strip()
+                section_summary_map = section_intel_result.get("section_summaries") or {}
+            if not doc_summary_text:
+                try:
+                    doc_summary_bundle = ctx.summarize_document(text)
+                    doc_summary_text = (doc_summary_bundle.get("abstract") or "").strip()
+                    if not section_summary_map:
+                        section_summary_map = doc_summary_bundle.get("section_summaries") or {}
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Document summary skipped for %s: %s", doc_tag, exc)
             section_title_to_pages = {
                 (sec.title or "").strip(): (sec.start_page, sec.end_page) for sec in text.sections
             }
@@ -2041,7 +2784,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             extra_chunks: List[str] = []
             extra_meta: List[Dict[str, Any]] = []
 
-            if doc_summary_text:
+            if doc_summary_text and not layout_used:
                 extra_chunks.append(doc_summary_text)
                 extra_meta.append(
                     {
@@ -2054,114 +2797,139 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                         "chunk_index": len(chunks) + len(extra_chunks) - 1,
                         "chunk_type": "summary",
                         "chunk_kind": "doc_summary",
+                        "chunking_mode": chunking_mode,
                         "doc_type": doc_type,
                         "sentence_complete": True,
                     }
                 )
 
-            for title, summary in section_summary_map.items():
-                summary_text = str(summary).strip()
-                if not summary_text:
-                    continue
-                pages = section_title_to_pages.get((title or "").strip())
-                page_start, page_end = (pages or (None, None))
-                extra_chunks.append(summary_text)
-                extra_meta.append(
-                    {
-                        "document_id": doc_tag,
-                        "section_title": title or "Section",
-                        "section_path": title or "Section",
-                        "page_start": page_start,
-                        "page_end": page_end,
-                        "page_number": page_start,
-                        "chunk_index": len(chunks) + len(extra_chunks) - 1,
-                        "chunk_type": "summary",
-                        "chunk_kind": "section_summary",
-                        "doc_type": doc_type,
-                        "sentence_complete": True,
-                    }
-                )
-
-            for chunk_text, meta in zip(chunks, chunk_metadata):
-                facts = _extract_facts(chunk_text)
-                if len(facts) < 2:
-                    continue
-                fact_text = "\n".join(facts[:20])
-                extra_chunks.append(fact_text)
-                extra_meta.append(
-                    {
-                        "document_id": doc_tag,
-                        "section_title": meta.get("section_title") or "Facts",
-                        "section_path": meta.get("section_path") or meta.get("section_title") or "Facts",
-                        "page_start": meta.get("page_start"),
-                        "page_end": meta.get("page_end"),
-                        "page_number": meta.get("page_start"),
-                        "chunk_index": len(chunks) + len(extra_chunks) - 1,
-                        "chunk_type": "fact",
-                        "chunk_kind": "structured_field",
-                        "doc_type": doc_type,
-                        "sentence_complete": True,
-                    }
-                )
-
-            for table in text.tables or []:
-                table_text = normalize_text(table.csv or table.text or "")
-                if table_text:
-                    extra_chunks.append(table_text)
+            if not layout_used:
+                for title, summary in section_summary_map.items():
+                    if not getattr(Config.Intelligence, "SECTION_SUMMARY_VECTORS_ENABLED", False):
+                        continue
+                    summary_text = str(summary).strip()
+                    if not summary_text or len(summary_text.split()) < 6:
+                        continue
+                    pages = section_title_to_pages.get((title or "").strip())
+                    page_start, page_end = (pages or (None, None))
+                    extra_chunks.append(summary_text)
                     extra_meta.append(
                         {
                             "document_id": doc_tag,
-                            "section_title": "Table",
-                            "section_path": "Table",
-                            "page_start": table.page,
-                            "page_end": table.page,
-                            "page_number": table.page,
+                            "section_title": title or "Section",
+                            "section_path": title or "Section",
+                            "page_start": page_start,
+                            "page_end": page_end,
+                            "page_number": page_start,
                             "chunk_index": len(chunks) + len(extra_chunks) - 1,
-                            "chunk_type": "table",
-                            "chunk_kind": "table_text",
+                            "chunk_type": "summary",
+                            "chunk_kind": "section_summary",
+                            "chunking_mode": chunking_mode,
                             "doc_type": doc_type,
                             "sentence_complete": True,
                         }
                     )
-                for row_text in _table_rows_from_csv(table.csv or ""):
-                    extra_chunks.append(row_text)
+
+            if not layout_used:
+                for chunk_text, meta in zip(chunks, chunk_metadata):
+                    facts = _extract_facts(chunk_text)
+                    if len(facts) < 2:
+                        continue
+                    fact_text = "\n".join(facts[:20])
+                    extra_chunks.append(fact_text)
                     extra_meta.append(
                         {
                             "document_id": doc_tag,
-                            "section_title": "Table Row",
-                            "section_path": "Table Row",
-                            "page_start": table.page,
-                            "page_end": table.page,
-                            "page_number": table.page,
+                            "section_title": meta.get("section_title") or "Facts",
+                            "section_path": meta.get("section_path") or meta.get("section_title") or "Facts",
+                            "page_start": meta.get("page_start"),
+                            "page_end": meta.get("page_end"),
+                            "page_number": meta.get("page_start"),
                             "chunk_index": len(chunks) + len(extra_chunks) - 1,
-                            "chunk_type": "table_row",
+                            "chunk_type": "fact",
                             "chunk_kind": "structured_field",
+                            "chunking_mode": chunking_mode,
                             "doc_type": doc_type,
                             "sentence_complete": True,
                         }
                     )
+
+            if not layout_used:
+                for table in text.tables or []:
+                    table_text = normalize_text(table.csv or table.text or "")
+                    if table_text:
+                        extra_chunks.append(table_text)
+                        extra_meta.append(
+                            {
+                                "document_id": doc_tag,
+                                "section_title": "Table",
+                                "section_path": "Table",
+                                "page_start": table.page,
+                                "page_end": table.page,
+                                "page_number": table.page,
+                                "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                                "chunk_type": "table",
+                                "chunk_kind": "table_text",
+                                "chunking_mode": chunking_mode,
+                                "doc_type": doc_type,
+                                "sentence_complete": True,
+                            }
+                        )
+                    for row_text in _table_rows_from_csv(table.csv or ""):
+                        extra_chunks.append(row_text)
+                        extra_meta.append(
+                            {
+                                "document_id": doc_tag,
+                                "section_title": "Table Row",
+                                "section_path": "Table Row",
+                                "page_start": table.page,
+                                "page_end": table.page,
+                                "page_number": table.page,
+                                "chunk_index": len(chunks) + len(extra_chunks) - 1,
+                                "chunk_type": "table_row",
+                                "chunk_kind": "structured_field",
+                                "chunking_mode": chunking_mode,
+                                "doc_type": doc_type,
+                                "sentence_complete": True,
+                            }
+                        )
 
             if extra_chunks:
                 extra_chunks, extra_meta, dropped_extra = _apply_chunk_quality_filter(extra_chunks, extra_meta)
+                if extra_chunks:
+                    extra_chunks, extra_meta, extra_diag, _valid_indices = _filter_invalid_chunk_texts(
+                        extra_chunks,
+                        extra_meta,
+                        min_chars=min_chars,
+                        min_tokens=min_tokens,
+                    )
+                    dropped_extra += int(extra_diag.get("invalid_chunks", 0))
                 for idx, meta in enumerate(extra_meta):
                     meta["chunk_index"] = len(chunks) + idx
                 dropped_chunks += dropped_extra
-                chunks.extend(extra_chunks)
-                chunk_metadata.extend(extra_meta)
-                sparse_vectors.extend(build_sparse_vectors(extra_chunks))
-                extra_embeddings = encode_with_fallback(
-                    extra_chunks,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                )
-                embeddings_array = list(embeddings_array) + list(extra_embeddings)
-                summaries.extend([None for _ in extra_chunks])
+                if extra_chunks:
+                    chunks.extend(extra_chunks)
+                    chunk_metadata.extend(extra_meta)
+                    sparse_vectors.extend(build_sparse_vectors(extra_chunks))
+                    extra_embeddings = encode_with_fallback(
+                        extra_chunks,
+                        convert_to_numpy=True,
+                        normalize_embeddings=True,
+                        device=device,
+                    )
+                    embeddings_array = list(embeddings_array) + list(extra_embeddings)
+                    summaries.extend([None for _ in extra_chunks])
 
             for meta in chunk_metadata:
                 section_title = (meta.get("section_title") or "Untitled Section").strip() or "Untitled Section"
                 section_path = (meta.get("section_path") or section_title).strip() or section_title
                 meta["section_title"] = section_title
                 meta["section_path"] = section_path
+                meta["document_id"] = doc_tag
+                meta.setdefault("doc_type", doc_type)
+                if doc_domain:
+                    meta.setdefault("doc_domain", doc_domain)
+                meta.setdefault("chunking_mode", chunking_mode)
                 meta["section_id"] = meta.get("section_id") or hashlib.sha1(
                     f"{doc_tag}|{section_path}".encode("utf-8")
                 ).hexdigest()[:12]
@@ -2185,10 +2953,13 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 "doc_type": doc_type,
                 "doc_metadata": doc_metadata,
                 "ocr_confidence": doc_ocr_confidence,
+                "doc_domain": doc_domain,
+                "section_intelligence": section_intel_result,
             }
 
             result = save_embeddings_to_qdrant(embeddings_payload, subscription_id, profile_id, doc_tag, doc_name)
             saved = result.get("points_saved", 0)
+            dropped_chunks += int(result.get("dropped_invalid", 0))
             expected_points = len(chunks)
             if saved != expected_points:
                 raise ValueError(
@@ -2212,6 +2983,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             doc_metadata = _fetch_document_metadata(doc_tag, doc_name, None)
             doc_type = doc_metadata.get("doc_type")
 
+            chunking_mode = "section_aware"
             try:
                 chunks, chunk_metadata, _ = _chunk_with_section_chunker(
                     text,
@@ -2219,6 +2991,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                     doc_name=doc_name,
                     doc_type=doc_type,
                     doc_ocr_confidence=None,
+                    chunking_mode=chunking_mode,
                 )
             except Exception as exc:  # noqa: BLE001
                 # Fallback to the legacy chunker to avoid total failure on edge cases.
@@ -2226,6 +2999,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 chunks_with_meta = chunk_text_for_embedding(text, doc_name, document_id=doc_tag)
                 chunks = [chunk_text for chunk_text, _meta in chunks_with_meta if (chunk_text or "").strip()]
                 chunk_metadata = [meta for chunk_text, meta in chunks_with_meta if (chunk_text or "").strip()]
+                chunking_mode = "sliding_window_fallback"
 
             if not chunks:
                 raise ValueError(f"No valid chunks in {doc_name}")
@@ -2242,6 +3016,64 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             dropped_chunks = prep_stats.dropped_quality + prep_stats.dropped_dedupe
             if not chunks:
                 raise ValueError(f"Chunk preparation removed all chunks for {doc_name}")
+
+            min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 80))
+            min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 15))
+            min_valid = int(getattr(Config.Retrieval, "MIN_REQUIRED_CHUNKS", 3))
+            chunks, chunk_metadata, validity_diag, _valid_indices = _filter_invalid_chunk_texts(
+                chunks,
+                chunk_metadata,
+                min_chars=min_chars,
+                min_tokens=min_tokens,
+            )
+            dropped_chunks += int(validity_diag.get("invalid_chunks", 0))
+            fallback_used = False
+            if len(chunks) < min_valid:
+                if is_valid_text(text, min_chars=min_chars, min_tokens=min_tokens):
+                    fallback_chunks, fallback_meta, fallback_prep, fallback_diag, _fallback_indices = (
+                        _fallback_chunks_for_full_text(
+                            text,
+                            doc_tag=doc_tag,
+                            doc_name=doc_name,
+                            subscription_id=subscription_id,
+                            profile_id=profile_id,
+                            doc_type=doc_type,
+                            doc_ocr_confidence=None,
+                            min_required=min_valid,
+                            min_chars=min_chars,
+                            min_tokens=min_tokens,
+                        )
+                    )
+                    if len(fallback_chunks) >= min_valid:
+                        chunks = fallback_chunks
+                        chunk_metadata = fallback_meta
+                        validity_diag = fallback_diag or validity_diag
+                        dropped_chunks = (
+                            int((fallback_prep or ChunkPrepStats()).dropped_quality)
+                            + int((fallback_prep or ChunkPrepStats()).dropped_dedupe)
+                            + int(validity_diag.get("invalid_chunks", 0))
+                        )
+                        chunking_mode = "sliding_window_fallback"
+                        fallback_used = True
+
+                if len(chunks) < min_valid:
+                    diagnostics = {
+                        **(validity_diag or {}),
+                        "reason": "insufficient_valid_chunks",
+                        "extracted_chars": len(str(text or "").strip()),
+                        "expected_chunks": int(validity_diag.get("total_chunks", 0)),
+                        "prepared_chunks": int(validity_diag.get("total_chunks", 0)),
+                        "valid_chunks": len(chunks),
+                        "min_required": min_valid,
+                        "chunking_mode": "sliding_window_fallback" if fallback_used else "section_aware",
+                        "fallback_used": fallback_used,
+                    }
+                    _mark_chunking_failed(doc_tag, doc_name, diagnostics)
+                    raise ChunkingDiagnosticError(
+                        f"EXTRACTION_OR_CHUNKING_FAILED: valid_chunks={len(chunks)} "
+                        f"min_required={min_valid} for document {doc_tag}",
+                        diagnostics=diagnostics,
+                    )
 
             chunk_lengths = [len(chunk) for chunk in chunks]
             sentence_flags = [bool(meta.get("sentence_complete", False)) for meta in chunk_metadata]
@@ -2271,6 +3103,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                         "chunk_index": len(chunks) + len(fact_chunks) - 1,
                         "chunk_type": "fact",
                         "chunk_kind": "structured_field",
+                        "chunking_mode": chunking_mode,
                         "doc_type": doc_type,
                         "sentence_complete": True,
                     }
@@ -2298,6 +3131,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 chunks,
                 convert_to_numpy=True,
                 normalize_embeddings=True,
+                device=device,
             )
             embed_latency_ms = (time.time() - embed_start) * 1000
             if telemetry:
@@ -2310,12 +3144,13 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
             sparse_vectors = build_sparse_vectors(chunks)
 
             # Create summaries
-            summaries = compute_section_summaries(chunks, chunk_metadata)
+            try:
+                summaries = compute_section_summaries(chunks, chunk_metadata)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Section summaries skipped for %s: %s", doc_tag, exc)
+                summaries = []
             if not any(summaries):
-                summaries = [
-                    chunk[:200] + "..." if len(chunk) > 200 else chunk
-                    for chunk in chunks
-                ]
+                summaries = [chunk[:200] + "..." if len(chunk) > 200 else chunk for chunk in chunks]
 
             #  VERIFICATION STEP 2: Final check before saving
             logging.info(f"Final verification before saving to Qdrant")
@@ -2334,6 +3169,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name):
                 ).hexdigest()[:12]
                 meta["chunk_type"] = meta.get("chunk_type", "text")
                 meta["chunk_kind"] = meta.get("chunk_kind", "section_text")
+                meta.setdefault("chunking_mode", chunking_mode)
                 page_start = meta.get("page_start", meta.get("page_number"))
                 page_end = meta.get("page_end", page_start)
                 meta["page_start"] = page_start

@@ -289,28 +289,34 @@ def test_non_agent_path_unchanged(monkeypatch):
 
     import src.main as main
 
-    called = {"execute": False}
+    called = {"run": False}
 
-    def fake_execute(request, session_state=None, ctx=None, stream=False, debug=False):
-        called["execute"] = True
-        return ExecutionResult(
-            answer={"response": "ok", "sources": [], "grounded": False, "context_found": False},
-            mode=ExecutionMode.NORMAL,
-            debug={},
+    def fake_run(**kwargs):
+        called["run"] = True
+        return {"response": "ok", "sources": [{"file_name": "doc.pdf", "page": 1}]}
+
+    monkeypatch.setattr(main.rag_v3, "run", fake_run)
+
+    from src.api.rag_state import AppState, set_app_state
+
+    set_app_state(
+        AppState(
+            embedding_model=object(),
+            reranker=None,
+            qdrant_client=object(),
+            redis_client=None,
+            ollama_client=None,
+            rag_system=None,
         )
-
-    monkeypatch.setattr(main, "execute_request", fake_execute)
-    monkeypatch.setattr(main, "route_message", lambda *args, **kwargs: types.SimpleNamespace(direct_response=False))
-    monkeypatch.setattr(main, "add_message_to_history", lambda *args, **kwargs: (None, "session"))
-    monkeypatch.setattr(main, "get_docwain_persona", lambda *args, **kwargs: "")
-    monkeypatch.setattr(main, "enforce_docwain_identity", lambda response, *_args, **_kwargs: response)
-    monkeypatch.setattr(main, "sanitize_response", lambda response: response)
+    )
 
     request = main.QuestionRequest(
         query="What is in the document?",
         user_id="user-1",
         profile_id="profile-1",
         subscription_id="sub-1",
+        document_id=None,
+        tool_hint=None,
         model_name="llama3.2",
         persona="DocWain",
         session_id=None,
@@ -325,5 +331,6 @@ def test_non_agent_path_unchanged(monkeypatch):
     request.stream = False
 
     response = main.ask_question_api(request, stream=False)
-    assert called["execute"] is True
-    assert response.answer.response == "ok"
+    assert called["run"] is True
+    assert response.answer == "ok"
+    assert response.sources == [{"file_name": "doc.pdf", "page": 1}]
