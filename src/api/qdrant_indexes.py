@@ -11,7 +11,11 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_PAYLOAD_INDEX_FIELDS: List[str] = [
     "subscription_id",
+    "subscriptionId",
+    "subscription.id",
     "profile_id",
+    "profileId",
+    "profile.id",
     "document_id",
     "source_name",
     "doc_domain",

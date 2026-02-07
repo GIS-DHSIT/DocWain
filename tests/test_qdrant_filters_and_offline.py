@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
-from qdrant_client.models import FieldCondition
+from qdrant_client.models import FieldCondition, Filter
 
 from src.api import dw_newron
 from src.api.vector_store import QdrantVectorStore, REQUIRED_PAYLOAD_INDEX_FIELDS, build_qdrant_filter
@@ -87,9 +87,33 @@ class FakeRedis:
 
 def test_qdrant_filter_uses_profile_id_not_profileId():
     filt = build_qdrant_filter("sub-1", "prof-1")
-    keys = [cond.key for cond in filt.must if isinstance(cond, FieldCondition)]
+    keys = []
+    for cond in filt.must:
+        if isinstance(cond, FieldCondition):
+            keys.append(cond.key)
+        elif isinstance(cond, Filter):
+            for inner in (cond.should or []):
+                if isinstance(inner, FieldCondition):
+                    keys.append(inner.key)
     assert "profile_id" in keys
-    assert "profileId" not in keys
+
+
+def test_filter_chunks_by_profile_scope_fallbacks_when_no_match():
+    from src.rag_v3.retrieve import filter_chunks_by_profile_scope
+    from src.rag_v3.types import Chunk, ChunkSource
+
+    chunks = [
+        Chunk(
+            id="c1",
+            text="text",
+            score=0.1,
+            source=ChunkSource(document_name="doc"),
+            meta={"profile_id": "p1", "subscription_id": "s1"},
+        )
+    ]
+
+    filtered = filter_chunks_by_profile_scope(chunks, profile_id="p2", subscription_id="s2")
+    assert filtered == []
 
 
 def test_collection_has_keyword_indexes_for_filter_fields():

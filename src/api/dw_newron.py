@@ -88,6 +88,7 @@ from src.quality.auto_repair import AutoRepairEngine, RepairConfig
 from src.quality.telemetry import emit_quality_telemetry
 from src.retrieval.profile_document_index import build_profile_document_index
 from src.retrieval.retrieval_planner import RetrievalPlanner
+from src.intent.llm_intent import parse_intent
 
 try:
     import torch
@@ -3304,7 +3305,7 @@ class EnterpriseRAGSystem:
             'corrections': [],
             'reformulated': False,
             'expanded': False,
-            'intent': self._detect_intent(query)
+            'intent': self._detect_intent_llm(query)
         }
 
         processed_query = re.sub(r"\s+", " ", query or "").strip()
@@ -3356,6 +3357,22 @@ class EnterpriseRAGSystem:
         if any(word in q for word in ["difference", "compare", "vs", "versus", "comparison"]):
             return "comparison"
         return "factual"
+
+    def _detect_intent_llm(self, query: str) -> str:
+        parsed = parse_intent(query=query, llm_client=self.llm_client, redis_client=getattr(self, "redis_client", None))
+        if parsed and parsed.intent:
+            mapping = {
+                "compare": "comparison",
+                "summarize": "factual",
+                "rank": "factual",
+                "list": "factual",
+                "extract": "factual",
+                "contact": "factual",
+                "qa": "factual",
+                "generate": "procedural",
+            }
+            return mapping.get(parsed.intent, "factual")
+        return self._detect_intent(query)
 
     @staticmethod
     def _expand_query_terms(query: str) -> str:

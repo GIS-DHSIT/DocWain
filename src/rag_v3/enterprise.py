@@ -88,6 +88,24 @@ def _render_hr(schema: HRSchema, intent: str, strict: bool = False) -> str:
         if schema.candidates and schema.candidates.missing_reason:
             return schema.candidates.missing_reason
         return MISSING_REASON
+    if intent == "contact":
+        sections = []
+        for cand in candidates:
+            name = cand.name or "Candidate"
+            emails = _render_contact_value(cand.emails)
+            phones = _render_contact_value(cand.phones)
+            linkedins = _render_contact_value(cand.linkedins)
+            sections.append(
+                "\n".join(
+                    [
+                        f"**Candidate:** {name}",
+                        f"- Email: {emails}",
+                        f"- Phone: {phones}",
+                        f"- LinkedIn: {linkedins}",
+                    ]
+                )
+            )
+        return "\n\n".join(sections).strip()
     if intent in {"rank", "compare"} and len(candidates) > 1:
         ranked = _rank_candidates(candidates)
         lines = ["Based on the skills mentioned, here is a ranking of the candidates:"]
@@ -179,6 +197,11 @@ def _format_candidate_detail(cand: Any) -> str:
         f"- Source type: {source}",
     ]
     return "\n".join(lines)
+
+
+def _render_contact_value(value: Any) -> str:
+    items = [item for item in (value or []) if item]
+    return ", ".join(items) if items else MISSING_REASON
 
 
 def _render_invoice(schema: InvoiceSchema, intent: str, strict: bool = False) -> str:
