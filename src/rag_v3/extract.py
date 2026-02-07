@@ -58,6 +58,8 @@ _LEGAL_HINTS = {"agreement", "contract", "clause", "terms", "warranty", "liabili
 _PRODUCT_INTENTS = {"item", "items", "product", "products", "service", "services", "line item", "line items"}
 
 _TOTAL_INTENTS = {"total", "amount due", "balance", "subtotal"}
+_CONTACT_INTENTS = {"contact", "contacts", "email", "emails", "phone", "phones", "reach", "linkedin"}
+_FIT_INTENTS = {"fit", "fitting", "suitable", "suitability", "best", "top", "most", "match"}
 
 
 def schema_extract(
@@ -69,8 +71,9 @@ def schema_extract(
     correlation_id: Optional[str] = None,
     scope_document_id: Optional[str] = None,
     domain_hint: Optional[str] = None,
+    intent_hint: Optional[str] = None,
 ) -> ExtractionResult:
-    domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint)
+    domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint, intent_hint=intent_hint)
     schema = _deterministic_extract(domain, intent, query, chunks)
 
     if _schema_is_empty(schema) and llm_client and budget.consume():
@@ -85,7 +88,12 @@ def schema_extract(
     return ExtractionResult(domain=domain, intent=intent, schema=schema)
 
 
-def _infer_domain_intent(query: str, chunks: List[Any], domain_hint: Optional[str] = None) -> Tuple[str, str]:
+def _infer_domain_intent(
+    query: str,
+    chunks: List[Any],
+    domain_hint: Optional[str] = None,
+    intent_hint: Optional[str] = None,
+) -> Tuple[str, str]:
     if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
         return "generic", "facts"
     combined = " ".join([query] + [getattr(c, "text", "") or "" for c in chunks]).lower()
@@ -106,28 +114,34 @@ def _infer_domain_intent(query: str, chunks: List[Any], domain_hint: Optional[st
         elif any(hint in combined for hint in _LEGAL_HINTS):
             domain = "legal"
 
-    intent = "summary"
+    intent = _normalize_intent_hint(intent_hint) or "summary"
     lowered_query = query.lower()
     if domain == "invoice":
-        if any(word in lowered_query for word in _PRODUCT_INTENTS):
+        if intent == "summary" and any(word in lowered_query for word in _PRODUCT_INTENTS):
             intent = "products_list"
-        elif any(word in lowered_query for word in _TOTAL_INTENTS):
+        elif intent == "summary" and any(word in lowered_query for word in _TOTAL_INTENTS):
             intent = "totals"
-        else:
+        elif intent == "summary":
             intent = "summary"
     elif domain == "hr":
-        if "rank" in lowered_query or "ranking" in lowered_query:
+        if intent == "summary" and any(word in lowered_query for word in _CONTACT_INTENTS):
+            intent = "contact"
+        elif intent == "summary" and (
+            "rank" in lowered_query or "ranking" in lowered_query or any(word in lowered_query for word in _FIT_INTENTS)
+        ):
             intent = "rank"
-        elif "compare" in lowered_query:
+        elif intent == "summary" and "compare" in lowered_query:
             intent = "compare"
-        elif "list" in lowered_query or "candidates" in lowered_query:
+        elif intent == "summary" and ("list" in lowered_query or "candidates" in lowered_query):
             intent = "candidate_list"
-        else:
+        elif intent == "summary":
             intent = "summary"
     elif domain == "legal":
-        intent = "clauses"
+        if intent == "summary":
+            intent = "clauses"
     else:
-        intent = "facts"
+        if intent == "summary":
+            intent = "facts"
 
     return domain, intent
 
@@ -294,6 +308,17 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                 _append_span(cand, chunk_id, cleaned, span_seen)
                 continue
 
+            contact = _extract_contact_fields(cleaned)
+            if contact:
+                if contact.get("emails"):
+                    cand.emails = _merge_list(cand.emails, contact["emails"])
+                if contact.get("phones"):
+                    cand.phones = _merge_list(cand.phones, contact["phones"])
+                if contact.get("linkedins"):
+                    cand.linkedins = _merge_list(cand.linkedins, contact["linkedins"])
+                _append_span(cand, chunk_id, cleaned, span_seen)
+                continue
+
         tech_block = sections.get("technical_skills") or []
         func_block = sections.get("functional_skills") or []
         skills_block = sections.get("skills") or []
@@ -339,6 +364,12 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
             missing["education"] = MISSING_REASON
         if not cand.achievements:
             missing["achievements"] = MISSING_REASON
+        if not cand.emails:
+            missing["emails"] = MISSING_REASON
+        if not cand.phones:
+            missing["phones"] = MISSING_REASON
+        if not cand.linkedins:
+            missing["linkedins"] = MISSING_REASON
         if not cand.source_type:
             missing["source_type"] = MISSING_REASON
         cand.missing_reason = missing
@@ -598,6 +629,9 @@ def _sanitize_schema_payload(domain: str, payload: Any, chunks: List[Any]) -> An
                 "certifications",
                 "education",
                 "achievements",
+                "emails",
+                "phones",
+                "linkedins",
                 "source_type",
             ],
         )
@@ -625,6 +659,36 @@ def _extract_json(raw: Any) -> dict:
         except Exception:
             return {}
     return {}
+
+
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+_PHONE_RE = re.compile(r"\+?\d[\d\s().-]{6,}\d")
+_LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/[A-Za-z0-9._/?=&-]+", re.IGNORECASE)
+
+
+def _extract_contact_fields(line: str) -> Dict[str, List[str]]:
+    if not line:
+        return {}
+    emails = [_clean_contact_value(val) for val in _EMAIL_RE.findall(line)]
+    phones = [_clean_contact_value(val) for val in _PHONE_RE.findall(line)]
+    linkedins = [_clean_contact_value(val) for val in _LINKEDIN_RE.findall(line)]
+
+    if "linkedin" in line.lower() and not linkedins:
+        match = re.search(r"(?i)linkedin\s*[:\-]\s*([A-Za-z0-9._/+-]+)", line)
+        if match:
+            linkedins.append(_clean_contact_value(match.group(1)))
+
+    return {
+        "emails": [e for e in emails if e],
+        "phones": [p for p in phones if p],
+        "linkedins": [l for l in linkedins if l],
+    }
+
+
+def _clean_contact_value(value: str) -> str:
+    cleaned = value.strip().strip(".,;:()[]{}<>")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
 
 
 def _split_lines(text: str) -> List[str]:
@@ -665,6 +729,19 @@ def _extract_years_experience(text: str) -> Optional[str]:
     match = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)\b", text, re.IGNORECASE)
     if match:
         return f"{match.group(1)} years"
+    return None
+
+
+def _normalize_intent_hint(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"summary", "contact", "rank", "compare", "candidate_list"}:
+        return normalized
+    if normalized in {"list", "listing"}:
+        return "candidate_list"
+    if normalized in {"qa", "answer", "facts"}:
+        return "summary"
     return None
 
 
@@ -960,6 +1037,7 @@ def extract_schema(
     budget: LLMBudget,
     correlation_id: Optional[str] = None,
     scope_document_id: Optional[str] = None,
+    intent_hint: Optional[str] = None,
 ) -> ExtractionResult:
     return schema_extract(
         query=query,
@@ -969,4 +1047,5 @@ def extract_schema(
         correlation_id=correlation_id,
         scope_document_id=scope_document_id,
         domain_hint=domain,
+        intent_hint=intent_hint,
     )

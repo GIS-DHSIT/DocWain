@@ -5,16 +5,25 @@ import logging
 import re
 import time
 import uuid
+import concurrent.futures
 from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
 from src.api import rag_state
+from src.api.vector_store import build_collection_name, build_qdrant_filter
+from src.intent.llm_intent import IntentParse, parse_intent
 
 from .domain_router import DomainRouter
 from .extract import extract_schema
 from .judge import JudgeResult, judge
 from .renderers.router import render
-from .retrieve import retrieve
+from .retrieve import (
+    expand_full_scan_by_document,
+    expand_full_scan_by_profile,
+    expand_full_scan_unscoped,
+    filter_chunks_by_profile_scope,
+    retrieve,
+)
 from .rerank import rerank
 from .rewrite import rewrite_query
 from .sanitize import FALLBACK_ANSWER, sanitize
@@ -25,6 +34,8 @@ from .types import (
     FieldValuesField,
     GenericSchema,
     HRSchema,
+    InvoiceSchema,
+    LegalSchema,
     LLMBudget,
     MISSING_REASON,
     MultiEntitySchema,
@@ -68,6 +79,12 @@ def run(
 
     budget = LLMBudget(llm_client=llm_client, max_calls=2)
     original_query = query or ""
+    intent_future = _start_intent_parse(
+        query=original_query,
+        llm_client=llm_client,
+        redis_client=redis_client,
+    )
+    intent_parse = _resolve_intent_future(intent_future)
     intent_type = _infer_intent_type(original_query)
     scope_document_id = _infer_scope_document_id(original_query, document_id)
 
@@ -83,6 +100,117 @@ def run(
     )
     _log_stage("rewrite", stage_start, correlation_id)
 
+    profile_count, total_count = _profile_point_counts(subscription_id, profile_id, qdrant_client, correlation_id)
+    if _should_unconditional_profile_scan(profile_count):
+        logger.info(
+            "RAG v3 unconditional profile scan triggered",
+            extra={"stage": "profile_scan_unconditional", "correlation_id": correlation_id},
+        )
+        stage_start = time.time()
+        profile_chunks = expand_full_scan_by_profile(
+            qdrant_client=qdrant_client,
+            collection=build_collection_name(subscription_id),
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            correlation_id=correlation_id,
+        )
+        _log_stage("profile_scan_retrieve", stage_start, correlation_id)
+        if profile_chunks:
+            reranked = profile_chunks
+            stage_start = time.time()
+            extraction = extract_schema(
+                "hr" if _query_is_hr(original_query) else None,
+                query=original_query,
+                chunks=reranked,
+                llm_client=llm_client,
+                budget=budget,
+                correlation_id=correlation_id,
+                scope_document_id=scope_document_id,
+                intent_hint=intent_parse.intent if intent_parse else None,
+            )
+            _log_stage("profile_scan_extract", stage_start, correlation_id)
+            rendered = render(
+                domain="hr" if _query_is_hr(original_query) else "generic",
+                intent=extraction.intent,
+                schema=extraction.schema,
+                strict=False,
+            )
+            sanitized = sanitize(rendered)
+            sources = _collect_sources(reranked)
+            metadata = {
+                "domain": "resume" if _query_is_hr(original_query) else "generic",
+                "intent": extraction.intent,
+                "intent_type": _infer_intent_type(original_query, intent_parse),
+                "scope": {"profile_id": profile_id},
+                "quality": "HIGH",
+                "rag_v3": True,
+                "profile_scan": True,
+            }
+            return _build_answer(
+                response_text=sanitized,
+                sources=sources,
+                request_id=request_id,
+                metadata=metadata,
+            )
+    if profile_count == 0 and (total_count == 0 or total_count <= 80):
+        logger.warning(
+            "RAG v3 profile filter returned 0 points; using unscoped scan for small collection",
+            extra={"stage": "profile_scan_unscoped", "correlation_id": correlation_id, "total_points": total_count},
+        )
+        stage_start = time.time()
+        unscoped = expand_full_scan_unscoped(
+            qdrant_client=qdrant_client,
+            collection=build_collection_name(subscription_id),
+            correlation_id=correlation_id,
+        )
+        reranked = filter_chunks_by_profile_scope(
+            unscoped,
+            profile_id=str(profile_id),
+            subscription_id=str(subscription_id),
+        )
+        if unscoped and not reranked:
+            logger.warning(
+                "RAG v3 unscoped scan filter dropped all chunks; using unfiltered scan",
+                extra={"stage": "profile_scan_unscoped", "correlation_id": correlation_id},
+            )
+            reranked = unscoped
+        _log_stage("unscoped_scan_retrieve", stage_start, correlation_id)
+        if reranked:
+            stage_start = time.time()
+            extraction = extract_schema(
+                "hr" if _query_is_hr(original_query) else None,
+                query=original_query,
+                chunks=reranked,
+                llm_client=llm_client,
+                budget=budget,
+                correlation_id=correlation_id,
+                scope_document_id=scope_document_id,
+                intent_hint=intent_parse.intent if intent_parse else None,
+            )
+            _log_stage("unscoped_scan_extract", stage_start, correlation_id)
+            rendered = render(
+                domain="hr" if _query_is_hr(original_query) else "generic",
+                intent=extraction.intent,
+                schema=extraction.schema,
+                strict=False,
+            )
+            sanitized = sanitize(rendered)
+            sources = _collect_sources(reranked)
+            metadata = {
+                "domain": "resume" if _query_is_hr(original_query) else "generic",
+                "intent": extraction.intent,
+                "intent_type": _infer_intent_type(original_query, intent_parse),
+                "scope": {"profile_id": profile_id},
+                "quality": "HIGH",
+                "rag_v3": True,
+                "profile_scan": "unscoped",
+            }
+            return _build_answer(
+                response_text=sanitized,
+                sources=sources,
+                request_id=request_id,
+                metadata=metadata,
+            )
     stage_start = time.time()
     retrieved = retrieve(
         query=rewritten,
@@ -118,6 +246,8 @@ def run(
         if Config.Features.DOMAIN_SPECIFIC_ENABLED
         else "generic"
     )
+    if intent_parse and intent_parse.domain in {"resume"} and domain != "resume":
+        domain = "resume"
 
     stage_start = time.time()
     reranked = rerank(
@@ -139,8 +269,40 @@ def run(
             budget=budget,
             correlation_id=correlation_id,
             scope_document_id=scope_document_id,
+            intent_hint=intent_parse.intent if intent_parse else None,
         )
         _log_stage("resume_extract_hr", stage_start, correlation_id)
+
+        if _needs_full_scan_hr(extraction.schema, extraction.intent):
+            stage_start = time.time()
+            expanded = expand_full_scan_by_document(
+                qdrant_client=qdrant_client,
+                collection=build_collection_name(subscription_id),
+                base_chunks=reranked,
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+                correlation_id=correlation_id,
+            )
+            reranked = expanded or reranked
+            if _needs_profile_scan(reranked):
+                reranked = expand_full_scan_by_profile(
+                    qdrant_client=qdrant_client,
+                    collection=build_collection_name(subscription_id),
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    correlation_id=correlation_id,
+                ) or reranked
+            extraction = extract_schema(
+                "hr",
+                query=original_query,
+                chunks=reranked,
+                llm_client=None,
+                budget=budget,
+                correlation_id=correlation_id,
+                scope_document_id=scope_document_id,
+                intent_hint=intent_parse.intent if intent_parse else None,
+            )
+            _log_stage("resume_full_scan_extract_hr", stage_start, correlation_id)
 
         _log_extraction_diagnostics(
             extraction=extraction,
@@ -191,15 +353,107 @@ def run(
 
     stage_start = time.time()
     extraction = extract_schema(
-        None,
+        intent_parse.domain if intent_parse and intent_parse.domain != "generic" else None,
         query=original_query,
         chunks=reranked,
         llm_client=llm_client,
         budget=budget,
         correlation_id=correlation_id,
         scope_document_id=scope_document_id,
+        intent_hint=intent_parse.intent if intent_parse else None,
     )
     _log_stage("extract", stage_start, correlation_id)
+
+    if isinstance(extraction.schema, HRSchema) and _needs_full_scan_hr(extraction.schema, extraction.intent):
+        stage_start = time.time()
+        expanded = expand_full_scan_by_document(
+            qdrant_client=qdrant_client,
+            collection=build_collection_name(subscription_id),
+            base_chunks=reranked,
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            correlation_id=correlation_id,
+        )
+        reranked = expanded or reranked
+        if _needs_profile_scan(reranked):
+            reranked = expand_full_scan_by_profile(
+                qdrant_client=qdrant_client,
+                collection=build_collection_name(subscription_id),
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+                correlation_id=correlation_id,
+            ) or reranked
+        extraction = extract_schema(
+            "hr",
+            query=original_query,
+            chunks=reranked,
+            llm_client=None,
+            budget=budget,
+            correlation_id=correlation_id,
+            scope_document_id=scope_document_id,
+            intent_hint=intent_parse.intent if intent_parse else None,
+        )
+        _log_stage("full_scan_extract_hr", stage_start, correlation_id)
+    elif isinstance(extraction.schema, InvoiceSchema) and _needs_full_scan_invoice(extraction.schema, extraction.intent):
+        stage_start = time.time()
+        expanded = expand_full_scan_by_document(
+            qdrant_client=qdrant_client,
+            collection=build_collection_name(subscription_id),
+            base_chunks=reranked,
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            correlation_id=correlation_id,
+        )
+        reranked = expanded or reranked
+        if _needs_profile_scan(reranked):
+            reranked = expand_full_scan_by_profile(
+                qdrant_client=qdrant_client,
+                collection=build_collection_name(subscription_id),
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+                correlation_id=correlation_id,
+            ) or reranked
+        extraction = extract_schema(
+            "invoice",
+            query=original_query,
+            chunks=reranked,
+            llm_client=None,
+            budget=budget,
+            correlation_id=correlation_id,
+            scope_document_id=scope_document_id,
+            intent_hint=intent_parse.intent if intent_parse else None,
+        )
+        _log_stage("full_scan_extract_invoice", stage_start, correlation_id)
+    elif isinstance(extraction.schema, LegalSchema) and _needs_full_scan_legal(extraction.schema, extraction.intent):
+        stage_start = time.time()
+        expanded = expand_full_scan_by_document(
+            qdrant_client=qdrant_client,
+            collection=build_collection_name(subscription_id),
+            base_chunks=reranked,
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            correlation_id=correlation_id,
+        )
+        reranked = expanded or reranked
+        if _needs_profile_scan(reranked):
+            reranked = expand_full_scan_by_profile(
+                qdrant_client=qdrant_client,
+                collection=build_collection_name(subscription_id),
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+                correlation_id=correlation_id,
+            ) or reranked
+        extraction = extract_schema(
+            "legal",
+            query=original_query,
+            chunks=reranked,
+            llm_client=None,
+            budget=budget,
+            correlation_id=correlation_id,
+            scope_document_id=scope_document_id,
+            intent_hint=intent_parse.intent if intent_parse else None,
+        )
+        _log_stage("full_scan_extract_legal", stage_start, correlation_id)
 
     if Config.Features.DOMAIN_SPECIFIC_ENABLED and extraction.domain == "multi" and _query_is_hr(original_query):
         stage_start = time.time()
@@ -211,6 +465,7 @@ def run(
             budget=budget,
             correlation_id=correlation_id,
             scope_document_id=scope_document_id,
+            intent_hint=intent_parse.intent if intent_parse else None,
         )
         _log_stage("extract_hr_fallback", stage_start, correlation_id)
 
@@ -300,156 +555,20 @@ def run_docwain_rag_v3(
     cross_encoder: Optional[Any] = None,
     document_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    correlation_id = request_id
-    budget = LLMBudget(llm_client=llm_client, max_calls=2)
-    original_query = query or ""
-    intent_type = _infer_intent_type(original_query)
-    scope_document_id = _infer_scope_document_id(original_query, document_id)
-
-    stage_start = time.time()
-    rewritten = rewrite_query(
-        query=original_query,
+    return run(
+        query=query,
         subscription_id=subscription_id,
         profile_id=profile_id,
-        redis_client=redis_client,
-        llm_client=llm_client,
-        budget=budget,
-        correlation_id=correlation_id,
-    )
-    _log_stage("rewrite", stage_start, correlation_id)
-
-    stage_start = time.time()
-    retrieved = retrieve(
-        query=rewritten,
-        raw_query=original_query,
-        subscription_id=subscription_id,
-        profile_id=profile_id,
-        qdrant_client=qdrant_client,
-        embedder=embedder,
-        document_id=scope_document_id,
-        correlation_id=correlation_id,
-        intent_type=intent_type,
-    )
-    _log_stage("retrieve", stage_start, correlation_id)
-
-    if not retrieved:
-        return _build_answer(
-            response_text=NO_CHUNKS_MESSAGE,
-            sources=[],
-            request_id=request_id,
-            metadata={
-                "domain": None,
-                "intent": None,
-                "intent_type": intent_type,
-                "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
-                "quality": "LOW",
-                "rag_v3": True,
-            },
-        )
-
-    stage_start = time.time()
-    reranked = rerank(
-        query=rewritten,
-        chunks=retrieved,
-        cross_encoder=cross_encoder,
-        top_k=8,
-        correlation_id=correlation_id,
-    )
-    _log_stage("rerank", stage_start, correlation_id)
-
-    stage_start = time.time()
-    extraction = extract_schema(
-        None,
-        query=original_query,
-        chunks=reranked,
-        llm_client=llm_client,
-        budget=budget,
-        correlation_id=correlation_id,
-        scope_document_id=scope_document_id,
-    )
-    _log_stage("extract", stage_start, correlation_id)
-
-    if Config.Features.DOMAIN_SPECIFIC_ENABLED and extraction.domain == "multi" and _query_is_hr(original_query):
-        stage_start = time.time()
-        extraction = extract_schema(
-            "hr",
-            query=original_query,
-            chunks=reranked,
-            llm_client=None,
-            budget=budget,
-            correlation_id=correlation_id,
-            scope_document_id=scope_document_id,
-        )
-        _log_stage("extract_hr_fallback", stage_start, correlation_id)
-
-    _log_extraction_diagnostics(
-        extraction=extraction,
-        intent_type=intent_type,
-        chunks=reranked,
-        correlation_id=correlation_id,
-    )
-    _maybe_log_hr_schema(extraction, correlation_id)
-
-    stage_start = time.time()
-    rendered = render(domain=extraction.domain, intent=extraction.intent, schema=extraction.schema, strict=False)
-    _log_stage("render", stage_start, correlation_id)
-
-    stage_start = time.time()
-    sanitized = sanitize(rendered)
-    _log_stage("sanitize", stage_start, correlation_id)
-
-    stage_start = time.time()
-    verdict = judge(
-        answer=sanitized,
-        schema=extraction.schema,
-        intent=extraction.intent,
-        llm_client=llm_client,
-        budget=budget,
-        sources_present=bool(reranked),
-        correlation_id=correlation_id,
-    )
-    _log_stage("judge", stage_start, correlation_id)
-
-    final_answer = sanitized
-    if verdict.status == "fail":
-        if verdict.reason in {"no_sources", "no_evidence_spans"}:
-            final_answer = NO_CHUNKS_MESSAGE
-            verdict = JudgeResult(status="fail", reason=verdict.reason)
-        else:
-            retry_answer = _retry_render(extraction, correlation_id)
-            retry_sanitized = sanitize(retry_answer)
-            retry_verdict = judge(
-                answer=retry_sanitized,
-                schema=extraction.schema,
-                intent=extraction.intent,
-                llm_client=None,
-                budget=budget,
-                sources_present=bool(reranked),
-                correlation_id=correlation_id,
-            )
-            if retry_verdict.status == "pass":
-                final_answer = retry_sanitized
-                verdict = retry_verdict
-            else:
-                final_answer = FALLBACK_ANSWER
-                verdict = JudgeResult(status="fail", reason="retry_failed")
-
-    sources = _collect_sources(reranked)
-    metadata = {
-        "domain": extraction.domain,
-        "intent": extraction.intent,
-        "intent_type": intent_type,
-        "scope": {"document_id": scope_document_id} if scope_document_id else {"profile_id": profile_id},
-        "quality": "HIGH" if verdict.status == "pass" else "LOW",
-        "rag_v3": True,
-        "judge": {"status": verdict.status, "reason": verdict.reason},
-    }
-
-    return _build_answer(
-        response_text=final_answer,
-        sources=sources,
+        document_id=document_id,
+        tool_hint=None,
+        session_id=session_id,
+        user_id=user_id,
         request_id=request_id,
-        metadata=metadata,
+        llm_client=llm_client,
+        qdrant_client=qdrant_client,
+        redis_client=redis_client,
+        embedder=embedder,
+        cross_encoder=cross_encoder,
     )
 
 
@@ -698,7 +817,20 @@ def _log_stage(stage: str, start_time: float, correlation_id: Optional[str]) -> 
     )
 
 
-def _infer_intent_type(query: str) -> str:
+def _infer_intent_type(query: str, intent_parse: Optional[IntentParse] = None) -> str:
+    if intent_parse:
+        mapping = {
+            "compare": "compare",
+            "rank": "rank",
+            "summarize": "summarize",
+            "list": "extract",
+            "extract": "extract",
+            "contact": "extract",
+            "qa": "answer",
+        }
+        mapped = mapping.get(intent_parse.intent)
+        if mapped:
+            return mapped
     lowered = (query or "").lower()
     if any(tok in lowered for tok in ("compare", "versus", "vs")):
         return "compare"
@@ -709,6 +841,29 @@ def _infer_intent_type(query: str) -> str:
     if any(tok in lowered for tok in ("extract", "list", "pull")):
         return "extract"
     return "answer"
+
+
+def _start_intent_parse(
+    *,
+    query: str,
+    llm_client: Optional[Any],
+    redis_client: Optional[Any],
+) -> Optional[concurrent.futures.Future]:
+    if not query or llm_client is None:
+        return None
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(parse_intent, query=query, llm_client=llm_client, redis_client=redis_client)
+    executor.shutdown(wait=False)
+    return future
+
+
+def _resolve_intent_future(future: Optional[concurrent.futures.Future]) -> Optional[IntentParse]:
+    if future is None:
+        return None
+    try:
+        return future.result(timeout=0.05)
+    except Exception:
+        return None
 
 
 def _infer_scope_document_id(query: str, explicit_document_id: Optional[str]) -> Optional[str]:
@@ -745,6 +900,101 @@ def _query_is_hr(query: str) -> bool:
             "certifications",
         )
     )
+
+
+def _needs_full_scan_hr(schema: HRSchema, intent: str) -> bool:
+    candidates = (schema.candidates.items if schema.candidates else None) or []
+    if not candidates:
+        return False
+    if intent == "contact":
+        missing = 0
+        for cand in candidates:
+            if not (cand.emails or cand.phones or cand.linkedins):
+                missing += 1
+        return missing >= max(1, len(candidates) // 2)
+
+    missing = 0
+    for cand in candidates:
+        lacks_core = not (cand.technical_skills or cand.functional_skills or cand.certifications or cand.total_years_experience)
+        if lacks_core:
+            missing += 1
+    return missing >= max(1, len(candidates) // 2)
+
+
+def _needs_full_scan_invoice(schema: InvoiceSchema, intent: str) -> bool:
+    _ = intent
+    items = (schema.items.items if schema.items else None) or []
+    totals = (schema.totals.items if schema.totals else None) or []
+    parties = (schema.parties.items if schema.parties else None) or []
+    terms = (schema.terms.items if schema.terms else None) or []
+    missing_groups = sum(1 for group in (items, totals, parties, terms) if not group)
+    return missing_groups >= 2
+
+
+def _needs_full_scan_legal(schema: LegalSchema, intent: str) -> bool:
+    _ = intent
+    clauses = (schema.clauses.items if schema.clauses else None) or []
+    return not clauses
+
+
+def _needs_profile_scan(chunks: List[Chunk]) -> bool:
+    if not chunks:
+        return True
+    unique_docs = {(_chunk_document_id(c) or "") for c in chunks}
+    if len(unique_docs) < 2:
+        return True
+    top_score = max((c.score for c in chunks), default=0.0)
+    return top_score < 0.2
+
+
+def _profile_point_counts(
+    subscription_id: str,
+    profile_id: str,
+    qdrant_client: Any,
+    correlation_id: Optional[str],
+) -> tuple[int, int]:
+    count = 0
+    total = 0
+    try:
+        response = qdrant_client.count(
+            collection_name=build_collection_name(subscription_id),
+            count_filter=build_qdrant_filter(
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+            ),
+            exact=True,
+        )
+        count = int(getattr(response, "count", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "RAG v3 profile scan count failed: %s",
+            exc,
+            extra={"stage": "profile_scan_check", "correlation_id": correlation_id},
+        )
+    try:
+        response = qdrant_client.count(
+            collection_name=build_collection_name(subscription_id),
+            exact=True,
+        )
+        total = int(getattr(response, "count", 0) or 0)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "RAG v3 total collection count failed: %s",
+            exc,
+            extra={"stage": "profile_scan_check", "correlation_id": correlation_id},
+        )
+    logger.info(
+        "RAG v3 profile point count=%s total_count=%s (threshold=%s)",
+        count,
+        total,
+        80,
+        extra={"stage": "profile_scan_check", "correlation_id": correlation_id},
+    )
+    return count, total
+
+
+def _should_unconditional_profile_scan(profile_count: int, threshold: int = 80) -> bool:
+    return bool(profile_count and profile_count <= threshold)
 
 
 __all__ = ["run_docwain_rag_v3", "run"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.vector_store import build_collection_name, build_qdrant_filter
@@ -14,6 +15,18 @@ MIN_RESULTS = 8
 FALLBACK_LIMIT = 200
 MAX_UNION_RESULTS = 24
 LOW_SCORE_THRESHOLD = 0.2
+MAX_EXPANDED_DOCS = 3
+MAX_DOC_CHUNKS = 20
+MAX_FULL_SCAN_DOCS = 3
+MAX_FULL_SCAN_CHUNKS = 160
+MAX_PROFILE_SCAN_CHUNKS = 5000
+MAX_UNSCOPED_SCAN_CHUNKS = 2000
+SECTION_KEYWORDS_BY_DOMAIN = {
+    "hr": ["experience", "summary", "skills", "certification", "education", "project"],
+    "invoice": ["total", "amount", "payment", "invoice", "bill to", "due"],
+    "legal": ["clause", "section", "term", "liability", "warranty"],
+    "generic": [],
+}
 
 
 def retrieve_chunks(
@@ -119,7 +132,17 @@ def retrieve_chunks(
         merged = _apply_domain_gate(merged, query, correlation_id)
         merged = sorted(merged, key=lambda c: c.score, reverse=True)[:MAX_UNION_RESULTS]
         _log_top5(merged, correlation_id, label="hybrid")
-        return merged
+        results = merged
+
+    results = _expand_by_document(
+        qdrant_client=qdrant_client,
+        collection=collection,
+        base_chunks=results,
+        subscription_id=str(subscription_id),
+        profile_id=str(profile_id),
+        correlation_id=correlation_id,
+        domain=domain,
+    )
 
     return results
 
@@ -149,6 +172,224 @@ def retrieve(
         correlation_id=correlation_id,
         intent_type=intent_type,
     )
+
+
+def expand_full_scan_by_document(
+    *,
+    qdrant_client: Any,
+    collection: str,
+    base_chunks: List[Chunk],
+    subscription_id: str,
+    profile_id: str,
+    correlation_id: Optional[str],
+    max_docs: int = MAX_FULL_SCAN_DOCS,
+    max_chunks_per_doc: int = MAX_FULL_SCAN_CHUNKS,
+) -> List[Chunk]:
+    doc_ids = []
+    for chunk in base_chunks:
+        doc_id = _chunk_doc_id(chunk)
+        if not doc_id:
+            continue
+        if doc_id not in doc_ids:
+            doc_ids.append(doc_id)
+    doc_ids = doc_ids[:max_docs]
+    if not doc_ids:
+        return base_chunks
+
+    def _fetch(doc_id: str) -> List[Chunk]:
+        q_filter = build_qdrant_filter(
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            document_id=doc_id,
+        )
+        collected: List[Any] = []
+        offset = None
+        remaining = max_chunks_per_doc
+        while remaining > 0:
+            limit = min(remaining, 64)
+            try:
+                response, offset = qdrant_client.scroll(
+                    collection_name=collection,
+                    scroll_filter=q_filter,
+                    limit=limit,
+                    with_payload=True,
+                    with_vectors=False,
+                    offset=offset,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "RAG v3 full scan failed for doc_id=%s: %s",
+                    doc_id,
+                    exc,
+                    extra={"stage": "retrieve_full_scan", "correlation_id": correlation_id},
+                )
+                break
+            if not response:
+                break
+            collected.extend(response)
+            remaining -= len(response)
+            if offset is None:
+                break
+        chunks = [_to_chunk(point) for point in collected if point is not None]
+        return chunks
+
+    expanded: List[Chunk] = []
+    with ThreadPoolExecutor(max_workers=min(4, len(doc_ids))) as executor:
+        futures = {executor.submit(_fetch, doc_id): doc_id for doc_id in doc_ids}
+        for future in as_completed(futures):
+            try:
+                expanded.extend(future.result() or [])
+            except Exception:
+                continue
+
+    merged = _merge_dedupe(base_chunks, expanded)
+    merged = sorted(merged, key=lambda c: c.score, reverse=True)[:MAX_UNION_RESULTS]
+    _log_top5(merged, correlation_id, label="full_scan")
+    return merged
+
+
+def expand_full_scan_by_profile(
+    *,
+    qdrant_client: Any,
+    collection: str,
+    subscription_id: str,
+    profile_id: str,
+    correlation_id: Optional[str],
+    max_chunks: int = MAX_PROFILE_SCAN_CHUNKS,
+) -> List[Chunk]:
+    q_filter = build_qdrant_filter(
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+    )
+    collected: List[Any] = []
+    offset = None
+    remaining = max_chunks
+    while remaining > 0:
+        limit = min(remaining, 64)
+        try:
+            response, offset = qdrant_client.scroll(
+                collection_name=collection,
+                scroll_filter=q_filter,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "RAG v3 profile scan failed: %s",
+                exc,
+                extra={"stage": "retrieve_profile_scan", "correlation_id": correlation_id},
+            )
+            break
+        if not response:
+            break
+        collected.extend(response)
+        remaining -= len(response)
+        if offset is None:
+            break
+    chunks = [_to_chunk(point) for point in collected if point is not None]
+    chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
+    _log_top5(chunks, correlation_id, label="profile_scan")
+    return chunks
+
+
+def expand_full_scan_unscoped(
+    *,
+    qdrant_client: Any,
+    collection: str,
+    correlation_id: Optional[str],
+    max_chunks: int = MAX_UNSCOPED_SCAN_CHUNKS,
+) -> List[Chunk]:
+    collected: List[Any] = []
+    offset = None
+    remaining = max_chunks
+    while remaining > 0:
+        limit = min(remaining, 64)
+        try:
+            response, offset = qdrant_client.scroll(
+                collection_name=collection,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "RAG v3 unscoped scan failed: %s",
+                exc,
+                extra={"stage": "retrieve_unscoped_scan", "correlation_id": correlation_id},
+            )
+            break
+        if not response:
+            break
+        collected.extend(response)
+        remaining -= len(response)
+        if offset is None:
+            break
+    chunks = [_to_chunk(point) for point in collected if point is not None]
+    chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
+    _log_top5(chunks, correlation_id, label="unscoped_scan")
+    return chunks
+
+
+def filter_chunks_by_profile_scope(
+    chunks: List[Chunk],
+    *,
+    profile_id: str,
+    subscription_id: str,
+) -> List[Chunk]:
+    if not chunks:
+        return chunks
+    profile_id = str(profile_id)
+    subscription_id = str(subscription_id)
+
+    def _extract_values(payload: Dict[str, Any], keys: List[str]) -> List[str]:
+        values = []
+        for key in keys:
+            val = payload.get(key)
+            if val is not None and str(val).strip():
+                values.append(str(val))
+        return values
+
+    def _nested_value(payload: Dict[str, Any], key: str, subkey: str) -> Optional[str]:
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            val = nested.get(subkey)
+            if val is not None and str(val).strip():
+                return str(val)
+        return None
+
+    profile_keys = ["profile_id", "profileId", "profileID", "profile.id"]
+    subscription_keys = ["subscription_id", "subscriptionId", "subscriptionID", "subscription.id"]
+
+    any_profile_key = False
+    any_subscription_key = False
+    scoped: List[Chunk] = []
+    for chunk in chunks:
+        payload = chunk.meta or {}
+        profile_values = _extract_values(payload, profile_keys)
+        subscription_values = _extract_values(payload, subscription_keys)
+        nested_profile = _nested_value(payload, "profile", "id")
+        nested_subscription = _nested_value(payload, "subscription", "id")
+        if nested_profile:
+            profile_values.append(nested_profile)
+        if nested_subscription:
+            subscription_values.append(nested_subscription)
+
+        if profile_values:
+            any_profile_key = True
+        if subscription_values:
+            any_subscription_key = True
+
+        profile_ok = not profile_values or profile_id in profile_values
+        subscription_ok = not subscription_values or subscription_id in subscription_values
+        if profile_ok and subscription_ok:
+            scoped.append(chunk)
+
+    if any_profile_key or any_subscription_key:
+        return scoped
+    return chunks
 
 
 def _query(
@@ -252,6 +493,97 @@ def _needs_hybrid_fallback(chunks: List[Chunk]) -> bool:
     return top_score < LOW_SCORE_THRESHOLD
 
 
+def _needs_doc_expansion(chunks: List[Chunk]) -> bool:
+    if not chunks:
+        return False
+    if len(chunks) < MIN_RESULTS:
+        return True
+    unique_docs = {(_chunk_doc_id(c) or "") for c in chunks}
+    if len(unique_docs) < 2:
+        return True
+    top_score = max((c.score for c in chunks), default=0.0)
+    return top_score < 0.25
+
+
+def _expand_by_document(
+    *,
+    qdrant_client: Any,
+    collection: str,
+    base_chunks: List[Chunk],
+    subscription_id: str,
+    profile_id: str,
+    correlation_id: Optional[str],
+    domain: str,
+) -> List[Chunk]:
+    if not _needs_doc_expansion(base_chunks):
+        return base_chunks
+
+    doc_ids = []
+    for chunk in base_chunks:
+        doc_id = _chunk_doc_id(chunk)
+        if not doc_id:
+            continue
+        if doc_id not in doc_ids:
+            doc_ids.append(doc_id)
+    doc_ids = doc_ids[:MAX_EXPANDED_DOCS]
+    if not doc_ids:
+        return base_chunks
+
+    def _fetch(doc_id: str) -> List[Chunk]:
+        q_filter = build_qdrant_filter(
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            document_id=doc_id,
+        )
+        try:
+            response, _next = qdrant_client.scroll(
+                collection_name=collection,
+                scroll_filter=q_filter,
+                limit=MAX_DOC_CHUNKS,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "RAG v3 doc expansion failed for doc_id=%s: %s",
+                doc_id,
+                exc,
+                extra={"stage": "retrieve_expand_doc", "correlation_id": correlation_id},
+            )
+            return []
+        chunks = [_to_chunk(point) for point in response or [] if point is not None]
+        return _filter_section_chunks(chunks, domain)
+
+    expanded: List[Chunk] = []
+    with ThreadPoolExecutor(max_workers=min(4, len(doc_ids))) as executor:
+        futures = {executor.submit(_fetch, doc_id): doc_id for doc_id in doc_ids}
+        for future in as_completed(futures):
+            try:
+                expanded.extend(future.result() or [])
+            except Exception:
+                continue
+
+    merged = _merge_dedupe(base_chunks, expanded)
+    merged = sorted(merged, key=lambda c: c.score, reverse=True)[:MAX_UNION_RESULTS]
+    _log_top5(merged, correlation_id, label="expand_doc")
+    return merged
+
+
+def _filter_section_chunks(chunks: List[Chunk], domain: str) -> List[Chunk]:
+    keywords = SECTION_KEYWORDS_BY_DOMAIN.get(domain) or []
+    if not keywords:
+        return chunks
+    filtered: List[Chunk] = []
+    for chunk in chunks:
+        meta = chunk.meta or {}
+        section_title = str(meta.get("section_title") or meta.get("section.title") or "")
+        section_kind = str(meta.get("section_kind") or meta.get("section.kind") or "")
+        haystack = f"{section_title} {section_kind}".lower()
+        if any(k in haystack for k in keywords):
+            filtered.append(chunk)
+    return filtered or chunks
+
+
 def _expand_query(query: str) -> str:
     tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
     stop = {"the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "from", "about"}
@@ -318,7 +650,6 @@ def _scroll_points(
             limit=int(limit),
             with_payload=True,
             with_vectors=False,
-            query_filter=q_filter,
             scroll_filter=q_filter,
         )
         if isinstance(response, tuple):
@@ -485,6 +816,15 @@ def _apply_domain_gate(chunks: List[Chunk], query: str, correlation_id: Optional
 def _chunk_domain(chunk: Chunk) -> str:
     meta = chunk.meta or {}
     return str(meta.get("doc_domain") or meta.get("doc_type") or meta.get("document.type") or "").lower()
+
+
+def _chunk_doc_id(chunk: Chunk) -> Optional[str]:
+    meta = chunk.meta or {}
+    for key in ("document_id", "doc_id", "docId"):
+        value = meta.get(key)
+        if value:
+            return str(value)
+    return None
 
 
 def _infer_domain(query: str) -> str:

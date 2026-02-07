@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from src.cache.redis_keys import RedisKeys
 from src.cache.redis_store import RedisStore
 from src.embed.entity_extractor import EntityExtractor
+from src.intent.llm_intent import parse_intent
 from .models import Plan
 
 
@@ -74,7 +75,8 @@ class Planner:
             return cached
 
         normalized = " ".join((query or "").strip().split())
-        intent = _detect_intent(normalized)
+        intent_parse = parse_intent(query=normalized, llm_client=self.llm_client, redis_client=self.redis_client)
+        intent = intent_parse.intent or _detect_intent(normalized)
         if _is_greeting(normalized):
             intent = "greet"
 
@@ -91,7 +93,7 @@ class Planner:
             return plan
 
         plan_payload = None
-        if self.llm_client and intent != "greet":
+        if self.llm_client and intent != "greet" and intent_parse.source not in {"llm", "cache"}:
             plan_payload = _llm_plan(self.llm_client, normalized, subscription_id, profile_id, document_id)
         if not plan_payload:
             plan_payload = _fallback_plan(normalized, subscription_id, profile_id, document_id)
@@ -100,8 +102,11 @@ class Planner:
             intent=plan_payload.get("intent") or intent,
             scope=plan_payload.get("scope") or _scope(subscription_id, profile_id, document_id),
             query_rewrites=plan_payload.get("query_rewrites") or _query_rewrites(normalized),
-            entity_hints=plan_payload.get("entity_hints") or _entity_hints(normalized, self.entity_extractor),
-            expected_answer_shape=plan_payload.get("expected_answer_shape") or _answer_shape(intent),
+            entity_hints=plan_payload.get("entity_hints")
+            or _merge_hints(_entity_hints(normalized, self.entity_extractor), intent_parse.entity_hints),
+            expected_answer_shape=plan_payload.get("expected_answer_shape")
+            or _shape_from_output_format(intent_parse.output_format)
+            or _answer_shape(intent),
             query=normalized or query,
         )
         self._cache_plan(subscription_id, profile_id, session_id, query, plan)
@@ -181,6 +186,33 @@ def _answer_shape(intent: str) -> str:
     if intent == "draft":
         return "letter"
     return "bullets"
+
+
+def _shape_from_output_format(output_format: str) -> Optional[str]:
+    normalized = (output_format or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized == "table":
+        return "table"
+    if normalized in {"markdown", "bullets"}:
+        return "bullets"
+    if normalized == "paragraph":
+        return "paragraph"
+    if normalized == "json":
+        return "json"
+    return None
+
+
+def _merge_hints(primary: List[str], extra: List[str]) -> List[str]:
+    merged: List[str] = []
+    seen = set()
+    for hint in (primary or []) + (extra or []):
+        key = hint.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(hint)
+    return merged[:12]
 
 
 def _query_rewrites(query: str) -> List[str]:

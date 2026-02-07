@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import ollama
 
+from src.intent.llm_intent import parse_intent
+
 logger = logging.getLogger(__name__)
 
 _INTENT_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -88,7 +90,12 @@ def _ollama_intent(query: str, model_name: Optional[str]) -> Optional[IntentResu
         return None
 
 
-def analyze_intent(query: str, model_name: Optional[str] = None) -> IntentResult:
+def analyze_intent(
+    query: str,
+    model_name: Optional[str] = None,
+    llm_client: Optional[Any] = None,
+    redis_client: Optional[Any] = None,
+) -> IntentResult:
     query = (query or "").strip()
     if not query:
         return IntentResult(intent="qa", target_doc_types=[], constraints={}, need_tables=False, source="empty")
@@ -98,7 +105,17 @@ def analyze_intent(query: str, model_name: Optional[str] = None) -> IntentResult
         cached = _INTENT_CACHE[key]
         return IntentResult(**cached)
 
-    result = _ollama_intent(query, model_name=model_name) or _heuristic_intent(query)
+    if llm_client is not None:
+        parsed = parse_intent(query=query, llm_client=llm_client, redis_client=redis_client)
+        result = IntentResult(
+            intent=parsed.intent,
+            target_doc_types=parsed.constraints.get("target_doc_types", []) if isinstance(parsed.constraints, dict) else [],
+            constraints=parsed.constraints or {},
+            need_tables=parsed.output_format == "table",
+            source=parsed.source,
+        )
+    else:
+        result = _ollama_intent(query, model_name=model_name) or _heuristic_intent(query)
 
     if len(_INTENT_CACHE) >= _INTENT_CACHE_MAX:
         _INTENT_CACHE.pop(next(iter(_INTENT_CACHE)))

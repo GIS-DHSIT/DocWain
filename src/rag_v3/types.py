@@ -87,6 +87,9 @@ class Candidate(BaseModel):
     certifications: Optional[List[str]] = None
     education: Optional[List[str]] = None
     achievements: Optional[List[str]] = None
+    emails: Optional[List[str]] = None
+    phones: Optional[List[str]] = None
+    linkedins: Optional[List[str]] = None
     source_type: Optional[str] = None
     missing_reason: Optional[Dict[str, str]] = None
     evidence_spans: List[EvidenceSpan]

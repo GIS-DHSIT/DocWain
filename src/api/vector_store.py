@@ -110,9 +110,12 @@ def build_qdrant_filter(
     if not subscription_id or not str(subscription_id).strip():
         raise ValueError("subscription_id is required for retrieval to enforce isolation")
 
+    def _id_condition(keys: List[str], value: str) -> Filter:
+        return Filter(should=[FieldCondition(key=key, match=MatchValue(value=value)) for key in keys])
+
     must: List[object] = [
-        FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
-        FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
+        _id_condition(["subscription_id", "subscriptionId", "subscription.id"], str(subscription_id)),
+        _id_condition(["profile_id", "profileId", "profile.id"], str(profile_id)),
     ]
 
     def _coerce_values(value: object) -> List[str]:
