@@ -135,7 +135,7 @@ class AIMetricsStore:
         agent: Optional[str] = None,
         tool: Optional[str] = None,
     ) -> None:
-        if not self.redis:
+        if not self.redis or not hasattr(self.redis, "pipeline"):
             return
         bucket = _hour_bucket(ts)
         keys = self._key_variants(

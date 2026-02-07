@@ -74,7 +74,7 @@ def ensure_payload_indexes(
     create_missing: bool = True,
 ) -> Dict[str, Any]:
     fields = [str(f) for f in required_fields if f]
-    existing = set(list_payload_indexes(client, collection_name))
+    existing = set(list_payload_indexes(client, collection_name, refresh=create_missing))
     missing = [field for field in fields if field not in existing]
 
     created: List[str] = []

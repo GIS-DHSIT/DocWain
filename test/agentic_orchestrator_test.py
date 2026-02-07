@@ -1,6 +1,8 @@
 import json
 import sys
 import types
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional
 from pathlib import Path
 
 import pytest
@@ -67,11 +69,42 @@ sys.modules["src.teams.bot_app"] = types.SimpleNamespace(
 )
 sys.modules["src.metrics.telemetry"] = types.SimpleNamespace(METRICS_V2_ENABLED=False, telemetry_store=None, __spec__=types.SimpleNamespace())
 sys.modules["src.mode.execution_mode"] = types.SimpleNamespace(
-    ExecutionMode=types.SimpleNamespace(AGENT="agent", value="agent"), resolve_execution_mode=lambda *a, **k: None, __spec__=types.SimpleNamespace()
+    ExecutionMode=types.SimpleNamespace(AGENT="agent", NORMAL="normal", value="agent"),
+    resolve_execution_mode=lambda *a, **k: None,
+    __spec__=types.SimpleNamespace(),
 )
 sys.modules["src.execution.router"] = types.SimpleNamespace(execute_request=lambda *a, **k: None, __spec__=types.SimpleNamespace())
-sys.modules["src.execution.common"] = types.SimpleNamespace(normalize_answer=lambda x: x, chunk_text_stream=lambda x: iter([x]), __spec__=types.SimpleNamespace())
-sys.modules["src.mode.session_state"] = types.SimpleNamespace(SessionStateStore=object, __spec__=types.SimpleNamespace())
+@dataclass
+class _StubExecutionResult:
+    answer: Dict[str, Any]
+    mode: Any
+    debug: Dict[str, Any]
+    stream: Optional[Iterable[str]] = None
+
+
+@dataclass
+class _StubSessionState:
+    preferred_execution_mode: Optional[Any] = None
+    last_docs_used: List[str] = field(default_factory=list)
+    last_intent: Optional[str] = None
+    last_request_fingerprint: Optional[str] = None
+    last_evidence_fingerprint: Optional[str] = None
+    last_answer_hash: Optional[str] = None
+    last_request_id: Optional[str] = None
+    last_query: Optional[str] = None
+
+
+sys.modules["src.execution.common"] = types.SimpleNamespace(
+    ExecutionResult=_StubExecutionResult,
+    normalize_answer=lambda x: x,
+    chunk_text_stream=lambda x: iter([x]),
+    __spec__=types.SimpleNamespace(),
+)
+sys.modules["src.mode.session_state"] = types.SimpleNamespace(
+    SessionState=_StubSessionState,
+    SessionStateStore=object,
+    __spec__=types.SimpleNamespace(),
+)
 sys.modules["src.runtime.request_context"] = types.SimpleNamespace(RequestContext=object, __spec__=types.SimpleNamespace())
 
 from src import main as docwain_api

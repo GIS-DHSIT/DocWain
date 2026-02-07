@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, Optional
 
 from src.embedding.pipeline import schema_normalizer as _schema_normalizer
 from src.embedding.pipeline.chunk_integrity import clean_text_for_embedding
+from src.metadata.normalizer import normalize_chunk_kind
 from src.utils.payload_utils import get_canonical_text, token_count
 
 _EVIDENCE_RE = re.compile(r"Section:\s*(.*?)(?:,|$)\s*Page:\s*(.*)$", re.IGNORECASE)
@@ -154,7 +155,7 @@ def normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     chunk_count = _intify(payload.get("chunk_count"))
 
     chunk_type = _stringify(payload.get("chunk_type")) or "text"
-    chunk_role = _stringify(payload.get("chunk_kind")) or "section_text"
+    chunk_role = normalize_chunk_kind({"chunk_kind": payload.get("chunk_kind"), "chunk_type": chunk_type}, strict=False)
 
     canonical_text = get_canonical_text({"text": clean_text, "content": payload.get("content")})
     canonical: Dict[str, Any] = {
@@ -259,16 +260,7 @@ def normalize_chunk_metadata(
         page_end = _intify(m.get("page_end")) or page_start
 
         chunk_type = _stringify(m.get("chunk_type")) or "text"
-        chunk_kind = _stringify(m.get("chunk_kind"))
-        if not chunk_kind:
-            if chunk_type in {"table", "table_row", "table_header"}:
-                chunk_kind = "table_text"
-            elif chunk_type == "image_caption":
-                chunk_kind = "image_caption"
-            elif chunk_type == "summary":
-                chunk_kind = "section_summary"
-            else:
-                chunk_kind = "section_text"
+        chunk_kind = normalize_chunk_kind({"chunk_kind": m.get("chunk_kind"), "chunk_type": chunk_type}, strict=False)
 
         if document_id:
             m["document_id"] = str(document_id)

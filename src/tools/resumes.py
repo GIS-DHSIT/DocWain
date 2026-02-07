@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import APIRouter, Header
+from fastapi import HTTPException, status
 from pydantic import BaseModel, Field
 
+from src.api.config import Config
 from src.tools.base import generate_correlation_id, register_tool, standard_response
+from src.tools.base import ToolError
 from src.tools.common.grounding import build_source_record
 from src.tools.common.text_extract import sanitize_text
 
@@ -49,8 +52,18 @@ def _parse_resume(text: str) -> Dict[str, Any]:
     }
 
 
+def _ensure_domain_enabled() -> None:
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise ToolError(
+            "Resume-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+            code="deprecated",
+            status_code=410,
+        )
+
+
 @register_tool("resumes")
 async def resumes_handler(payload: Dict[str, Any], correlation_id: str | None = None) -> Dict[str, Any]:
+    _ensure_domain_enabled()
     req = ResumeRequest(**(payload.get("input") or payload))
     parsed = _parse_resume(req.text)
     sources = [build_source_record("tool", correlation_id or "resumes", title="resume")]
@@ -59,6 +72,11 @@ async def resumes_handler(payload: Dict[str, Any], correlation_id: str | None = 
 
 @router.post("/analyze")
 async def analyze(request: ResumeRequest, x_correlation_id: str | None = Header(None)):
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Resume-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+        )
     cid = generate_correlation_id(x_correlation_id)
     parsed = _parse_resume(request.text)
     sources = [build_source_record("tool", cid, title="resume")]

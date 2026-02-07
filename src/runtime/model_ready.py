@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Iterable, Optional, Set
+from typing import Set
 
 import ollama
 
@@ -67,4 +67,3 @@ def ensure_model_ready(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Startup model readiness check failed: %s", exc)
         return False
-

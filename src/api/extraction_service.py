@@ -6,20 +6,37 @@ from typing import Any, Dict, List, Optional
 from src.api.config import Config
 from src.api.content_store import save_extracted_pickle
 from src.api.blob_store import blob_storage_configured
-from src.api.dataHandler import (
-    extract_document_info,
-    decrypt_data,
-    fileProcessor,
-    get_azure_docs,
-    get_s3_client,
-    get_subscription_pii_setting,
-    mask_document_content,
-    read_s3_file,
-    resolve_subscription_id,
-    update_extraction_metadata,
-    update_layout_graph_metadata,
-    update_pii_stats,
-)
+try:
+    from src.api.dataHandler import (
+        extract_document_info,
+        decrypt_data,
+        fileProcessor,
+        get_azure_docs,
+        get_s3_client,
+        get_subscription_pii_setting,
+        mask_document_content,
+        read_s3_file,
+        resolve_subscription_id,
+        update_extraction_metadata,
+        update_layout_graph_metadata,
+        update_pii_stats,
+    )
+except Exception as _datahandler_exc:  # noqa: BLE001
+    def _datahandler_unavailable(*_args, **_kwargs):
+        raise RuntimeError("dataHandler unavailable") from _datahandler_exc
+
+    extract_document_info = _datahandler_unavailable
+    decrypt_data = _datahandler_unavailable
+    fileProcessor = _datahandler_unavailable
+    get_azure_docs = _datahandler_unavailable
+    get_s3_client = _datahandler_unavailable
+    get_subscription_pii_setting = _datahandler_unavailable
+    mask_document_content = _datahandler_unavailable
+    read_s3_file = _datahandler_unavailable
+    resolve_subscription_id = _datahandler_unavailable
+    update_extraction_metadata = _datahandler_unavailable
+    update_layout_graph_metadata = _datahandler_unavailable
+    update_pii_stats = _datahandler_unavailable
 from src.api.layout_graph_store import save_layout_graph, save_layout_graph_local
 from src.api.document_status import init_document_record, set_error, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument

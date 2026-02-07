@@ -1,4 +1,10 @@
-from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest, FinetuneStatus, ResolvedModel
+from src.finetune.models import (
+    AutoFinetuneRunRequest,
+    CollectionOnlyFinetuneRequest,
+    FinetuneRequest,
+    FinetuneStatus,
+    ResolvedModel,
+)
 
 
 def get_finetune_manager():
@@ -16,3 +22,15 @@ def resolve_model_for_profile(profile_id: str, requested_model: str | None) -> R
 
 def list_models():
     return get_finetune_manager().list_models()
+
+
+__all__ = [
+    "AutoFinetuneRunRequest",
+    "CollectionOnlyFinetuneRequest",
+    "FinetuneRequest",
+    "FinetuneStatus",
+    "ResolvedModel",
+    "get_finetune_manager",
+    "list_models",
+    "resolve_model_for_profile",
+]

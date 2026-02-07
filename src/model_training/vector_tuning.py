@@ -4,7 +4,7 @@ import numpy as np
 from src.api.config import Config
 from qdrant_client import QdrantClient
 from qdrant_client.models import Filter
-from sentence_transformers import SentenceTransformer, losses, models
+from sentence_transformers import SentenceTransformer, losses
 from torch.utils.data import DataLoader
 from sentence_transformers import SentencesDataset, InputExample
 from transformers import AdamW, get_linear_schedule_with_warmup

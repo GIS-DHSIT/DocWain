@@ -13,7 +13,7 @@ from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.finetune.dataset_builder import _sample_chunks, build_dataset_from_qdrant
-from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest, FinetuneStatus
+from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
 from src.finetune.unsloth_trainer import get_finetune_manager
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.utils.payload_utils import get_source_name

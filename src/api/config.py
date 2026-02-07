@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -42,6 +41,14 @@ class Config:
         SENTIMENT_ENABLED = os.getenv("DOCWAIN_SENTIMENT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         SMALLTALK_MODEL = os.getenv("DOCWAIN_SMALLTALK_MODEL", "")
         INTENT_THRESHOLD = float(os.getenv("DOCWAIN_INTENT_THRESHOLD", "0.65"))
+
+    class Features:
+        DOMAIN_SPECIFIC_ENABLED = os.getenv("DOCWAIN_DOMAIN_SPECIFIC_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     class Qdrant:
         URL = os.getenv("QDRANT_URL", 'https://89f776c3-76fb-493f-8509-c583d9579329.europe-west3-0.gcp.cloud.qdrant.io')

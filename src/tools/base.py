@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -137,4 +137,3 @@ def register_tool(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any
         return func
 
     return _decorator
-

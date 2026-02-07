@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from typing import Iterable, Optional
+from typing import Iterable
 
 from fastapi import UploadFile
 
@@ -64,4 +64,3 @@ def coerce_text(data: bytes, *, fallback: str = "") -> str:
             return data.decode("latin-1")
         except Exception:
             return fallback
-

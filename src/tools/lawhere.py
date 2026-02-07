@@ -4,10 +4,11 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.tools.base import generate_correlation_id, register_tool, standard_response
+from src.api.config import Config
+from src.tools.base import ToolError, generate_correlation_id, register_tool, standard_response
 from src.tools.common.grounding import build_source_record
 from src.tools.common.safety import LEGAL_DISCLAIMER, add_disclaimer
 from src.tools.common.text_extract import sanitize_text
@@ -43,8 +44,18 @@ def _analyze(request: LawHereRequest) -> Dict[str, Any]:
     }
 
 
+def _ensure_domain_enabled() -> None:
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise ToolError(
+            "Legal-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+            code="deprecated",
+            status_code=410,
+        )
+
+
 @register_tool("lawhere")
 async def lawhere_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
+    _ensure_domain_enabled()
     req = LawHereRequest(**(payload.get("input") or payload))
     result = _analyze(req)
     sources = [build_source_record("tool", correlation_id or "lawhere", title="lawhere")]
@@ -53,6 +64,11 @@ async def lawhere_handler(payload: Dict[str, Any], correlation_id: Optional[str]
 
 @router.post("/analyze")
 async def analyze(request: LawHereRequest, x_correlation_id: str | None = Header(None)):
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Legal-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+        )
     cid = generate_correlation_id(x_correlation_id)
     result = _analyze(request)
     sources = [build_source_record("tool", cid, title="lawhere")]

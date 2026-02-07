@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from src.api.config import Config
-from src.kg.entity_extractor import EntityExtractor, ExtractedEntity
+from src.kg.entity_extractor import EntityExtractor
 from src.kg.neo4j_store import Neo4jStore
 
 logger = logging.getLogger(__name__)

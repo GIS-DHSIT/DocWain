@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 try:  # pragma: no cover - optional dependency
     import numpy as np
@@ -13,7 +13,7 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # noqa: BLE001
     torch = None  # type: ignore
 
-from qdrant_client.models import FieldCondition, Filter, MatchAny
+from qdrant_client.models import FieldCondition, MatchAny
 
 from src.api.vector_store import build_qdrant_filter
 from .models import EvidenceChunk

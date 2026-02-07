@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 from src.rag.answer_stability import (
     build_finalizer_prompt,
@@ -190,4 +190,3 @@ def generate_rag_answer(
         "attempts": attempts,
     }
     return answer, diagnostics
-

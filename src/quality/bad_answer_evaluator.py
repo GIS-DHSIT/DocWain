@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Iterable, List, Optional, Sequence
 
 from .fast_grounding import GroundingResult, evaluate_grounding
 from .fast_intent import IntentResult, evaluate_intent_alignment

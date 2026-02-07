@@ -45,6 +45,14 @@ def _decode_raw_bytes(raw_bytes_base64: Optional[str]) -> Optional[bytes]:
         return None
 
 
+def _require_domain_specific() -> None:
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Domain-specific screening is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+        )
+
+
 def _error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details or {}}}
 
@@ -585,6 +593,7 @@ def screen_resume(
     request: Union[MultiDocOptions, ScreenResumeRequest] = Body(...),
     engine: ScreeningEngine = Depends(get_screening_engine),
 ):
+    _require_domain_specific()
     if isinstance(request, MultiDocOptions):
         return _run_doc_based_screening("resume", request)
 
@@ -647,6 +656,7 @@ def screen_security(options: MultiDocOptions = Body(...)):
 
 @screening_router.post("/legality", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_legality(options: MultiDocLegalityOptions = Body(...)):
+    _require_domain_specific()
     return _run_doc_based_screening("legality", options)
 
 

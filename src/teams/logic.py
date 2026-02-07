@@ -8,6 +8,11 @@ from qdrant_client.http.exceptions import UnexpectedResponse
 from src.api.config import Config
 from src.api.vector_store import QdrantVectorStore, build_collection_name
 
+try:
+    from src.api import dw_newron
+except Exception:  # noqa: BLE001
+    dw_newron = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,9 +148,11 @@ class TeamsChatService:
         self.ensure_collection(context.subscription_id)
 
         try:
-            from src.api import dw_newron
-
-            answer = dw_newron.answer_question(
+            if dw_newron is None:
+                from src.api import dw_newron as _dw_newron
+            else:
+                _dw_newron = dw_newron
+            answer = _dw_newron.answer_question(
                 query=question,
                 user_id=context.user_id,
                 profile_id=context.profile_id,

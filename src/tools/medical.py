@@ -4,12 +4,13 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from src.tools.base import generate_correlation_id, register_tool, standard_response
+from src.api.config import Config
+from src.tools.base import ToolError, generate_correlation_id, register_tool, standard_response
 from src.tools.common.grounding import build_source_record
-from src.tools.common.safety import MEDICAL_DISCLAIMER, add_disclaimer, collect_warnings
+from src.tools.common.safety import add_disclaimer, collect_warnings
 from src.tools.common.text_extract import sanitize_text
 
 logger = logging.getLogger(__name__)
@@ -45,8 +46,18 @@ def _summarize_medical(text: str, redact: bool) -> Dict[str, Any]:
     return {"summary": summary, "entities": entities, "redacted_text": cleaned if redact else None}
 
 
+def _ensure_domain_enabled() -> None:
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise ToolError(
+            "Medical-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+            code="deprecated",
+            status_code=410,
+        )
+
+
 @register_tool("medical")
 async def medical_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
+    _ensure_domain_enabled()
     req = MedicalSummaryRequest(**(payload.get("input") or payload))
     result = _summarize_medical(req.text, req.redact)
     sources = [build_source_record("tool", correlation_id or "medical", title="medical")]
@@ -61,6 +72,11 @@ async def medical_handler(payload: Dict[str, Any], correlation_id: Optional[str]
 
 @router.post("/summarize")
 async def summarize(request: MedicalSummaryRequest, x_correlation_id: str | None = Header(None)):
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Medical-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+        )
     cid = generate_correlation_id(x_correlation_id)
     result = _summarize_medical(request.text, request.redact)
     sources = [build_source_record("tool", cid, title="medical")]
@@ -77,6 +93,11 @@ async def summarize(request: MedicalSummaryRequest, x_correlation_id: str | None
 
 @router.post("/image-analyze")
 async def image_analyze(request: MedicalImageRequest, x_correlation_id: str | None = Header(None)):
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Medical-specific tooling is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+        )
     cid = generate_correlation_id(x_correlation_id)
     note = request.notes or "Medical image analysis is not available in this environment."
     result = {

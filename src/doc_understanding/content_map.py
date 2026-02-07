@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 def _section_offsets(sections: List[Any]) -> Dict[str, Dict[str, int]]:

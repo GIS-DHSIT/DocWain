@@ -54,6 +54,13 @@ def retrieve_chunks(
     )
 
     results = _query(qdrant_client, collection, vector, q_filter, top_k, correlation_id)
+    if results:
+        results = [
+            chunk
+            for chunk in results
+            if str((chunk.meta or {}).get("profile_id") or "") == str(profile_id)
+            and str((chunk.meta or {}).get("subscription_id") or "") == str(subscription_id)
+        ]
     if domain != "generic" and len(results) < MIN_RESULTS:
         fallback_filter = build_qdrant_filter(
             subscription_id=str(subscription_id),
@@ -61,12 +68,26 @@ def retrieve_chunks(
             document_id=document_id,
         )
         broad = _query(qdrant_client, collection, vector, fallback_filter, top_k, correlation_id, label="retrieve_broad")
+        if broad:
+            broad = [
+                chunk
+                for chunk in broad
+                if str((chunk.meta or {}).get("profile_id") or "") == str(profile_id)
+                and str((chunk.meta or {}).get("subscription_id") or "") == str(subscription_id)
+            ]
         results = _merge_dedupe(results, broad)
     if _needs_expansion(results):
         expanded_query = _expand_query(raw_query)
         if expanded_query and expanded_query != query:
             expanded_vector = _embed(expanded_query, embedder)
             expanded_results = _query(qdrant_client, collection, expanded_vector, q_filter, top_k, correlation_id, label="retrieve_expand")
+            if expanded_results:
+                expanded_results = [
+                    chunk
+                    for chunk in expanded_results
+                    if str((chunk.meta or {}).get("profile_id") or "") == str(profile_id)
+                    and str((chunk.meta or {}).get("subscription_id") or "") == str(subscription_id)
+                ]
             results = _merge_results(results, expanded_results)
 
     if domain == "hr" and (wants_skill_rank or skill_focus):
@@ -87,6 +108,13 @@ def retrieve_chunks(
             limit=FALLBACK_LIMIT,
             correlation_id=correlation_id,
         )
+        if fallback:
+            fallback = [
+                chunk
+                for chunk in fallback
+                if str((chunk.meta or {}).get("profile_id") or "") == str(profile_id)
+                and str((chunk.meta or {}).get("subscription_id") or "") == str(subscription_id)
+            ]
         merged = _merge_dedupe(results, fallback)
         merged = _apply_domain_gate(merged, query, correlation_id)
         merged = sorted(merged, key=lambda c: c.score, reverse=True)[:MAX_UNION_RESULTS]

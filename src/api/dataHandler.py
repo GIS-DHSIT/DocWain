@@ -1,5 +1,4 @@
 
-import copy
 import csv
 import hashlib
 import json
@@ -9,7 +8,6 @@ import os
 import re
 import subprocess
 import time
-import uuid
 from io import BytesIO, StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,7 +19,6 @@ from Crypto.Cipher import AES
 from bson.objectid import ObjectId
 from pymongo import MongoClient, errors
 from qdrant_client import QdrantClient
-from qdrant_client.models import SparseVector
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import HashingVectorizer
 from urllib.parse import urlparse
@@ -35,22 +32,18 @@ from src.api.context_understanding import ContextUnderstanding
 from src.api.pii_masking import mask_document_content
 from src.api.dw_document_extractor import DocumentExtractor
 from src.api.content_store import delete_extracted_pickle, save_extracted_pickle
-from src.api.pipeline_models import ChunkCandidate, ChunkRecord, ExtractedDocument, Section
+from src.api.pipeline_models import ChunkRecord, ExtractedDocument, Section
 from src.api.vector_store import QdrantVectorStore, build_collection_name, compute_chunk_id
-from src.embedding.pipeline.chunk_integrity import clean_text_for_embedding, is_valid_chunk_text
+from src.embedding.pipeline.chunk_integrity import is_valid_chunk_text
 from src.embedding.pipeline.embed_pipeline import ChunkPrepStats, prepare_embedding_chunks, normalize_chunk_chain
 from src.embedding.pipeline.payload_normalizer import build_qdrant_payload, normalize_chunk_metadata
 from src.embedding.pipeline.schema_normalizer import EMBED_PIPELINE_VERSION
 from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
-from src.embedding.model_loader import (
-    encode_with_fallback as model_encode_with_fallback,
-    get_embedding_model,
-    get_model_info,
-)
+from src.embedding.model_loader import encode_with_fallback as model_encode_with_fallback, get_embedding_model
 from src.embedding.chunking.section_chunker import SectionChunker, normalize_text
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.telemetry import METRICS_V2_ENABLED, telemetry_store
-from src.utils.payload_utils import is_valid_text, token_count
+from src.utils.payload_utils import is_valid_text
 from azure.core.exceptions import ResourceNotFoundError
 
 from src.storage.azure_blob_client import (
@@ -240,30 +233,35 @@ def create_mongo_client():
     """Create a Mongo client with a graceful fallback when the primary URI is misconfigured."""
     primary_uri = Config.MongoDB.URI
     fallback_uri = getattr(Config.MongoDB, "FALLBACK_URI", None)
+    client = None
     try:
         client = MongoClient(primary_uri, serverSelectionTimeoutMS=5000)
         try:
-            # Verify connectivity early so failures are visible
-            client.admin.command('ping')
+            client.admin.command("ping")
             logging.info(f"Connected to MongoDB primary URI: {primary_uri}")
+            return client
         except Exception as ping_exc:
             logging.warning(f"Ping to primary MongoDB URI failed: {ping_exc}")
-            # allow fallback to kick in below
-            raise ping_exc
-        return client
     except Exception as exc:
-        if fallback_uri and fallback_uri != primary_uri:
-            logging.warning(f"Primary MongoDB URI failed ({exc}); attempting fallback {fallback_uri}")
+        logging.warning(f"Primary MongoDB URI failed ({exc}); attempting fallback")
+
+    if fallback_uri and fallback_uri != primary_uri:
+        try:
+            fallback_client = MongoClient(fallback_uri, serverSelectionTimeoutMS=5000)
             try:
-                client = MongoClient(fallback_uri, serverSelectionTimeoutMS=5000)
-                client.admin.command('ping')
+                fallback_client.admin.command("ping")
                 logging.info(f"Connected to MongoDB fallback URI: {fallback_uri}")
-                return client
-            except Exception as fb_exc:
-                logging.error(f"Fallback MongoDB URI also failed: {fb_exc}")
-                raise
-        logging.error(f"Unable to create MongoClient: {exc}")
-        raise
+            except Exception as fb_ping:
+                logging.warning(f"Ping to fallback MongoDB URI failed: {fb_ping}")
+            return fallback_client
+        except Exception as fb_exc:
+            logging.error(f"Fallback MongoDB URI also failed: {fb_exc}")
+
+    if client is not None:
+        logging.warning("Using MongoClient without verified connectivity")
+        return client
+    logging.error("Unable to create MongoClient; falling back to localhost without ping")
+    return MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=5000)
 
 
 mongoClient = create_mongo_client()
@@ -1177,7 +1175,6 @@ def extract_document_info():
         return {}
 
 
-from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 
 def delete_embeddings(subscription_id: str, profile_id: str, document_id: str):

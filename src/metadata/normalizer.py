@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
+
+from src.utils.payload_utils import get_canonical_text, token_count
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +17,7 @@ ALLOWED_CHUNK_KINDS = {
     "doc_summary",
     "section_summary",
     "structured_field",
+    "fact",
 }
 
 
@@ -126,16 +131,33 @@ def _infer_chunk_kind(metadata: Dict[str, Any], *, fallback: str = "section_text
     return fallback
 
 
+def infer_chunk_kind(metadata: Dict[str, Any], *, fallback: str = "section_text") -> str:
+    return _infer_chunk_kind(metadata, fallback=fallback)
+
+
+def normalize_chunk_kind(
+    metadata: Dict[str, Any],
+    *,
+    fallback: str = "section_text",
+    strict: bool = True,
+) -> str:
+    chunk_kind = _infer_chunk_kind(metadata, fallback=fallback)
+    if chunk_kind not in ALLOWED_CHUNK_KINDS:
+        if strict:
+            logger.error("Invalid chunk_kind: %s", chunk_kind)
+            raise MetadataNormalizationError(f"Invalid chunk_kind: {chunk_kind}")
+        logger.warning("Unknown chunk_kind '%s'; falling back to %s", chunk_kind, fallback)
+        return fallback
+    return chunk_kind
+
+
 def normalize_chunk_metadata(metadata: Dict[str, Any], *, strict: bool = True) -> NormalizedMetadata:
     document_type = _resolve_field(metadata, "document_type", aliases=("type",), required=False)
     doc_type = _stringify(metadata.get("doc_type"))
     warnings: list[str] = []
     if doc_type and document_type and doc_type != document_type:
         warnings.append(f"document_type_conflict:{document_type} vs {doc_type}")
-    chunk_kind = _infer_chunk_kind(metadata)
-    if chunk_kind not in ALLOWED_CHUNK_KINDS:
-        logger.error("Invalid chunk_kind: %s", chunk_kind)
-        raise MetadataNormalizationError(f"Invalid chunk_kind: {chunk_kind}")
+    chunk_kind = normalize_chunk_kind(metadata, strict=strict)
 
     page_start = _resolve_int_field(metadata, "page_start", aliases=("page", "page_number"))
     page_end = _resolve_int_field(metadata, "page_end")
@@ -219,6 +241,57 @@ def normalize_payload_metadata(payload: Dict[str, Any], *, strict: bool = True) 
     return merged
 
 
+def normalize_chunk_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize ingestion chunk payloads using the canonical metadata normalizer."""
+    canonical_text = get_canonical_text({"text": raw.get("text"), "content": raw.get("content")})
+    chunk_hash = hashlib.sha256((canonical_text or "").encode("utf-8")).hexdigest() if canonical_text else None
+
+    normalized_meta = normalize_payload_metadata(raw, strict=False)
+    chunk_kind = normalize_chunk_kind(
+        {"chunk_kind": normalized_meta.get("chunk_kind"), "chunk_type": normalized_meta.get("chunk_type")},
+        strict=False,
+    )
+
+    payload: Dict[str, Any] = {
+        "subscription_id": _stringify(normalized_meta.get("subscription_id") or raw.get("subscription_id")),
+        "profile_id": _stringify(normalized_meta.get("profile_id") or raw.get("profile_id")),
+        "document_id": _stringify(normalized_meta.get("document_id") or raw.get("document_id")),
+        "filename": _stringify(
+            normalized_meta.get("file_name")
+            or raw.get("filename")
+            or raw.get("source_name")
+            or raw.get("source_file")
+        ),
+        "source_type": _stringify(raw.get("source_type")),
+        "domain": _stringify(raw.get("domain")) or "generic",
+        "chunk_kind": chunk_kind,
+        "section_path": raw.get("section_path") or [],
+        "page_range": raw.get("page_range") or [raw.get("page_start"), raw.get("page_end")],
+        "anchors": raw.get("anchors") or [],
+        "entity_types_present": raw.get("entity_types_present") or [],
+        "checksum_sha256": _stringify(raw.get("checksum_sha256")),
+        "source_version": _stringify(raw.get("source_version")),
+        "ingest_timestamp": raw.get("ingest_timestamp") or time.time(),
+        "chunk_id": _stringify(raw.get("chunk_id")),
+        "chunk_hash": chunk_hash,
+        "text": canonical_text,
+        "canonical_text": canonical_text,
+        "canonical_text_len": len(canonical_text) if canonical_text else 0,
+        "canonical_token_count": token_count(canonical_text) if canonical_text else 0,
+        "text_data": {"clean": canonical_text, "raw": raw.get("text") if raw.get("text") != canonical_text else None},
+    }
+
+    payload["source_name"] = payload.get("filename")
+    payload["doc_domain"] = payload.get("domain")
+    payload["section_path"] = payload.get("section_path")
+    if payload.get("page_range"):
+        payload["page_start"] = _intify(payload["page_range"][0]) if isinstance(payload["page_range"], list) else None
+        payload["page_end"] = _intify(payload["page_range"][1]) if isinstance(payload["page_range"], list) else None
+        payload["page"] = payload["page_start"]
+
+    return payload
+
+
 def normalize_ingestion_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize metadata for ingestion/embedding without hard-failing on conflicts."""
     warnings: list[str] = []
@@ -263,9 +336,12 @@ def normalize_ingestion_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 __all__ = [
     "ALLOWED_CHUNK_KINDS",
+    "infer_chunk_kind",
+    "normalize_chunk_kind",
     "MetadataNormalizationError",
     "NormalizedMetadata",
     "normalize_chunk_metadata",
+    "normalize_chunk_payload",
     "normalize_document_metadata",
     "normalize_ingestion_metadata",
     "normalize_payload_metadata",

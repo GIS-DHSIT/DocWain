@@ -2,6 +2,7 @@ import argparse
 import logging
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from docwain_ft.infer import run_one
@@ -23,6 +24,12 @@ def run_eval(eval_path: str, out_path: str, mock: bool = False) -> None:
             answer = run_one(prompt)
         outputs.append({"prompt": prompt, "answer": answer, "context": row.get("context", ""), "output_rules": row.get("output_rules", "")})
     write_jsonl(out_path, outputs)
+
+
+def load_eval_outputs(eval_path: str = "data/docwain_eval.jsonl") -> list[dict]:
+    out_path = Path(tempfile.gettempdir()) / "docwain_eval_outputs.jsonl"
+    run_eval(eval_path, str(out_path), mock=True)
+    return read_jsonl(out_path)
 
 
 def main() -> None:

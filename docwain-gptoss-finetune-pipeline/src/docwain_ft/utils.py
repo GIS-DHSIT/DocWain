@@ -26,7 +26,13 @@ def write_jsonl(path: str | Path, rows: Iterable[dict]) -> None:
 
 
 def read_jsonl(path: str | Path) -> list[dict]:
-    with open(path, "r", encoding="utf-8") as handle:
+    path_obj = Path(path)
+    if not path_obj.is_absolute() and not path_obj.exists():
+        base_dir = Path(__file__).resolve().parents[2]
+        candidate = base_dir / path_obj
+        if candidate.exists():
+            path_obj = candidate
+    with open(path_obj, "r", encoding="utf-8") as handle:
         return [json.loads(line) for line in handle if line.strip()]
 
 

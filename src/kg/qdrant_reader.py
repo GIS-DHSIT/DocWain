@@ -1,7 +1,7 @@
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from src.utils.payload_utils import get_document_type, get_source_name
 

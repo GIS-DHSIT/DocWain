@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from src.agentic.memory import AgentMemory
-from src.agentic.verification_agent import RetrievalVerification, VerificationAgent
+from src.agentic.verification_agent import VerificationAgent
 
 logger = logging.getLogger(__name__)
 

@@ -5,7 +5,10 @@ import pytest
 
 from src.agent.limits import LimitResult, check_and_count
 from src.agent.orchestrator import AgentOrchestrator, DocumentContext
-from src.execution.common import ExecutionResult
+try:
+    from src.execution.common import ExecutionResult
+except ImportError:
+    from src.execution import ExecutionResult
 from src.mode.execution_mode import ExecutionMode
 
 
