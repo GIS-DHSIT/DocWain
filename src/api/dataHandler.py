@@ -1,4 +1,3 @@
-
 import csv
 import hashlib
 import json
@@ -1363,6 +1362,16 @@ def save_embeddings_to_qdrant(
                 )
             except Exception:
                 doc_domain = doc_domain or "unknown"
+
+        # Final safety net — use content classifier if still unknown
+        if not doc_domain or str(doc_domain).strip().lower() in {"unknown", ""}:
+            from src.embedding.pipeline.content_classifier import classify_doc_domain
+
+            doc_domain = classify_doc_domain(
+                full_text_seed or " ".join([t for t in texts if t]),
+                filename or source_filename,
+                doc_type or document_type or "",
+            )
         embeddings["doc_domain"] = doc_domain
 
         if not texts:
@@ -1389,6 +1398,37 @@ def save_embeddings_to_qdrant(
 
         collection_name = build_collection_name(subscription_id)
         ensure_qdrant_collection(collection_name, vector_size)
+
+        # Apply embedding enhancement for better retrieval
+        try:
+            from src.embedding.pipeline_enhancement import enhance_chunks_for_embedding
+
+            enhancement_result = enhance_chunks_for_embedding(
+                texts=list(texts),
+                chunk_metadata=list(chunk_metadata) if chunk_metadata else [],
+                document_metadata={
+                    "document_id": str(doctag),
+                    "document_type": doc_type or document_type,
+                    "document_domain": doc_domain,
+                },
+                domain=doc_domain or "generic",
+            )
+
+            # Update chunk metadata with enhanced data
+            if enhancement_result.enhanced_metadata:
+                for idx, enhanced_meta in enumerate(enhancement_result.enhanced_metadata):
+                    if idx < len(chunk_metadata):
+                        chunk_metadata[idx].update(enhanced_meta)
+                    else:
+                        chunk_metadata.append(enhanced_meta)
+
+            logging.info(
+                f"Embedding enhancement: {enhancement_result.original_count} -> "
+                f"{enhancement_result.deduplicated_count} chunks, "
+                f"avg quality: {enhancement_result.average_quality_score:.2f}"
+            )
+        except Exception as enhance_exc:  # noqa: BLE001
+            logging.debug("Embedding enhancement skipped: %s", enhance_exc)
 
         records: List[ChunkRecord] = []
         invalid_samples: List[Dict[str, Any]] = []
@@ -1450,54 +1490,25 @@ def save_embeddings_to_qdrant(
 
             embedding_text = chunk_meta.get("embedding_text") or chunk_meta.get("text_clean") or text
             content_text = chunk_meta.get("content") or chunk_meta.get("text_raw") or chunk_meta.get("text_clean") or text
+            # Single source of truth: pass flat fields to build_qdrant_payload()
             raw_payload = {
+                **chunk_meta,
                 "subscription_id": str(subscription_id),
                 "profile_id": str(profile_id),
                 "document_id": str(doctag),
                 "content": content_text,
                 "embedding_text": embedding_text,
-                "text_clean": embedding_text,
-                "text_data": {"clean": embedding_text} if embedding_text else {},
-                "source": {"name": filename or source_filename},
-                "anchors": chunk_meta.get("anchors"),
-                "file_type": doc_metadata.get("file_type") or _safe_basename(filename or source_filename).split(".")[-1],
-                "mime_type": doc_metadata.get("mime_type"),
-                "connector_type": doc_metadata.get("ingestion_source") or doc_metadata.get("source_type"),
-                "document": {
-                    "type": chunk_meta.get("doc_type")
-                    or doc_type
-                    or doc_metadata.get("document_type")
-                    or doc_metadata.get("doc_type"),
-                    "domain": doc_domain,
-                    "ingestion_source": doc_metadata.get("ingestion_source") or doc_metadata.get("source_type"),
-                },
+                "source_name": filename or source_filename,
                 "doc_domain": doc_domain,
-                "section": {"id": section_id, "title": section_val, "path": section_path, "kind": section_kind},
                 "section_id": section_id,
-                "section_kind": section_kind,
-                "section_confidence": chunk_meta.get("section_confidence"),
-                "section_salience": chunk_meta.get("section_salience"),
-                "section_title": section_val or chunk_meta.get("section"),
+                "section_title": section_val,
                 "section_path": section_path,
+                "section_kind": section_kind,
                 "page": page_val,
-                "page_start": page_start,
                 "chunk_id": chunk_id,
                 "chunk_index": idx,
                 "chunk_count": max_len,
-                "chunk_role": chunk_meta.get("chunk_role") or chunk_meta.get("role"),
                 "chunk_kind": chunk_kind,
-                "chunking_mode": chunk_meta.get("chunking_mode"),
-                "detected_language": doc_metadata.get("detected_language") or (languages[0] if languages else None),
-                "language_confidence": doc_metadata.get("language_confidence"),
-                "languages": languages,
-                "chunk": {
-                    "id": chunk_id,
-                    "index": idx,
-                    "count": max_len,
-                    "type": chunk_kind,
-                    "role": chunk_meta.get("chunk_role") or chunk_meta.get("role"),
-                    "hash": chunk_meta.get("chunk_hash") or chunk_hash,
-                },
                 "hash": chunk_meta.get("chunk_hash") or chunk_hash,
                 "doc_version_hash": doc_version_hash,
                 "embed_pipeline_version": EMBED_PIPELINE_VERSION,
@@ -1990,6 +2001,8 @@ def _build_chunk_metadata_from_section_chunks(
     doc_ocr_confidence: Optional[float],
     chunking_mode: str = "section_aware",
 ) -> List[Dict[str, Any]]:
+    from src.embedding.pipeline.content_classifier import classify_section_kind
+
     metadata: List[Dict[str, Any]] = []
     for chunk in section_chunks:
         section_title = (getattr(chunk, "section_title", "") or "Untitled Section").strip() or "Untitled Section"
@@ -1998,11 +2011,14 @@ def _build_chunk_metadata_from_section_chunks(
         page_end = getattr(chunk, "page_end", None)
         chunk_index = int(getattr(chunk, "chunk_index", len(metadata)))
         sentence_complete = bool(getattr(chunk, "sentence_complete", False))
+        chunk_text = getattr(chunk, "text", "") or ""
+        section_kind = classify_section_kind(chunk_text, section_title)
         metadata.append(
             {
                 "document_id": doc_tag,
                 "section_title": section_title,
                 "section_path": section_path,
+                "section_kind": section_kind,
                 "page_start": page_start,
                 "page_end": page_end,
                 "page_number": page_start,
@@ -2190,6 +2206,29 @@ def _fallback_chunks_for_full_text(
     return fallback_chunks, fallback_meta, prep_stats, validity_diag, valid_indices
 
 
+def _extract_text_from_item(item: Any) -> str:
+    """Extract clean text from a texts list item that may be a string or chunk dict."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("text", "content", "full_text", "raw_text", "canonical_text"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        # Never stringify the dict — that produces garbage metadata text
+        return ""
+    if hasattr(item, "text"):
+        val = getattr(item, "text", "")
+        if isinstance(val, str) and val.strip():
+            return val
+    if hasattr(item, "full_text"):
+        val = getattr(item, "full_text", "")
+        if isinstance(val, str) and val.strip():
+            return val
+    # Never return str(item) — that's the garbage source
+    return ""
+
+
 def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, device: Optional[str] = None):
     """
      COMPLETELY FIXED: Trains and stores embeddings with strict document_id verification
@@ -2202,6 +2241,8 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
     try:
         telemetry = telemetry_store() if METRICS_V2_ENABLED else None
         metrics_store = get_metrics_store()
+        coverage_ratio = None
+        dropped_chunks = 0
         logging.info(f"=" * 80)
         logging.info(f"Starting training for {doc_name}")
         logging.info(f"  Document ID: {doc_tag}")
@@ -2223,11 +2264,13 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
 
         if isinstance(text, dict):
             doc_type_hint = text.get("doc_type") or text.get("document_type") or text.get("type")
+            doc_domain = text.get("doc_domain")
             doc_metadata = _fetch_document_metadata(doc_tag, doc_name, doc_type_hint)
             doc_type = doc_metadata.get("doc_type") or doc_type_hint
 
             chunk_metadata = list(text.get("chunk_metadata") or [])
-            texts = [str(t) for t in (text.get("texts") or []) if str(t).strip()]
+            texts = [_extract_text_from_item(t) for t in (text.get("texts") or [])]
+            texts = [t for t in texts if t.strip()]
 
             # If structured payload contains raw text but lacks chunking, chunk it safely.
             if not texts:
@@ -2257,6 +2300,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                         "chunk_index": idx,
                         "chunk_type": "text",
                         "doc_type": doc_type,
+                        "doc_domain": doc_domain,
                         "sentence_complete": str(texts[idx]).strip().endswith((".", "?", "!")),
                     }
                     for idx in range(len(texts))
@@ -2299,6 +2343,8 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             )
             for idx, meta in enumerate(chunk_metadata):
                 meta["chunk_index"] = idx
+                if doc_domain and not meta.get("doc_domain"):
+                    meta["doc_domain"] = doc_domain
                 if "sentence_complete" not in meta:
                     meta["sentence_complete"] = str(texts[idx]).strip().endswith((".", "?", "!"))
 
@@ -2314,6 +2360,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             dropped_chunks = prep_stats.dropped_quality + prep_stats.dropped_dedupe
             if not texts:
                 raise ValueError(f"Chunk preparation removed all chunks for document {doc_tag}")
+
+            # Update full_text with clean content from prepared chunks so fallback
+            # paths never re-chunk garbage ExtractedDocument repr strings.
+            text["full_text"] = "\n\n".join(texts)
 
             min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 80))
             min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 15))
@@ -2390,7 +2440,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                         chunk_texts=list(texts),
                         chunk_metadata=chunk_metadata,
                         metadata={
-                            "doc_type": doc_type,
+                            "doc_type": doc_type or document_type,
                             "source_name": doc_metadata.get("filename") or doc_name,
                         },
                     )
@@ -2433,7 +2483,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                         if added:
                             force_reembed = True
                 except Exception as exc:  # noqa: BLE001
-                    logging.debug("Section intelligence build skipped for %s: %s", doc_tag, exc)
+                    logging.debug("Section intelligence build skipped for %s: %s", doctag, exc)
             chunk_metadata = normalize_chunk_chain(
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -2695,11 +2745,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                         fallback_used = True
 
                 if len(chunks) < min_valid:
-                    extracted_chars = len(full_text or "")
                     diagnostics = {
                         **(validity_diag or {}),
                         "reason": "insufficient_valid_chunks",
-                        "extracted_chars": extracted_chars,
+                        "extracted_chars": len(str(text or "").strip()),
                         "expected_chunks": int(validity_diag.get("total_chunks", 0)),
                         "prepared_chunks": int(validity_diag.get("total_chunks", 0)),
                         "valid_chunks": len(chunks),
@@ -2724,6 +2773,19 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             )
 
             logging.info("Generated %s section-aware chunks for %s", len(chunks), doc_name)
+
+            # Pre-embedding validation: filter garbage text before vectorization
+            from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage as _is_embed_garbage
+            _valid_c, _valid_m = [], []
+            for _vc_t, _vc_m in zip(chunks, chunk_metadata):
+                if _is_embed_garbage(_vc_t) or len((_vc_t or "").strip()) < 20:
+                    logging.warning("Pre-embed gate: dropping garbage chunk for %s", doc_tag)
+                    continue
+                _valid_c.append(_vc_t)
+                _valid_m.append(_vc_m)
+            if _valid_c:
+                chunks = _valid_c
+                chunk_metadata = _valid_m
 
             embed_start = time.time()
             embeddings_array = encode_with_fallback(
@@ -2945,24 +3007,32 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 "sparse_vectors": sparse_vectors,
                 "summaries": summaries,
                 "chunk_metadata": chunk_metadata,
-                "pages": [m.get("page_number") for m in chunk_metadata],
-                "sections": [m.get("section_title") for m in chunk_metadata],
-                "doc_type": doc_type,
                 "doc_metadata": doc_metadata,
-                "ocr_confidence": doc_ocr_confidence,
-                "doc_domain": doc_domain,
-                "section_intelligence": section_intel_result,
+                "doc_type": doc_type,
             }
 
-            result = save_embeddings_to_qdrant(embeddings_payload, subscription_id, profile_id, doc_tag, doc_name)
+            # Save to Qdrant (will perform additional verification)
+            logging.info(f"Saving to Qdrant...")
+            result = save_embeddings_to_qdrant(
+                embeddings_payload,
+                subscription_id,
+                profile_id,
+                doc_tag,
+                doc_name
+            )
+
+            logging.info(f"=" * 80)
             saved = result.get("points_saved", 0)
-            dropped_chunks += int(result.get("dropped_invalid", 0))
             expected_points = len(chunks)
             if saved != expected_points:
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
                 )
-            logging.info("Stored %s section-aware embeddings for %s", saved, doc_name)
+            logging.info(f" SUCCESS: Stored {saved} embeddings")
+            logging.info(f"  Document ID: {doc_tag}")
+            logging.info(f"  File: {doc_name}")
+            logging.info(f"=" * 80)
+
             return {
                 "status": "success",
                 "points_saved": saved,
@@ -3081,48 +3151,21 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 sentence_complete_flags=sentence_flags,
             )
 
-            fact_chunks: List[str] = []
-            fact_meta: List[Dict[str, Any]] = []
-            for chunk_text, meta in zip(chunks, chunk_metadata):
-                facts = _extract_facts(chunk_text)
-                if len(facts) < 2:
+            logging.info("Generated %s section-aware chunks for %s", len(chunks), doc_name)
+
+            # Pre-embedding validation: filter garbage text before vectorization
+            from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage as _is_embed_garbage
+            _valid_c, _valid_m = [], []
+            for _vc_t, _vc_m in zip(chunks, chunk_metadata):
+                if _is_embed_garbage(_vc_t) or len((_vc_t or "").strip()) < 20:
+                    logging.warning("Pre-embed gate: dropping garbage chunk for %s", doc_tag)
                     continue
-                fact_text = "\n".join(facts[:20])
-                fact_chunks.append(fact_text)
-                fact_meta.append(
-                    {
-                        "document_id": doc_tag,
-                        "section_title": meta.get("section_title") or "Facts",
-                        "section_path": meta.get("section_path") or meta.get("section_title") or "Facts",
-                        "page_start": meta.get("page_start"),
-                        "page_end": meta.get("page_end"),
-                        "page_number": meta.get("page_start"),
-                        "chunk_index": len(chunks) + len(fact_chunks) - 1,
-                        "chunk_type": "fact",
-                        "chunk_kind": "structured_field",
-                        "chunking_mode": chunking_mode,
-                        "doc_type": doc_type,
-                        "sentence_complete": True,
-                    }
-                )
-            if fact_chunks:
-                fact_chunks, fact_meta, dropped_facts = _apply_chunk_quality_filter(fact_chunks, fact_meta)
-                for idx, meta in enumerate(fact_meta):
-                    meta["chunk_index"] = len(chunks) + idx
-                dropped_chunks += dropped_facts
-                chunks.extend(fact_chunks)
-                chunk_metadata.extend(fact_meta)
+                _valid_c.append(_vc_t)
+                _valid_m.append(_vc_m)
+            if _valid_c:
+                chunks = _valid_c
+                chunk_metadata = _valid_m
 
-            chunk_metadata = normalize_chunk_chain(
-                chunk_metadata,
-                subscription_id=subscription_id,
-                profile_id=profile_id,
-                document_id=doc_tag,
-                chunks=chunks,
-            )
-
-            # Generate embeddings
-            logging.info(f"Generating embeddings for {len(chunks)} chunks")
             embed_start = time.time()
             embeddings_array = encode_with_fallback(
                 chunks,
@@ -3137,10 +3180,21 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 telemetry.observe("embedding_latency_ms", embed_latency_ms)
                 telemetry.record_doc_metric(doc_tag, "chunks_embedded", len(chunks))
                 telemetry.set_gauge("last_embedding_time", time.time())
-
+            if metrics_store.available and len(embeddings_array) > 0:
+                if len(embeddings_array) > 1:
+                    sims = np.sum(embeddings_array[:-1] * embeddings_array[1:], axis=1)
+                    coherence = float(np.mean(sims))
+                else:
+                    coherence = 1.0
+                drift = max(0.0, min(1.0, 1.0 - coherence))
+                metrics_store.record(
+                    values={
+                        "embedding_coherence_score": coherence,
+                        "chunk_semantic_drift_score": drift,
+                    },
+                    document_id=doc_tag,
+                )
             sparse_vectors = build_sparse_vectors(chunks)
-
-            # Create summaries
             try:
                 summaries = compute_section_summaries(chunks, chunk_metadata)
             except Exception as exc:  # noqa: BLE001
@@ -3217,7 +3271,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 "points_saved": saved,
                 "chunks": expected_points,
                 "dropped_chunks": dropped_chunks,
-                "coverage_ratio": None,
+                "coverage_ratio": coverage_ratio,
             }
 
         else:
@@ -3377,13 +3431,15 @@ def process_document_pipeline(
             "errors": errors,
         }
 
+    # Preserve extracted pickle files for audit / retraining. Do NOT delete by default.
     try:
-        cleanup_info["pickle_deleted"] = delete_extracted_pickle(document_id)
-        cleanup_info["cleanup_pending"] = not cleanup_info["pickle_deleted"]
-    except Exception as exc:  # noqa: BLE001
-        logging.warning(f"Cleanup failed for {document_id}: {exc}")
+        logging.info("Preserving extracted pickle for document %s (deletion skipped)", document_id)
         cleanup_info["pickle_deleted"] = False
-        cleanup_info["cleanup_pending"] = True
+        cleanup_info["cleanup_pending"] = False
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Preserve-pickle logging failed for %s: %s", document_id, exc)
+        cleanup_info["pickle_deleted"] = False
+        cleanup_info["cleanup_pending"] = False
 
     return {
         "document_id": document_id,

@@ -22,6 +22,20 @@ class FakeQdrant:
     def __init__(self, points: List[FakePoint]):
         self._points = points
         self.last_filter = None
+        self._payload_schema = {
+            "subscription_id": {}, "subscriptionId": {}, "subscription.id": {},
+            "profile_id": {}, "profileId": {},
+        }
+
+    def get_collection(self, collection_name):  # noqa: ANN001
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            payload_schema=self._payload_schema,
+            config=SimpleNamespace(params=SimpleNamespace(vectors=SimpleNamespace(size=4))),
+        )
+
+    def create_payload_index(self, collection_name, field_name, field_schema):  # noqa: ANN001
+        self._payload_schema[field_name] = {"data_type": field_schema}
 
     def query_points(self, **kwargs):  # noqa: ANN003
         self.last_filter = kwargs.get("query_filter")
@@ -40,6 +54,14 @@ class FakeQdrant:
         if isinstance(limit, int) and limit > 0:
             points = points[:limit]
         return points, None
+
+    def count(self, **kwargs):  # noqa: ANN003
+        count_filter = kwargs.get("count_filter")
+        if count_filter is not None:
+            points = _apply_filter(self._points, count_filter)
+        else:
+            points = self._points
+        return type("CountResult", (), {"count": len(points)})()
 
 
 class FakeEmbedder:
@@ -129,6 +151,8 @@ def make_point(
     page: int,
     score: float = 0.9,
     section_id: str = "sec-1",
+    section_title: str = "Section",
+    section_kind: str = "",
     chunk_kind: str = "section_text",
     doc_domain: str = "generic",
 ):
@@ -141,7 +165,8 @@ def make_point(
             "document_id": document_id,
             "source_name": file_name,
             "section_id": section_id,
-            "section_title": "Section",
+            "section_title": section_title,
+            "section_kind": section_kind,
             "page": page,
             "chunk_kind": chunk_kind,
             "doc_domain": doc_domain,

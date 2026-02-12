@@ -11,19 +11,16 @@ logger = logging.getLogger(__name__)
 
 REQUIRED_PAYLOAD_INDEX_FIELDS: List[str] = [
     "subscription_id",
-    "subscriptionId",
-    "subscription.id",
     "profile_id",
-    "profileId",
-    "profile.id",
     "document_id",
     "source_name",
     "doc_domain",
     "section_kind",
     "section_id",
     "chunk_kind",
-    "file_type",
-    "connector_type",
+    "chunk_id",
+    "page",
+    "embed_pipeline_version",
 ]
 
 _INDEX_CACHE: Dict[str, Tuple[float, List[str]]] = {}

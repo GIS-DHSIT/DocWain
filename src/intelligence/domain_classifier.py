@@ -29,6 +29,18 @@ DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "certification",
         "summary",
         "objective",
+        "technical skills",
+        "professional experience",
+        "career objective",
+        "work experience",
+        "key skills",
+        "professional summary",
+        "career",
+        "achievements",
+        "accomplishments",
+        "qualifications",
+        "soft skills",
+        "functional skills",
     ),
     "tax": (
         "tax",
@@ -56,14 +68,12 @@ DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
     ),
     "purchase_order": (
         "purchase order",
-        "po",
-        "vendor",
-        "ship to",
-        "bill to",
         "order date",
-        "item",
         "qty",
-        "unit price",
+        "delivery date",
+        "requisition",
+        "purchase requisition",
+        "po number",
     ),
     "bank_statement": (
         "bank statement",
@@ -128,11 +138,18 @@ class DomainClassification:
 
 
 def _score_keywords(text: str) -> Dict[str, float]:
+    import re as _re
     lowered = (text or "").lower()
     scores = {domain: 0.0 for domain in DOMAIN_LABELS}
     for domain, keywords in DOMAIN_KEYWORDS.items():
         for keyword in keywords:
-            if keyword and keyword in lowered:
+            if not keyword:
+                continue
+            # Short keywords (<=3 chars) need word boundaries to avoid false matches
+            if len(keyword) <= 3:
+                if _re.search(r'\b' + _re.escape(keyword) + r'\b', lowered):
+                    scores[domain] += 1.0
+            elif keyword in lowered:
                 scores[domain] += 1.0
     return scores
 

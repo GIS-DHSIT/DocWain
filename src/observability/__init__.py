@@ -1,4 +1,17 @@
-from src.observability.metrics import metrics_store
-from src.observability.logging import get_logger
+"""
+Observability package for DocWain.
 
-__all__ = ["metrics_store", "get_logger"]
+Provides metrics collection, tracing, and monitoring utilities for the RAG pipeline.
+"""
+
+from src.observability.rag_metrics import (
+    RAGPipelineMetrics,
+    StageTimer,
+    log_pipeline_summary,
+)
+
+__all__ = [
+    "RAGPipelineMetrics",
+    "StageTimer",
+    "log_pipeline_summary",
+]

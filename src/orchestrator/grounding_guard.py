@@ -32,7 +32,7 @@ def _sanitize_labelled_entities(answer: str, evidence: str) -> str:
         value = match.group(2).strip()
         if value and value.lower() in evidence_lower:
             return match.group(0)
-        return f"{label}: not explicitly mentioned"
+        return ""
 
     return _LABELLED_ENTITY_RE.sub(replace, answer)
 

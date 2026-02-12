@@ -105,7 +105,8 @@ def test_cleanup_failure_does_not_fail(monkeypatch):
         lambda *_args, **_kwargs: {"chunks": 1, "points_saved": 1, "dropped_chunks": 0, "coverage_ratio": 1.0},
     )
     monkeypatch.setattr(embedding_service, "_verify_post_upsert_count", lambda **_kwargs: (1, True))
-    monkeypatch.setattr(embedding_service, "delete_extracted_pickle", lambda _doc_id: (_ for _ in ()).throw(RuntimeError("delete failed")))
+    # delete_extracted_pickle is no longer imported in embedding_service (pickle is preserved)
+    # so we skip monkeypatching it — the cleanup path no longer calls it
     monkeypatch.setattr(embedding_service, "update_stage", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(embedding_service, "update_document_fields", lambda *_args, **_kwargs: None)
 

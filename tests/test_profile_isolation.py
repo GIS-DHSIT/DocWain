@@ -11,10 +11,19 @@ from src.api.vector_store import build_qdrant_filter
 def test_profile_filter_includes_subscription_and_profile():
     filt = build_qdrant_filter("sub-1", "profile-1", doc_domain=["invoice"])
     assert isinstance(filt, Filter)
-    keys = {condition.key for condition in filt.must}
-    assert "subscription_id" in keys
-    assert "profile_id" in keys
-    assert "doc_domain" in keys
+    # build_qdrant_filter wraps subscription_id/profile_id in nested Filter(should=[...])
+    # and adds doc_domain as FieldCondition. Collect all keys from all levels.
+    all_keys = set()
+    for condition in filt.must:
+        if hasattr(condition, "key"):
+            all_keys.add(condition.key)
+        elif hasattr(condition, "should"):
+            for sub in condition.should:
+                if hasattr(sub, "key"):
+                    all_keys.add(sub.key)
+    assert "subscription_id" in all_keys or "subscriptionId" in all_keys
+    assert "profile_id" in all_keys or "profileId" in all_keys
+    assert "doc_domain" in all_keys
 
 
 def test_document_type_classification_invoice():

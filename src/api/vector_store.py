@@ -36,20 +36,7 @@ class QdrantCollectionSchemaMismatch(ValueError):
         self.code = "qdrant_schema_mismatch"
         self.details = details
 
-PAYLOAD_INDEX_FIELDS = [
-    *REQUIRED_PAYLOAD_INDEX_FIELDS,
-    "profile_name",
-    "doc_type",
-    "file_type",
-    "source.name",
-    "page",
-    "section.id",
-    "section.kind",
-    "section_title",
-    "document.type",
-    "chunk_id",
-    "chunk_type",
-]
+PAYLOAD_INDEX_FIELDS = list(REQUIRED_PAYLOAD_INDEX_FIELDS)
 
 
 def build_collection_name(subscription_id: str, profile_id: Optional[str] = None) -> str:
@@ -110,13 +97,16 @@ def build_qdrant_filter(
     if not subscription_id or not str(subscription_id).strip():
         raise ValueError("subscription_id is required for retrieval to enforce isolation")
 
-    def _id_condition(keys: List[str], value: str) -> Filter:
-        return Filter(should=[FieldCondition(key=key, match=MatchValue(value=value)) for key in keys])
-
     must: List[object] = [
-        _id_condition(["subscription_id", "subscriptionId", "subscription.id"], str(subscription_id)),
-        _id_condition(["profile_id", "profileId", "profile.id"], str(profile_id)),
+        FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
+        FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
     ]
+
+    logger = logging.getLogger(__name__)
+    logger.debug(
+        "build_qdrant_filter: subscription_id=%s profile_id=%s document_id=%s",
+        subscription_id, profile_id, document_id,
+    )
 
     def _coerce_values(value: object) -> List[str]:
         if isinstance(value, (list, tuple, set)):
@@ -139,14 +129,10 @@ def build_qdrant_filter(
 
     section_values = _coerce_values(section_kind)
     if section_values:
-        must.append(
-            Filter(
-                should=[
-                    FieldCondition(key="section_kind", match=MatchAny(any=section_values)),
-                    FieldCondition(key="section.kind", match=MatchAny(any=section_values)),
-                ],
-            )
-        )
+        if len(section_values) == 1:
+            must.append(FieldCondition(key="section_kind", match=MatchValue(value=section_values[0])))
+        else:
+            must.append(FieldCondition(key="section_kind", match=MatchAny(any=section_values)))
 
     chunk_values = _coerce_values(chunk_kind)
     if chunk_values:

@@ -50,7 +50,7 @@ def test_info_mode_returns_short_intro():
     assert ResponseModeClassifier.classify(query) == INFO_MODE
     intro = build_docwain_intro()
     assert "docwain" in intro.lower()
-    assert len(intro) <= 160
+    assert len(intro) <= 500  # Structured response format
 
 
 def test_hallucinated_doc_name_removed():

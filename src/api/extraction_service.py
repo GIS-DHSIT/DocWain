@@ -6,6 +6,19 @@ from typing import Any, Dict, List, Optional
 from src.api.config import Config
 from src.api.content_store import save_extracted_pickle
 from src.api.blob_store import blob_storage_configured
+from src.api.structured_extraction import get_extraction_engine
+
+# Import intelligence layer
+try:
+    from src.intelligence.integration import (
+        DocumentIntelligenceProcessor,
+        process_document_intelligence,
+    )
+    INTELLIGENCE_AVAILABLE = True
+except ImportError:
+    INTELLIGENCE_AVAILABLE = False
+    DocumentIntelligenceProcessor = None
+    process_document_intelligence = None
 try:
     from src.api.dataHandler import (
         extract_document_info,
@@ -130,6 +143,88 @@ def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
     }
 
 
+def _process_document_intelligence(
+    document_id: str,
+    extracted_docs: Dict[str, Any],
+    filename: str,
+    subscription_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Process document through intelligence layer for entity extraction and Q&A generation.
+
+    Args:
+        document_id: Document ID.
+        extracted_docs: Extracted document content.
+        filename: Original filename.
+        subscription_id: Optional subscription ID.
+        profile_id: Optional profile ID.
+
+    Returns:
+        Intelligence result dictionary or None on failure.
+    """
+    if not INTELLIGENCE_AVAILABLE:
+        logger.debug("Intelligence layer not available, skipping")
+        return None
+
+    try:
+        # Get text content from extracted docs
+        raw_text = ""
+        file_size = 0
+
+        if isinstance(extracted_docs, dict):
+            for fname, content in extracted_docs.items():
+                if isinstance(content, dict):
+                    text = content.get("full_text") or content.get("text") or ""
+                    if not text and content.get("sections"):
+                        text = "\n".join(
+                            sec.get("text", "") for sec in content.get("sections", [])
+                            if sec.get("text")
+                        )
+                    raw_text += text
+                    file_size = content.get("file_size", 0) or len(raw_text)
+                elif isinstance(content, str):
+                    raw_text += content
+                    file_size = len(raw_text)
+
+        if not raw_text:
+            logger.debug("No text content for intelligence processing")
+            return None
+
+        # Get Redis client if available
+        redis_client = None
+        try:
+            from src.api.dataHandler import get_redis_client
+            redis_client = get_redis_client()
+        except Exception:
+            pass
+
+        # Process through intelligence layer
+        result = process_document_intelligence(
+            document_id=document_id,
+            content=raw_text,
+            filename=filename,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            file_size=file_size,
+            redis_client=redis_client,
+        )
+
+        logger.info(
+            "Intelligence processing complete for %s: domain=%s, entities=%d, qa_pairs=%d",
+            document_id,
+            result.domain,
+            len(result.entities.get_all_searchable_terms()) if result.entities else 0,
+            len(result.qa_pairs),
+        )
+
+        return result.to_dict()
+
+    except Exception as exc:
+        logger.warning("Intelligence processing failed for %s: %s", document_id, exc)
+        return None
+
+
 def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> Any:
     if isinstance(extracted_docs, dict):
         normalized: Dict[str, Any] = {}
@@ -149,6 +244,68 @@ def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> A
             normalized[name] = content
         return normalized
     return extracted_docs
+
+
+def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract document type/classification from structured extraction results."""
+    for fname, value in (structured_docs or {}).items():
+        if isinstance(value, dict):
+            return {
+                "document_type": value.get("document_type", "GENERIC"),
+                "domain": (value.get("document_classification") or {}).get("domain", "generic"),
+                "confidence": (value.get("document_classification") or {}).get("confidence", 0.0),
+                "filename": fname,
+            }
+        if hasattr(value, "document_type"):
+            doc_cls = getattr(value, "document_classification", None)
+            domain = doc_cls.get("domain", "generic") if isinstance(doc_cls, dict) else "generic"
+            confidence = doc_cls.get("confidence", 0.0) if isinstance(doc_cls, dict) else 0.0
+            return {
+                "document_type": getattr(value, "document_type", "GENERIC"),
+                "domain": domain,
+                "confidence": confidence,
+                "filename": fname,
+            }
+    return {"document_type": "GENERIC", "domain": "generic", "confidence": 0.0}
+
+
+def _sanitize_raw_text_fields(docs: Any) -> Any:
+    """Ensure no stringified repr or dict garbage in text fields."""
+    if not isinstance(docs, dict):
+        return docs
+    from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
+
+    for fname, content in docs.items():
+        if not isinstance(content, dict):
+            continue
+        # Sanitize full_text
+        full_text = content.get("full_text")
+        if isinstance(full_text, str) and _is_metadata_garbage(full_text):
+            section_texts = []
+            for sec in content.get("sections") or []:
+                if isinstance(sec, dict):
+                    t = sec.get("text") or sec.get("content") or ""
+                    if isinstance(t, str) and t.strip() and not _is_metadata_garbage(t):
+                        section_texts.append(t.strip())
+            if section_texts:
+                content["full_text"] = "\n\n".join(section_texts)
+                logger.info("Recovered full_text from sections for %s", fname)
+            else:
+                logger.warning("full_text is garbage for %s and no clean sections found", fname)
+
+        # Sanitize texts list
+        texts = content.get("texts")
+        if isinstance(texts, list):
+            clean_texts = []
+            for t in texts:
+                if isinstance(t, str) and t.strip() and not _is_metadata_garbage(t):
+                    clean_texts.append(t)
+                elif isinstance(t, dict):
+                    extracted = t.get("text") or t.get("content") or ""
+                    if isinstance(extracted, str) and extracted.strip():
+                        clean_texts.append(extracted)
+            content["texts"] = clean_texts
+    return docs
 
 
 def _set_document_status(
@@ -292,6 +449,7 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                     masked_docs[fname] = content
 
         masked_docs = _normalize_extracted_metadata(masked_docs, document_id=doc_id)
+        masked_docs = _sanitize_raw_text_fields(masked_docs)
 
         _persist_layout_graph(
             document_id=doc_id,
@@ -300,8 +458,67 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             extracted_docs=masked_docs,
         )
 
+        # Structured extraction: build structured JSON from masked/raw text and persist alongside raw extraction
         try:
-            save_info = save_extracted_pickle(doc_id, masked_docs)
+            engine = get_extraction_engine()
+            # For each file in masked_docs, create structured doc; if multiple files, pick the first as primary
+            # Compose a combined structured representation keyed by filename
+            structured_docs = {}
+            for fname, content in masked_docs.items():
+                try:
+                    # Determine raw text to feed into structured extractor
+                    raw_text = ""
+                    if isinstance(content, dict):
+                        raw_text = content.get("full_text") or content.get("text") or "\n".join(
+                            [sec.get("text") for sec in (content.get("sections") or []) if sec.get("text")]
+                        )
+                        page_count = content.get("pages") or (len(content.get("sections") or []) or 1)
+                    else:
+                        raw_text = str(content)
+                        page_count = 1
+
+                    structured = engine.extract_document(
+                        document_id=doc_id,
+                        text=raw_text,
+                        filename=fname,
+                        metadata={"source": "extraction", "orig_filename": fname},
+                        page_count=page_count,
+                    )
+                    structured_docs[fname] = structured
+                except Exception as sexc:  # noqa: BLE001
+                    logger.warning("Structured extraction failed for %s: %s", fname, sexc)
+                    # fallback: store raw content under structured as minimal
+                    structured_docs[fname] = {
+                        "document_id": doc_id,
+                        "original_filename": fname,
+                        "document_type": "GENERIC",
+                        "sections": [{"section_id": "section_0", "section_type": "content", "content": raw_text}],
+                        "extraction_quality_score": 0.0,
+                    }
+
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to run structured extraction engine for %s: %s", doc_id, exc)
+            structured_docs = {}
+
+        # Intelligence layer processing: entity extraction, Q&A generation
+        intelligence_result = _process_document_intelligence(
+            document_id=doc_id,
+            extracted_docs=masked_docs,
+            filename=doc_data.get("name", "document"),
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+        )
+
+        try:
+            # Persist raw, structured extraction and intelligence in the pickle for source-of-truth
+            doc_classification = _extract_classification_from_structured(structured_docs)
+            payload_to_save = {
+                "raw": masked_docs,
+                "structured": structured_docs,
+                "intelligence": intelligence_result,
+                "document_classification": doc_classification,
+            }
+            save_info = save_extracted_pickle(doc_id, payload_to_save)
             update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
         except Exception as exc:  # noqa: BLE001
             _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
@@ -412,6 +629,7 @@ def extract_uploaded_document(
         raise
 
     extracted = _normalize_extracted_metadata(extracted, document_id=document_id)
+    extracted = _sanitize_raw_text_fields(extracted)
 
     _persist_layout_graph(
         document_id=document_id,
@@ -420,77 +638,75 @@ def extract_uploaded_document(
         extracted_docs=extracted,
     )
 
+    # Structured extraction for uploaded document
     try:
-        save_info = save_extracted_pickle(document_id, extracted)
+        engine = get_extraction_engine()
+        structured_docs = {}
+        for fname, content in extracted.items() if isinstance(extracted, dict) else [(filename, extracted)]:
+            try:
+                raw_text = ""
+                if isinstance(content, dict):
+                    raw_text = content.get("full_text") or content.get("text") or "\n".join(
+                        [sec.get("text") for sec in (content.get("sections") or []) if sec.get("text")]
+                    )
+                    page_count = content.get("pages") or (len(content.get("sections") or []) or 1)
+                else:
+                    raw_text = str(content)
+                    page_count = 1
+
+                structured = engine.extract_document(
+                    document_id=document_id,
+                    text=raw_text,
+                    filename=fname,
+                    metadata={"source": "upload", "orig_filename": fname},
+                    page_count=page_count,
+                )
+                structured_docs[fname] = structured
+            except Exception as sexc:  # noqa: BLE001
+                logger.warning("Structured extraction failed for upload %s: %s", fname, sexc)
+                structured_docs[fname] = {"document_id": document_id, "original_filename": fname, "document_type": "GENERIC", "sections": [{"section_id": "section_0", "section_type": "content", "content": raw_text}], "extraction_quality_score": 0.0}
+    except Exception:
+        structured_docs = {}
+
+    # Intelligence layer processing: entity extraction, Q&A generation
+    intelligence_result = _process_document_intelligence(
+        document_id=document_id,
+        extracted_docs=extracted if isinstance(extracted, dict) else {filename: extracted},
+        filename=filename,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+    )
+
+    try:
+        # Persist uploaded file extraction (raw, structured, intelligence, classification) in the pickle
+        doc_classification = _extract_classification_from_structured(structured_docs)
+        payload_to_save = {
+            "raw": extracted,
+            "structured": structured_docs,
+            "intelligence": intelligence_result,
+            "document_classification": doc_classification,
+        }
+        save_info = save_extracted_pickle(document_id, payload_to_save)
         update_extraction_metadata(document_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
     except Exception as exc:  # noqa: BLE001
-        set_error(document_id, "extraction", exc)
-        _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
-        raise
-    finally:
-        release_lock(lock)
+        _set_document_status(document_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
+        return {"document_id": document_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
-    stats = _build_extraction_summary(extracted)
-    update_stage(
-        document_id,
-        "extraction",
-        {
-            "status": "COMPLETED",
-            "completed_at": time.time(),
-            "error": None,
-            "stats": stats,
-        },
-    )
-    blob_name = None
-    if save_info.get("path"):
-        blob_name = Path(save_info.get("path")).name
-    update_document_fields(
-        document_id,
-        {
-            "blob": {
-                "container": "document-content",
-                "name": blob_name,
-                "etag": None,
-                "size": save_info.get("size"),
-            },
-            "extracted_pickle_path": save_info.get("path"),
-            "extracted_hash": save_info.get("sha256"),
-        },
-    )
+    extra_fields = {
+        "subscription_id": subscription_id,
+        "profile_id": profile_id,
+        "extracted_pickle_path": save_info.get("path"),
+        "extracted_hash": save_info.get("sha256"),
+    }
+    _set_document_status(document_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
 
-    _set_document_status(
-        document_id,
-        STATUS_EXTRACTION_COMPLETED,
-        extra_fields={"extracted_pickle_path": save_info.get("path"), "extracted_hash": save_info.get("sha256")},
-    )
-
-    update_stage(
-        document_id,
-        "screening.security",
-        {
-            "status": "PENDING",
-            "risk_level": None,
-            "started_at": None,
-            "completed_at": None,
-            "error": None,
-        },
-    )
-    update_stage(
-        document_id,
-        "screening",
-        {"overall_status": "PENDING", "last_run_id": None, "updated_at": time.time()},
-    )
-    update_stage(
-        document_id,
-        "embedding",
-        {"status": "PENDING", "reason": None, "started_at": None, "completed_at": None, "error": None},
-    )
-
+    summary = _build_extraction_summary(extracted)
     return {
         "document_id": document_id,
         "status": STATUS_EXTRACTION_COMPLETED,
         "pickle_path": save_info.get("path"),
-        "summary": stats,
-        "extraction": {"status": "COMPLETED", "stats": stats},
-        "blob": {"container": "document-content", "name": blob_name},
+        "summary": summary,
+        "doc_name": filename,
+        "intelligence": intelligence_result is not None,
     }
+

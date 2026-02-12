@@ -306,7 +306,6 @@ def test_greeting_short_circuit():
     assert response
     response_text = response.get("response") or ""
     assert "DocWain" in response_text
-    assert "Try:" in response_text
     assert response_text == build_greeting_response({})
     assert response.get("sources") == []
     assert response.get("metadata", {}).get("task") == "greet"

@@ -83,7 +83,7 @@ class FakeNeo4jStore:
         self.state[name] = state
         return state
 
-    def fetch_existing_hashes(self, chunk_ids: Iterable[str]) -> Dict[str, Optional[str]]:
+    def fetch_existing_hashes(self, chunk_ids: Iterable[str], *, subscription_id: Optional[str] = None, profile_id: Optional[str] = None) -> Dict[str, Optional[str]]:
         return {chunk_id: self.chunks.get(chunk_id) for chunk_id in chunk_ids}
 
     def upsert_batch(self, rows: List[Dict[str, Any]]) -> None:
@@ -127,7 +127,7 @@ def test_sync_skips_unchanged_chunks():
     store.chunks["c1"] = "hash1"
     service = KGSyncService(qdrant_reader=reader, neo4j_store=store)
 
-    stats = service.run(batch_size=2, max_points=10, state_name="default")
+    stats = service.run(batch_size=2, max_points=10, state_name="default", subscription_id="sub", profile_id="profile")
     assert stats.chunks_upserted == 1
     assert stats.skipped_points == 1
     assert store.chunks["c1"] == "hash1"
@@ -140,7 +140,7 @@ def test_missing_hash_defaults_to_nohash():
     store = FakeNeo4jStore()
     service = KGSyncService(qdrant_reader=reader, neo4j_store=store)
 
-    stats = service.run(batch_size=1, max_points=10, state_name="default")
+    stats = service.run(batch_size=1, max_points=10, state_name="default", subscription_id="sub", profile_id="profile")
     assert stats.chunks_upserted == 1
     assert store.chunks["c9"] == "nohash:c9"
 
@@ -150,13 +150,13 @@ def test_idempotent_sync():
     reader1 = FakeQdrantReader([QdrantBatch(points=[chunk], next_offset=1)])
     store = FakeNeo4jStore()
     service1 = KGSyncService(qdrant_reader=reader1, neo4j_store=store)
-    stats1 = service1.run(batch_size=1, max_points=10, state_name="default")
+    stats1 = service1.run(batch_size=1, max_points=10, state_name="default", subscription_id="sub", profile_id="profile")
 
     store.state["default"] = KGState(name="default", last_qdrant_offset=None, last_sync_at=dt.datetime.utcnow().isoformat())
 
     reader2 = FakeQdrantReader([QdrantBatch(points=[chunk], next_offset=1)])
     service2 = KGSyncService(qdrant_reader=reader2, neo4j_store=store)
-    stats2 = service2.run(batch_size=1, max_points=10, state_name="default")
+    stats2 = service2.run(batch_size=1, max_points=10, state_name="default", subscription_id="sub", profile_id="profile")
 
     assert stats1.chunks_upserted == 1
     assert stats2.chunks_upserted == 0
@@ -170,7 +170,7 @@ def test_state_persistence():
     store = FakeNeo4jStore()
     service = KGSyncService(qdrant_reader=reader, neo4j_store=store)
 
-    stats = service.run(batch_size=1, max_points=10, state_name="default")
+    stats = service.run(batch_size=1, max_points=10, state_name="default", subscription_id="sub", profile_id="profile")
     state = store.state["default"]
 
     assert stats.last_qdrant_offset == 99
@@ -185,6 +185,6 @@ def test_scroll_pagination_respects_max_points():
     store = FakeNeo4jStore()
     service = KGSyncService(qdrant_reader=reader, neo4j_store=store)
 
-    stats = service.run(batch_size=2, max_points=3, state_name="default")
+    stats = service.run(batch_size=2, max_points=3, state_name="default", subscription_id="sub", profile_id="profile")
     assert stats.processed_points == 3
     assert stats.last_qdrant_offset == 20

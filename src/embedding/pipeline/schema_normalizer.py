@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from src.embedding.pipeline.content_classifier import classify_doc_domain, classify_section_kind, classify_section_kind_with_source
 from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
 from src.metadata.normalizer import normalize_chunk_kind
 from src.utils.payload_utils import token_count
@@ -91,13 +92,11 @@ def normalize_content(text: str) -> str:
         return ""
     normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
 
-    normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", normalized)
+    # Only safe digit-letter boundary splitting (preserves camelCase, compound words)
     normalized = re.sub(r"([A-Za-z])(\d)", r"\1 \2", normalized)
     normalized = re.sub(r"(\d)([A-Za-z])", r"\1 \2", normalized)
-    normalized = re.sub(r"([A-Za-z])\(", r"\1 (", normalized)
     normalized = re.sub(r"\s*&\s*", " & ", normalized)
     normalized = re.sub(r"\s*—\s*", " — ", normalized)
-    normalized = re.sub(r"(?<=\w)-(?=\w)", " - ", normalized)
 
     normalized = re.sub(r"(?<!^)(?<!\n)\s*([•●])", r"\n\1", normalized)
     lines = []
@@ -106,6 +105,103 @@ def normalize_content(text: str) -> str:
         if compacted:
             lines.append(compacted)
     return "\n".join(lines).strip()
+
+
+_METADATA_GARBAGE_MARKERS = (
+    "'chunk_type':", "'section_id':", "'section_title':", "'page': None",
+    "section_id :", "chunk_type :", "section_title :",
+    "Chunk Candidate text", "chunk_candidates Chunk",
+    # Space-delimited format (no colon between key and value)
+    ", section_id ", ", chunk_type ", ", section_title ",
+    ", start_page ", ", end_page ", "text : ",
+)
+# Strong markers: a single occurrence means garbage (never in real document text)
+_STRONG_GARBAGE_MARKERS = (
+    "Extracted Document full_text",
+    "Extracted Document (full_text=",
+    "ExtractedDocument(",
+    "Section section_id",
+    "start_page 1, end_page",
+    "Chunk Candidate text",
+)
+
+
+def _is_metadata_garbage(text: str) -> bool:
+    """Detect text that is actually stringified chunk metadata dicts or ExtractedDocument repr."""
+    if not text or len(text) < 30:
+        return False
+    # Definitive: text IS a Python repr of an internal object (prefix is unmistakable)
+    if text.startswith("Extracted Document (") or text.startswith("ExtractedDocument("):
+        return True
+    # Long texts (>500 chars) are real content even if they contain strong/soft markers.
+    # Markers like "Section section_id" or "start_page 1, end_page" can appear
+    # incidentally in large documents (e.g. SAP technical docs discussing DB schemas).
+    # Only the definitive prefix check above should flag long texts as garbage.
+    if len(text) > 500:
+        return False
+    if any(m in text for m in _STRONG_GARBAGE_MARKERS):
+        return True
+    # Multiple "text :" or ", text " segments = metadata key contamination
+    if text.count("text : ") >= 2 or text.count(", text ") >= 2:
+        return True
+    return sum(1 for marker in _METADATA_GARBAGE_MARKERS if marker in text) >= 2
+
+
+_SECTION_PREFIX_RE = re.compile(r"^\[[\w\s]+\]\s*(?:Section\s*\d+\s*:\s*)?(?:[\w\s&/,-]+:\s*)?")
+_METADATA_KEY_RE = re.compile(
+    r"^(?:section_id|section_title|chunk_type|page|start_page|end_page"
+    r"|tables|figures|level|Section section_id|title)\s",
+    re.IGNORECASE,
+)
+_CHUNK_CANDIDATE_RE = re.compile(
+    r"^(?:chunk_candidates\s+)?Chunk\s+Candidate\s+text\s*(.*)",
+    re.IGNORECASE,
+)
+# "text <actual content>" — strip key prefix, keep value
+_TEXT_KEY_RE = re.compile(r"^text\s+:?\s*", re.IGNORECASE)
+
+
+def _strip_section_prefix(text: str) -> str:
+    """Strip [Section Kind] Section N: prefix from embedding text."""
+    return _SECTION_PREFIX_RE.sub("", text).strip() if text else ""
+
+
+_EXTRACTED_DOC_PREFIX_RE = re.compile(
+    r"^(?:Extracted\s+Document\s+(?:full_text|[\w.]+)\s*)", re.IGNORECASE
+)
+
+
+def _clean_metadata_fragments(text: str) -> str:
+    """Strip metadata key-value fragments that are comma-separated with actual content."""
+    if not text:
+        return ""
+    # Strip "Extracted Document full_text" prefix
+    text = _EXTRACTED_DOC_PREFIX_RE.sub("", text).strip()
+    text = text.lstrip("-").strip()
+    parts = re.split(r"\s*,\s*", text)
+    content_parts: list = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if _METADATA_KEY_RE.match(part) and len(part) < 40:
+            continue
+        m = _CHUNK_CANDIDATE_RE.match(part)
+        if m:
+            remainder = m.group(1).strip()
+            if remainder:
+                content_parts.append(remainder)
+            continue
+        # "text <content>" — strip key prefix, keep the value
+        tm = _TEXT_KEY_RE.match(part)
+        if tm:
+            remainder = part[tm.end():].strip()
+            if remainder and len(remainder) > 3:
+                content_parts.append(remainder)
+            continue
+        content_parts.append(part)
+    result = ", ".join(content_parts) if content_parts else ""
+    return re.sub(r"\s{2,}", " ", result).strip()
 
 
 def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,6 +223,16 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     mime_type = _stringify(raw.get("mime_type") or raw.get("mimeType"))
 
     doc_domain = _stringify(raw.get("doc_domain") or (raw.get("document") or {}).get("domain")) or "unknown"
+
+    # Filename-based domain override — takes precedence over pickle classification
+    # because pickle classification can be wrong (e.g., SCM resume classified as purchase_order)
+    if source_name:
+        from src.embedding.pipeline.content_classifier import _FILENAME_HINTS
+        fn_lower = source_name.lower()
+        for hint, hint_domain in _FILENAME_HINTS.items():
+            if hint in fn_lower:
+                doc_domain = hint_domain
+                break
 
     section_id = _stringify(raw.get("section_id") or (raw.get("section") or {}).get("id")) or "unknown"
     section_title = _stringify(raw.get("section_title") or (raw.get("section") or {}).get("title") or "Section")
@@ -155,13 +261,67 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     content = normalize_content(raw_content or "")
 
     canonical_text = _stringify(raw.get("canonical_text")) or content
+    if _is_metadata_garbage(canonical_text):
+        canonical_text = content
     canonical_text = normalize_content(canonical_text or content)
+    if _is_metadata_garbage(canonical_text):
+        # Try cleaning metadata fragments instead of emptying
+        cleaned = _clean_metadata_fragments(canonical_text)
+        if cleaned and len(cleaned) > 20 and not _is_metadata_garbage(cleaned):
+            canonical_text = cleaned
+        else:
+            canonical_text = ""
+
+    # Fallback: derive canonical_text from embedding_text (strip prefix + metadata)
+    if not canonical_text:
+        et = _stringify(raw.get("embedding_text") or "")
+        if et:
+            et = _strip_section_prefix(et)
+            et = _clean_metadata_fragments(et)
+            if et and not _is_metadata_garbage(et) and len(et) > 20:
+                canonical_text = normalize_content(et)
+
+    # ── Classify generic section_kind / doc_domain ──
+    section_kind_source = _stringify(raw.get("section_kind_source")) or "content"
+    # Section kinds that belong to invoice/purchase_order domain — if the doc is actually
+    # a resume, these must be re-classified to get correct HR section kinds.
+    _INVOICE_ONLY_KINDS = {
+        "financial_summary", "line_items", "invoice_metadata",
+        "parties_addresses", "terms_conditions",
+    }
+    needs_reclassify = (
+        section_kind in ("misc", "section_text", "unknown")
+        or (doc_domain == "resume" and section_kind in _INVOICE_ONLY_KINDS)
+    )
+    if needs_reclassify:
+        section_kind, section_kind_source = classify_section_kind_with_source(canonical_text, section_title or "")
+    # NOTE: Do NOT re-classify doc_domain per-chunk from chunk text.
+    # Document-level classification (dataHandler.py) is the single source of truth.
+    # Per-chunk classification causes inconsistent domains for the same document_id
+    # (e.g., resume address chunks misclassified as "purchase_order").
+    # Filename hints above (lines 229-235) are still applied as they are consistent.
 
     embedding_text = _stringify(raw.get("embedding_text") or raw.get("text_clean") or raw.get("embeddingText"))
+    if embedding_text and _is_metadata_garbage(embedding_text):
+        embedding_text = None
     if not embedding_text:
         embedding_text = ensure_embedding_text(content, doc_domain, section_kind)
     if embedding_text.strip() == content.strip():
         embedding_text = ensure_embedding_text(content, doc_domain, section_kind)
+
+    # ── Enrich embedding_text with section prefix for vector awareness ──
+    # Only add prefix when section_kind was determined from a clear title match
+    # (high confidence).  Content-keyword-derived kinds are lower confidence and
+    # the prefix biases the embedding vector toward labels rather than content.
+    if (
+        section_kind not in ("misc", "section_text", "unknown", None)
+        and section_kind_source == "title"
+    ):
+        pretty = section_kind.replace("_", " ").title()
+        prefix = f"[{pretty}]"
+        if section_title and section_title.lower() not in ("untitled section", "section"):
+            prefix += f" {section_title}:"
+        embedding_text = f"{prefix} {embedding_text}"
 
     canonical_text_len = len(canonical_text or "")
     canonical_token_count = token_count(canonical_text or "")
@@ -181,67 +341,46 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(languages, str):
         languages = [languages]
 
+    # ── Slim payload: ~15 core fields + embedding_text ──
+    # Retrieval layer (_to_chunk) reads canonical_text, source_name, page, chunk_id
+    # from flat fields with fallback to nested objects, so old data keeps working.
     payload: Dict[str, Any] = {
+        # identity
         "subscription_id": subscription_id,
         "profile_id": profile_id,
         "document_id": document_id,
-        "source_name": source_name,
-        "connector_type": connector_type,
-        "file_type": file_type,
-        "mime_type": mime_type,
-        "doc_domain": doc_domain,
-        "section_id": section_id,
-        "section_title": section_title,
-        "section_path": section_path,
-        "section_kind": section_kind,
-        "section_confidence": max(0.0, min(section_confidence, 1.0)),
-        "section_salience": max(0.0, min(section_salience, 1.0)),
-        "page": page_start,
-        "chunk_id": chunk_id,
-        "chunk_index": chunk_index,
-        "chunk_count": chunk_count,
-        "chunk_kind": chunk_kind,
-        "chunking_mode": chunking_mode,
-        "hash": chunk_hash,
-        "content": content,
+        # text
         "canonical_text": canonical_text,
         "embedding_text": embedding_text,
-        "canonical_text_len": canonical_text_len,
-        "canonical_token_count": canonical_token_count,
-        "doc_version_hash": _doc_version_hash(raw, canonical_text=canonical_text),
-        "embed_pipeline_version": _stringify(raw.get("embed_pipeline_version")) or EMBED_PIPELINE_VERSION,
-        "detected_language": detected_language,
-        "language_confidence": language_confidence,
-        "languages": languages,
-    }
-
-    anchors = raw.get("anchors")
-    if anchors:
-        payload["anchors"] = anchors
-
-    payload["source"] = {"name": source_name, "uri": _stringify(raw.get("source_uri"))}
-    payload["document"] = {
-        "type": _stringify(raw.get("document_type") or raw.get("doc_type")),
-        "domain": doc_domain,
-        "ingestion_source": connector_type,
-    }
-    payload["section"] = {
-        "id": section_id,
-        "title": section_title,
-        "path": section_path,
-        "kind": section_kind,
-    }
-    payload["chunk"] = {
-        "id": chunk_id,
-        "index": chunk_index,
-        "count": chunk_count,
-        "type": chunk_kind,
-    }
-    payload["provenance"] = {
-        "page_start": page_start,
-        "page_end": page_end,
+        # source
+        "source_name": source_name,
+        # section
+        "section_id": section_id,
+        "section_kind": section_kind,
         "section_title": section_title,
+        # location
+        "page": page_start,
+        "chunk_index": chunk_index,
+        # classification
+        "doc_domain": doc_domain,
+        "chunk_kind": chunk_kind,
+        "chunk_id": chunk_id,
+        # integrity
+        "hash": chunk_hash,
+        "embed_pipeline_version": _stringify(raw.get("embed_pipeline_version")) or EMBED_PIPELINE_VERSION,
     }
+
+    # Table structure metadata (only for table chunks)
+    if raw.get("chunk_type") == "table":
+        table_headers = raw.get("table_headers")
+        if isinstance(table_headers, list):
+            payload["table_headers"] = table_headers
+        table_type = raw.get("table_type")
+        if table_type:
+            payload["table_type"] = table_type
+        table_row_count = raw.get("table_row_count")
+        if isinstance(table_row_count, int):
+            payload["table_row_count"] = table_row_count
 
     return {k: v for k, v in payload.items() if v is not None}
 

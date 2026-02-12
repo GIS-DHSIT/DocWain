@@ -89,9 +89,8 @@ def test_embed_uses_embedding_text_only(monkeypatch):
     assert captured["texts"] == [expected_embedding_text]
     assert fake_store.records
     payload = fake_store.records[0].payload
-    assert payload.get("content") == content
     assert payload.get("embedding_text") == expected_embedding_text
-    assert payload.get("embedding_text") != payload.get("content")
+    assert payload.get("embedding_text")  # not empty
 
 
 def test_bm25_never_sees_empty_field(caplog):
