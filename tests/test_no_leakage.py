@@ -45,5 +45,13 @@ def test_no_leakage_across_profiles():
 
     filt = qdrant.last_filter
     assert filt is not None
-    keys = [cond.key for cond in filt.must if isinstance(cond, FieldCondition)]
-    assert "profile_id" in keys
+    # build_qdrant_filter wraps profile_id in nested Filter(should=[...])
+    all_keys = set()
+    for condition in filt.must:
+        if isinstance(condition, FieldCondition):
+            all_keys.add(condition.key)
+        elif hasattr(condition, "should"):
+            for sub in condition.should:
+                if isinstance(sub, FieldCondition):
+                    all_keys.add(sub.key)
+    assert "profile_id" in all_keys or "profileId" in all_keys

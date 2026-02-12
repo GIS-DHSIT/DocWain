@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -107,12 +108,13 @@ def _extract_field_values(field: str, chunks: List[EvidenceChunk]) -> List[str]:
             candidate = line
             if field == "certifications":
                 if "cert" in line.lower():
-                    candidate = line
+                    candidate = re.sub(r"^certifications?\s*[:–\-]\s*", "", line, flags=re.IGNORECASE)
                 else:
                     continue
             if field == "skills":
                 if any(token in line.lower() for token in ["skill", "tool", "technology"]):
-                    candidate = line
+                    # Strip the label prefix (e.g. "Skills:" or "Technical Skills:")
+                    candidate = re.sub(r"^(?:technical\s+|functional\s+)?skills?\s*[:–\-]\s*", "", line, flags=re.IGNORECASE)
             # Split common delimiters
             parts = [p.strip("-• ") for p in re.split(r"[,;/]\s*", candidate) if p.strip()]
             for part in parts:

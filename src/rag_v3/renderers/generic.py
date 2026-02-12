@@ -10,12 +10,12 @@ def render_generic(schema: GenericSchema, intent: str, strict: bool = False) -> 
             return ""
         if schema.facts and schema.facts.missing_reason:
             return schema.facts.missing_reason
-        return MISSING_REASON
+        return ""
     facts = [fact.value for fact in facts_items if fact.value]
     if not facts:
         if strict:
             return ""
-        return MISSING_REASON
+        return ""
     cleaned = [" ".join(fact.split()) for fact in facts]
     if len(cleaned) == 1:
         return cleaned[0].strip()

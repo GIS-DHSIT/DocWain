@@ -144,7 +144,7 @@ def test_context_cap_and_second_pass(caplog, monkeypatch):
                 "metadata": {"source_name": f"doc{idx}.pdf", "section_title": "Body", "page": 1},
             }
         )
-    monkeypatch.setattr(Config.Retrieval, "MAX_CONTEXT_CHARS", 1200)
+    monkeypatch.setattr(Config.RagV3, "MAX_CONTEXT_CHARS", 1200)
     builder = IntelligentContextBuilder(max_context_chunks=6)
     with caplog.at_level(logging.INFO):
         context, _sources = builder.build_context(chunks=chunks, query="Provide details")

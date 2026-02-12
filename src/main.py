@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field, constr
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
+from src.middleware.correlation import CorrelationIdMiddleware
+from src.utils.logging_utils import configure_logging
 from src.api.app_lifespan import lifespan
 try:
     from src.api.dataHandler import (
@@ -120,6 +122,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add correlation ID middleware for request tracing
+app.add_middleware(CorrelationIdMiddleware)
+
 api_router.include_router(screening_router)
 api_router.include_router(documents_router, tags=["Documents"])
 api_router.include_router(profiles_router)
@@ -141,6 +146,14 @@ session_state_store = SessionStateStore()
 
 @app.on_event("startup")
 async def _startup_checks() -> None:
+    # Configure structured logging
+    configure_logging(
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        json_format=os.getenv("JSON_LOGGING", "false").lower() in {"1", "true", "yes"},
+        include_correlation_id=True,
+    )
+    logger.info("DocWain API starting up")
+
     try:
         validate_storage_configured_once()
     except Exception as exc:  # noqa: BLE001

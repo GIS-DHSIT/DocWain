@@ -26,6 +26,12 @@ except Exception:  # noqa: BLE001
     easyocr = None
 
 
+_OCR_RETRY_THRESHOLD = 70.0
+_DIGIT_MASK_RE = re.compile(r"\d+")
+_COPYRIGHT_RE = re.compile(r"(?:copyright|©|\(c\))\s*\d{4}", re.IGNORECASE)
+_CONFIDENTIAL_RE = re.compile(r"\b(?:confidential|proprietary|internal use only|do not distribute)\b", re.IGNORECASE)
+
+
 class DocumentExtractor:
     """Layout-aware document extractor with selective OCR and structured output."""
 
@@ -44,6 +50,86 @@ class DocumentExtractor:
             return True
         heading_pattern = re.compile(r"^(\d+\.)+\s+.+|^[A-Z][A-Z0-9\s,:-]{4,}$")
         return bool(heading_pattern.match(clean))
+
+    def _detect_sections_dpie(self, text: str) -> List[Dict[str, Any]]:
+        """Use DPIE ML model to detect section boundaries.
+
+        Returns a list of section dicts with keys: start_line, end_line,
+        heading, confidence.  Returns an empty list when DPIE is not
+        available or the input is empty.
+        """
+        try:
+            from src.intelligence.dpie_integration import DPIERegistry
+            registry = DPIERegistry.get_instance()
+            if registry.is_loaded and text:
+                return registry.detect_sections(text[:10000])
+        except Exception:
+            pass
+        return []
+
+    def _apply_dpie_sections(
+        self,
+        chunk_candidates: List["ChunkCandidate"],
+        dpie_sections: List[Dict[str, Any]],
+        full_text: str,
+    ) -> None:
+        """Re-assign section_title and section_id on *chunk_candidates* using
+        DPIE-detected section boundaries.
+
+        DPIE sections use *line numbers* (0-indexed, content lines only,
+        excluding blank lines and ``--- Page N ---`` markers).  We build a
+        mapping from content-line index to page number from *full_text* so
+        that each chunk (which carries a ``page`` attribute) can be matched
+        to the correct DPIE section.
+        """
+        if not dpie_sections or not chunk_candidates:
+            return
+
+        # Build line_index -> page mapping from full_text.
+        # Content lines are non-blank lines that are not page markers.
+        line_to_page: Dict[int, int] = {}
+        current_page = 1
+        content_line_idx = 0
+        for raw_line in full_text.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            # Detect page markers like "--- Page 3 ---"
+            if stripped.startswith("--- Page ") and stripped.endswith("---"):
+                try:
+                    current_page = int(stripped.split("Page")[1].split("---")[0].strip())
+                except (ValueError, IndexError):
+                    pass
+                continue
+            line_to_page[content_line_idx] = current_page
+            content_line_idx += 1
+
+        # Build page -> DPIE section mapping.
+        # For each DPIE section, determine which pages it spans.
+        page_to_section: Dict[int, Dict[str, Any]] = {}
+        for sec in dpie_sections:
+            start = sec.get("start_line", 0)
+            end = sec.get("end_line", start)
+            pages_in_section: set = set()
+            for li in range(start, end + 1):
+                pg = line_to_page.get(li)
+                if pg is not None:
+                    pages_in_section.add(pg)
+            for pg in pages_in_section:
+                # If a page falls into multiple sections, later section wins
+                # (which is fine for overlaps at page boundaries).
+                page_to_section[pg] = sec
+
+        # Update chunk candidates
+        for cand in chunk_candidates:
+            if cand.page is None:
+                continue
+            matched = page_to_section.get(cand.page)
+            if matched:
+                heading = matched.get("heading", "")
+                if heading:
+                    cand.section_title = heading
+                    cand.section_id = self._make_section_id(heading, cand.page)
 
     @staticmethod
     def _looks_like_table(text: str) -> bool:
@@ -123,24 +209,8 @@ class DocumentExtractor:
         if easyocr and self._easyocr_reader is None:
             self._easyocr_reader = easyocr.Reader(["en"], gpu=False)
 
-    def _ocr_image(self, image: Image.Image, *, engine: Optional[str] = None) -> Tuple[str, Optional[float]]:
-        active_engine = (engine or self.ocr_engine).lower()
-        if active_engine == "easyocr" and easyocr:
-            try:
-                self._ensure_easyocr()
-                result = self._easyocr_reader.readtext(np.array(image), detail=1)
-                texts = []
-                confidences = []
-                for _, text, conf in result:
-                    if text:
-                        texts.append(text)
-                    if conf is not None:
-                        confidences.append(float(conf) * 100.0)
-                text_value = " ".join(texts).strip()
-                avg_conf = sum(confidences) / len(confidences) if confidences else None
-                return text_value, avg_conf
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("EasyOCR failed, falling back to tesseract: %s", exc)
+    def _ocr_pytesseract(self, image: Image.Image) -> Tuple[str, Optional[float]]:
+        """Run pytesseract OCR on *image* and return (text, confidence%)."""
         try:
             data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
             words = [w.strip() for w in data.get("text", []) if w.strip()]
@@ -156,8 +226,61 @@ class DocumentExtractor:
             avg_conf = sum(confidences) / len(confidences) if confidences else None
             return text_value, avg_conf
         except Exception as exc:  # noqa: BLE001
-            logger.error("OCR failed: %s", exc)
+            logger.error("pytesseract OCR failed: %s", exc)
             return "", None
+
+    def _ocr_easyocr(self, image: Image.Image) -> Tuple[str, Optional[float]]:
+        """Run easyocr on *image* and return (text, confidence%)."""
+        try:
+            self._ensure_easyocr()
+            result = self._easyocr_reader.readtext(np.array(image), detail=1)
+            texts = []
+            confidences = []
+            for _, text, conf in result:
+                if text:
+                    texts.append(text)
+                if conf is not None:
+                    confidences.append(float(conf) * 100.0)
+            text_value = " ".join(texts).strip()
+            avg_conf = sum(confidences) / len(confidences) if confidences else None
+            return text_value, avg_conf
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("EasyOCR failed: %s", exc)
+            return "", None
+
+    def _ocr_image(self, image: Image.Image, *, engine: Optional[str] = None) -> Tuple[str, Optional[float]]:
+        """Coordinate OCR with per-image dual-engine retry.
+
+        Calls the primary engine first (default: pytesseract).  If the
+        confidence is below ``_OCR_RETRY_THRESHOLD`` (70%), retries with
+        the alternate engine and returns whichever result is better.
+        """
+        active_engine = (engine or self.ocr_engine).lower()
+
+        # --- primary pass ---
+        if active_engine == "easyocr" and easyocr:
+            primary_text, primary_conf = self._ocr_easyocr(image)
+            alternate_method = self._ocr_pytesseract
+        else:
+            primary_text, primary_conf = self._ocr_pytesseract(image)
+            alternate_method = self._ocr_easyocr if easyocr else None
+
+        # --- per-image retry when confidence is low ---
+        if (
+            alternate_method is not None
+            and (primary_conf is None or primary_conf < _OCR_RETRY_THRESHOLD)
+        ):
+            try:
+                retry_text, retry_conf = alternate_method(image)
+                # Pick the better result (higher confidence wins; treat None as 0)
+                retry_conf_val = retry_conf if retry_conf is not None else 0.0
+                primary_conf_val = primary_conf if primary_conf is not None else 0.0
+                if retry_conf_val > primary_conf_val:
+                    return retry_text, retry_conf
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("OCR retry with alternate engine failed: %s", exc)
+
+        return primary_text, primary_conf
 
     def _finalize_section(
         self,
@@ -179,6 +302,18 @@ class DocumentExtractor:
                     text="\n".join(buffer).strip(),
                 )
             )
+
+    def _reorder_blocks_by_layout(self, blocks: List[dict], page_width: float = 612.0) -> List[dict]:
+        """Reorder text blocks using layout analysis for multi-column detection."""
+        try:
+            from src.intelligence.layout_analyzer import LayoutAnalyzer
+            analyzer = LayoutAnalyzer(page_width=page_width)
+            result = analyzer.analyze(blocks)
+            if result.ordered_blocks:
+                return result.ordered_blocks
+        except Exception:
+            pass
+        return blocks
 
     @staticmethod
     def _coerce_file_like(content: object):
@@ -272,25 +407,67 @@ class DocumentExtractor:
             return {}, [], []
         headers: Dict[str, int] = {}
         footers: Dict[str, int] = {}
+        # Also track digit-masked versions for running headers/footers with page numbers
+        masked_headers: Dict[str, int] = {}
+        masked_footers: Dict[str, int] = {}
+
         for lines in pages.values():
             non_empty = [ln.strip() for ln in lines if ln.strip()]
             if not non_empty:
                 continue
-            headers[non_empty[0]] = headers.get(non_empty[0], 0) + 1
-            footers[non_empty[-1]] = footers.get(non_empty[-1], 0) + 1
+            first = non_empty[0]
+            last = non_empty[-1]
+
+            headers[first] = headers.get(first, 0) + 1
+            footers[last] = footers.get(last, 0) + 1
+
+            # Mask digits to group "Page 1", "Page 2", etc. as same pattern
+            masked_first = _DIGIT_MASK_RE.sub("N", first)
+            masked_last = _DIGIT_MASK_RE.sub("N", last)
+            masked_headers[masked_first] = masked_headers.get(masked_first, 0) + 1
+            masked_footers[masked_last] = masked_footers.get(masked_last, 0) + 1
+
         total_pages = max(1, len(pages))
-        header_lines = [line for line, count in headers.items() if count / total_pages >= 0.6]
-        footer_lines = [line for line, count in footers.items() if count / total_pages >= 0.6]
+        threshold = 0.6
+        header_lines_set = {line for line, count in headers.items() if count / total_pages >= threshold}
+        footer_lines_set = {line for line, count in footers.items() if count / total_pages >= threshold}
+
+        # Running headers/footers (digit-masked patterns)
+        masked_header_patterns = {pat for pat, count in masked_headers.items() if count / total_pages >= threshold}
+        masked_footer_patterns = {pat for pat, count in masked_footers.items() if count / total_pages >= threshold}
+
+        # Build the return lists (for backward compat)
+        header_lines = list(header_lines_set)
+        footer_lines = list(footer_lines_set)
+
         cleaned: Dict[int, List[str]] = {}
         for page, lines in pages.items():
             filtered = []
+            non_empty = [ln.strip() for ln in lines if ln.strip()]
+            first_line = non_empty[0] if non_empty else ""
+            last_line = non_empty[-1] if non_empty else ""
+
             for line in lines:
                 stripped = line.strip()
                 if not stripped:
                     continue
-                if stripped in header_lines or stripped in footer_lines:
+                # Exact match headers/footers
+                if stripped in header_lines_set or stripped in footer_lines_set:
                     continue
+                # Page number lines
                 if DocumentExtractor._page_number_line(stripped):
+                    continue
+                # Digit-masked pattern match (for running headers with page numbers)
+                masked = _DIGIT_MASK_RE.sub("N", stripped)
+                if stripped == first_line and masked in masked_header_patterns:
+                    continue
+                if stripped == last_line and masked in masked_footer_patterns:
+                    continue
+                # Copyright lines
+                if _COPYRIGHT_RE.search(stripped):
+                    continue
+                # Confidentiality notices (only short ones, to avoid stripping content)
+                if _CONFIDENTIAL_RE.search(stripped) and len(stripped) < 60:
                     continue
                 filtered.append(line)
             cleaned[page] = filtered
@@ -407,6 +584,16 @@ class DocumentExtractor:
                         except Exception as exc:  # noqa: BLE001
                             errors.append(f"pdf_layout_blocks_failed: page={page_index} err={exc}")
 
+                        # Apply layout analysis to reorder multi-column content
+                        try:
+                            page_layout_blocks = [b for b in layout_blocks if b.get("page") == page_index]
+                            if page_layout_blocks:
+                                reordered = self._reorder_blocks_by_layout(page_layout_blocks, page_width=float(page.rect.width))
+                                # Replace the page's layout blocks with reordered ones
+                                layout_blocks = [b for b in layout_blocks if b.get("page") != page_index] + reordered
+                        except Exception:
+                            pass
+
                         images = page.get_images(full=True)
                         page_text = "\n".join(page_text_parts).strip()
                         if self._detect_scanned_page(page_text, len(images)):
@@ -493,18 +680,45 @@ class DocumentExtractor:
                         try:
                             extracted_tables = page.extract_tables()
                             if extracted_tables:
+                                try:
+                                    from src.intelligence.table_parser import TableParser
+                                    _table_parser = TableParser()
+                                except Exception:
+                                    _table_parser = None
                                 for tbl in extracted_tables:
-                                    formatted_table = "\n".join([", ".join(row) for row in tbl])
-                                    tables.append(Table(page=page_index, text=formatted_table, csv=formatted_table))
-                                    chunk_candidates.append(
-                                        ChunkCandidate(
-                                            text=formatted_table,
-                                            page=page_index,
-                                            section_title=current_title,
-                                            section_id=current_section_id,
-                                            chunk_type="table",
+                                    if _table_parser:
+                                        structured = _table_parser.parse(tbl, page=page_index, title=current_title)
+                                        table_type = _table_parser.classify_table_type(structured)
+                                        structured.table_type = table_type
+                                        formatted_table = structured.flat_text
+                                        tables.append(Table(page=page_index, text=formatted_table, csv=formatted_table, structured=structured))
+                                        chunk_candidates.append(
+                                            ChunkCandidate(
+                                                text=formatted_table,
+                                                page=page_index,
+                                                section_title=current_title,
+                                                section_id=current_section_id,
+                                                chunk_type="table",
+                                                table_meta={
+                                                    "headers": structured.headers,
+                                                    "table_type": table_type,
+                                                    "row_count": structured.row_count,
+                                                    "col_count": structured.col_count,
+                                                },
+                                            )
                                         )
-                                    )
+                                    else:
+                                        formatted_table = "\n".join([", ".join(str(c) for c in row) for row in tbl if row])
+                                        tables.append(Table(page=page_index, text=formatted_table, csv=formatted_table))
+                                        chunk_candidates.append(
+                                            ChunkCandidate(
+                                                text=formatted_table,
+                                                page=page_index,
+                                                section_title=current_title,
+                                                section_id=current_section_id,
+                                                chunk_type="table",
+                                            )
+                                        )
                         except Exception as exc:  # noqa: BLE001
                             errors.append(f"pdf_table_extract_failed: page={page_index} err={exc}")
             except Exception as exc:  # noqa: BLE001
@@ -572,6 +786,12 @@ class DocumentExtractor:
             )
 
         full_text = "\n".join(full_text_parts).strip()
+
+        # DPIE ML section detection (fallback: _is_heading regex already applied above)
+        dpie_sections = self._detect_sections_dpie(full_text)
+        if dpie_sections:
+            self._apply_dpie_sections(chunk_candidates, dpie_sections, full_text)
+
         doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "document.pdf")
         pages = [
             {"page_number": page, "text": "\n".join(lines).strip()}
@@ -1010,6 +1230,18 @@ class DocumentIntelligence:
         full_text: str,
         filename_hint: Optional[str] = None,
     ) -> str:
+        # Strategy 1: DPIE ML classification
+        try:
+            from src.intelligence.dpie_integration import DPIERegistry
+            registry = DPIERegistry.get_instance()
+            if registry.is_loaded and full_text and len(full_text) > 50:
+                doc_type, confidence = registry.classify_document(full_text[:5000])
+                if confidence >= 0.4 and doc_type != "other":
+                    return doc_type
+        except Exception:
+            pass
+
+        # Strategy 2: existing heuristic
         name = (filename_hint or "").lower()
         if name.endswith((".ppt", ".pptx")):
             return "presentation"

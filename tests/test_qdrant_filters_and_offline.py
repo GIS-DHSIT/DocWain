@@ -44,8 +44,26 @@ class FakeQdrantAll:
         return FakeQueryResult(self._points)
 
     def scroll(self, **kwargs):  # noqa: ANN003
-        _ = kwargs
-        return self._points, None
+        filt = kwargs.get("scroll_filter") or kwargs.get("filter")
+        if filt is None:
+            return self._points, None
+        # Basic profile_id filtering for test isolation
+        filtered = []
+        for p in self._points:
+            payload = p.payload if hasattr(p, "payload") else {}
+            keep = True
+            if hasattr(filt, "must"):
+                for cond in filt.must:
+                    if hasattr(cond, "should"):
+                        for sub in cond.should:
+                            if hasattr(sub, "key") and hasattr(sub, "match"):
+                                k = sub.key
+                                v = sub.match.value if hasattr(sub.match, "value") else None
+                                if k in payload and v is not None and payload[k] != v:
+                                    keep = False
+            if keep:
+                filtered.append(p)
+        return filtered, None
 
     def count(self, **kwargs):  # noqa: ANN003
         _ = kwargs

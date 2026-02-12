@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
-from typing import Dict
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI
 
@@ -136,9 +137,94 @@ def initialize_app_state(app: FastAPI) -> AppState:
     return state
 
 
+def _bootstrap_dpie_background(
+    qdrant_client: Any,
+    embedding_model: Any,
+) -> None:
+    """Discover all Qdrant collections and train DPIE models in the background.
+
+    Runs in a daemon thread so it does not block server startup.
+    Skips silently if DPIE dependencies are not available or if
+    models are already trained.
+    """
+    try:
+        from src.intelligence.dpie_integration import DPIERegistry
+        from src.api.vector_store import build_collection_name
+
+        registry = DPIERegistry.get()
+        if registry.is_loaded:
+            logger.info("DPIE models already loaded; skipping background training")
+            return
+
+        # Discover all collections (each is a subscription_id)
+        collections = qdrant_client.get_collections().collections
+        if not collections:
+            logger.info("DPIE: no Qdrant collections found; skipping")
+            return
+
+        for col in collections:
+            subscription_id = getattr(col, "name", None) or str(col)
+            # Try to find a profile_id by scrolling a few points
+            profile_id = _discover_profile_id(qdrant_client, subscription_id)
+            if not profile_id:
+                logger.debug("DPIE: no profile found in collection %s; skipping", subscription_id)
+                continue
+
+            logger.info("DPIE: auto-training for subscription=%s profile=%s", subscription_id, profile_id)
+            try:
+                registry.ensure_ready(
+                    qdrant_client=qdrant_client,
+                    sentence_model=embedding_model,
+                    collection_name=subscription_id,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                )
+                logger.info("DPIE: models ready for subscription=%s", subscription_id)
+                break  # Train on the first valid collection
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DPIE: training failed for %s: %s", subscription_id, exc)
+
+    except ImportError:
+        logger.debug("DPIE: intelligence.dpie_integration not available; skipping")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("DPIE: background bootstrap failed: %s", exc)
+
+
+def _discover_profile_id(qdrant_client: Any, collection_name: str) -> Optional[str]:
+    """Scroll a few points to discover a profile_id in the collection."""
+    try:
+        result = qdrant_client.scroll(
+            collection_name=collection_name,
+            limit=5,
+            with_payload=True,
+            with_vectors=False,
+        )
+        points = result[0] if result else []
+        for point in points:
+            payload = getattr(point, "payload", None) or {}
+            pid = payload.get("profile_id")
+            if pid:
+                return str(pid)
+    except Exception:
+        pass
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    initialize_app_state(app)
+    state = initialize_app_state(app)
+
+    # Kick off DPIE background training (non-blocking)
+    if state.qdrant_client and state.embedding_model:
+        dpie_thread = threading.Thread(
+            target=_bootstrap_dpie_background,
+            args=(state.qdrant_client, state.embedding_model),
+            daemon=True,
+            name="dpie-bootstrap",
+        )
+        dpie_thread.start()
+        logger.info("DPIE background training thread started")
+
     yield
 
 

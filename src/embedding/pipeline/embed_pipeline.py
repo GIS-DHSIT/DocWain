@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -15,6 +16,59 @@ from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_te
 from src.embedding.pipeline.dedupe_gate import DedupeConfig, apply_dedupe_gate
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Text salvage for ExtractedDocument repr strings
+# ---------------------------------------------------------------------------
+_EXTRACTED_DOC_REPR_RE = re.compile(
+    r"^Extracted\s*Document\s*\(\s*full_text=['\"]", re.IGNORECASE,
+)
+_EXTRACTED_DOC_FULLTEXT_RE = re.compile(
+    r"full_text=['\"](.+?)(?:['\"],\s*\w+=|['\"]\s*\)$)", re.DOTALL,
+)
+_EXTRACTED_DOC_PREFIX_RE = re.compile(
+    r"^Extracted\s+Document\s+(?:full_text|[\w.]+)\s*", re.IGNORECASE,
+)
+
+
+def _salvage_chunk_text(text: str) -> str:
+    """Try to extract real document content from garbage/metadata-contaminated text.
+
+    Handles two formats:
+    1. Python repr: ``ExtractedDocument(full_text='...', sections=[...])``
+    2. Space-delimited: ``Extracted Document full_text actual content, section_id ...``
+    """
+    if not text:
+        return ""
+
+    # Strategy 1: Extract full_text from ExtractedDocument(...) Python repr
+    if _EXTRACTED_DOC_REPR_RE.match(text):
+        m = _EXTRACTED_DOC_FULLTEXT_RE.search(text)
+        if m:
+            extracted = m.group(1).replace("\\n", "\n").strip()
+            if extracted and len(extracted) > 20:
+                return extracted
+        # Fallback: strip the wrapper, find end of full_text value
+        stripped = re.sub(r"^Extracted\s*Document\s*\(\s*full_text=['\"]", "", text)
+        for end_marker in ("', sections=", '", sections=', "', tables=", '", tables=',
+                           "', metadata=", '", metadata=', "', doc_type=", '", doc_type=',
+                           "')", '")'):
+            idx = stripped.find(end_marker)
+            if idx != -1:
+                stripped = stripped[:idx]
+                break
+        stripped = stripped.replace("\\n", "\n").strip()
+        if stripped and len(stripped) > 20:
+            return stripped
+
+    # Strategy 2: Strip "Extracted Document full_text" prefix (space-delimited format)
+    if text.startswith("Extracted Document"):
+        stripped = _EXTRACTED_DOC_PREFIX_RE.sub("", text).strip()
+        if stripped and len(stripped) > 20:
+            return stripped
+
+    return ""
 
 
 @dataclass(frozen=True)
@@ -107,7 +161,11 @@ def prepare_embedding_chunks(
         m = dict(meta)
         m["document_id"] = document_id
         section_title = (m.get("section_title") or "Untitled Section").strip() or "Untitled Section"
-        section_path = (m.get("section_path") or section_title).strip() or section_title
+        raw_path = m.get("section_path") or section_title
+        if isinstance(raw_path, list):
+            section_path = " > ".join(str(p).strip() for p in raw_path if str(p).strip()) or section_title
+        else:
+            section_path = str(raw_path).strip() or section_title
         m["section_title"] = section_title
         m["section_path"] = section_path
         m["section_id"] = m.get("section_id") or hashlib.sha1(
@@ -117,13 +175,37 @@ def prepare_embedding_chunks(
         m["chunk_kind"] = m.get("chunk_kind", "section_text")
         raw_text = chunk_text
         clean_text = clean_text_for_embedding(raw_text)
+        # Guard against metadata garbage in raw text — try salvage before fallback
+        from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
+        if _is_metadata_garbage(raw_text):
+            salvaged = _salvage_chunk_text(raw_text)
+            if salvaged and len(salvaged.strip()) >= 20:
+                raw_text = salvaged
+                clean_text = clean_text_for_embedding(raw_text)
+            else:
+                raw_text = clean_text
         embedding_text = ensure_embedding_text(raw_text, m.get("doc_domain"), m.get("section_kind"))
+        # Pre-embedding validation gate: never embed garbage or trivially short text
+        final_text = embedding_text or clean_text
+        if _is_metadata_garbage(final_text):
+            # Last-chance salvage before dropping
+            salvaged = _salvage_chunk_text(final_text)
+            if salvaged and len(salvaged.strip()) >= 20 and not _is_metadata_garbage(salvaged):
+                raw_text = salvaged
+                embedding_text = ensure_embedding_text(salvaged, m.get("doc_domain"), m.get("section_kind"))
+                final_text = embedding_text or salvaged
+        if _is_metadata_garbage(final_text) or len(final_text.strip()) < 20:
+            logger.warning(
+                "Dropping garbage/short chunk %d for %s (len=%d)",
+                len(prepared_chunks), doc_name, len(final_text.strip()),
+            )
+            continue
         m["content"] = raw_text
         m["embedding_text"] = embedding_text
         m["text_clean"] = embedding_text
         if raw_text != embedding_text:
             m["text_raw"] = raw_text
-        prepared_chunks.append(embedding_text or clean_text)
+        prepared_chunks.append(final_text)
         prepared_meta.append(m)
 
     prepared_chunks, prepared_meta, integrity_stats = enforce_chunk_integrity(

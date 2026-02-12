@@ -38,6 +38,8 @@ class FieldValue(BaseModel):
 
     label: Optional[str] = None
     value: str
+    document_name: Optional[str] = None
+    section: Optional[str] = None
     evidence_spans: List[EvidenceSpan]
 
 
@@ -149,6 +151,15 @@ class MultiEntitySchema(BaseModel):
 
     entities: Optional[List[EntitySummary]] = None
     missing_reason: Optional[str] = None
+
+
+class LLMResponseSchema(BaseModel):
+    """Schema returned by LLM-first extraction. Contains the final answer text
+    directly, bypassing the render step."""
+    model_config = ConfigDict(extra="ignore")
+
+    text: str
+    evidence_chunks: List[str] = Field(default_factory=list)
 
 
 @dataclass

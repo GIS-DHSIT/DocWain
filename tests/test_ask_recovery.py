@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.api.dw_newron import EnterpriseRAGSystem, PromptBuilder
+import src.api.dw_newron as dn
 
 
 class FakeChunk:
@@ -82,6 +83,28 @@ class FakeConversationSummarizer:
         return ""
 
 
+class FakeConversationState:
+    def __init__(self):
+        self.enriched_turns = []
+    def resolve_query(self, query, namespace, user_id):
+        return query
+    def record_turn(self, namespace, user_id, user_message, assistant_response, resolved_query=None):
+        return None
+    def get_entity_context(self):
+        return ""
+    def clear(self, namespace, user_id):
+        return None
+
+
+class FakeProgressiveSummarizer:
+    def update(self, new_turn, existing_summary=""):
+        return ""
+    def get_summary(self):
+        return ""
+    def clear(self):
+        pass
+
+
 class FakeFeedbackMemory:
     def clear(self, namespace, user_id):
         return None
@@ -124,6 +147,7 @@ def _build_rag(fake_llm, chunk_text="Candidate summary.", metadata=None):
     rag.llm_client = fake_llm
     rag.model_name = "gpt-oss:latest"
     rag.client = FakeQdrantClient()
+    rag.model = SimpleNamespace()  # no encode — v3/v2 will fall through to legacy
     rag.retriever = SimpleNamespace(expand_with_neighbors=lambda **kwargs: kwargs["seed_chunks"])
     rag.reranker = FakeReranker()
     rag.graph_support_scorer = FakeGraphSupportScorer()
@@ -135,10 +159,15 @@ def _build_rag(fake_llm, chunk_text="Candidate summary.", metadata=None):
     rag.answerability_detector = FakeAnswerabilityDetector()
     rag.conversation_history = FakeConversationHistory()
     rag.conversation_summarizer = FakeConversationSummarizer()
+    rag.conversation_state = FakeConversationState()
+    rag.progressive_summarizer = FakeProgressiveSummarizer()
     rag.feedback_memory = FakeFeedbackMemory()
     rag.redis_client = None
+    default_meta = {"document_id": "doc-1", "profile_id": "profile"}
+    if metadata:
+        default_meta.update(metadata)
     rag.retrieve_with_priorities = lambda **kwargs: {
-        "chunks": [FakeChunk(chunk_text, metadata=metadata or {"document_id": "doc-1"})],
+        "chunks": [FakeChunk(chunk_text, metadata=default_meta)],
         "query": kwargs["query"],
         "metadata": {},
         "attempts": [],
@@ -151,6 +180,7 @@ def _build_rag(fake_llm, chunk_text="Candidate summary.", metadata=None):
 
 def test_empty_generation_with_context_recovers(monkeypatch):
     monkeypatch.setattr("src.api.dw_newron.get_metrics_tracker", lambda: FakeMetrics())
+    monkeypatch.setattr(dn, "_ensure_qdrant_indexes", lambda *a, **kw: None)
     rag = _build_rag(EmptyThenValidLLM())
 
     response = rag.answer_question(
@@ -167,6 +197,7 @@ def test_empty_generation_with_context_recovers(monkeypatch):
 
 def test_missing_fields_use_not_available(monkeypatch):
     monkeypatch.setattr("src.api.dw_newron.get_metrics_tracker", lambda: FakeMetrics())
+    monkeypatch.setattr(dn, "_ensure_qdrant_indexes", lambda *a, **kw: None)
     rag = _build_rag(AlwaysEmptyLLM(), chunk_text="Project summary with no contact details.")
 
     response = rag.answer_question(
@@ -182,6 +213,7 @@ def test_missing_fields_use_not_available(monkeypatch):
 
 def test_normal_path_unchanged(monkeypatch):
     monkeypatch.setattr("src.api.dw_newron.get_metrics_tracker", lambda: FakeMetrics())
+    monkeypatch.setattr(dn, "_ensure_qdrant_indexes", lambda *a, **kw: None)
     rag = _build_rag(ValidLLM())
 
     response = rag.answer_question(
@@ -201,4 +233,6 @@ def test_prompt_prevents_docwain_intro():
         context="Sample context.",
         persona="DocWain",
     )
-    assert "do not introduce docwain" in prompt.lower()
+    lowered = prompt.lower()
+    assert "docwain" in lowered
+    assert "never add docwain product intro" in lowered or "do not introduce docwain" in lowered

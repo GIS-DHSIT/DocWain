@@ -69,6 +69,7 @@ def test_text_content_separation():
         "content": "Line 1\nLine 2\nLine 3",
     }
     payload = build_qdrant_payload(raw)
-    assert payload["content"]
+    text_field = payload.get("canonical_text") or payload.get("content")
+    assert text_field
     assert payload["embedding_text"]
-    assert payload["embedding_text"] != payload["content"]
+    assert payload["embedding_text"] != text_field

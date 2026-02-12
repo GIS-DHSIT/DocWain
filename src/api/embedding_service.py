@@ -21,7 +21,7 @@ from src.api.blob_store import (
     is_trusted_blob,
 )
 from src.api.config import Config
-from src.api.content_store import build_pickle_path, delete_extracted_pickle, load_extracted_pickle, save_extracted_pickle
+from src.api.content_store import build_pickle_path, load_extracted_pickle, save_extracted_pickle
 try:
     from src.api.dataHandler import (
         ChunkingDiagnosticError,
@@ -64,6 +64,8 @@ except Exception as _datahandler_exc:  # noqa: BLE001
     update_pii_stats = _datahandler_unavailable
 from src.api.document_status import get_document_record, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
+from dataclasses import is_dataclass, asdict
+from src.api.structured_extraction import StructuredDocument
 from src.api.pii_masking import mask_document_content
 from src.api.statuses import (
     STATUS_EMBEDDING_COMPLETED,
@@ -508,6 +510,23 @@ def _payload_has_required_schema(content: Any) -> bool:
     return False
 
 
+def _safe_text_item(item: Any) -> str:
+    """Extract text from a list item without stringifying dicts/objects."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("text", "content", "full_text", "raw_text", "canonical_text"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return ""
+    if hasattr(item, "text"):
+        val = getattr(item, "text", "")
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
 def _normalize_content_in_place(content: Any) -> Any:
     """Normalize extracted text fields without losing layout cues."""
     if isinstance(content, ExtractedDocument):
@@ -522,7 +541,7 @@ def _normalize_content_in_place(content: Any) -> Any:
             if isinstance(content.get(key), str):
                 content[key] = normalize_text(content.get(key) or "")
         if isinstance(content.get("texts"), list):
-            content["texts"] = [normalize_text(str(t)) for t in content.get("texts") or []]
+            content["texts"] = [normalize_text(_safe_text_item(t)) for t in content.get("texts") or []]
         if isinstance(content.get("sections"), list):
             normalized_sections = []
             for sec in content.get("sections") or []:
@@ -1004,55 +1023,170 @@ def _build_chunks_for_extracted_doc(
 
 
 def _estimate_chunks_for_content(content: Any, *, document_id: str, doc_name: str) -> Tuple[int, Optional[float]]:
+    """
+    Estimate the number of chunks that will be produced from content.
+
+    Improved to properly handle cases where texts array is empty but full_text exists.
+    """
     if isinstance(content, ExtractedDocument):
         chunks, _, coverage_ratio, _ = _build_chunks_for_extracted_doc(
             content, document_id=document_id, doc_name=doc_name
         )
         return len(chunks), coverage_ratio
+
     if isinstance(content, dict):
-        if isinstance(content.get("texts"), list):
-            return len([text for text in content.get("texts") if text]), None
+        # Check for pre-computed texts array with actual content
+        texts_list = content.get("texts")
+        if isinstance(texts_list, list):
+            non_empty_texts = [text for text in texts_list if isinstance(text, str) and text.strip()]
+            if non_empty_texts:
+                return len(non_empty_texts), None
+            # texts array exists but is empty - fall through to try full_text
+
+        # Check for pre-computed embeddings
         if isinstance(content.get("embeddings"), (list, tuple)):
-            return len(content.get("embeddings") or []), None
-        if isinstance(content.get("chunk_metadata"), list):
-            return len(content.get("chunk_metadata") or []), None
+            embeddings = content.get("embeddings") or []
+            if embeddings:
+                return len(embeddings), None
+
+        # Check for pre-computed chunk_metadata
+        chunk_meta = content.get("chunk_metadata")
+        if isinstance(chunk_meta, list) and chunk_meta:
+            return len(chunk_meta), None
+
+        # Try to chunk from full_text or equivalent fields
         text_value = content.get("full_text") or content.get("text") or content.get("content")
         if isinstance(text_value, str) and text_value.strip():
             try:
                 chunker = SectionChunker()
-                section_chunks = chunker.chunk_document(text_value, doc_internal_id=document_id, source_filename=doc_name)
-                return len(section_chunks), None
+                section_chunks = chunker.chunk_document(
+                    text_value,
+                    doc_internal_id=document_id,
+                    source_filename=doc_name
+                )
+                if section_chunks:
+                    return len(section_chunks), None
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Section chunk estimation failed for %s: %s", doc_name, exc)
-                return 0, None
-        if isinstance(content.get("pages"), list):
-            pages_text: List[str] = []
-            for page in content.get("pages") or []:
-                if isinstance(page, dict):
-                    pages_text.append(str(page.get("text") or page.get("content") or ""))
-                else:
-                    pages_text.append(str(page))
-            joined = "\n\n".join(pages_text).strip()
-            if joined:
+                # Don't return 0 yet - try other sources
+
+        # Try to extract from sections
+        sections = content.get("sections")
+        if isinstance(sections, list) and sections:
+            section_texts = []
+            for sec in sections:
+                if isinstance(sec, dict):
+                    sec_text = (sec.get("text") or sec.get("content") or "").strip()
+                    if sec_text:
+                        section_texts.append(sec_text)
+            if section_texts:
                 try:
                     chunker = SectionChunker()
-                    section_chunks = chunker.chunk_document(joined, doc_internal_id=document_id, source_filename=doc_name)
-                    return len(section_chunks), None
+                    joined = "\n\n".join(section_texts)
+                    section_chunks = chunker.chunk_document(
+                        joined,
+                        doc_internal_id=document_id,
+                        source_filename=doc_name
+                    )
+                    if section_chunks:
+                        return len(section_chunks), None
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Section chunk estimation from sections failed for %s: %s", doc_name, exc)
+
+        # Try to extract from pages
+        pages = content.get("pages")
+        if isinstance(pages, list) and pages:
+            pages_text: List[str] = []
+            for page in pages:
+                if isinstance(page, dict):
+                    page_text = (page.get("text") or page.get("content") or "").strip()
+                    if page_text:
+                        pages_text.append(page_text)
+                elif isinstance(page, str) and page.strip():
+                    pages_text.append(page.strip())
+            if pages_text:
+                joined = "\n\n".join(pages_text)
+                try:
+                    chunker = SectionChunker()
+                    section_chunks = chunker.chunk_document(
+                        joined,
+                        doc_internal_id=document_id,
+                        source_filename=doc_name
+                    )
+                    if section_chunks:
+                        return len(section_chunks), None
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Section chunk estimation failed for %s pages: %s", doc_name, exc)
-                    return 0, None
-    if isinstance(content, str):
+
+        # Last resort: if we have any text, use simple character-based estimation
+        text_value = content.get("full_text") or content.get("text") or content.get("content")
+        if isinstance(text_value, str) and len(text_value.strip()) > 100:
+            # Rough estimate: ~500 chars per chunk on average
+            estimated_chunks = max(1, len(text_value.strip()) // 500)
+            logger.info("Using character-based chunk estimate for %s: %d chunks", doc_name, estimated_chunks)
+            return estimated_chunks, None
+
+    if isinstance(content, str) and content.strip():
         try:
             chunker = SectionChunker()
-            section_chunks = chunker.chunk_document(content, doc_internal_id=document_id, source_filename=doc_name)
-            return len(section_chunks), None
+            section_chunks = chunker.chunk_document(
+                content,
+                doc_internal_id=document_id,
+                source_filename=doc_name
+            )
+            if section_chunks:
+                return len(section_chunks), None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Section chunk estimation failed for %s: %s", doc_name, exc)
-            return 0, None
+            # Fall back to character-based estimation
+            if len(content.strip()) > 100:
+                estimated_chunks = max(1, len(content.strip()) // 500)
+                return estimated_chunks, None
+
     return 0, None
 
 
 def _normalize_extracted_docs(extracted: Any) -> Dict[str, Any]:
+    """
+    Normalize extracted document payload to a consistent format for embedding.
+
+    Handles multiple input formats:
+    - New format: {"raw": {...}, "structured": {...}, "intelligence": {...}}
+    - Legacy format: ExtractedDocument dataclass
+    - Simple dict with texts/embeddings/chunk_metadata
+    - Raw string
+
+    Key improvement: Falls back to raw extraction when structured extraction
+    produces empty/insufficient content.
+    """
+    # New format: payload may be {"raw": {...}, "structured": {...}}
+    if isinstance(extracted, dict) and ("raw" in extracted or "structured" in extracted):
+        structured = extracted.get("structured") or {}
+        raw = extracted.get("raw") or {}
+
+        # Try to normalize structured first
+        if structured:
+            normalized = _normalize_structured_payload(structured)
+            # Validate that structured produced useful content
+            if _has_useful_content(normalized):
+                logger.debug("Using structured extraction with %d documents", len(normalized))
+                return normalized
+            else:
+                logger.warning(
+                    "Structured extraction produced no useful content; falling back to raw"
+                )
+
+        # Fall back to raw extraction
+        if raw:
+            normalized = _normalize_raw_payload(raw)
+            if normalized:
+                logger.debug("Using raw extraction with %d documents", len(normalized))
+                return normalized
+
+        # Last resort: try to extract any usable content
+        logger.warning("Both structured and raw extraction failed; attempting recovery")
+        return _recover_from_payload(extracted)
+
     if isinstance(extracted, ExtractedDocument):
         return {"document": extracted}
     if isinstance(extracted, dict):
@@ -1064,6 +1198,297 @@ def _normalize_extracted_docs(extracted: Any) -> Dict[str, Any]:
     raise ValueError(f"Unsupported extracted payload type: {type(extracted)}")
 
 
+def _salvage_repr_text(text: str) -> str:
+    """Salvage real content from ExtractedDocument/Section repr strings."""
+    if not text or not isinstance(text, str):
+        return text or ""
+    from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
+    if not _is_metadata_garbage(text):
+        return text
+    from src.embedding.pipeline.embed_pipeline import _salvage_chunk_text
+    salvaged = _salvage_chunk_text(text)
+    if salvaged and len(salvaged.strip()) >= 20:
+        return salvaged
+    return text
+
+
+def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert structured extraction to embedding-compatible format."""
+    normalized: Dict[str, Any] = {}
+
+    for name, value in structured.items():
+        try:
+            if is_dataclass(value):
+                sd = asdict(value)
+            elif isinstance(value, dict):
+                sd = value
+            else:
+                # Check if it's an object with raw_text/full_text attrs before str()
+                raw_text_attr = getattr(value, "raw_text", None) or getattr(value, "full_text", None)
+                if isinstance(raw_text_attr, str) and raw_text_attr.strip():
+                    text_content = _salvage_repr_text(raw_text_attr.strip())
+                else:
+                    text_content = _salvage_repr_text(str(value).strip())
+                from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
+                if _is_metadata_garbage(text_content):
+                    logger.warning("Skipping garbage text from structured value for %s", name)
+                    continue
+                if text_content:
+                    normalized[name] = {
+                        "full_text": text_content,
+                        "sections": [{"text": text_content, "start_page": 1, "end_page": 1}],
+                        "texts": [text_content],
+                    }
+                continue
+
+            # Extract full text - prefer raw_text, fall back to joining sections
+            section_contents = []
+            for sec in sd.get("sections", []):
+                content = _salvage_repr_text((sec.get("content") or sec.get("text") or "").strip())
+                if content:
+                    section_contents.append(content)
+
+            full_text = _salvage_repr_text((sd.get("raw_text") or sd.get("full_text") or "").strip())
+            if not full_text and section_contents:
+                full_text = "\n\n".join(section_contents)
+
+            # If no full_text at all, skip this document
+            if not full_text:
+                logger.warning("Structured document %s has no extractable text", name)
+                continue
+
+            # Build sections list
+            sections = []
+            texts = []
+            chunk_meta = []
+
+            for idx, sec in enumerate(sd.get("sections", [])):
+                text_val = _salvage_repr_text((sec.get("content") or sec.get("text") or "").strip())
+                sections.append({
+                    "text": text_val,
+                    "start_page": sec.get("start_page") or 1,
+                    "end_page": sec.get("end_page") or 1,
+                })
+                if text_val:
+                    texts.append(text_val)
+                    chunk_meta.append({
+                        "document_id": sd.get("document_id"),
+                        "section_title": sec.get("section_type") or sec.get("title") or "Section",
+                        "section_path": sec.get("section_type") or sec.get("title") or "Section",
+                        "page_start": sec.get("start_page") or 1,
+                        "page_end": sec.get("end_page") or 1,
+                        "page_number": sec.get("start_page") or 1,
+                        "chunk_index": idx,
+                        "chunk_type": "text",
+                        "doc_type": sd.get("document_type"),
+                        "sentence_complete": text_val.endswith(('.', '?', '!')),
+                    })
+
+            # If no section texts but we have full_text, use full_text as single chunk
+            if not texts and full_text:
+                texts = [full_text]
+                sections = [{"text": full_text, "start_page": 1, "end_page": 1}]
+                chunk_meta = [{
+                    "document_id": sd.get("document_id"),
+                    "section_title": "Content",
+                    "section_path": "Content",
+                    "page_start": 1,
+                    "page_end": sd.get("total_pages") or 1,
+                    "page_number": 1,
+                    "chunk_index": 0,
+                    "chunk_type": "text",
+                    "doc_type": sd.get("document_type"),
+                    "sentence_complete": True,
+                }]
+
+            normalized[name] = {
+                "full_text": full_text,
+                "sections": sections,
+                "texts": texts,
+                "chunk_metadata": chunk_meta,
+                "doc_type": sd.get("document_type"),
+                "doc_domain": (sd.get("document_classification") or {}).get("domain", "generic"),
+            }
+
+        except Exception as exc:
+            logger.warning("Failed to normalize structured document %s: %s", name, exc)
+            # Try raw_text/full_text attrs before falling back to str()
+            raw_text_attr = getattr(value, "raw_text", None) or getattr(value, "full_text", None)
+            text_content = raw_text_attr if isinstance(raw_text_attr, str) else (str(value).strip() if value else "")
+            from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
+            if text_content and not _is_metadata_garbage(text_content):
+                normalized[name] = {
+                    "full_text": text_content,
+                    "sections": [{"text": text_content, "start_page": 1, "end_page": 1}],
+                    "texts": [text_content],
+                }
+
+    return normalized
+
+
+def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
+    """Convert raw extraction to embedding-compatible format."""
+    if not raw:
+        return {}
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text:
+            return {"document": {"full_text": text, "texts": [text]}}
+        return {}
+
+    if isinstance(raw, dict):
+        # Check if it's already in the right format
+        if {"texts", "embeddings", "chunk_metadata", "full_text"}.intersection(raw.keys()):
+            return {"document": raw}
+
+        # Process each document in raw
+        normalized: Dict[str, Any] = {}
+        for name, content in raw.items():
+            if isinstance(content, ExtractedDocument):
+                normalized[name] = content
+            elif isinstance(content, dict):
+                # Extract text from various possible fields
+                full_text = (
+                    content.get("full_text") or
+                    content.get("text") or
+                    content.get("content") or
+                    ""
+                ).strip()
+
+                # Try to get text from sections
+                if not full_text and content.get("sections"):
+                    section_texts = []
+                    for sec in content.get("sections", []):
+                        if isinstance(sec, dict):
+                            sec_text = (sec.get("text") or sec.get("content") or "").strip()
+                            if sec_text:
+                                section_texts.append(sec_text)
+                    full_text = "\n\n".join(section_texts)
+
+                # Try to get text from pages
+                if not full_text and content.get("pages"):
+                    page_texts = []
+                    for page in content.get("pages", []):
+                        if isinstance(page, dict):
+                            page_text = (page.get("text") or page.get("content") or "").strip()
+                            if page_text:
+                                page_texts.append(page_text)
+                        elif isinstance(page, str):
+                            page_texts.append(page.strip())
+                    full_text = "\n\n".join(page_texts)
+
+                if full_text:
+                    # Preserve existing texts array if present, otherwise create from full_text
+                    texts = content.get("texts")
+                    if not texts or not any(t.strip() for t in texts if isinstance(t, str)):
+                        texts = [full_text]
+
+                    normalized[name] = {
+                        "full_text": full_text,
+                        "texts": texts,
+                        "sections": content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}]),
+                        "chunk_metadata": content.get("chunk_metadata", []),
+                        "doc_type": content.get("doc_type"),
+                    }
+            elif isinstance(content, str) and content.strip():
+                normalized[name] = {
+                    "full_text": content.strip(),
+                    "texts": [content.strip()],
+                }
+
+        return normalized if normalized else {}
+
+    return {}
+
+
+def _has_useful_content(normalized: Dict[str, Any]) -> bool:
+    """Check if normalized payload has useful content for embedding."""
+    if not normalized:
+        return False
+
+    for name, content in normalized.items():
+        if isinstance(content, ExtractedDocument):
+            if content.full_text and content.full_text.strip():
+                return True
+            if content.sections and any(s.text.strip() for s in content.sections):
+                return True
+        elif isinstance(content, dict):
+            # Check full_text
+            full_text = content.get("full_text", "")
+            if isinstance(full_text, str) and len(full_text.strip()) > 50:
+                return True
+            # Check texts array
+            texts = content.get("texts", [])
+            if texts and any(t.strip() for t in texts if isinstance(t, str)):
+                return True
+        elif isinstance(content, str) and len(content.strip()) > 50:
+            return True
+
+    return False
+
+
+def _recover_from_payload(extracted: Dict[str, Any]) -> Dict[str, Any]:
+    """Attempt to recover any usable text from the payload."""
+    recovered: Dict[str, Any] = {}
+
+    # Try to find text anywhere in the payload
+    def extract_text_recursive(obj: Any, path: str = "") -> List[str]:
+        texts = []
+        if isinstance(obj, str) and len(obj.strip()) > 20:
+            texts.append(obj.strip())
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in ("full_text", "text", "content", "raw_text"):
+                    if isinstance(value, str) and value.strip():
+                        texts.append(value.strip())
+                else:
+                    texts.extend(extract_text_recursive(value, f"{path}.{key}"))
+        elif isinstance(obj, list):
+            for i, item in enumerate(obj):
+                texts.extend(extract_text_recursive(item, f"{path}[{i}]"))
+        return texts
+
+    all_texts = extract_text_recursive(extracted)
+
+    if all_texts:
+        # Use the longest text as the main content
+        all_texts.sort(key=len, reverse=True)
+        main_text = all_texts[0]
+        recovered["recovered_document"] = {
+            "full_text": main_text,
+            "texts": [main_text],
+            "sections": [{"text": main_text, "start_page": 1, "end_page": 1}],
+        }
+        logger.info("Recovered %d characters from payload", len(main_text))
+
+    return recovered
+
+
+def _diagnose_content(content: Any, doc_name: str) -> str:
+    """Generate diagnostic info for failed chunk estimation."""
+    if content is None:
+        return "content is None"
+    if isinstance(content, str):
+        return f"string content length={len(content)}, stripped={len(content.strip())}"
+    if isinstance(content, ExtractedDocument):
+        return f"ExtractedDocument full_text={len(content.full_text or '')}, sections={len(content.sections or [])}"
+    if isinstance(content, dict):
+        fields = []
+        for key in ["full_text", "text", "content", "texts", "sections", "pages"]:
+            val = content.get(key)
+            if val is not None:
+                if isinstance(val, str):
+                    fields.append(f"{key}:str({len(val)})")
+                elif isinstance(val, list):
+                    non_empty = sum(1 for x in val if x)
+                    fields.append(f"{key}:list({len(val)}, non_empty={non_empty})")
+                else:
+                    fields.append(f"{key}:{type(val).__name__}")
+        return f"dict with {', '.join(fields) if fields else 'no text fields'}"
+    return f"unknown type: {type(content).__name__}"
+
+
 def _screen_payload(extracted_docs: Dict[str, Any], document_id: str) -> Tuple[int, List[float]]:
     total_chunks = 0
     coverage_values: List[float] = []
@@ -1072,7 +1497,13 @@ def _screen_payload(extracted_docs: Dict[str, Any], document_id: str) -> Tuple[i
     for doc_name, content in extracted_docs.items():
         chunks_count, coverage = _estimate_chunks_for_content(content, document_id=document_id, doc_name=doc_name)
         if chunks_count <= 0:
-            raise ValueError(f"No chunks available for {doc_name}")
+            # Enhanced diagnostic logging
+            content_info = _diagnose_content(content, doc_name)
+            logger.error(
+                "No chunks available for %s (document_id=%s). Diagnosis: %s",
+                doc_name, document_id, content_info
+            )
+            raise ValueError(f"No chunks available for {doc_name}: {content_info}")
         total_chunks += chunks_count
         if coverage is not None:
             coverage_values.append(float(coverage))
@@ -1390,17 +1821,9 @@ def _process_blob(
             )
             _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
             deleted = False
-            try:
-                deleted = store.delete_blob(blob.name, lease=lease_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "embed_request_id=%s doc=%s blob delete failed: %s",
-                    embed_request_id,
-                    doc_id,
-                    exc,
-                )
+            logger.info("Preserving pickle for %s after embedding (cleanup disabled)", doc_id)
             if telemetry:
-                telemetry.increment("embed_pickles_deleted_total" if deleted else "embed_pickles_delete_fail_total")
+                telemetry.increment("embed_pickles_retained_total")
             _safe_update_stage(
                 doc_id,
                 "cleanup",
@@ -1648,21 +2071,14 @@ def _process_blob(
                 )
 
         deleted = False
+        # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            try:
-                deleted = store.delete_blob(blob.name, lease=lease_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "embed_request_id=%s doc=%s blob delete failed: %s",
-                    embed_request_id,
-                    doc_id,
-                    exc,
-                )
-                deleted = False
+            logger.info("Skipping pickle deletion for %s (preserve enabled)", doc_id)
             if telemetry:
-                telemetry.increment("embed_pickles_deleted_total" if deleted else "embed_pickles_delete_fail_total")
+                telemetry.increment("embed_pickles_retained_total")
+            deleted = False
             if not deleted:
-                cleanup_error = {"message": "blob_delete_failed"}
+                cleanup_error = {"message": "pickle_retained"}
         cleanup_payload = None
         if not deleted:
             cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
@@ -1841,6 +2257,13 @@ def _process_local_document(
     try:
         try:
             extracted = load_extracted_pickle(document_id)
+            if isinstance(extracted, dict):
+                pickle_keys = list(extracted.keys())
+                has_screening = "screening" in extracted
+                logger.info(
+                    "Loaded pickle for %s: keys=%s, has_screening=%s",
+                    document_id, pickle_keys, has_screening,
+                )
         except Exception as exc:  # noqa: BLE001
             error_message = _truncate_error_message(str(exc) or repr(exc))
             logger.error(
@@ -2035,6 +2458,8 @@ def _process_local_document(
 
         if total_chunks != total_upserted:
             error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
+            if telemetry:
+                telemetry.increment("embed_qdrant_upsert_fail_total")
             error_payload = _build_error_payload(
                 stage="embedding",
                 message=error_msg,
@@ -2084,7 +2509,7 @@ def _process_local_document(
             },
         )
 
-        _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
 
         post_count: Optional[int] = None
         cleanup_allowed = True
@@ -2094,11 +2519,11 @@ def _process_local_document(
                 post_count, cleanup_allowed = _verify_post_upsert_count(
                     subscription_id=subscription_id,
                     profile_id=profile_id,
-                    document_id=document_id,
+                    document_id=doc_id,
                     expected_chunks=total_chunks,
                 )
                 if post_count is not None:
-                    logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
+                    logger.info("Post-upsert Qdrant points for %s: %s", doc_id, post_count)
                 if not cleanup_allowed:
                     cleanup_error = (
                         {"message": "post_upsert_count_unavailable"}
@@ -2111,7 +2536,7 @@ def _process_local_document(
                     )
                     logger.warning(
                         "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
-                        document_id,
+                        doc_id,
                         post_count,
                         total_chunks,
                     )
@@ -2121,24 +2546,19 @@ def _process_local_document(
                 logger.warning(
                     "embed_request_id=%s doc=%s post-upsert count failed: %s",
                     embed_request_id,
-                    document_id,
+                    doc_id,
                     exc,
                 )
 
         deleted = False
+        # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            try:
-                deleted = delete_extracted_pickle(document_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "embed_request_id=%s doc=%s local pickle delete failed: %s",
-                    embed_request_id,
-                    document_id,
-                    exc,
-                )
-                deleted = False
+            logger.info("Skipping pickle deletion for %s (preserve enabled)", doc_id)
+            if telemetry:
+                telemetry.increment("embed_pickles_retained_total")
+            deleted = False
             if not deleted:
-                cleanup_error = {"message": "local_pickle_delete_failed"}
+                cleanup_error = {"message": "pickle_retained"}
         cleanup_payload = None
         if not deleted:
             cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
@@ -2149,7 +2569,7 @@ def _process_local_document(
                 details=cleanup_details,
             )
         _safe_update_stage(
-            document_id,
+            doc_id,
             "cleanup",
             {
                 "pickle_deleted": deleted,
@@ -2203,6 +2623,36 @@ def _process_local_document(
             result.get("status"),
         )
         request_ctx.__exit__(*sys.exc_info())
+
+
+def _maybe_trigger_dpie_retrain(
+    subscription_id: Optional[str],
+    profile_id: Optional[str],
+) -> None:
+    """Trigger DPIE retrain if new data was embedded and models are stale."""
+    if not subscription_id or not profile_id:
+        return
+    try:
+        from src.intelligence.dpie_integration import DPIERegistry
+        from src.api.rag_state import get_app_state
+
+        state = get_app_state()
+        if not state or not state.qdrant_client or not state.embedding_model:
+            return
+        registry = DPIERegistry.get()
+        if not registry.is_loaded:
+            return  # Not yet initialized; startup/query triggers will handle it
+        collection_name = str(subscription_id)
+        if registry.needs_retrain(state.qdrant_client, collection_name, str(profile_id)):
+            registry.retrain_async(
+                state.qdrant_client,
+                state.embedding_model,
+                collection_name,
+                str(subscription_id),
+                str(profile_id),
+            )
+    except Exception as exc:
+        logger.debug("DPIE retrain trigger skipped: %s", exc)
 
 
 def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2312,7 +2762,9 @@ def _embed_from_local_pickles(
                 )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
-    return _build_embed_summary(results)
+    summary = _build_embed_summary(results)
+    _maybe_trigger_dpie_retrain(subscription_id, profile_id)
+    return summary
 
 
 def embed_documents(
@@ -2413,7 +2865,9 @@ def embed_documents(
         if telemetry:
             telemetry.increment("embed_pickles_processed_total")
 
-    return _build_embed_summary(results)
+    summary = _build_embed_summary(results)
+    _maybe_trigger_dpie_retrain(subscription_id, profile_id)
+    return summary
 
 
 def embedding_integrity_report(

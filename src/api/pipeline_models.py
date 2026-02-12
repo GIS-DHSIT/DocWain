@@ -17,6 +17,7 @@ class Table:
     page: int
     text: str
     csv: Optional[str] = None
+    structured: Optional[Any] = None  # StructuredTable when available
 
 
 @dataclass
@@ -32,6 +33,7 @@ class ChunkCandidate:
     section_title: str
     section_id: Optional[str]
     chunk_type: str = "text"
+    table_meta: Optional[Dict[str, Any]] = None
 
 
 @dataclass

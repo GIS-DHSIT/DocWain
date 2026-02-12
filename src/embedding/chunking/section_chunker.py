@@ -29,6 +29,26 @@ _PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", r
 _BOILERPLATE_RE = re.compile(r"^\s*(confidential|draft|internal use only)\s*$", re.IGNORECASE)
 
 
+def _safe_text(item: Any) -> str:
+    """Extract text from a list item that might be a string, dict, or object.
+
+    Never calls str() on dicts/objects — that produces metadata garbage.
+    """
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        for key in ("text", "content", "full_text", "raw_text", "canonical_text"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return ""
+    if hasattr(item, "text"):
+        val = getattr(item, "text", "")
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
 def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if value is None:
@@ -98,12 +118,52 @@ def _is_heading_line(line: str) -> bool:
 
 
 def _infer_sections_from_text(text: str, *, fallback_title: str) -> List[Section]:
-    """Infer sections using heading-like lines when explicit sections are missing."""
+    """Infer sections using heading-like lines when explicit sections are missing.
+
+    Strategy 1: DPIE ML-based section detection (if available).
+    Strategy 2: Regex-based heading detection (always available).
+    """
     normalized = normalize_text(text)
     if not normalized:
         return []
 
-    sections: List[Section] = []
+    # ── Strategy 1: DPIE ML section detection ──────────────────────────
+    try:
+        from src.intelligence.dpie_integration import DPIERegistry
+
+        registry = DPIERegistry.get_instance()
+        if registry.is_loaded:
+            dpie_sections = registry.detect_sections(normalized[:10000])
+            if dpie_sections:
+                all_lines = normalized.splitlines()
+                sections: List[Section] = []
+                for sec in dpie_sections:
+                    start = sec.get("start_line", 0)
+                    end = sec.get("end_line", len(all_lines) - 1)
+                    heading = sec.get("heading", fallback_title) or fallback_title
+                    body = "\n".join(all_lines[start : end + 1]).strip()
+                    if not body:
+                        continue
+                    section_id = hashlib.sha1(
+                        f"{heading}|1".encode("utf-8")
+                    ).hexdigest()[:12]
+                    sections.append(
+                        Section(
+                            section_id=section_id,
+                            title=heading,
+                            level=1,
+                            start_page=1,
+                            end_page=1,
+                            text=body,
+                        )
+                    )
+                if sections:
+                    return sections
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── Strategy 2: Regex heading detection (fallback) ─────────────────
+    sections = []
     current_title = fallback_title
     current_lines: List[str] = []
 
@@ -311,7 +371,7 @@ class SectionChunker:
                 end_page=1,
                 text="",
             )
-            blocks = [Block(normalize_text(str(t)), "text", None, None) for t in payload.get("texts") or [] if str(t).strip()]
+            blocks = [Block(normalize_text(_safe_text(t)), "text", None, None) for t in payload.get("texts") or [] if _safe_text(t).strip()]
             return [("Structured Content", fake_section, blocks)]
 
         sections_raw = payload.get("sections")
@@ -623,6 +683,26 @@ class SectionChunker:
             parts.append(block.text)
         chunk_text = "\n\n".join(part for part in parts if part).strip()
         return chunk_text, page_start, page_end
+
+    def _build_table_chunk_meta(self, table_text: str) -> Optional[Dict[str, Any]]:
+        """Extract column headers from table text for chunk metadata."""
+        lines = [ln.strip() for ln in table_text.splitlines() if ln.strip()]
+        if not lines:
+            return None
+
+        # Try pipe-delimited format
+        if "|" in lines[0]:
+            headers = [h.strip() for h in lines[0].split("|") if h.strip()]
+            if headers and len(headers) >= 2:
+                return {"table_headers": headers, "table_rows": len(lines) - 1}
+
+        # Try comma-delimited format
+        if "," in lines[0]:
+            headers = [h.strip() for h in lines[0].split(",") if h.strip()]
+            if headers and len(headers) >= 2:
+                return {"table_headers": headers, "table_rows": len(lines) - 1}
+
+        return None
 
     def _is_sentence_complete(self, text: str, block_type: str) -> bool:
         stripped = (text or "").strip()

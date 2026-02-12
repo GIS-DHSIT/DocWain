@@ -89,6 +89,7 @@ from src.quality.telemetry import emit_quality_telemetry
 from src.retrieval.profile_document_index import build_profile_document_index
 from src.retrieval.retrieval_planner import RetrievalPlanner
 from src.intent.llm_intent import parse_intent
+from src.intelligence.conversation_state import ConversationState, ProgressiveSummarizer
 
 try:
     import torch
@@ -569,14 +570,13 @@ def _format_evidence_fallback(query: str, ledger: List[Dict[str, str]]) -> str:
             value = _find_field_value(field, ledger)
             if value:
                 lines.append(f"- {field}: {value}")
-            else:
-                lines.append(f"- {field}: Not available in retrieved context")
+            # else: omit field entirely
     if ledger:
         lines.append("Evidence snippets:")
         for entry in ledger:
             lines.append(f"- {entry['doc_name']}: {entry['snippet']}")
     else:
-        lines.append("Not available in retrieved context.")
+        lines.append("No matching information was found in the documents.")
     return "\n".join(lines).strip()
 
 
@@ -3269,6 +3269,13 @@ class EnterpriseRAGSystem:
             self.conversation_history = ConversationHistory(max_turns=3, redis_client=redis_client)
             self.conversation_summarizer = ConversationSummarizer(self.llm_client)
             self.feedback_memory = ChatFeedbackMemory(max_items=12, redis_client=redis_client)
+            self.conversation_state = ConversationState(
+                conversation_history=self.conversation_history,
+                redis_client=redis_client,
+            )
+            self.progressive_summarizer = ProgressiveSummarizer(
+                llm_client=self.llm_client,
+            )
             self._warm_up_llm()
 
             neo4j_store = None
@@ -3916,6 +3923,7 @@ class EnterpriseRAGSystem:
             if effective_new_session:
                 logger.info("Resetting conversation context for new session: %s", session_id or "default")
                 self.conversation_history.clear_history(namespace, user_id)
+                self.conversation_state.clear(namespace, user_id)
                 try:
                     self.feedback_memory.clear(namespace, user_id)
                 except Exception as feedback_exc:
@@ -4005,6 +4013,8 @@ class EnterpriseRAGSystem:
                         redis_client=self.redis_client,
                         embedder=self.model,
                         cross_encoder=getattr(self.reranker, "cross_encoder", None),
+                        tools=tool_list if use_tooling else None,
+                        tool_inputs=tool_inputs if use_tooling else None,
                     )
                     if v3_answer:
                         return v3_answer
@@ -4089,6 +4099,11 @@ class EnterpriseRAGSystem:
                     logger.warning("Intelligent pipeline failed, falling back: %s", exc)
 
             logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
+
+            resolved_query = self.conversation_state.resolve_query(query, namespace, user_id)
+            if resolved_query != query:
+                logger.info("Context resolution: '%s' -> '%s'", query, resolved_query)
+                query = resolved_query
 
             retrieval_start = time.time()
             try:
@@ -4626,7 +4641,13 @@ class EnterpriseRAGSystem:
                     context = (context or "") + "\n\n".join(tool_chunks)
 
             conversation_context = self.conversation_history.get_context(namespace, user_id, max_turns=3)
-            conversation_summary = self.conversation_summarizer.summarize(conversation_context)
+            if self.conversation_state.enriched_turns:
+                last_turn = self.conversation_state.enriched_turns[-1]
+                conversation_summary = self.progressive_summarizer.update(
+                    last_turn, self.progressive_summarizer.get_summary()
+                )
+            else:
+                conversation_summary = self.conversation_summarizer.summarize(conversation_context)
             adapter_text = DomainPromptAdapter.build_adapter(profile_context_data, query)
             feedback_text = self.feedback_memory.build_feedback_context(namespace, user_id, limit=5)
             evidence_synthesis = None
@@ -4866,7 +4887,10 @@ class EnterpriseRAGSystem:
             sources = context_sources or self.context_builder.extract_sources(final_chunks)
             answer = render_source_citations(answer, sources)
 
-            self.conversation_history.add_turn(namespace, user_id, query, answer)
+            self.conversation_state.record_turn(
+                namespace, user_id, query, answer,
+                resolved_query=resolved_query if 'resolved_query' in dir() and resolved_query != query else None,
+            )
             final_doc_ids = [
                 (chunk.metadata or {}).get("document_id") for chunk in final_chunks
             ]

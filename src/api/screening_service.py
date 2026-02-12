@@ -88,9 +88,30 @@ def _status_from_security_report(report: Dict[str, Any]) -> str:
     return "passed" if risk_level and risk_level not in {"HIGH", "CRITICAL"} else "failed"
 
 
+def _update_pickle_with_screening(document_id: str, screening_report: Dict[str, Any]) -> None:
+    """Load existing pickle, add screening results, re-save."""
+    try:
+        from src.api.content_store import load_extracted_pickle, save_extracted_pickle
+
+        existing = load_extracted_pickle(document_id)
+        if isinstance(existing, dict):
+            existing["screening"] = screening_report
+        else:
+            existing = {"raw": existing, "screening": screening_report}
+        save_extracted_pickle(document_id, existing)
+        logger.info("Updated pickle with screening results for %s", document_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to update pickle with screening for %s: %s", document_id, exc)
+
+
 def apply_security_result(document_id: str, report: Dict[str, Any]) -> None:
     status_text = _status_from_security_report(report)
     update_security_screening(document_id, report, status_text)
+    _update_pickle_with_screening(document_id, {
+        "status": status_text,
+        "risk_level": str(report.get("overall_risk_level") or report.get("risk_level") or ""),
+        "report": report,
+    })
     record = get_document_record(document_id) or {}
     current_status = record.get("status")
     if status_text == "passed":
