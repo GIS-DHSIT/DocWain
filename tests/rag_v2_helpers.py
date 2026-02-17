@@ -25,6 +25,9 @@ class FakeQdrant:
         self._payload_schema = {
             "subscription_id": {}, "subscriptionId": {}, "subscription.id": {},
             "profile_id": {}, "profileId": {},
+            "document_id": {}, "source_name": {}, "doc_domain": {},
+            "section_kind": {}, "section_id": {}, "chunk_kind": {},
+            "chunk_id": {}, "page": {}, "embed_pipeline_version": {},
         }
 
     def get_collection(self, collection_name):  # noqa: ANN001

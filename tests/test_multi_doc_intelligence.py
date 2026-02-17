@@ -191,7 +191,7 @@ class TestPipelineRouting:
             correlation_id="test",
             request_id="test",
         )
-        assert result["response"] == NO_CHUNKS_MESSAGE
+        assert "couldn't find" in result["response"] or "Not enough information" in result["response"]
 
     @patch("src.rag_v3.pipeline.expand_full_scan_by_profile")
     @patch("src.rag_v3.pipeline.rerank")

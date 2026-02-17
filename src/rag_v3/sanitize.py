@@ -4,6 +4,9 @@ import re
 
 FALLBACK_ANSWER = "Not enough information in the documents to answer that."
 
+# Matches C0/C1 control characters EXCEPT \t (0x09), \n (0x0a), \r (0x0d).
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
 # Stray 'n' from escaped newlines: "HANAn Sales" → "HANA Sales"
 _STRAY_N_RE = re.compile(r"(?<=[a-zA-Z0-9.,:;)>])\s*\bn\s+(?=[A-Z])")
 _LEADING_N_RE = re.compile(r"(?m)^\s*n\b\s+")
@@ -25,8 +28,8 @@ _BROKEN_HYPHEN_RE = re.compile(r"(\w) - (\w)")
 
 def sanitize_text(text: str) -> str:
     if not text:
-        return FALLBACK_ANSWER
-    cleaned = str(text)
+        return ""
+    cleaned = _CONTROL_CHAR_RE.sub("", str(text))
     # Re-join broken compound-word hyphens
     cleaned = _BROKEN_HYPHEN_RE.sub(r"\1-\2", cleaned)
     # Strip stray 'n' artifacts
@@ -36,7 +39,7 @@ def sanitize_text(text: str) -> str:
     cleaned = _METADATA_LEAK_RE.sub("", cleaned)
     # Normalize whitespace per line
     cleaned = "\n".join(line.strip() for line in cleaned.splitlines() if line.strip())
-    return cleaned or FALLBACK_ANSWER
+    return cleaned or ""
 
 
 def sanitize(text: str) -> str:

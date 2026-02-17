@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 INTENT_CACHE_MAX = 512
 INTENT_CACHE_TTL_SEC = 60 * 60
-INTENT_TIMEOUT_MS = 180
+INTENT_TIMEOUT_MS = 500
 INTENT_MAX_TOKENS = 160
 
 _INTENT_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -257,13 +257,15 @@ def _heuristic_parse(query: str) -> Dict[str, Any]:
         intent = "extract"
     elif re.search(r"\b(contact|email|phone|reach|linkedin)\b", lowered):
         intent = "contact"
+    elif re.search(r"\b(generate|write|draft|create|compose|prepare)\b", lowered):
+        intent = "generate"
 
     domain = "generic"
-    if any(tok in lowered for tok in ("resume", "cv", "candidate", "experience")):
+    if any(tok in lowered for tok in ("resume", "cv", "candidate", "experience", "skills", "qualifications")):
         domain = "resume"
-    elif any(tok in lowered for tok in ("invoice", "amount due", "billing")):
+    elif any(tok in lowered for tok in ("invoice", "amount due", "billing", "payment", "total amount")):
         domain = "invoice"
-    elif any(tok in lowered for tok in ("contract", "agreement", "clause")):
+    elif any(tok in lowered for tok in ("contract", "agreement", "clause", "legal", "terms and conditions")):
         domain = "legal"
 
     output_format = "bullets"
@@ -285,6 +287,12 @@ def _heuristic_parse(query: str) -> Dict[str, Any]:
         fields.append("linkedin")
     if "skills" in lowered:
         fields.append("skills")
+    if re.search(r"\b(education|degree|university|college)\b", lowered):
+        fields.append("education")
+    if re.search(r"\b(certification|certificate|certified)\b", lowered):
+        fields.append("certifications")
+    if re.search(r"\b(experience|work history|employment)\b", lowered):
+        fields.append("experience")
 
     # Extract entity hints — find capitalized names that aren't common English words
     entity_hints = []

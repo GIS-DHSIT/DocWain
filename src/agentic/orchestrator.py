@@ -74,8 +74,26 @@ def run_agent_mode(
     except Exception:
         companion_payload = None
 
+    # --- Auto-tool selection -------------------------------------------
+    auto_tools: List[str] = []
+    try:
+        if getattr(Config.Execution, "AGENT_AUTO_TOOLS", True):
+            from src.agentic.tool_selector import ToolSelector
+            selector = ToolSelector()
+            auto_tools = selector.select_tools(
+                query=str(query_text),
+                intent_parse=analysis if "analysis" in locals() else None,
+            )
+            if auto_tools:
+                ctx.with_tools(auto_tools)
+                logger.info("Agent auto-selected tools: %s", ctx.tools)
+    except Exception:
+        logger.debug("Auto-tool selection skipped", exc_info=True)
+
     trace: List[Dict[str, Any]] = _bounded_trace(max_steps)
     trace.append({"phase": "planning", "detail": "Decomposing request and goals", "timestamp": time.time()})
+    if auto_tools:
+        trace.append({"phase": "tool_selection", "detail": f"Auto-selected tools: {auto_tools}", "timestamp": time.time()})
     trace.append({"phase": "retrieval", "detail": "Collecting evidence", "timestamp": time.time()})
 
     # Ensure agentic path uses the configured default model unless explicitly overridden.

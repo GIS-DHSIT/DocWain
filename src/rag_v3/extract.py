@@ -72,9 +72,22 @@ def schema_extract(
     scope_document_id: Optional[str] = None,
     domain_hint: Optional[str] = None,
     intent_hint: Optional[str] = None,
+    query_focus: Optional[Any] = None,
 ) -> ExtractionResult:
     domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint, intent_hint=intent_hint)
-    schema = _deterministic_extract(domain, intent, query, chunks)
+
+    # Handle domain mismatch: query asks for a domain that doesn't match the actual chunks
+    if domain == "mismatch":
+        query_domain = _query_domain_override(query) or "unknown"
+        chunk_domain = _majority_chunk_domain(chunks) or "unknown"
+        _DOMAIN_LABEL = {"hr": "resumes", "resume": "resumes", "invoice": "invoices", "legal": "legal documents"}
+        asked = _DOMAIN_LABEL.get(query_domain, query_domain)
+        available = _DOMAIN_LABEL.get(chunk_domain, chunk_domain)
+        msg = f"No {asked} found in this profile. The available documents are {available}."
+        schema = GenericSchema(facts=FieldValuesField(items=[FieldValue(label=None, value=msg, evidence_spans=[])]))
+        return ExtractionResult(domain=chunk_domain, intent=intent, schema=schema)
+
+    schema = _deterministic_extract(domain, intent, query, chunks, query_focus=query_focus)
 
     if _schema_is_empty(schema) and llm_client and budget.consume():
         llm_schema = _llm_extract(domain, intent, query, chunks, llm_client, correlation_id)
@@ -88,13 +101,18 @@ def schema_extract(
     return ExtractionResult(domain=domain, intent=intent, schema=schema)
 
 
-_HR_CONTENT_HINTS = ("resume", "candidate", "skills", "experience", "education", "certification")
+_HR_CONTENT_HINTS = (
+    "resume", "candidate", "skills", "experience", "education", "certification",
+    "employment", "designation", "qualification", "career", "profile summary",
+    "work history", "professional", "objective", "achievements",
+)
 _INVOICE_CONTENT_HINTS = ("invoice", "amount due", "bill to", "total due", "payment terms")
 _LEGAL_CONTENT_HINTS = ("contract", "agreement", "clause", "liability", "parties")
 
 # Strong query signals that override chunk-based domain detection
 _QUERY_HR_STRONG = ("resume", "cv", "curriculum vitae", "candidate")
-_QUERY_HR_WEAK = ("skills", "education", "certification", "certifications", "experience", "achievements")
+_QUERY_HR_WEAK = ("skills", "education", "certification", "certifications", "experience", "achievements",
+                   "profile", "qualified", "suitable", "background", "career", "designation", "work history")
 _QUERY_INVOICE_STRONG = ("invoice", "invoices", "payment", "bill", "amount due")
 _QUERY_LEGAL_STRONG = ("contract", "agreement", "clause", "liability")
 
@@ -110,8 +128,20 @@ def _query_domain_override(query: str) -> Optional[str]:
         return "invoice"
     if any(token in lowered for token in _QUERY_LEGAL_STRONG):
         return "legal"
-    # Weak HR signals — need at least 2 to count as HR query
-    if sum(1 for token in _QUERY_HR_WEAK if token in lowered) >= 2:
+    # Weak HR signals — a single match is sufficient (skills/education/etc. are unambiguously HR)
+    if any(token in lowered for token in _QUERY_HR_WEAK):
+        return "hr"
+    if not query:
+        return None
+    # Person-name possessive: "Gaurav's profile", "Dhayal's career"
+    if re.search(r"\b[A-Z][a-z]+(?:'s)\s+(?:profile|summary|background|details|career|role|strengths|weaknesses)", query):
+        return "hr"
+    # Reasoning about a person: "Is Gokul qualified for...", "Can Dev handle..."
+    if re.search(r"\b(?:is|does|can|would)\s+[A-Z][a-z]+\b.*\b(?:qualified|suitable|fit|capable|eligible|ready)\b", query, re.I):
+        return "hr"
+    # Summarize/describe a person: "Summarize Gaurav", "Describe Dev's experience"
+    # Use case-insensitive for verb, but require capitalized name (proper noun)
+    if re.search(r"(?i:summarize|describe|tell\s+me\s+about)\s+[A-Z][a-z]+", query):
         return "hr"
     return None
 
@@ -127,10 +157,17 @@ def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
     if domain_counts:
         best = max(domain_counts, key=domain_counts.get)
         domain_map = {"resume": "hr", "hr": "hr", "invoice": "invoice", "legal": "legal"}
-        return domain_map.get(best, best)
+        mapped = domain_map.get(best, best)
+        # Content-based correction: if metadata says non-HR but content looks like a resume,
+        # override to HR (handles misclassified resume data, e.g., SAP EWM resume → purchase_order)
+        if mapped not in ("hr", "invoice", "legal"):
+            sample = " ".join((getattr(c, "text", "") or "")[:500] for c in chunks[:10]).lower()
+            if any(h in sample for h in _HR_CONTENT_HINTS):
+                return "hr"
+        return mapped
 
     # Content-based fallback when metadata is missing
-    sample = " ".join((getattr(c, "text", "") or "")[:200] for c in chunks[:3]).lower()
+    sample = " ".join((getattr(c, "text", "") or "")[:500] for c in chunks[:5]).lower()
     if any(h in sample for h in _HR_CONTENT_HINTS):
         return "hr"
     if any(h in sample for h in _INVOICE_CONTENT_HINTS):
@@ -152,18 +189,29 @@ def _infer_domain_intent(
     route through the structured HR extractor instead of the generic one.
     """
     # Detect domain: query signals first, then chunk metadata majority
+    # Cross-check: flag mismatch when query asks for invoice/legal but chunks are HR
+    # (prevents InvoiceSchema extraction from resume text)
+    # Trust query override when it says HR — user may be correcting misclassified chunks
     domain = (domain_hint or "").strip().lower()
     if not domain or domain == "generic":
-        # Query-based override takes precedence (e.g., "Abinaya's resume" → hr)
         query_domain = _query_domain_override(query)
-        if query_domain:
-            domain = query_domain
-        else:
-            detected = _majority_chunk_domain(chunks)
-            if detected:
-                domain = detected
+        chunk_domain = _majority_chunk_domain(chunks)
+        if query_domain and chunk_domain:
+            _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal"}
+            q_family = _DOMAIN_FAMILY.get(query_domain, query_domain)
+            c_family = _DOMAIN_FAMILY.get(chunk_domain, chunk_domain)
+            if q_family != c_family and q_family != "hr":
+                # Query asks for invoice/legal but chunks are a different domain → mismatch
+                domain = "mismatch"
             else:
-                domain = "generic"
+                # Query says HR, or domains match — trust query
+                domain = query_domain
+        elif query_domain:
+            domain = query_domain
+        elif chunk_domain:
+            domain = chunk_domain
+        else:
+            domain = "generic"
 
     intent = _normalize_intent_hint(intent_hint) or "summary"
     lowered_query = (query or "").lower()
@@ -197,14 +245,14 @@ def _looks_like_hr_total(text: str) -> bool:
     )
 
 
-def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[Any]):
+def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[Any], *, query_focus: Optional[Any] = None):
     """Route to domain-specific extractor when domain is known, else generic."""
     if domain in ("hr", "resume"):
         return _extract_hr(chunks)
-    return _extract_document_intelligence(query, chunks)
+    return _extract_document_intelligence(query, chunks, query_focus=query_focus)
 
 
-def _extract_document_intelligence(query: str, chunks: List[Any]) -> GenericSchema:
+def _extract_document_intelligence(query: str, chunks: List[Any], *, query_focus: Optional[Any] = None) -> GenericSchema:
     """Universal document intelligence extraction.
 
     Works for ANY document type by analysing content structure
@@ -297,6 +345,20 @@ def _extract_document_intelligence(query: str, chunks: List[Any]) -> GenericSche
 
     # ── Phase 4: Score and sort by query relevance ──────────────────────
     facts = _score_and_sort_facts(facts, keywords, query, intent=intent)
+
+    # ── Phase 4b: Query-focus soft cap — when focus has clear field_tags,
+    # limit non-matching facts to 3 per document to emphasize relevant content.
+    if query_focus and not query_focus.is_exhaustive and getattr(query_focus, "field_tags", None):
+        from .query_focus import score_fact_relevance as _sfr
+        matching: list = []
+        non_matching: list = []
+        for f in facts:
+            rel = _sfr(f.label or "", f.value or "", query_focus)
+            if rel >= 0.15:
+                matching.append(f)
+            else:
+                non_matching.append(f)
+        facts = matching + non_matching[:3]
 
     # ── Phase 5: Limit and fallback ─────────────────────────────────────
     facts = facts[:60]
@@ -587,14 +649,16 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                     chunks_by_section[doc_id][sec_kind].append((chunk_id, sec_text, sec_kind))
                 continue  # Skip normal single-section processing
 
-        # If section_kind is generic OR belongs to a different domain (e.g., invoice
-        # section kinds on a resume document), re-infer from actual content.
+        # If section_kind is generic, too broad (projects covers mixed content),
+        # or belongs to a different domain (e.g., invoice section kinds on a
+        # resume document), re-infer from actual content.
         _WRONG_DOMAIN_KINDS = {
             "financial_summary", "line_items", "invoice_metadata",
             "parties_addresses", "terms_conditions",
         }
+        _TOO_BROAD_KINDS = {"projects", "section_summary"}
         inferred = False
-        if not section_kind or section_kind in ("section_text", "misc") or section_kind in _WRONG_DOMAIN_KINDS:
+        if not section_kind or section_kind in ("section_text", "misc") or section_kind in _WRONG_DOMAIN_KINDS or section_kind in _TOO_BROAD_KINDS:
             section_kind = _infer_section_kind_from_content(text, section_title)
             inferred = True
 
@@ -649,6 +713,13 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                         cleaned = " ".join(text.split())[:500]  # Take first 500 chars
                         cand.experience_summary = cleaned
                         _append_span(cand, chunk_id, cleaned[:120], span_seen)
+                    # Summary/objective often contains years of experience
+                    if text and not cand.total_years_experience:
+                        years = _extract_years_experience(text)
+                        if years:
+                            cand.total_years_experience = years
+                            _append_span(cand, chunk_id, years, span_seen)
+                    if cand.experience_summary:
                         break
                 if cand.experience_summary:
                     break
@@ -794,6 +865,29 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                         _append_span(cand, chunk_id, item[:120], span_seen)
                     break
 
+        # Mine section_text chunks (failed re-inference) for missed fields
+        for section_key in sections:
+            if not section_key.startswith("section_text"):
+                continue
+            for chunk_id, text, section_title in sections[section_key]:
+                if not text:
+                    continue
+                # Try extracting skills from unclassified chunks
+                if not cand.technical_skills:
+                    tech_items = _flatten_skill_block(_split_lines(text))
+                    if tech_items:
+                        cand.technical_skills = _merge_list(cand.technical_skills, tech_items)
+                # Try extracting education
+                if not cand.education:
+                    edu_items = _parse_education_block(_split_lines(text))
+                    if edu_items:
+                        cand.education = _merge_list(cand.education, edu_items)
+                # Try extracting years of experience
+                if not cand.total_years_experience:
+                    years = _extract_years_experience(text)
+                    if years:
+                        cand.total_years_experience = years
+
         # Extract contact info from all chunks
         for section_chunks in sections.values():
             for chunk_id, text, _ in section_chunks:
@@ -901,6 +995,7 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                             break
 
                 # Fallback: Take first substantial paragraph as summary
+                # Prefer experience/project descriptions over skill lists
                 if not cand.experience_summary:
                     # Collect multi-line summary from first meaningful text
                     summary_lines = []
@@ -918,6 +1013,15 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                                 ['skills', 'education', 'contact', 'certification',
                                  'key skills', 'technical', 'personal details', 'extracted document',
                                  'section_id', 'chunk_type']):
+                                continue
+                            # Skip comma-separated skill/tool lists (e.g., "Python, SQL, Docker, React")
+                            comma_count = cleaned.count(',')
+                            if comma_count >= 3 and len(cleaned) < 300:
+                                avg_item_len = len(cleaned) / (comma_count + 1)
+                                if avg_item_len < 25:
+                                    continue  # Short comma-separated items = skill list
+                            # Skip bullet-point lists of tools (e.g., "• Python • SQL • Docker")
+                            if cleaned.count('•') >= 3:
                                 continue
                             if len(cleaned) > 20:
                                 summary_lines.append(cleaned)
@@ -944,17 +1048,12 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
     for cand in candidates:
         _sanitize_candidate(cand)
 
-    # Last-resort name extraction: use cleaned filename when all other methods fail
+    # Last-resort name extraction: use the canonical _name_from_filename helper
     for doc_id, cand in by_doc.items():
         if not cand.name and doc_id in doc_names:
-            fname = doc_names[doc_id]
-            # Strip extension, underscores, and common noise words
-            cleaned = re.sub(r"\.(pdf|docx?|rtf)$", "", fname, flags=re.IGNORECASE)
-            cleaned = re.sub(r"[_\-]+", " ", cleaned)
-            cleaned = re.sub(r"\b(?:resume|cv|profile|linkedin|update\d*|new|old|final|draft|copy|v\d+|dev|ip)\b", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            if cleaned and len(cleaned) >= 2:
-                cand.name = _smart_title_case(cleaned)
+            filename_name = _name_from_filename(doc_names[doc_id])
+            if filename_name:
+                cand.name = filename_name
 
     for cand in candidates:
         missing = cand.missing_reason or {}
@@ -1068,7 +1167,28 @@ def _sanitize_field_list(items: Optional[List[str]], max_item_length: int = 100)
         "details", "introduction", "contact", "personal", "profile",
         "references", "declaration", "hobbies", "interests",
         "certifications", "achievements", "awards", "languages",
+        "projects", "project details",
     }
+
+    # Pattern for project titles that leak as skills
+    _project_title_re = re.compile(
+        r"^\s*(?:Projects?\s+)?(?:[A-Z][a-zA-Z]+\s+){1,4}"
+        r"(?:Classifier|Predictor|Tracker|Monitor|Detector|Generator|Builder|System|App|Application|Tool|Platform)\b",
+        re.IGNORECASE,
+    )
+
+    # Date range patterns that pollute skill/cert entries
+    _date_tail_re = re.compile(
+        r"\s*\(?\s*(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4}\s*[\-–—]\s*"
+        r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)?\s*\d{4}\s*\)?\s*$",
+        re.IGNORECASE,
+    )
+    # Sentence-start patterns (bullet points + action verbs)
+    _sentence_re = re.compile(
+        r"^[●•▪■]\s+"
+        r"|^(?:Implemented|Developed|Designed|Created|Built|Led|Managed|Worked|Used|Applied|Integrated|Achieved|Configured)\b",
+        re.IGNORECASE,
+    )
 
     cleaned = []
     seen = set()
@@ -1082,11 +1202,21 @@ def _sanitize_field_list(items: Optional[List[str]], max_item_length: int = 100)
         item = " ".join(item.replace("\\n", " ").split()).strip().strip(",").strip().rstrip(".")
         if not item:
             continue
+        # Strip date range tails: "ANN (OCT 2023 – NOV 2023)" → "ANN"
+        item = _date_tail_re.sub("", item).strip()
+        if not item:
+            continue
+        # Skip items that look like sentences (bullet point + verb)
+        if _sentence_re.search(item) and len(item) > 30:
+            continue
         # Skip items containing metadata artifact patterns
         if _artifact_patterns.search(item):
             continue
         # Skip single-word section headers used as skill items
         if item.strip().lower().rstrip('.') in _section_header_items:
+            continue
+        # Skip project titles that leak as skills (e.g., "Stock Profit Classifier")
+        if _project_title_re.search(item):
             continue
         # Skip items starting with conjunctions (split sentence fragments)
         if re.match(r"^(?:and|or|but|nor)\s+", item, re.IGNORECASE) and len(item) < 50:
@@ -1115,7 +1245,18 @@ def _sanitize_candidate(cand: Candidate) -> None:
 
     # Clean experience summary
     if cand.experience_summary:
-        cand.experience_summary = _sanitize_field_value(cand.experience_summary, max_length=500)
+        summary = cand.experience_summary
+        # Strip leading "Projects" + everything up to first bullet point
+        # e.g., "Projects Stock Profit Classifier | Python,Flask,...ANN (OCT 2023 – NOV 2023) ●..." → "●..."
+        summary = re.sub(
+            r"^Projects?\b[^●•▪■]*(?=[●•▪■])",
+            "", summary, count=1, flags=re.IGNORECASE,
+        ).strip()
+        # Strip orphaned closing parentheses/brackets at start
+        summary = re.sub(r"^[)\]}\s]+", "", summary).strip()
+        # Strip leading bullet/action items
+        summary = re.sub(r"^[●•▪■\-*]\s*", "", summary)
+        cand.experience_summary = _sanitize_field_value(summary, max_length=500) if summary else None
 
     # Clean total years experience
     if cand.total_years_experience:
@@ -2301,6 +2442,11 @@ def _looks_like_name(value: str) -> bool:
         'results oriented', 'detail oriented', 'highly motivated',
         'cross functional team', 'team lead', 'cross functional collaboration',
         'functional team', 'team collaboration',
+        # Project/product names
+        'stock profit', 'profit classifier', 'machine learning', 'deep learning',
+        'natural language', 'neural network', 'web application', 'mobile application',
+        'data pipeline', 'real time', 'open source', 'full stack',
+        'front end', 'back end', 'cloud computing', 'big data',
     }
     value_lower = value_cleaned.lower()
     if any(phrase in value_lower for phrase in phrases_not_names):
@@ -2340,6 +2486,14 @@ def _looks_like_name(value: str) -> bool:
         # Additional section header words
         'language', 'languages', 'proficiency', 'hobbies', 'interests',
         'references', 'declaration', 'signature', 'date', 'birth',
+        # Project/product name words — never part of a person's name
+        'stock', 'profit', 'classifier', 'predictor', 'tracker', 'monitor',
+        'builder', 'generator', 'detector', 'parser', 'compiler', 'optimizer',
+        'scheduler', 'calculator', 'converter', 'processor', 'handler',
+        'factory', 'wrapper', 'helper', 'logger', 'checker', 'scanner',
+        'validator', 'formatter', 'pipeline', 'framework', 'module',
+        'application', 'platform', 'service', 'network', 'learning',
+        'computing', 'database', 'storage', 'automation', 'integration',
     }
     if any(part.lower() in non_name_words for part in parts):
         return False
@@ -2370,7 +2524,10 @@ def _name_from_filename(doc_name: str) -> Optional[str]:
     cleaned = re.sub(r"\b(resume|cv|profile|linkedin)\b", "", cleaned, flags=re.IGNORECASE)
     # Strip common filename noise BEFORE name check
     cleaned = re.sub(r"\b(?:update|version|rev)\d*\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\b(?:dev|ip|prod|test|doc|file|scan|scanned)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:ip|prod|test|doc|file|scan|scanned)\b", "", cleaned, flags=re.IGNORECASE)
+    # Strip leading/trailing numbers and parenthesized dedup suffixes — "21 Gokul (1)" → "Gokul"
+    cleaned = re.sub(r"^\d+\s*", "", cleaned)
+    cleaned = re.sub(r"\s*\(\d+\)\s*", " ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if _looks_like_name(cleaned):
         return _smart_title_case(cleaned)
@@ -2380,6 +2537,8 @@ def _name_from_filename(doc_name: str) -> Optional[str]:
         "new", "old", "updated", "update", "final", "draft",
         "copy", "scm", "sap", "erp", "latest", "revised", "v1", "v2", "v3",
         "ip", "dev", "prod", "test", "doc", "file", "scan", "scanned",
+        # SAP module abbreviations that leak into filenames
+        "ewm", "sd", "mm", "fi", "co", "wm", "bw", "abap", "hana", "scm",
     }
     parts = cleaned.split()
     name_parts = [p.title() for p in parts if p.lower() not in _filename_noise and len(p) > 1]
@@ -2450,14 +2609,12 @@ def _extract_name_from_text(text: str) -> Optional[str]:
             if _looks_like_name(name):
                 return name
 
-        # Pattern 2: Line with 2-4 capitalized words
+        # Pattern 2: Line with 2-4 capitalized words — validate with _looks_like_name()
         words = line.split()
         if 2 <= len(words) <= 4:
             if all(w[0].isupper() for w in words if w):
-                # Filter out common non-name patterns
-                if not any(w.lower() in ['resume', 'cv', 'page', 'date', 'name'] for w in words):
-                    # Make sure it's not an email or has numbers
-                    if '@' not in line and not any(c.isdigit() for c in line):
+                if '@' not in line and not any(c.isdigit() for c in line):
+                    if _looks_like_name(line):
                         return line
 
     return None
@@ -2546,6 +2703,8 @@ def _extract_skills_from_text(text: str, skill_type: str = "technical") -> List[
                     'linkedin', 'github', 'twitter', 'implementation', 'support',
                     'in the', 'with the', 'for the', 'of the', 'ed in', 'ing in',
                     'responsible', 'managed', 'developed', 'coordinated',
+                    'projects ', 'project ', 'classifier', 'predictor',
+                    'tracker', 'monitor', 'detector', 'generator',
                 ]
                 if not any(pat in item.lower() for pat in skip_patterns):
                     # Also skip if it looks like a phone number or email
@@ -2557,12 +2716,31 @@ def _extract_skills_from_text(text: str, skill_type: str = "technical") -> List[
     # Deduplicate while preserving order and filter garbage
     seen = set()
     unique_skills = []
+    # Regex to strip date ranges like "(OCT 2023 – NOV 2023)" or "(2023-2024)"
+    _date_range_re = re.compile(
+        r"\s*\(?\s*(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{4}\s*[\-–—]\s*"
+        r"(?:JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)?\s*\d{4}\s*\)?\s*$",
+        re.IGNORECASE,
+    )
+    # Regex to detect sentence starts (bullet points + verbs)
+    _sentence_start_re = re.compile(
+        r"^[●•▪■\-*]\s*"
+        r"|^(?:Implemented|Developed|Designed|Created|Built|Led|Managed|Worked|Used|Applied|Integrated|Achieved|Configured|Supported|Conducted)\b",
+        re.IGNORECASE,
+    )
     for skill in skills:
         # Clean up the skill
         skill = skill.strip()
 
+        # Strip date ranges from skill items — "ANN (OCT 2023 – NOV 2023)" → "ANN"
+        skill = _date_range_re.sub("", skill).strip()
+
         # Skip items containing newlines (likely garbage)
         if '\\n' in skill or '\n' in skill:
+            continue
+
+        # Skip items that start with bullet points or action verbs (sentences, not skills)
+        if _sentence_start_re.search(skill):
             continue
 
         # Skip very long items (likely sentences, not skills)
@@ -2582,6 +2760,7 @@ def _extract_skills_from_text(text: str, skill_type: str = "technical") -> List[
             'dec 20', 'jan 20', 'feb 20', 'mar 20', 'apr 20', 'may 20',
             'jun 20', 'jul 20', 'aug 20', 'sep 20', 'oct 20', 'nov 20',
             'coimbatore', 'bangalore', 'chennai', 'mumbai', 'delhi',
+            'stock profit', 'profit classifier', 'classifier', 'predictor',
         ]
         if any(garbage in skill_lower for garbage in garbage_indicators):
             continue
@@ -2651,6 +2830,25 @@ def _extract_education_from_text(text: str) -> List[str]:
     return unique_edu[:5]
 
 
+_CONTACT_INFO_RE = re.compile(
+    r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b'  # phone numbers
+    r'|\S+@\S+\.\S+'                        # emails
+    r'|https?://\S+'                         # URLs
+    r'|\b\d{5,}\b',                          # long numbers (zip, ID)
+)
+
+
+def _clean_extracted_item(item: str) -> str:
+    """Strip phone numbers, emails, URLs from an extracted cert/skill string."""
+    item = _CONTACT_INFO_RE.sub('', item)
+    return re.sub(r'\s+', ' ', item).strip()
+
+
+def _is_contact_line(line: str) -> bool:
+    """Return True if the line is primarily contact information (phone, email, address)."""
+    return bool(re.search(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b|\S+@\S+\.\S+', line))
+
+
 def _extract_certifications_from_text(text: str) -> List[str]:
     """Extract certifications from text with broad pattern matching."""
     certs = []
@@ -2659,39 +2857,43 @@ def _extract_certifications_from_text(text: str) -> List[str]:
     text = re.sub(r'^Certifications?\s*:\s*', '', text, flags=re.IGNORECASE | re.MULTILINE)
     text = re.sub(r'\nCertifications?\s*:\s*', '\n', text, flags=re.IGNORECASE)
 
-    # Common certification patterns
+    # Common certification patterns (tightened tails to avoid capturing contact info)
     cert_patterns = [
-        r"(?:AWS|Amazon)\s+(?:Certified|Solutions?\s+Architect|Developer|SysOps)[^\n,]{0,50}",
-        r"(?:Azure|Microsoft)\s+(?:Certified|Administrator|Developer|Expert)[^\n,]{0,50}",
-        r"(?:Google|GCP)\s+(?:Certified|Cloud|Professional)[^\n,]{0,50}",
+        r"(?:AWS|Amazon)\s+(?:Certified|Solutions?\s+Architect|Developer|SysOps)[^\n,\d@]{0,35}",
+        r"(?:Azure|Microsoft)\s+(?:Certified|Administrator|Developer|Expert)[^\n,\d@]{0,35}",
+        r"(?:Google|GCP)\s+(?:Certified|Cloud|Professional)[^\n,\d@]{0,35}",
         r"PMP|Project Management Professional",
-        r"CAPM[^\n,]{0,60}",
+        r"CAPM[^\n,\d@]{0,35}",
         r"Scrum\s+(?:Master|Product Owner|Developer)",
-        r"(?:CISSP|CISM|CISA|CEH|CompTIA)[^\n,]{0,30}",
-        r"(?:Oracle|Salesforce)\s+Certified[^\n,]{0,50}",
-        r"SAP\s+(?:S/4\s*HANA|ERP|BW|FICO|SD|MM|PP|HR|SRM|SCM|Analytics\s+Cloud|SAC|Certified)[^\n,]{0,60}",
-        r"(?:CCNA|CCNP|CCIE)[^\n,]{0,30}",
-        r"(?:ITIL|Six\s+Sigma|TOGAF|PRINCE2|COBIT)[^\n,]{0,30}",
-        r"(?:CPA|CFA|FRM|ACCA|CA\b)[^\n,]{0,30}",
-        r"Business\s+Analysis[^\n,]{0,40}",
-        r"Certified\s+(?:Associate|Professional|Expert|Engineer|Specialist|Manager|Analyst|Auditor|ScrumMaster)[^\n,]{0,50}",
+        r"(?:CISSP|CISM|CISA|CEH|CompTIA)[^\n,\d@]{0,25}",
+        r"(?:Oracle|Salesforce)\s+Certified[^\n,\d@]{0,35}",
+        r"SAP\s+(?:S/4\s*HANA|ERP|BW|FICO|SD|MM|PP|HR|SRM|SCM|Analytics\s+Cloud|SAC|Certified)[^\n,\d@]{0,35}",
+        r"(?:CCNA|CCNP|CCIE)[^\n,\d@]{0,25}",
+        r"(?:ITIL|Six\s+Sigma|TOGAF|PRINCE2|COBIT)[^\n,\d@]{0,25}",
+        r"(?:CPA|CFA|FRM|ACCA|CA\b)[^\n,\d@]{0,25}",
+        r"Business\s+Analysis[^\n,\d@]{0,30}",
+        r"Certified\s+(?:Associate|Professional|Expert|Engineer|Specialist|Manager|Analyst|Auditor|ScrumMaster)[^\n,\d@]{0,35}",
     ]
 
     for pattern in cert_patterns:
         for match in re.finditer(pattern, text, re.IGNORECASE):
-            cert = match.group(0).strip()
-            if cert:
+            cert = _clean_extracted_item(match.group(0))
+            if cert and len(cert) >= 3:
                 certs.append(cert)
 
-    # Line-by-line: look for lines mentioning certifications
+    # Line-by-line: look for lines mentioning certifications (skip contact lines)
     for line in text.split('\n'):
         line = line.strip()
         if not line or len(line) < 5:
             continue
+        if _is_contact_line(line):
+            continue
         lower = line.lower()
         if any(kw in lower for kw in ("certified", "certification", "certificate", "credential", "license")):
             if len(line) < 200 and not any(skip in lower for skip in ("skills", "education", "experience")):
-                certs.append(line)
+                cleaned = _clean_extracted_item(line)
+                if cleaned and len(cleaned) >= 5:
+                    certs.append(cleaned)
 
     # Deduplicate
     seen = set()
@@ -2830,6 +3032,7 @@ def extract_schema(
     scope_document_id: Optional[str] = None,
     intent_hint: Optional[str] = None,
     document_data: Optional[Dict[str, Any]] = None,
+    query_focus: Optional[Any] = None,
 ) -> ExtractionResult:
     """Extract structured data from chunks.
 
@@ -2840,8 +3043,31 @@ def extract_schema(
     """
     from .llm_extract import llm_extract_and_respond, _count_unique_documents
 
+    # Check for domain mismatch before any extraction
+    query_domain = _query_domain_override(query)
+    chunk_domain = _majority_chunk_domain(chunks)
+    if query_domain and chunk_domain:
+        _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal"}
+        q_family = _DOMAIN_FAMILY.get(query_domain, query_domain)
+        c_family = _DOMAIN_FAMILY.get(chunk_domain, chunk_domain)
+        if q_family != c_family and q_family != "hr":
+            # Query asks for invoice/legal but chunks are a different domain
+            _DOMAIN_LABEL = {"hr": "resumes", "resume": "resumes", "invoice": "invoices", "legal": "legal documents"}
+            asked = _DOMAIN_LABEL.get(query_domain, query_domain)
+            available = _DOMAIN_LABEL.get(chunk_domain, chunk_domain)
+            msg = f"No {asked} found in this profile. The available documents are {available}."
+            schema = GenericSchema(facts=FieldValuesField(items=[FieldValue(label=None, value=msg, evidence_spans=[])]))
+            return ExtractionResult(domain=chunk_domain, intent=intent_hint or "answer", schema=schema)
+
+    # Contact queries use deterministic extraction directly — LLMs often refuse
+    # to share personal contact details due to safety guardrails.
+    _is_contact_query = any(
+        kw in (query or "").lower()
+        for kw in ("contact", "email", "phone", "linkedin", "reach", "call")
+    )
+
     # STRATEGY 1: LLM-first generic extraction (preferred for ALL document types)
-    if llm_client and budget.allow():
+    if llm_client and budget.allow() and not _is_contact_query:
         try:
             llm_result = llm_extract_and_respond(
                 query=query,
@@ -2853,8 +3079,8 @@ def extract_schema(
                 num_documents=_count_unique_documents(chunks),
             )
             if llm_result is not None:
-                # Query-based domain takes precedence over chunk majority
-                inferred = _query_domain_override(query) or _majority_chunk_domain(chunks) or domain or "generic"
+                # Use chunk-based domain (more reliable than query override)
+                inferred = chunk_domain or query_domain or domain or "generic"
                 logger.info(
                     "LLM-first extraction succeeded (domain=%s)",
                     inferred,
@@ -2882,6 +3108,7 @@ def extract_schema(
         scope_document_id=scope_document_id,
         domain_hint=domain,
         intent_hint=intent_hint,
+        query_focus=query_focus,
     )
 
 

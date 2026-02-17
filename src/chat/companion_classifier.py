@@ -169,10 +169,9 @@ class CompanionClassifier:
 
         def _run() -> Optional[str]:
             try:
-                import ollama
-
-                response = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-                text = (response.get("response") or "").strip().lower()
+                from src.llm.gateway import get_llm_gateway
+                text = get_llm_gateway().generate(prompt)
+                text = (text or "").strip().lower()
                 for label in ["neutral", "positive", "negative", "frustrated", "thankful"]:
                     if label in text:
                         return label

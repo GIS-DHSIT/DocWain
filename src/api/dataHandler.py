@@ -116,10 +116,24 @@ def get_subscription_pii_setting(subscription_id: str) -> bool:
                     f"Subscription {subscription_id}: PII masking is {'ENABLED' if pii_enabled else 'DISABLED'}")
                 return bool(pii_enabled)
             else:
-                logging.warning(f"Subscription {subscription_id}: PII setting not found, defaulting to ENABLED")
+                # Persist the default back so subsequent lookups don't repeat the warning
+                try:
+                    collection.update_one(
+                        {"_id": subscription["_id"]},
+                        {"$set": {"pii_enabled": True}},
+                    )
+                    logging.info(
+                        "Subscription %s: PII setting not found, persisted default ENABLED",
+                        subscription_id,
+                    )
+                except Exception as persist_exc:
+                    logging.warning(
+                        "Subscription %s: PII setting not found, defaulting to ENABLED (persist failed: %s)",
+                        subscription_id, persist_exc,
+                    )
                 return True  # Safe default - enable PII masking if not specified
         else:
-            logging.warning(
+            logging.info(
                 "PII masking defaulted to enabled because subscription not found (subscription_id=%s)",
                 subscription_id,
             )
@@ -461,6 +475,10 @@ def fileProcessor(content, file):
             elif file_name.endswith((".pptx", ".ppt")):
                 extracted_data[file_name] = extractor.extract_text_from_pptx(content, filename=file_name)
             elif file_name.endswith(".txt"):
+                extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
+            elif file_name.endswith(".doc"):
+                # Legacy .doc files are binary (often UTF-16LE);
+                # extract_text_from_txt handles via _smart_decode()
                 extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
             else:
                 extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
@@ -2534,10 +2552,18 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             text["doc_type"] = doc_type
             text["doc_metadata"] = doc_metadata
 
-            expected_points = len(texts)
+            pre_upsert_count = len(texts)
             result = save_embeddings_to_qdrant(text, subscription_id, profile_id, doc_tag, doc_name)
             saved = result.get("points_saved", 0)
-            dropped_chunks += int(result.get("dropped_invalid", 0))
+            upsert_dropped = int(result.get("dropped_invalid", 0))
+            dropped_chunks += upsert_dropped
+            # Post-pipeline expected count accounts for chunks dropped during upsert
+            expected_points = pre_upsert_count - upsert_dropped
+            if upsert_dropped:
+                logging.warning(
+                    "Embedding upsert dropped %d/%d chunks for %s (below min_chars/min_tokens)",
+                    upsert_dropped, pre_upsert_count, doc_tag,
+                )
             if expected_points and saved != expected_points:
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
@@ -2546,7 +2572,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             return {
                 "status": "success",
                 "points_saved": saved,
-                "chunks": expected_points,
+                "chunks": pre_upsert_count,
                 "dropped_chunks": dropped_chunks,
                 "coverage_ratio": None,
             }

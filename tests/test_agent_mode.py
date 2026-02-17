@@ -229,6 +229,12 @@ def test_non_agent_path_unchanged(monkeypatch):
     fake_datahandler.get_subscription_pii_setting = lambda *args, **kwargs: True
     fake_datahandler.trainData = lambda *args, **kwargs: None
     fake_datahandler.train_single_document = lambda *args, **kwargs: None
+    fake_datahandler.get_qdrant_client = lambda: None
+    fake_datahandler.get_redis_client = lambda: None
+    fake_datahandler.encode_with_fallback = lambda *args, **kwargs: [[0.1]*4]
+    fake_datahandler.fileProcessor = lambda *args, **kwargs: None
+    fake_datahandler.train_on_document = lambda *args, **kwargs: None
+    fake_datahandler.update_security_screening = lambda *args, **kwargs: None
     sys.modules["src.api.dataHandler"] = fake_datahandler
 
     from fastapi import APIRouter
@@ -268,11 +274,31 @@ def test_non_agent_path_unchanged(monkeypatch):
     stub_module("src.metrics.ai_metrics", get_metrics_store=lambda: pytypes.SimpleNamespace(available=False))
     stub_module("src.metrics.repository", MetricsRepository=object)
     stub_module("src.screening.api", screening_router=APIRouter())
-    stub_module("src.screening.config", log_legacy_vetting_notice_if_missing=lambda: None)
+    class _PermissiveScreeningConfig:
+        """Stub that returns None/False for any attribute access."""
+        ENABLED = False
+        @classmethod
+        def load(cls):
+            return cls()
+        def __getattr__(self, name):
+            return None
+    stub_module(
+        "src.screening.config",
+        log_legacy_vetting_notice_if_missing=lambda: None,
+        ScreeningConfig=_PermissiveScreeningConfig,
+    )
     stub_module(
         "src.storage.azure_blob_client",
         validate_containers_once=lambda: None,
         validate_storage_configured_once=lambda: None,
+        get_blob_service_client=lambda: None,
+        get_document_container_client=lambda: None,
+        has_blob_credentials=lambda: False,
+    )
+    stub_module(
+        "src.storage.blob_persistence",
+        save_pickle_atomic=lambda *args, **kwargs: None,
+        load_pickle=lambda *args, **kwargs: None,
     )
     stub_module("src.teams.adapter", TeamsAuthError=Exception, handle_teams_activity=lambda *args, **kwargs: {})
     stub_module(
@@ -307,6 +333,15 @@ def test_non_agent_path_unchanged(monkeypatch):
         return {"response": "ok", "sources": [{"file_name": "doc.pdf", "page": 1}]}
 
     monkeypatch.setattr(main.rag_v3, "run", fake_run)
+
+    # When src.main is already imported by other tests, the `execute_request`
+    # binding is already resolved. Monkeypatch it directly on the main module.
+    fake_execute = lambda *args, **kwargs: ExecutionResult(
+        answer={"response": "ok", "sources": [{"file_name": "doc.pdf", "page": 1}]},
+        mode=ExecutionMode.NORMAL,
+        debug={},
+    )
+    monkeypatch.setattr(main, "execute_request", fake_execute)
 
     from src.api.rag_state import AppState, set_app_state
 

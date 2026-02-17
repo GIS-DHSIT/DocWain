@@ -13,6 +13,15 @@ from src.utils.payload_utils import token_count
 
 EMBED_PIPELINE_VERSION = "dwx-2026-02-05"
 
+# Matches C0/C1 control characters EXCEPT \t (0x09), \n (0x0a), \r (0x0d).
+# Strips NULL, backspace, vertical tab, form feed, escape sequences, etc.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _strip_control_chars(text: str) -> str:
+    """Remove non-printable control characters that corrupt embeddings."""
+    return _CONTROL_CHAR_RE.sub("", text) if text else ""
+
 
 _DOC_CONNECTOR_MAP = {
     "local": "LOCAL",
@@ -90,7 +99,11 @@ def _doc_version_hash(raw: Dict[str, Any], *, canonical_text: str) -> str:
 def normalize_content(text: str) -> str:
     if not text:
         return ""
-    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    # Strip UTF-16 null byte artifacts before any other processing
+    if '\x00' in text:
+        text = text.replace('\x00', '')
+    normalized = _strip_control_chars(str(text))
+    normalized = normalized.replace("\r\n", "\n").replace("\r", "\n")
 
     # Only safe digit-letter boundary splitting (preserves camelCase, compound words)
     normalized = re.sub(r"([A-Za-z])(\d)", r"\1 \2", normalized)
@@ -105,6 +118,31 @@ def normalize_content(text: str) -> str:
         if compacted:
             lines.append(compacted)
     return "\n".join(lines).strip()
+
+
+def _is_encoding_garbage(text: str) -> bool:
+    """Detect text corrupted by wrong encoding (e.g. UTF-16 decoded as UTF-8).
+
+    Signatures:
+    - High density of null chars (\\x00) or replacement chars (U+FFFD)
+    - Very low alphanumeric ratio (most chars are control/garbage)
+    """
+    if not text or len(text) < 20:
+        return False
+    sample = text[:500]
+    # Null byte interleaving (UTF-16 artifact)
+    null_count = sample.count('\x00')
+    if null_count > len(sample) * 0.1:
+        return True
+    # Replacement char flood
+    repl_count = sample.count('\ufffd')
+    if repl_count > len(sample) * 0.1:
+        return True
+    # Very low alphanumeric ratio (less than 30% of chars are letters/digits/spaces)
+    alnum_count = sum(1 for c in sample if c.isalnum() or c in ' \n\t')
+    if len(sample) > 50 and alnum_count / len(sample) < 0.3:
+        return True
+    return False
 
 
 _METADATA_GARBAGE_MARKERS = (
@@ -130,6 +168,8 @@ def _is_metadata_garbage(text: str) -> bool:
     """Detect text that is actually stringified chunk metadata dicts or ExtractedDocument repr."""
     if not text or len(text) < 30:
         return False
+    if _is_encoding_garbage(text):
+        return True
     # Definitive: text IS a Python repr of an internal object (prefix is unmistakable)
     if text.startswith("Extracted Document (") or text.startswith("ExtractedDocument("):
         return True
@@ -301,7 +341,23 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     # (e.g., resume address chunks misclassified as "purchase_order").
     # Filename hints above (lines 229-235) are still applied as they are consistent.
 
+    # ── Strip wrong upstream prefixes from embedding_text ──
+    # The universal_enhancer may have applied a semantic prefix (e.g.,
+    # "Contact Information:") based on incorrect ContentTypeDetector
+    # classification (e.g., product codes matching phone regex).
+    # Strip any known prefix so we can re-classify and re-prefix correctly.
+    _KNOWN_PREFIXES_RE = re.compile(
+        r"^(?:Contact Information|Skills and (?:Competencies|Technologies)"
+        r"|Financial Information|Education and Qualifications"
+        r"|Professional (?:Experience|Summary)|Medical Information"
+        r"|Legal Terms|Work Experience|Technical Skills"
+        r"|Certifications(?: and Credentials)?|Invoice (?:Items|Totals)"
+        r"|Billing Information|Data|Payment Terms)\s*:\s*",
+        re.IGNORECASE,
+    )
     embedding_text = _stringify(raw.get("embedding_text") or raw.get("text_clean") or raw.get("embeddingText"))
+    if embedding_text:
+        embedding_text = _KNOWN_PREFIXES_RE.sub("", embedding_text, count=1).strip() or None
     if embedding_text and _is_metadata_garbage(embedding_text):
         embedding_text = None
     if not embedding_text:

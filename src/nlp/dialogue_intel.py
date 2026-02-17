@@ -7,8 +7,6 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-import ollama
-
 from src.api.config import Config
 from src.api.genai_client import generate_text
 from src.nlp.intent_rules import match_intent_rules
@@ -97,16 +95,17 @@ def _has_document_task_cues(text: str) -> bool:
     return bool(_DOC_TASK_CUES.search(text))
 
 
-def _classify_with_ollama(model_name: str, prompt: str) -> Optional[dict]:
-    if not model_name:
+def _classify_with_ollama(model_name: str, prompt: str, llm_client=None) -> Optional[dict]:
+    if not model_name and llm_client is None:
         return None
     try:
-        response = ollama.chat(
-            model=model_name,
-            messages=[{"role": "system", "content": "Return only JSON."}, {"role": "user", "content": prompt}],
-        )
-        content = response.get("message", {}).get("content", "")
-        return json.loads(content)
+        full_prompt = f"Return only JSON.\n\n{prompt}"
+        if llm_client is not None:
+            content = llm_client.generate(full_prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            content = get_llm_gateway().generate(full_prompt)
+        return json.loads((content or "").strip())
     except Exception as exc:  # noqa: BLE001
         logger.debug("Ollama classification failed: %s", exc)
         return None

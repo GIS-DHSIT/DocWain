@@ -31,14 +31,16 @@ pytestmark = pytest.mark.skipif(not LIVE, reason="LIVE_TEST=1 not set")
 # ── Shared fixtures ──────────────────────────────────────────────────────────
 
 SUBSCRIPTION_ID = "67fde0754e36c00b14cea7f5"
-PROFILE_ID = "698c46e6bcae2c45eca1d8d9"
+PROFILE_ID = "6992c4ec6034385742e451a6"
 
 # Known document IDs in this profile (from Qdrant data)
 DOC_IDS = {
-    "abinaya": "698590a6e8815f8e0a63fcdd",
-    "aadithya": "698590a5e8815f8e0a63fccd",
-    "duncan_inv132548": "6985827a2743a92f89fb735a",
-    "perry_inv148888": "6985827a2743a92f89fb7374",
+    "abinaya": "69935fd96034385742e45586",
+    "swapnil": "6992c5836034385742e45209",
+    "gokul": "69930cb66034385742e45469",
+    "abhishek": "69935fd96034385742e45573",
+    "aadithya": "69935fd96034385742e45576",
+    "aloysius": "69935fd96034385742e4558b",
 }
 
 
@@ -183,7 +185,7 @@ class TestLiveSingleDocument:
 
     def test_query_by_document_id(self):
         """Query with explicit document_id should return data about that document."""
-        doc_id = DOC_IDS["aadithya"]
+        doc_id = DOC_IDS["swapnil"]
         result = _run_query(
             "what are the skills and experience of this candidate",
             document_id=doc_id,
@@ -194,11 +196,11 @@ class TestLiveSingleDocument:
         # Should have sources
         sources = result.get("sources", [])
         assert len(sources) > 0, "Should have sources for single-doc query"
-        print(f"\n=== SINGLE DOC (Aadithya) RESPONSE ===\n{response[:500]}\n")
+        print(f"\n=== SINGLE DOC (Swapnil) RESPONSE ===\n{response[:500]}\n")
 
     def test_query_about_specific_person_by_name(self):
-        """'Tell me about Abinaya' should target that specific document."""
-        result = _run_query("tell me about Abinaya")
+        """'Tell me about Gokul' should target that specific document."""
+        result = _run_query("tell me about Gokul")
         response = result["response"]
         assert response, "Response should not be empty"
         _assert_no_unhelpful_phrases(response)
@@ -208,11 +210,11 @@ class TestLiveSingleDocument:
         assert scope != "all_profile", (
             f"Expected targeted scope, got: {scope}"
         )
-        print(f"\n=== ABOUT ABINAYA RESPONSE ===\n{response[:500]}\n")
+        print(f"\n=== ABOUT GOKUL RESPONSE ===\n{response[:500]}\n")
 
     def test_single_doc_sources_are_from_one_document(self):
         """Sources from single-doc query should all be from the same document."""
-        doc_id = DOC_IDS["abinaya"]
+        doc_id = DOC_IDS["abhishek"]
         result = _run_query(
             "what is this candidate's education and certifications",
             document_id=doc_id,

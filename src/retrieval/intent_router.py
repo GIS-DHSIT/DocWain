@@ -7,8 +7,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-import ollama
-
 from src.intent.llm_intent import parse_intent
 
 logger = logging.getLogger(__name__)
@@ -71,13 +69,17 @@ def _heuristic_intent(query: str) -> IntentResult:
     return IntentResult(intent=intent, target_doc_types=target_types, constraints={}, need_tables=need_tables, source="heuristic")
 
 
-def _ollama_intent(query: str, model_name: Optional[str]) -> Optional[IntentResult]:
-    if not model_name:
+def _ollama_intent(query: str, model_name: Optional[str], llm_client: Optional[Any] = None) -> Optional[IntentResult]:
+    if not model_name and llm_client is None:
         return None
     prompt = _INTENT_PROMPT.format(query=query)
     try:
-        resp = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-        payload = json.loads(resp.get("response", "").strip())
+        if llm_client is not None:
+            text = llm_client.generate(prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            text = get_llm_gateway().generate(prompt)
+        payload = json.loads((text or "").strip())
         return IntentResult(
             intent=str(payload.get("intent", "qa")),
             target_doc_types=[str(t) for t in payload.get("target_doc_types", []) if t],
@@ -115,7 +117,7 @@ def analyze_intent(
             source=parsed.source,
         )
     else:
-        result = _ollama_intent(query, model_name=model_name) or _heuristic_intent(query)
+        result = _ollama_intent(query, model_name=model_name, llm_client=llm_client) or _heuristic_intent(query)
 
     if len(_INTENT_CACHE) >= _INTENT_CACHE_MAX:
         _INTENT_CACHE.pop(next(iter(_INTENT_CACHE)))

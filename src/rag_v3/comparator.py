@@ -328,6 +328,10 @@ def render_comparison(result: ComparisonResult, intent: str = "") -> str:
     if len(result.documents) == 1:
         return result.summary
 
+    # No meaningful comparisons — return empty so caller falls through to detail view
+    if not result.field_comparisons:
+        return ""
+
     lines: List[str] = []
 
     if len(result.documents) == 2:

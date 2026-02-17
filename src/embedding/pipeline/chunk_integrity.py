@@ -15,6 +15,9 @@ _HEADING_RE = re.compile(
     re.IGNORECASE,
 )
 _ALL_CAPS_RE = re.compile(r"^[A-Z][A-Z0-9\s,:\-]{4,}$")
+# Matches C0/C1 control characters EXCEPT \t (0x09), \n (0x0a), \r (0x0d).
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
 _PAGE_MARKER_RE = re.compile(r"^\s*-+\s*page\s*\d+\s*-+\s*$", re.IGNORECASE)
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", re.IGNORECASE)
 _ONLY_PUNCT_RE = re.compile(r"^[\W_]+$")
@@ -40,6 +43,7 @@ class AtomicUnit:
 def clean_text_for_embedding(text: str) -> str:
     if not text:
         return ""
+    text = _CONTROL_CHAR_RE.sub("", text)
     lines = []
     for line in text.splitlines():
         stripped = line.strip()

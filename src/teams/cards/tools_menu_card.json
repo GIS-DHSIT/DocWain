@@ -10,6 +10,7 @@
     { "type": "Action.Submit", "title": "Summarize recent", "data": { "action": "summarize_recent" } },
     { "type": "Action.Submit", "title": "Extract invoice fields", "data": { "action": "extract_fields", "preset": "invoice" } },
     { "type": "Action.Submit", "title": "Extract contract fields", "data": { "action": "extract_fields", "preset": "contract" } },
+    { "type": "Action.Submit", "title": "Generate content", "data": { "action": "generate_content" } },
     { "type": "Action.Submit", "title": "List docs", "data": { "action": "list_docs" } },
     { "type": "Action.Submit", "title": "Switch model", "data": { "action": "set_model", "model": "{default_model}" } },
     { "type": "Action.Submit", "title": "Switch persona", "data": { "action": "set_persona", "persona": "{default_persona}" } },

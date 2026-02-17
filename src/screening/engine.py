@@ -253,6 +253,7 @@ class ScreeningEngine:
         normalized = category.lower()
         canonical = normalized.replace("_", "-")
         names = CATEGORY_TOOL_MAP.get(canonical) or CATEGORY_TOOL_MAP.get(canonical.replace("-", "_"))
+        explicit_category = names is not None  # user explicitly requested this category
         tools: List[ScreeningTool]
         if names:
             tools = [self._tools[name] for name in names if name in self._tools]
@@ -264,7 +265,10 @@ class ScreeningEngine:
         for tool in tools:
             if enabled and tool.name not in enabled:
                 continue
-            if not tool.applies_to(doc_type):
+            # Skip applies_to filter when user explicitly requests a category —
+            # they want those tools regardless of stored doc_type.
+            # The applies_to filter still applies in run_all() via _active_tools().
+            if not explicit_category and not tool.applies_to(doc_type):
                 continue
             filtered.append(tool)
         return filtered

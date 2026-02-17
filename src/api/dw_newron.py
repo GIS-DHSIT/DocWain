@@ -5181,55 +5181,43 @@ def create_llm_client(
         backend_override: Optional[str] = None,
         model_path: Optional[str] = None
 ):
-    """Factory to select LLM backend based on requested model name or env."""
-    global _LLM_SEMAPHORE
-    if _LLM_SEMAPHORE is None:
-        _LLM_SEMAPHORE = threading.Semaphore(getattr(Config.LLM, "MAX_CONCURRENCY", 2))
-    model_name = _resolve_model_alias(model_name)
-    name = (model_name or "").lower()
-    backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
-    resolved_backend = backend
-    if not resolved_backend:
-        resolved_backend = "gemini" if name.startswith("gemini") else "ollama"
-    if getattr(Config.LLM, "DISABLE_EXTERNAL", False) and resolved_backend in {"gemini", "openai", "openai_compatible", "local_http"}:
-        resolved_backend = "ollama"
-    cache_key = (resolved_backend, model_name or "", model_path)
-    if cache_key in _LLM_CLIENTS:
-        return _LLM_CLIENTS[cache_key]
-    try:
-        from src.api.rag_state import singleton_guard_active
+    """Factory to select LLM backend based on requested model name or env.
 
-        if singleton_guard_active() and _LLM_CLIENTS:
-            logger.error("LLM client reinit requested (%s); reusing existing singleton", cache_key)
-            return next(iter(_LLM_CLIENTS.values()))
+    Delegates to src.llm.gateway.create_llm_gateway() when possible.
+    Falls back to direct client creation for special backends (unsloth).
+    """
+    global _LLM_SEMAPHORE
+
+    # For unsloth/finetuned models, keep direct creation (not in gateway)
+    resolved_backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
+    if resolved_backend == "unsloth" or model_path:
+        if _LLM_SEMAPHORE is None:
+            _LLM_SEMAPHORE = threading.Semaphore(getattr(Config.LLM, "MAX_CONCURRENCY", 2))
+        from src.finetune.llm_client import UnslothLLMClient
+        target = model_path or model_name
+        client = UnslothLLMClient(target)
+        wrapped = _LLMClientWrapper(client, _LLM_SEMAPHORE)
+        setattr(wrapped, "backend", "unsloth")
+        return wrapped
+
+    # Check if gateway singleton already exists
+    try:
+        from src.llm.gateway import get_llm_gateway
+        gateway = get_llm_gateway()
+        if gateway is not None:
+            return gateway
     except Exception:
         pass
 
-    if resolved_backend in {"openai", "openai_compatible", "local_http"}:
-        client = OpenAICompatibleClient(model_name)
-    elif resolved_backend == "gemini" or name.startswith("gemini"):
-        try:
-            primary = GeminiClient(model_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Gemini init failed; using local LLM instead: %s", exc)
-            primary = None
-        fallback = OllamaClient(None)
-        client = ResilientLLMClient(primary, fallback) if primary else fallback
-    elif resolved_backend == "unsloth" or model_path:
-        from src.finetune.llm_client import UnslothLLMClient
+    # Fallback: create gateway directly
+    try:
+        from src.llm.gateway import create_llm_gateway
+        return create_llm_gateway(model_name=model_name, backend_override=backend_override)
+    except Exception as exc:
+        logger.warning("Gateway creation failed, falling back to direct Ollama: %s", exc)
 
-        target = model_path or model_name
-        client = UnslothLLMClient(target)
-    elif resolved_backend == "ollama":
-        client = OllamaClient(model_name)
-    else:
-        client = OllamaClient(model_name)
-
-    wrapped = _LLMClientWrapper(client, _LLM_SEMAPHORE)
-    setattr(wrapped, "backend", resolved_backend if resolved_backend != "gemini" else getattr(client, "backend", "gemini"))
-    _LLM_CLIENTS[cache_key] = wrapped
-    return wrapped
-    # default to local Ollama for plug-and-play usage
+    # Ultimate fallback: bare Ollama
+    model_name = _resolve_model_alias(model_name)
     return OllamaClient(model_name)
 
 
@@ -5359,8 +5347,12 @@ def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[
         qdrant_client = get_qdrant_client()
         collection_info = qdrant_client.get_collection(collection_name)
 
+        # Scope scroll by profile_id + subscription_id to prevent cross-tenant leaks
+        from src.api.vector_store import build_qdrant_filter as _build_isolation_filter
+        scroll_filter = _build_isolation_filter(subscription_id, profile_id)
         scroll_result = qdrant_client.scroll(
             collection_name=collection_name,
+            scroll_filter=scroll_filter,
             limit=3,
             with_payload=True,
             with_vectors=False

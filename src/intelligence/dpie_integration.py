@@ -160,7 +160,7 @@ class DPIERegistry:
         stats: Dict[str, Any] = {}
 
         # 1. Bootstrap training data
-        bootstrap = TrainingBootstrap(qdrant_client, sentence_model, collection_name)
+        bootstrap = TrainingBootstrap(qdrant_client, sentence_model, collection_name, subscription_id=subscription_id)
         data = bootstrap.generate_all(profile_id)
 
         doc_features, doc_labels = data["doc_type"]

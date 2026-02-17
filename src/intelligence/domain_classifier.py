@@ -137,6 +137,27 @@ class DomainClassification:
     uncertain: bool
 
 
+# Strong indicator phrases that are nearly unambiguous for a domain (weighted 2.0x)
+_STRONG_INDICATORS: Dict[str, Tuple[str, ...]] = {
+    "invoice": (
+        "invoice number", "invoice date", "purchase order number",
+        "amount due", "bill to", "remittance",
+    ),
+    "legal": (
+        "party of the first part", "hereinafter referred to",
+        "in witness whereof", "governing law", "indemnification",
+    ),
+    "medical": (
+        "chief complaint", "medical history", "review of systems",
+        "history of present illness", "physical examination",
+    ),
+    "bank_statement": (
+        "account statement", "available balance", "statement period",
+        "opening balance", "closing balance",
+    ),
+}
+
+
 def _score_keywords(text: str) -> Dict[str, float]:
     import re as _re
     lowered = (text or "").lower()
@@ -151,6 +172,11 @@ def _score_keywords(text: str) -> Dict[str, float]:
                     scores[domain] += 1.0
             elif keyword in lowered:
                 scores[domain] += 1.0
+    # Apply strong indicator bonuses (2.0x weight)
+    for domain, phrases in _STRONG_INDICATORS.items():
+        for phrase in phrases:
+            if phrase in lowered:
+                scores[domain] += 2.0
     return scores
 
 
@@ -183,7 +209,9 @@ def _pick_domain(scores: Dict[str, float]) -> Tuple[str, float, bool]:
     if best_score <= 0:
         return "generic", 0.0, True
     confidence = best_score / max(best_score + second_score, 1.0)
-    uncertain = confidence < 0.55 or best_score < 2.0
+    # Lower threshold when a strong indicator contributed (score includes 2.0x bonuses)
+    min_score_threshold = 1.5 if best_score >= 4.0 else 2.0
+    uncertain = confidence < 0.55 or best_score < min_score_threshold
     return best_domain, confidence, uncertain
 
 

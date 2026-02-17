@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-import ollama
-
 from src.observability.metrics import metrics_store
 from src.orchestrator.citations import format_citation
 from src.prompting.persona import DOCWAIN_META_RESPONSE, get_docwain_persona
@@ -191,8 +189,9 @@ def generate_answer(
     include_persona: bool,
     subscription_id: str,
     profile_id: str,
+    llm_client=None,
 ) -> Tuple[str, bool]:
-    if not model_name:
+    if not model_name and llm_client is None:
         return _fallback_answer(query, chunks)
 
     evidence = _build_evidence_block(chunks)
@@ -208,8 +207,12 @@ def generate_answer(
     ).strip()
 
     try:
-        response = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-        text = (response.get("response") or "").strip()
+        if llm_client is not None:
+            text = llm_client.generate(prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            text = get_llm_gateway().generate(prompt)
+        text = (text or "").strip()
         exact_match = _detect_exact_match(query, chunks)
         return text, exact_match
     except Exception as exc:  # noqa: BLE001

@@ -5,8 +5,6 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-import ollama
-
 from src.orchestrator.response_validator import validate_response_payload
 from src.retrieval.profile_evidence import DocumentEvidence, ProfileEvidenceGraph
 
@@ -33,6 +31,7 @@ def generate_structured_answer(
     target_document_ids: List[str],
     evidence_graph: ProfileEvidenceGraph,
     model_name: Optional[str],
+    llm_client=None,
 ) -> str:
     schema = select_output_schema(intent)
     base_payload = build_payload(
@@ -43,13 +42,17 @@ def generate_structured_answer(
         evidence_graph=evidence_graph,
     )
 
-    if not model_name:
+    if not model_name and llm_client is None:
         return json.dumps(base_payload, indent=2)
 
     prompt = _build_prompt(user_query, schema["schema"], base_payload)
     try:
-        response = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-        text = (response.get("response") or "").strip()
+        if llm_client is not None:
+            text = llm_client.generate(prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            text = get_llm_gateway().generate(prompt)
+        text = (text or "").strip()
         payload = _extract_json(text)
         if payload and validate_response_payload(payload, schema, evidence_graph):
             return json.dumps(payload, indent=2)

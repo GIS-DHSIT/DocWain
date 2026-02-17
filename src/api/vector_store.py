@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import threading
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -22,6 +23,18 @@ from src.api.pipeline_models import ChunkRecord
 from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, ensure_payload_indexes, list_payload_indexes
 
 logger = logging.getLogger(__name__)
+
+
+# Per-collection creation locks to prevent parallel creation attempts
+_collection_locks: Dict[str, threading.Lock] = {}
+_collection_locks_guard = threading.Lock()
+
+
+def _get_collection_lock(collection_name: str) -> threading.Lock:
+    with _collection_locks_guard:
+        if collection_name not in _collection_locks:
+            _collection_locks[collection_name] = threading.Lock()
+        return _collection_locks[collection_name]
 
 
 class QdrantCollectionSchemaMismatch(ValueError):
@@ -226,28 +239,32 @@ class QdrantVectorStore:
             info = self.client.get_collection(collection_name)
             _validate_schema(info)
         else:
-            try:
-                info = self.client.get_collection(collection_name)
-                _validate_schema(info)
-                exists = True
-            except Exception as exc:  # noqa: BLE001
-                logger.info("Creating Qdrant collection %s", collection_name)
+            # Use per-collection lock to prevent parallel creation races
+            lock = _get_collection_lock(collection_name)
+            with lock:
+                # Re-check after acquiring lock (another thread may have created it)
                 try:
-                    self.client.create_collection(
-                        collection_name=collection_name,
-                        vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
-                        sparse_vectors_config={"keywords_vector": SparseVectorParams()},
-                    )
-                except UnexpectedResponse as create_exc:
-                    if create_exc.status_code == 409:
-                        logger.info("Qdrant collection %s already exists; validating schema", collection_name)
-                        info = self.client.get_collection(collection_name)
-                        _validate_schema(info)
-                        exists = True
-                    else:
-                        raise
-                except Exception as create_exc:  # noqa: BLE001
-                    raise create_exc from exc
+                    info = self.client.get_collection(collection_name)
+                    _validate_schema(info)
+                    exists = True
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("Creating Qdrant collection %s", collection_name)
+                    try:
+                        self.client.create_collection(
+                            collection_name=collection_name,
+                            vectors_config={"content_vector": VectorParams(size=vector_size, distance=Distance.COSINE)},
+                            sparse_vectors_config={"keywords_vector": SparseVectorParams()},
+                        )
+                    except UnexpectedResponse as create_exc:
+                        if create_exc.status_code == 409:
+                            logger.info("Qdrant collection %s already exists; validating schema", collection_name)
+                            info = self.client.get_collection(collection_name)
+                            _validate_schema(info)
+                            exists = True
+                        else:
+                            raise
+                    except Exception as create_exc:  # noqa: BLE001
+                        raise create_exc from exc
         self.collection_dims[collection_name] = int(vector_size)
 
         self.ensure_payload_indexes(collection_name, PAYLOAD_INDEX_FIELDS, create_missing=True)

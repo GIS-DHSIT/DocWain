@@ -62,10 +62,12 @@ class TrainingBootstrap:
         qdrant_client: Any,
         embedding_model: Any,
         collection_name: str,
+        subscription_id: str = "",
     ) -> None:
         self._qdrant = qdrant_client
         self._embedding_model = embedding_model
         self._collection = collection_name
+        self._subscription_id = subscription_id
 
     # -- document type training data ---------------------------------------
 
@@ -337,9 +339,15 @@ class TrainingBootstrap:
         try:
             from qdrant_client.models import Filter, FieldCondition, MatchValue
 
-            filt = Filter(must=[
+            must_conditions = [
                 FieldCondition(key="profile_id", match=MatchValue(value=profile_id)),
-            ])
+            ]
+            # Defense-in-depth: also filter by subscription_id when available
+            if self._subscription_id:
+                must_conditions.append(
+                    FieldCondition(key="subscription_id", match=MatchValue(value=self._subscription_id)),
+                )
+            filt = Filter(must=must_conditions)
 
             all_points: List[Any] = []
             offset = None

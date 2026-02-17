@@ -17,9 +17,16 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Set
 from collections import Counter
+
+try:
+    import numpy as np
+    _HAS_NUMPY = True
+except ImportError:
+    _HAS_NUMPY = False
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +36,64 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class ContentTypeDetector:
-    """Detects the semantic content type of text chunks."""
+    """Detects the semantic content type of text chunks.
 
-    # Content type patterns
+    Supports two detection modes:
+    - ``detect()`` (classmethod): regex-based detection, no dependencies
+    - ``detect_ml()`` (instance method): zero-shot embedding similarity
+      using prototype descriptions — requires an embedder (e.g. BAAI/bge-large-en-v1.5)
+    """
+
+    # ── Prototype descriptions for ML zero-shot classification ────────
+    CONTENT_TYPE_DESCRIPTIONS: Dict[str, List[str]] = {
+        "contact_info": [
+            "Personal contact information with email address, phone number, and social media profiles",
+            "Name, email, phone, LinkedIn URL, GitHub profile, mailing address",
+            "Contact details section: email, mobile number, LinkedIn, location",
+        ],
+        "skills_list": [
+            "Technical skills list: Python, Java, JavaScript, React, AWS, Docker, Kubernetes, SQL",
+            "Programming languages, frameworks, tools, and technologies the candidate is proficient in",
+            "Skills and competencies: software development, cloud computing, databases, DevOps tools",
+        ],
+        "education": [
+            "Educational qualifications: Bachelor of Technology, Master of Science, university name, GPA, graduation year",
+            "Academic background with degree, institution, major, grade point average",
+            "Education section: college degree, university, coursework, specialization, academic achievements",
+        ],
+        "experience": [
+            "Professional work experience: job title, company name, employment dates, responsibilities and achievements",
+            "Career history showing roles, organizations, date ranges from 2019 to present, projects delivered",
+            "Work experience with accomplishments: managed team, developed software, deployed services, led projects",
+        ],
+        "financial": [
+            "Invoice with line items, unit prices, quantities, subtotals, tax amounts, and grand total in dollars",
+            "Financial document: payment terms, amount due, billing summary, account balance, transaction details",
+            "Purchase order with item descriptions, costs, shipping charges, and total amount payable",
+        ],
+        "legal": [
+            "Legal contract clause: governing law, indemnification, confidentiality, liability limitations",
+            "Agreement terms and conditions: whereas clauses, arbitration, force majeure, termination provisions",
+            "Legal document with definitions, obligations, representations, warranties, and signature blocks",
+        ],
+        "medical": [
+            "Medical record: patient diagnosis, symptoms, treatment plan, prescribed medications and dosages",
+            "Clinical findings: chief complaint, history of present illness, physical examination, lab results",
+            "Healthcare document with patient demographics, medical history, prognosis, and follow-up plan",
+        ],
+    }
+
+    # Content type patterns (regex fallback)
     PATTERNS = {
         "contact_info": [
-            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Email
-            r'[\+]?[(]?[0-9]{1,3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}',  # Phone
+            r'(?:^|(?:email|e-mail)\s*[:\-]?\s*)[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',  # Email with label context or start-of-line
+            r'(?:phone|tel|mobile|cell|fax)\s*[:\-]?\s*[\+]?[(]?[0-9]{1,3}[)]?[-\s\.]?[0-9]{3}[-\s\.]?[0-9]{4,6}',  # Phone with label context
             r'linkedin\.com/in/[\w-]+',  # LinkedIn
             r'github\.com/[\w-]+',  # GitHub
         ],
         "skills_list": [
             r'\b(python|java|javascript|typescript|react|angular|vue|node\.?js|sql|aws|azure|gcp|docker|kubernetes)\b',
             r'\b(excel|powerpoint|word|salesforce|sap|oracle|tableau|power\s*bi)\b',
-            r'[,;•·]\s*\w+\s*[,;•·]',  # Comma/bullet separated lists
         ],
         "education": [
             r'\b(bachelor|master|phd|doctorate|b\.?s\.?|m\.?s\.?|b\.?a\.?|m\.?a\.?|mba)\b',
@@ -57,8 +108,8 @@ class ContentTypeDetector:
             r'\b(20\d{2})\s*[-–]\s*(20\d{2}|present|current)\b',
         ],
         "financial": [
-            r'[\$€£¥]\s*[\d,]+\.?\d*',  # Currency amounts
-            r'\b(invoice|payment|amount|total|subtotal|tax|due)\b',
+            r'[\$€£¥]\s*[\d,]+\.?\d*',  # Currency amounts (anchor pattern)
+            r'\b(invoice\s+(?:number|no|date|#)|payment\s+(?:due|terms?)|amount\s+due|subtotal|grand\s+total)\b',
             r'\b(qty|quantity|unit\s*price|line\s*item)\b',
         ],
         "legal": [
@@ -81,10 +132,88 @@ class ContentTypeDetector:
         ],
     }
 
+    def __init__(self, embedder=None):
+        self._embedder = embedder
+        self._prototypes: Dict[str, Any] = {}  # type -> centroid vector (np.ndarray)
+        self._proto_lock = threading.Lock()
+
+    def _ensure_prototypes(self) -> None:
+        """Lazily compute prototype centroids (once, thread-safe)."""
+        if self._prototypes or self._embedder is None or not _HAS_NUMPY:
+            return
+        with self._proto_lock:
+            if self._prototypes:
+                return  # double-check after lock
+            try:
+                for ctype, descriptions in self.CONTENT_TYPE_DESCRIPTIONS.items():
+                    vecs = self._embedder.encode(
+                        descriptions,
+                        normalize_embeddings=True,
+                        convert_to_numpy=True,
+                    )
+                    centroid = np.asarray(vecs, dtype=np.float32).mean(axis=0)
+                    norm = np.linalg.norm(centroid)
+                    if norm > 1e-8:
+                        centroid /= norm
+                    self._prototypes[ctype] = centroid
+            except Exception:
+                logger.warning("Failed to compute content type prototypes", exc_info=True)
+                self._prototypes = {}
+
+    def detect_ml(self, text: str, section_title: str = "") -> Dict[str, Any]:
+        """ML-based content type detection via cosine similarity to prototypes.
+
+        Falls back to regex ``detect()`` when embedder is unavailable.
+        """
+        self._ensure_prototypes()
+        if not self._prototypes or self._embedder is None or not _HAS_NUMPY:
+            return self.detect(text, section_title)  # fallback
+
+        # Encode input text (first 500 chars for efficiency)
+        input_text = f"{section_title}: {text[:500]}" if section_title else text[:500]
+        try:
+            vec = np.asarray(
+                self._embedder.encode(
+                    input_text,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                ),
+                dtype=np.float32,
+            ).ravel()
+        except Exception:
+            logger.warning("Embedder encode failed in detect_ml, falling back to regex", exc_info=True)
+            return self.detect(text, section_title)
+
+        # Cosine similarity to each prototype
+        scores: Dict[str, float] = {}
+        for ctype, centroid in self._prototypes.items():
+            scores[ctype] = float(np.dot(vec, centroid))
+
+        # Structural detection stays regex-based (layout feature)
+        structure = self._detect_structure(text)
+
+        # Find best match
+        best_type = max(scores, key=scores.get)
+        best_score = scores[best_type]
+        confidence = max(0.0, min(1.0, best_score))
+
+        # Low confidence gate — gibberish / unrelated text → narrative
+        if best_score < 0.3:
+            best_type = "narrative"
+            confidence = 0.5
+
+        return {
+            "content_type": best_type,
+            "confidence": confidence,
+            "structure": structure,
+            "features": {},
+            "scores": scores,
+        }
+
     @classmethod
     def detect(cls, text: str, section_title: str = "") -> Dict[str, Any]:
         """
-        Detect content type and characteristics.
+        Detect content type and characteristics (regex fallback).
 
         Returns:
             Dict with content_type, confidence, and detected features
@@ -107,6 +236,33 @@ class ContentTypeDetector:
             scores[content_type] = matches
             if matched_items:
                 features[content_type] = matched_items[:5]
+
+        # ── Score normalization gates ──
+        # contact_info: only count if >=2 distinct signals (email, phone,
+        # linkedin/github) AND text is short or has "contact" in title.
+        if scores.get("contact_info", 0) > 0:
+            distinct = sum(
+                1 for p_idx, p in enumerate(cls.PATTERNS["contact_info"])
+                if re.search(p, combined, re.IGNORECASE | re.MULTILINE)
+            )
+            title_has_contact = "contact" in section_title.lower() if section_title else False
+            if distinct < 2 and not title_has_contact:
+                scores["contact_info"] = 0
+            elif len(text) > 300 and not title_has_contact:
+                scores["contact_info"] = max(0, scores["contact_info"] - 2)
+
+        # financial: only count if a currency symbol was actually found,
+        # not just keyword matches alone.
+        if scores.get("financial", 0) > 0:
+            has_currency = bool(re.search(r'[\$€£¥]\s*[\d,]+\.?\d*', combined))
+            if not has_currency:
+                # Keyword-only: require >=2 financial keywords to qualify
+                keyword_hits = sum(
+                    1 for p in cls.PATTERNS["financial"][1:]
+                    if re.search(p, combined, re.IGNORECASE)
+                )
+                if keyword_hits < 2:
+                    scores["financial"] = 0
 
         # Determine primary content type
         if not scores or max(scores.values()) == 0:
@@ -676,8 +832,8 @@ class UniversalEmbeddingEnhancer:
     - Query enrichment
     """
 
-    def __init__(self):
-        self.content_detector = ContentTypeDetector()
+    def __init__(self, embedder=None):
+        self.content_detector = ContentTypeDetector(embedder=embedder)
         self.field_extractor = SemanticFieldExtractor()
         self.quality_scorer = QualityScorer()
         self.text_builder = EmbeddingTextBuilder()
@@ -704,8 +860,11 @@ class UniversalEmbeddingEnhancer:
         Returns:
             EnhancedEmbeddingResult with all enhancements
         """
-        # Detect content type
-        content_info = self.content_detector.detect(text, section_title)
+        # Detect content type — ML when embedder available, regex fallback
+        if self.content_detector._embedder is not None:
+            content_info = self.content_detector.detect_ml(text, section_title)
+        else:
+            content_info = self.content_detector.detect(text, section_title)
         content_type = content_info["content_type"]
         structure = content_info["structure"]
 
@@ -849,6 +1008,7 @@ def enhance_for_embedding(
     section_title: str = "",
     section_path: str = "",
     document_type: str = "",
+    embedder=None,
 ) -> EnhancedEmbeddingResult:
     """
     Convenience function to enhance a single chunk.
@@ -858,11 +1018,12 @@ def enhance_for_embedding(
         section_title: Section heading
         section_path: Section hierarchy
         document_type: Document type
+        embedder: Optional embedding model for ML content detection
 
     Returns:
         EnhancedEmbeddingResult
     """
-    enhancer = UniversalEmbeddingEnhancer()
+    enhancer = UniversalEmbeddingEnhancer(embedder=embedder)
     return enhancer.enhance_chunk(
         text=text,
         section_title=section_title,
@@ -890,6 +1051,7 @@ def get_enhanced_payload(
     text: str,
     section_title: str = "",
     base_payload: Dict[str, Any] = None,
+    embedder=None,
 ) -> Dict[str, Any]:
     """
     Convenience function to get enhanced payload for Qdrant.
@@ -898,10 +1060,11 @@ def get_enhanced_payload(
         text: Chunk text
         section_title: Section heading
         base_payload: Existing payload to extend
+        embedder: Optional embedding model for ML content detection
 
     Returns:
         Enhanced payload dict
     """
-    enhancer = UniversalEmbeddingEnhancer()
+    enhancer = UniversalEmbeddingEnhancer(embedder=embedder)
     result = enhancer.enhance_chunk(text=text, section_title=section_title)
     return enhancer.build_enhanced_payload(result, base_payload)

@@ -57,6 +57,7 @@ from src.api.statuses import (
     STATUS_DELETED,
     STATUS_EXTRACTION_COMPLETED,
     STATUS_EXTRACTION_FAILED,
+    STATUS_SCREENING_COMPLETED,
     STATUS_UNDER_REVIEW,
 )
 from src.embedding.pipeline.payload_normalizer import normalize_chunk_metadata
@@ -269,6 +270,132 @@ def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> 
     return {"document_type": "GENERIC", "domain": "generic", "confidence": 0.0}
 
 
+# ── Ingestion-time entity metadata extraction ──────────────────────────
+
+import re as _re
+
+_EMAIL_RE = _re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+_PHONE_RE = _re.compile(
+    r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}"
+)
+_LINKEDIN_RE = _re.compile(r"linkedin\.com/in/[\w\-]+", _re.IGNORECASE)
+
+
+def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any]:
+    """Extract entity name, email, and phone from raw text at ingestion time.
+
+    Uses the first 500 chars of raw text plus filename-based heuristics.
+    Returns a dict suitable for storing as ``entity_metadata`` in the pickle.
+    """
+    text = ""
+    if isinstance(raw_docs, dict):
+        for _fname, content in raw_docs.items():
+            if isinstance(content, dict):
+                text = str(content.get("full_text") or content.get("text") or "")[:500]
+            elif isinstance(content, str):
+                text = content[:500]
+            if text:
+                break
+    elif isinstance(raw_docs, str):
+        text = raw_docs[:500]
+
+    result: Dict[str, Any] = {}
+
+    # Email
+    email_match = _EMAIL_RE.search(text)
+    if email_match:
+        result["entity_email"] = email_match.group()
+
+    # Phone
+    phone_match = _PHONE_RE.search(text)
+    if phone_match:
+        candidate = phone_match.group().strip()
+        # Only accept if it has enough digits (avoids matching year ranges)
+        digits = _re.sub(r"\D", "", candidate)
+        if len(digits) >= 7:
+            result["entity_phone"] = candidate
+
+    # LinkedIn
+    linkedin_match = _LINKEDIN_RE.search(text)
+    if linkedin_match:
+        result["entity_linkedin"] = linkedin_match.group()
+
+    # Name — try filename first (most reliable), then first line of text
+    name = ""
+    if filename:
+        try:
+            from src.rag_v3.extract import _name_from_filename
+            name = _name_from_filename(filename) or ""
+        except ImportError:
+            pass
+    if not name and text:
+        # Use first non-empty line that looks like a name (2-4 words, no special chars)
+        for line in text.split("\n")[:5]:
+            line = line.strip()
+            if not line or len(line) > 60:
+                continue
+            words = line.split()
+            if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
+                # Reject lines that look like headers/metadata
+                lower = line.lower()
+                if not any(kw in lower for kw in ("resume", "curriculum", "invoice", "page", "date")):
+                    name = line
+                    break
+    if name:
+        result["entity_name"] = name
+
+    return result
+
+
+def _validate_extraction_fields(
+    doc_classification: Dict[str, Any],
+    raw_docs: Any,
+    filename: str,
+) -> None:
+    """Log warnings for missing required fields per document type.
+
+    No hard failures — just structured logging for observability.
+    """
+    doc_type = (doc_classification.get("document_type") or "").lower()
+    domain = (doc_classification.get("domain") or "").lower()
+
+    # Build a quick text sample for checking
+    text = ""
+    if isinstance(raw_docs, dict):
+        for _fname, content in raw_docs.items():
+            if isinstance(content, dict):
+                text = str(content.get("full_text") or "")[:2000]
+            elif isinstance(content, str):
+                text = content[:2000]
+            if text:
+                break
+    elif isinstance(raw_docs, str):
+        text = raw_docs[:2000]
+
+    text_lower = text.lower()
+
+    if domain in ("resume", "hr") or "resume" in doc_type or "cv" in doc_type:
+        # Check for name (at least one capitalized word pair in first 300 chars)
+        has_name = bool(_re.search(r"[A-Z][a-z]+\s+[A-Z][a-z]+", text[:300]))
+        has_skills = any(kw in text_lower for kw in ("skill", "python", "java", "sql", "experience"))
+        has_experience = any(kw in text_lower for kw in ("experience", "worked", "years", "company"))
+        if not has_name:
+            logger.warning("extraction_validation: resume missing entity name — doc=%s file=%s", filename, doc_type)
+        if not has_skills:
+            logger.warning("extraction_validation: resume missing skills — doc=%s file=%s", filename, doc_type)
+        if not has_experience:
+            logger.warning("extraction_validation: resume missing experience — doc=%s file=%s", filename, doc_type)
+
+    elif domain == "invoice" or "invoice" in doc_type:
+        has_number = any(kw in text_lower for kw in ("invoice number", "invoice no", "inv #", "inv no"))
+        has_date = any(kw in text_lower for kw in ("invoice date", "date:", "due date"))
+        has_items = any(kw in text_lower for kw in ("line item", "description", "qty", "quantity", "total"))
+        if not has_number and not has_date:
+            logger.warning("extraction_validation: invoice missing number/date — doc=%s file=%s", filename, doc_type)
+        if not has_items:
+            logger.warning("extraction_validation: invoice missing line items/total — doc=%s file=%s", filename, doc_type)
+
+
 def _sanitize_raw_text_fields(docs: Any) -> Any:
     """Ensure no stringified repr or dict garbage in text fields."""
     if not isinstance(docs, dict):
@@ -326,6 +453,73 @@ def _set_document_status(
     logger.info("Document %s status updated to %s", document_id, status)
 
 
+def _run_auto_screening(document_id: str, doc_type: Optional[str] = None) -> None:
+    """Run screening automatically after extraction completes.
+
+    When auto_attach_on_ingest is enabled, runs the screening engine and
+    transitions status to SCREENING_COMPLETED (or TRAINING_BLOCKED_SECURITY).
+    When disabled, bypasses screening and directly sets SCREENING_COMPLETED.
+    On any failure, sets SCREENING_COMPLETED so embedding is not blocked.
+    """
+    try:
+        from src.screening.config import ScreeningConfig
+        cfg = ScreeningConfig.load()
+    except Exception:  # noqa: BLE001
+        logger.warning("Screening config unavailable for %s; bypassing screening", document_id)
+        _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
+        return
+
+    if not cfg.auto_attach_on_ingest:
+        logger.info("Auto-screening disabled; bypassing screening for %s", document_id)
+        _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
+        return
+
+    try:
+        from src.screening.engine import ScreeningEngine
+        from src.api.screening_service import apply_security_result
+
+        engine = ScreeningEngine(config=cfg)
+        report = engine.run_all(document_id, doc_type=doc_type)
+        report_dict = report.to_dict()
+        apply_security_result(document_id, report_dict)
+        logger.info(
+            "Auto-screening completed for %s: risk=%s score=%.1f",
+            document_id,
+            report.risk_level,
+            report.overall_score_0_100,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Auto-screening failed for %s: %s; setting SCREENING_COMPLETED to unblock pipeline",
+            document_id,
+            exc,
+        )
+        _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
+
+
+_DEBOUNCE_TTL_SECONDS = 5
+
+
+def _debounce_extraction(subscription_id: str, doc_id: str) -> bool:
+    """Return True if this extraction request is a duplicate within the debounce window."""
+    try:
+        from src.api.config import Config
+        redis_client = getattr(Config.Redis, "get_client", lambda: None)()
+        if redis_client is None:
+            from src.api.rag_state import get_app_state
+            state = get_app_state()
+            redis_client = getattr(state, "redis_client", None) if state else None
+        if redis_client is None:
+            return False
+        debounce_key = f"extract:debounce:{subscription_id}:{doc_id}"
+        if redis_client.get(debounce_key):
+            return True
+        redis_client.setex(debounce_key, _DEBOUNCE_TTL_SECONDS, "1")
+        return False
+    except Exception:
+        return False
+
+
 def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Dict[str, Any]) -> Dict[str, Any]:
     profile_id = str(doc_data.get("profile")) if doc_data.get("profile") else None
     subscription_candidate = (
@@ -342,10 +536,14 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
         return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
+    if _debounce_extraction(subscription_id, doc_id):
+        logger.info("Extraction debounced for %s (subscription %s); duplicate within %ds", doc_id, subscription_id, _DEBOUNCE_TTL_SECONDS)
+        return {"document_id": doc_id, "status": "CONFLICT", "reason": "debounced_duplicate"}
+
     lock = acquire_lock(stage="extraction", document_id=doc_id, subscription_id=subscription_id)
     if not lock.acquired:
         logger.info("Extraction already in progress for %s; skipping duplicate trigger.", doc_id)
-        return {"document_id": doc_id, "status": "SKIPPED", "reason": "duplicate_extraction_in_progress"}
+        return {"document_id": doc_id, "status": "CONFLICT", "reason": "duplicate_extraction_in_progress"}
 
     pii_masking_enabled = get_subscription_pii_setting(subscription_id)
     logger.info("Document %s (subscription %s): PII masking=%s", doc_id, subscription_id, pii_masking_enabled)
@@ -512,11 +710,14 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         try:
             # Persist raw, structured extraction and intelligence in the pickle for source-of-truth
             doc_classification = _extract_classification_from_structured(structured_docs)
+            entity_meta = _extract_entity_metadata(masked_docs, doc_data.get("name", ""))
+            _validate_extraction_fields(doc_classification, masked_docs, doc_data.get("name", ""))
             payload_to_save = {
                 "raw": masked_docs,
                 "structured": structured_docs,
                 "intelligence": intelligence_result,
                 "document_classification": doc_classification,
+                "entity_metadata": entity_meta,
             }
             save_info = save_extracted_pickle(doc_id, payload_to_save)
             update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
@@ -531,6 +732,9 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             "extracted_hash": save_info.get("sha256"),
         }
         _set_document_status(doc_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
+
+        # Auto-screen after extraction so embedding can proceed
+        _run_auto_screening(doc_id, doc_type=doc_classification.get("document_type"))
 
         summary = _build_extraction_summary(masked_docs)
         return {
@@ -680,11 +884,14 @@ def extract_uploaded_document(
     try:
         # Persist uploaded file extraction (raw, structured, intelligence, classification) in the pickle
         doc_classification = _extract_classification_from_structured(structured_docs)
+        entity_meta = _extract_entity_metadata(extracted, filename)
+        _validate_extraction_fields(doc_classification, extracted, filename)
         payload_to_save = {
             "raw": extracted,
             "structured": structured_docs,
             "intelligence": intelligence_result,
             "document_classification": doc_classification,
+            "entity_metadata": entity_meta,
         }
         save_info = save_extracted_pickle(document_id, payload_to_save)
         update_extraction_metadata(document_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
@@ -699,6 +906,9 @@ def extract_uploaded_document(
         "extracted_hash": save_info.get("sha256"),
     }
     _set_document_status(document_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
+
+    # Auto-screen after extraction so embedding can proceed
+    _run_auto_screening(document_id, doc_type=doc_classification.get("document_type"))
 
     summary = _build_extraction_summary(extracted)
     return {

@@ -28,11 +28,9 @@ def detect_pii_with_ai(text: str) -> List[Dict[str, str]]:
         for match in re.findall(pattern, text):
             detected.append({"type": label.strip("[]"), "value": match})
 
-    # Optional local Ollama refinement (llama3.2 by default)
+    # Optional LLM refinement via centralized gateway
     try:
-        import ollama
-
-        model_name = os.getenv("OLLAMA_MODEL", "llama3.2")
+        from src.llm.gateway import get_llm_gateway
         prompt = (
             "Identify PII (emails, phone numbers, SSNs, credit cards, passport numbers, addresses, bank accounts) "
             "in the provided text. Respond ONLY with JSON array of objects "
@@ -40,8 +38,7 @@ def detect_pii_with_ai(text: str) -> List[Dict[str, str]]:
             "Text:\n"
             f"{text[:4000]}"
         )
-        response = ollama.generate(model=model_name, prompt=prompt)
-        payload = response.get("response") if isinstance(response, dict) else None
+        payload = get_llm_gateway().generate(prompt)
         if payload:
             parsed = json.loads(payload)
             if isinstance(parsed, list):
@@ -54,7 +51,7 @@ def detect_pii_with_ai(text: str) -> List[Dict[str, str]]:
                             }
                         )
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Ollama PII detection fallback used due to: %s", exc)
+        logging.warning("LLM PII detection fallback used due to: %s", exc)
 
     # Deduplicate by value/type
     unique: Dict[Tuple[str, str], Dict[str, str]] = {}
