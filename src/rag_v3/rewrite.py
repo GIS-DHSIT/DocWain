@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import logging
 import re
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -14,6 +15,20 @@ logger = logging.getLogger(__name__)
 REWRITE_TIMEOUT_MS = 2500
 REWRITE_MAX_TOKENS = 96
 REWRITE_CACHE_TTL_SEC = 24 * 60 * 60
+
+# Shared semaphore to avoid rewrite and extract competing for the same GPU
+_ollama_semaphore: Optional[threading.Semaphore] = None
+
+
+def _get_ollama_semaphore() -> threading.Semaphore:
+    global _ollama_semaphore
+    if _ollama_semaphore is None:
+        try:
+            from src.api.config import Config
+            _ollama_semaphore = threading.Semaphore(getattr(Config.LLM, "MAX_CONCURRENCY", 2))
+        except Exception:
+            _ollama_semaphore = threading.Semaphore(2)
+    return _ollama_semaphore
 
 _STOPWORDS = {
     "the",
@@ -99,7 +114,8 @@ def rewrite_query(
         )
         if timed_out:
             logger.warning(
-                "RAG v3 rewrite timed out; using normalized query",
+                "RAG v3 rewrite timed out; using normalized query (original=%r)",
+                normalized[:200],
                 extra={"stage": "rewrite", "correlation_id": correlation_id},
             )
             _cache(redis_client, cache_key, normalized)
@@ -200,18 +216,25 @@ def _generate_with_timeout(
         "num_predict": int(max_tokens),
         "max_output_tokens": int(max_tokens),
     }
+    sem = _get_ollama_semaphore()
 
     def _call():
-        if hasattr(llm_client, "generate_with_metadata"):
-            text, meta = llm_client.generate_with_metadata(
-                prompt,
-                options=options,
-                max_retries=1,
-                backoff=0.3,
-            )
-            return text or "", meta or {}
-        text = llm_client.generate(prompt, max_retries=1, backoff=0.3)
-        return text or "", {}
+        acquired = sem.acquire(timeout=max(0.01, float(timeout_ms) / 2000.0))
+        if not acquired:
+            return "", {}
+        try:
+            if hasattr(llm_client, "generate_with_metadata"):
+                text, meta = llm_client.generate_with_metadata(
+                    prompt,
+                    options=options,
+                    max_retries=1,
+                    backoff=0.3,
+                )
+                return text or "", meta or {}
+            text = llm_client.generate(prompt, max_retries=1, backoff=0.3)
+            return text or "", {}
+        finally:
+            sem.release()
 
     deadline = max(0.05, float(timeout_ms) / 1000.0)
     start = time.monotonic()

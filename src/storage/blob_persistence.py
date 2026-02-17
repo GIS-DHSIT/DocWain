@@ -98,6 +98,33 @@ def _acquire_lease(blob_client, lease_duration: int) -> Optional[str]:
         raise
 
 
+def _release_lease_with_retry(
+    blob_client, lease_id: str, document_id: Optional[str], blob_name: str, *, max_attempts: int = 3
+) -> None:
+    """Release a blob lease with retry logic and short backoff."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            blob_client.release_lease(lease=lease_id)
+            logger.info(
+                "Released blob lease document_id=%s blob=%s (attempt %d)",
+                document_id, blob_name, attempt,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt < max_attempts:
+                backoff = 0.5 * attempt
+                logger.debug(
+                    "Blob lease release attempt %d/%d failed for %s: %s (retrying in %.1fs)",
+                    attempt, max_attempts, blob_name, exc, backoff,
+                )
+                time.sleep(backoff)
+            else:
+                logger.warning(
+                    "Failed to release blob lease after %d attempts document_id=%s blob=%s lease_id=%s: %s",
+                    max_attempts, document_id, blob_name, lease_id, exc,
+                )
+
+
 def _log_lease_state(blob_name: str, document_id: Optional[str], props: Any, *, attempt: int, outcome: str) -> None:
     lease = getattr(props, "lease", None)
     lease_status = getattr(lease, "status", None)
@@ -336,19 +363,7 @@ def save_pickle_atomic(
             raise
     finally:
         if lease_id:
-            try:
-                blob_client.release_lease(lease=lease_id)
-                logger.info(
-                    "Released blob lease document_id=%s blob=%s",
-                    document_id,
-                    normalized,
-                )
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "Failed to release blob lease document_id=%s blob=%s",
-                    document_id,
-                    normalized,
-                )
+            _release_lease_with_retry(blob_client, lease_id, document_id, normalized)
 
     try:
         props = blob_client.get_blob_properties()

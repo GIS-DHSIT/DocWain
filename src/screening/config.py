@@ -107,7 +107,7 @@ class ScreeningConfig:
     doc_type_templates: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_TEMPLATES))
     policy_rules: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_POLICY_RULES))
     sensitive_keywords: List[str] = field(default_factory=lambda: ["confidential", "proprietary"])
-    auto_attach_on_ingest: bool = False
+    auto_attach_on_ingest: bool = True
     block_high_risk: bool = False
     config_source: str = "defaults"
     config_hash: str = ""
@@ -165,7 +165,7 @@ class ScreeningConfig:
             os.getenv("SCREENING_INTERNET_ENABLED"),
             default=internet_from_file,
         )
-        auto_attach_default = _parse_bool(data.get("auto_attach_on_ingest"), default=False)
+        auto_attach_default = _parse_bool(data.get("auto_attach_on_ingest"), default=True)
         auto_attach = _parse_bool(
             os.getenv("SCREENING_AUTO_ATTACH_ON_INGEST"),
             default=auto_attach_default,

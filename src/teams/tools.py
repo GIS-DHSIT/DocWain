@@ -100,6 +100,12 @@ class TeamsToolRouter:
             return self._set_model(context, action_value.get("model"))
         if action == "set_persona":
             return self._set_persona(context, action_value.get("persona"))
+        if action == "generate_content":
+            return await self._generate_content(
+                context,
+                content_type=action_value.get("content_type"),
+                query=action_value.get("query") or action_value.get("text", ""),
+            )
         if action in {"open_ui", "open_web"}:
             return self._open_ui()
         if action in {"help", "show_tools"}:
@@ -156,6 +162,40 @@ class TeamsToolRouter:
         return _card_activity(
             build_card("answer_card", title="Extracted fields", text=body_text),
             text="Field extraction ready.",
+        )
+
+    async def _generate_content(
+        self,
+        context: TeamsChatContext,
+        content_type: Optional[str] = None,
+        query: str = "",
+    ) -> Dict[str, Any]:
+        """Generate document-grounded content using the RAG pipeline."""
+        uploads = self.state_store.list_uploads(context.subscription_id, context.profile_id, limit=5)
+        if not uploads:
+            return _card_activity(
+                build_card("error_card", message="No uploads found. Upload a document first to generate content from it.")
+            )
+
+        filenames = [u.get("filename") for u in uploads if u.get("filename")]
+        if not query:
+            query = "Generate a professional summary based on the uploaded documents."
+        generation_query = f"{query} Use documents: {', '.join(filenames)}."
+        if content_type:
+            generation_query = f"[{content_type}] {generation_query}"
+
+        try:
+            answer = await self._ask_docwain(generation_query, context)
+            response_text = answer.get("response") or "Could not generate content. Try rephrasing your request."
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Content generation via Teams failed: %s", exc, exc_info=True)
+            return _card_activity(
+                build_card("error_card", message="Content generation failed. Please try again.")
+            )
+
+        return _card_activity(
+            build_card("answer_card", title="Generated content", text=response_text),
+            text="Content generation complete.",
         )
 
     def _list_docs(self, context: TeamsChatContext) -> Dict[str, Any]:

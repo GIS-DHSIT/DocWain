@@ -211,12 +211,14 @@ class TestNameExtractionFixes:
         # "Update1" should be stripped by the regex
         assert "update" not in result.lower()
 
-    def test_name_from_filename_strips_dev_ip(self):
+    def test_name_from_filename_preserves_dev_name(self):
         from src.rag_v3.extract import _name_from_filename
 
         result = _name_from_filename("Dev_Resume_IP.pdf")
-        # "Dev" and "IP" are noise words — should produce None or empty
-        assert result is None or len(result.strip()) == 0
+        # "Dev" is a valid name (e.g., Dev Patel); "IP" is noise
+        # After stripping "resume" and "ip", "Dev" remains as a valid name
+        assert result is not None
+        assert "Dev" in result
 
     def test_name_from_filename_normal_name(self):
         from src.rag_v3.extract import _name_from_filename

@@ -273,8 +273,10 @@ class ResponseFormatter:
             ACKNOWLEDGEMENT_TEMPLATES[QueryIntent.UNKNOWN]
         )
 
-        # Use first template (can randomize if desired)
-        template = templates[0]
+        # Rotate templates deterministically by query hash so different
+        # queries get different phrasing while the same query stays stable
+        idx = hash(query) % len(templates) if query else 0
+        template = templates[idx]
 
         return template.format(topic=topic)
 

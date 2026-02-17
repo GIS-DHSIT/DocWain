@@ -19,6 +19,8 @@ class AppState:
     redis_client: Any
     ollama_client: Any
     rag_system: Any
+    llm_gateway: Any = None  # src.llm.gateway.LLMGateway — canonical LLM entry point
+    multi_agent_gateway: Any = None  # src.llm.multi_agent.MultiAgentGateway — role-specific models
     instance_ids: Dict[str, str] = field(default_factory=dict)
     qdrant_index_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
@@ -70,6 +72,7 @@ def register_instance_ids(state: AppState) -> None:
     _assign_instance_id("qdrant_client", state.qdrant_client, state.instance_ids)
     _assign_instance_id("redis_client", state.redis_client, state.instance_ids)
     _assign_instance_id("ollama_client", state.ollama_client, state.instance_ids)
+    _assign_instance_id("llm_gateway", state.llm_gateway, state.instance_ids)
     _assign_instance_id("rag_system", state.rag_system, state.instance_ids)
     logger.info("Singleton instance IDs: %s", state.instance_ids)
 

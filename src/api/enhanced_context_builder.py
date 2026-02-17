@@ -505,7 +505,7 @@ class IntelligentContextBuilder:
         # Add query restatement for focus
         context_parts.append(f"[QUERY: {query}]\n")
 
-        max_chars = int(getattr(Config.Retrieval, "MAX_CONTEXT_CHARS", 6000))
+        max_chars = int(getattr(Config.RagV3, "MAX_CONTEXT_CHARS", 6000))
         current_chars = 0
         truncated = False
         for i, chunk in enumerate(ordered_chunks, 1):

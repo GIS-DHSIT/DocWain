@@ -175,6 +175,14 @@ def prepare_embedding_chunks(
         m["chunk_kind"] = m.get("chunk_kind", "section_text")
         raw_text = chunk_text
         clean_text = clean_text_for_embedding(raw_text)
+        # Guard against encoding garbage (UTF-16 null interleaving, etc.)
+        from src.embedding.pipeline.schema_normalizer import _is_encoding_garbage
+        if _is_encoding_garbage(raw_text):
+            logger.warning(
+                "Dropping encoding-garbage chunk %d for %s (null/control char ratio too high)",
+                len(prepared_chunks), doc_name,
+            )
+            continue
         # Guard against metadata garbage in raw text — try salvage before fallback
         from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
         if _is_metadata_garbage(raw_text):

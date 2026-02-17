@@ -5,8 +5,6 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-import ollama
-
 from src.api.context_understanding import ContextUnderstanding
 from src.doc_understanding.structure_inference import infer_structure
 
@@ -27,8 +25,8 @@ def _fallback_entities(text: str) -> List[Dict[str, str]]:
     return entities
 
 
-def _ollama_understand(text: str, doc_type: str, model_name: Optional[str]) -> Optional[Dict[str, Any]]:
-    if not model_name:
+def _ollama_understand(text: str, doc_type: str, model_name: Optional[str], llm_client=None) -> Optional[Dict[str, Any]]:
+    if not model_name and llm_client is None:
         return None
     prompt = (
         "You are extracting structured understanding from a document. "
@@ -42,8 +40,12 @@ def _ollama_understand(text: str, doc_type: str, model_name: Optional[str]) -> O
         f"TEXT:\n{text[:8000]}"
     )
     try:
-        resp = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-        content = resp.get("response", "").strip()
+        if llm_client is not None:
+            content = llm_client.generate(prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            content = get_llm_gateway().generate(prompt)
+        content = (content or "").strip()
         return json.loads(content)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Ollama understanding failed: %s", exc)

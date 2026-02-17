@@ -47,6 +47,7 @@ def enhance_chunks_for_embedding(
     chunk_metadata: List[Dict[str, Any]],
     document_metadata: Dict[str, Any],
     domain: str = "generic",
+    embedder=None,
 ) -> EmbeddingEnhancementResult:
     """
     Enhance chunks before embedding for better retrieval quality.
@@ -85,6 +86,7 @@ def enhance_chunks_for_embedding(
             chunk_metadata=chunk_metadata,
             document_metadata=document_metadata,
             domain=domain,
+            embedder=embedder,
         )
 
     # Fallback to legacy enhancement
@@ -101,13 +103,14 @@ def _enhance_with_universal_enhancer(
     chunk_metadata: List[Dict[str, Any]],
     document_metadata: Dict[str, Any],
     domain: str = "generic",
+    embedder=None,
 ) -> EmbeddingEnhancementResult:
     """
     Enhance chunks using the universal enhancer for document-agnostic improvements.
     """
     try:
-        # Initialize universal enhancer
-        enhancer = UniversalEmbeddingEnhancer()
+        # Initialize universal enhancer (with optional ML embedder)
+        enhancer = UniversalEmbeddingEnhancer(embedder=embedder)
 
         # Prepare chunks for enhancement
         chunks_for_enhancement = []

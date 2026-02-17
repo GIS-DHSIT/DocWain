@@ -6,8 +6,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-import ollama
-
 logger = logging.getLogger(__name__)
 
 DOCUMENT_TAXONOMY = [
@@ -98,8 +96,8 @@ def _heuristic_classify(text: str, tables: str, filename: str) -> Optional[tuple
     return None
 
 
-def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional[str]) -> Optional[tuple[str, float]]:
-    if not model_name:
+def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional[str], llm_client=None) -> Optional[tuple[str, float]]:
+    if not model_name and llm_client is None:
         return None
     prompt = (
         "Classify the document into one of the following types: "
@@ -111,8 +109,12 @@ def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional
         f"Filename: {filename}\n\nText sample:\n{text[:2000]}\n\nTables sample:\n{tables[:2000]}\n"
     )
     try:
-        response = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-        content = response.get("response", "").strip()
+        if llm_client is not None:
+            content = llm_client.generate(prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            content = get_llm_gateway().generate(prompt)
+        content = (content or "").strip()
         payload = json.loads(content)
         doc_type = str(payload.get("document_type", "other")).strip()
         confidence = float(payload.get("confidence", 0.0))

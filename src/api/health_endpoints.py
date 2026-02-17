@@ -418,4 +418,105 @@ async def dpie_status() -> Dict[str, Any]:
         return {"is_loaded": False, "error": "dpie_integration not available"}
 
 
+@health_router.get("/api/admin/metrics/quality")
+async def quality_metrics(hours: int = 24) -> Dict[str, Any]:
+    """Return pipeline quality metrics aggregated over the last N hours."""
+    try:
+        from src.metrics.quality_metrics import get_quality_summary
+        return get_quality_summary(hours=hours)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@health_router.get("/api/admin/llm/status")
+async def llm_status() -> Dict[str, Any]:
+    """Return the current LLM gateway status and health."""
+    try:
+        from src.llm.gateway import get_llm_gateway
+        gateway = get_llm_gateway()
+        if gateway is None:
+            return {"status": "not_initialized"}
+        info: Dict[str, Any] = {
+            "status": "initialized",
+            "backend": getattr(gateway, "backend", "unknown"),
+            "model": getattr(gateway, "model_name", "unknown"),
+            "name": getattr(gateway, "name", "unknown"),
+        }
+        if hasattr(gateway, "get_stats"):
+            info["stats"] = gateway.get_stats()
+        return info
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+
+
+@health_router.get("/api/admin/teams/status")
+async def teams_status() -> Dict[str, Any]:
+    """Return Teams bot configuration status."""
+    from src.api.config import Config
+
+    app_id = getattr(Config.Teams, "BOT_APP_ID", None) or ""
+    app_password = getattr(Config.Teams, "BOT_APP_PASSWORD", None) or ""
+    shared_secret = getattr(Config.Teams, "SHARED_SECRET", None) or ""
+    masked_app_id = (app_id[:8] + "...") if len(app_id) > 8 else app_id
+
+    bot_adapter_ready = False
+    try:
+        from src.teams.bot_app import BOT_CREDENTIALS_CONFIGURED, bot_adapter as _ba
+
+        bot_adapter_ready = _ba is not None and BOT_CREDENTIALS_CONFIGURED
+    except ImportError:
+        pass
+
+    redis_status = "unknown"
+    try:
+        from src.teams.state import TeamsStateStore
+
+        store = TeamsStateStore()
+        if store.client:
+            store.client.ping()
+            redis_status = "healthy"
+        else:
+            redis_status = "in-memory fallback"
+    except Exception as exc:
+        redis_status = f"unhealthy: {str(exc)[:80]}"
+
+    return {
+        "bot_credentials_configured": bool(app_id and app_password),
+        "app_id_masked": masked_app_id or "(not set)",
+        "shared_secret_configured": bool(shared_secret),
+        "bot_adapter_ready": bot_adapter_ready,
+        "state_store_redis": redis_status,
+        "diag_mode": getattr(Config.Teams, "DIAG_MODE", False),
+        "session_as_subscription": getattr(Config.Teams, "SESSION_AS_SUBSCRIPTION", True),
+        "profile_per_user": getattr(Config.Teams, "PROFILE_PER_USER", True),
+        "default_model": getattr(Config.Teams, "DEFAULT_MODEL", ""),
+        "default_persona": getattr(Config.Teams, "DEFAULT_PERSONA", ""),
+    }
+
+
+@health_router.get("/api/admin/multi-agent/status")
+async def multi_agent_status() -> Dict[str, Any]:
+    """Return multi-agent gateway status and per-role statistics."""
+    from src.api.config import Config
+
+    enabled = getattr(Config, "MultiAgent", None) and getattr(Config.MultiAgent, "ENABLED", False)
+    if not enabled:
+        return {"enabled": False, "status": "disabled"}
+
+    try:
+        from src.api.rag_state import get_app_state
+        state = get_app_state()
+        gw = getattr(state, "multi_agent_gateway", None) if state else None
+        if gw is None:
+            return {"enabled": True, "status": "not_initialized"}
+        stats = gw.get_stats() if hasattr(gw, "get_stats") else {}
+        return {
+            "enabled": True,
+            "status": "initialized",
+            **stats,
+        }
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)[:200]}
+
+
 __all__ = ["health_router"]

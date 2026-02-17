@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -67,3 +67,10 @@ class RequestContext:
             use_tools=use_tools,
             tool_inputs=tool_inputs,
         )
+
+    def with_tools(self, tool_names: List[str]) -> None:
+        """Inject auto-selected tools into this context."""
+        existing = self.tools or []
+        self.tools = list(dict.fromkeys(existing + tool_names))
+        if self.tools:
+            self.use_tools = True

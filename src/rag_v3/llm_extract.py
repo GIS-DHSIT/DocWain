@@ -21,9 +21,12 @@ logger = logging.getLogger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────
 LLM_EXTRACT_TIMEOUT_S = 60.0
+LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S = 30.0
 LLM_MAX_OUTPUT_TOKENS = 2048
 LLM_MAX_CONTEXT_CHARS = 6144
 LLM_MAX_CHUNKS = 8  # Send only top-scored chunks to LLM
+LLM_CHUNKED_TOKEN_THRESHOLD = 2000  # Estimated token count to trigger chunked extraction
+_CHARS_PER_TOKEN = 4  # Rough char-to-token ratio for estimation
 
 
 def llm_extract_and_respond(
@@ -74,8 +77,33 @@ def llm_extract_and_respond(
         num_documents=num_documents,
     )
 
-    raw_text = _generate(llm_client, prompt, correlation_id)
+    # Use GENERATOR role for multi-agent, else default
+    _gen_role = None
+    try:
+        from src.llm.multi_agent import MultiAgentGateway, AgentRole
+        if isinstance(llm_client, MultiAgentGateway):
+            _gen_role = AgentRole.GENERATOR
+    except ImportError:
+        pass
+
+    # Build simplified fallback prompt for intermediate timeout
+    est_tokens = _estimate_tokens(full_evidence)
+    fallback_prompt = None
+    if est_tokens > LLM_CHUNKED_TOKEN_THRESHOLD:
+        fallback_prompt = _build_simplified_prompt(query, full_evidence)
+        logger.info(
+            "LLM extract: large context (~%d tokens, %d chunks), fallback prompt ready",
+            est_tokens, len(top_chunks),
+            extra={"stage": "llm_extract", "correlation_id": correlation_id},
+        )
+
+    raw_text = _generate(llm_client, prompt, correlation_id, role=_gen_role, fallback_prompt=fallback_prompt)
     if not raw_text:
+        logger.warning(
+            "LLM extract returned no result: domain=%s chunks=%d est_tokens=%d",
+            intent_type, len(top_chunks), est_tokens,
+            extra={"stage": "llm_extract_timeout", "correlation_id": correlation_id},
+        )
         return None
 
     return _parse_response(raw_text, top_chunks)
@@ -385,10 +413,27 @@ def _build_grouped_evidence(chunks: List[Any]) -> str:
 
 # ── LLM call with timeout ────────────────────────────────────────────
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token count estimate based on character length."""
+    return max(1, len(text) // _CHARS_PER_TOKEN)
+
+
+def _build_simplified_prompt(query: str, evidence: str) -> str:
+    """Shorter prompt for intermediate-timeout fallback."""
+    truncated = evidence[:LLM_MAX_CONTEXT_CHARS // 2]
+    return (
+        f"Answer this question concisely using ONLY the evidence below.\n"
+        f"Question: {query}\n\nEvidence:\n{truncated}\n\nAnswer:"
+    )
+
+
 def _generate(
     llm_client: Any,
     prompt: str,
     correlation_id: Optional[str],
+    role: Optional[str] = None,
+    *,
+    fallback_prompt: Optional[str] = None,
 ) -> Optional[str]:
     options = {
         "num_predict": LLM_MAX_OUTPUT_TOKENS,
@@ -397,27 +442,65 @@ def _generate(
         "stop": [],
     }
 
-    def _call() -> str:
+    def _call(p: str) -> str:
+        # Multi-agent role-aware dispatch (isinstance avoids MagicMock false positives)
+        if role:
+            try:
+                from src.llm.multi_agent import MultiAgentGateway
+                if isinstance(llm_client, MultiAgentGateway):
+                    text, _meta = llm_client.generate_with_metadata_for_role(
+                        role, p, options=options, max_retries=1, backoff=0.4,
+                    )
+                    return text or ""
+            except ImportError:
+                pass
         if hasattr(llm_client, "generate_with_metadata"):
             text, _meta = llm_client.generate_with_metadata(
-                prompt, options=options, max_retries=1, backoff=0.4,
+                p, options=options, max_retries=1, backoff=0.4,
             )
             return text or ""
-        return llm_client.generate(prompt, max_retries=1, backoff=0.4) or ""
+        return llm_client.generate(p, max_retries=1, backoff=0.4) or ""
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_call)
+    future = executor.submit(_call, prompt)
     try:
-        result = future.result(timeout=LLM_EXTRACT_TIMEOUT_S)
+        # Try intermediate timeout first if we have a fallback prompt
+        timeout = LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S if fallback_prompt else LLM_EXTRACT_TIMEOUT_S
+        result = future.result(timeout=timeout)
         return result if result and result.strip() else None
     except concurrent.futures.TimeoutError:
         future.cancel()
-        logger.warning(
-            "LLM extract timed out after %.1fs",
-            LLM_EXTRACT_TIMEOUT_S,
-            extra={"stage": "llm_extract", "correlation_id": correlation_id},
-        )
-        return None
+        if fallback_prompt:
+            logger.warning(
+                "LLM extract hit intermediate timeout (%.1fs), retrying with simplified prompt",
+                LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S,
+                extra={"stage": "llm_extract", "correlation_id": correlation_id},
+            )
+            # Retry with simplified prompt and remaining time budget
+            executor2 = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future2 = executor2.submit(_call, fallback_prompt)
+            try:
+                remaining = LLM_EXTRACT_TIMEOUT_S - LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S
+                result = future2.result(timeout=max(remaining, 5.0))
+                return result if result and result.strip() else None
+            except (concurrent.futures.TimeoutError, Exception) as exc:
+                future2.cancel()
+                logger.warning(
+                    "LLM extract fallback also failed after %.1fs: %s",
+                    LLM_EXTRACT_TIMEOUT_S,
+                    exc,
+                    extra={"stage": "llm_extract", "correlation_id": correlation_id},
+                )
+                return None
+            finally:
+                executor2.shutdown(wait=False)
+        else:
+            logger.warning(
+                "LLM extract timed out after %.1fs",
+                LLM_EXTRACT_TIMEOUT_S,
+                extra={"stage": "llm_extract", "correlation_id": correlation_id},
+            )
+            return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "LLM extract failed: %s",
@@ -460,10 +543,10 @@ def _parse_response(raw: str, chunks: List[Any]) -> Optional[LLMResponseSchema]:
     # Fallback: if JSON parsing failed but we got usable text, use it
     if not answer:
         cleaned = _clean_raw_response(raw)
-        if cleaned and len(cleaned) >= 30 and not _looks_like_metadata(cleaned):
+        if cleaned and len(cleaned) >= 10 and not _looks_like_metadata(cleaned):
             answer = cleaned
 
-    if not answer or len(answer) < 30:
+    if not answer or len(answer) < 10:
         return None
 
     return LLMResponseSchema(text=answer, evidence_chunks=chunks_used)

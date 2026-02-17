@@ -133,14 +133,14 @@ def _make_chunk(text: str, idx: int = 0) -> Chunk:
 
 
 def test_emergency_chunk_summary_produces_output():
-    """Three chunks should produce 'Based on available information:' plus bullets."""
+    """Three chunks should produce query-aware bullets."""
     chunks = [
         _make_chunk("Alice has 5 years of Python experience.", 0),
         _make_chunk("Bob specializes in data engineering.", 1),
         _make_chunk("Carol holds a PMP certification.", 2),
     ]
     result = _emergency_chunk_summary(chunks, "tell me about the candidates")
-    assert result.startswith("Based on available information:")
+    assert result.startswith("Based on")
     assert "- Alice has 5 years of Python experience." in result
     assert "- Bob specializes in data engineering." in result
     assert "- Carol holds a PMP certification." in result
@@ -163,23 +163,24 @@ def test_emergency_chunk_summary_blank_text_chunks():
 
 
 def test_emergency_chunk_summary_truncates_long_text():
-    """Chunks longer than 200 chars should be truncated."""
-    long_text = "A" * 300
+    """Chunks with very long single sentences (>300 chars) use fallback truncation."""
+    long_text = "A" * 400
     chunks = [_make_chunk(long_text, 0)]
     result = _emergency_chunk_summary(chunks, "query")
-    # The bullet should contain exactly 200 chars of 'A'
-    lines = result.strip().split("\n")
-    assert len(lines) == 2  # header + 1 bullet
-    bullet_text = lines[1].lstrip("- ")
-    assert len(bullet_text) == 200
+    # 400-char sentence exceeds 300-char sentence limit, so it's skipped
+    # by sentence selection. The fallback truncates to first 200 chars.
+    assert result  # produces some output
+    assert "A" * 200 in result
+    assert "A" * 300 not in result  # was truncated
 
 
-def test_emergency_chunk_summary_takes_only_top_3():
-    """Only the first 3 chunks should be used."""
-    chunks = [_make_chunk(f"Chunk {i} content here.", i) for i in range(5)]
-    result = _emergency_chunk_summary(chunks, "query")
-    assert "Chunk 0" in result
-    assert "Chunk 1" in result
-    assert "Chunk 2" in result
-    assert "Chunk 3" not in result
-    assert "Chunk 4" not in result
+def test_emergency_chunk_summary_takes_only_top_5():
+    """At most 5 chunks are scanned, and at most 4 bullet lines are produced."""
+    chunks = [_make_chunk(f"Chunk {i} has relevant content here.", i) for i in range(7)]
+    result = _emergency_chunk_summary(chunks, "query about content")
+    # Up to 5 chunks scanned, up to 4 bullets (header + 4 = 5 lines max)
+    lines = [l for l in result.strip().split("\n") if l.strip()]
+    assert len(lines) <= 5
+    # Chunks 5 and 6 should never appear (beyond 5-chunk scan limit)
+    assert "Chunk 5" not in result
+    assert "Chunk 6" not in result

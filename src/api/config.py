@@ -35,6 +35,8 @@ class Config:
         MAX_AGENT_EVIDENCE = int(os.getenv("MAX_AGENT_EVIDENCE", "20"))
         AGENT_MODEL_NAME = os.getenv("AGENT_MODEL_NAME", "nemotron-3-nano")
         RETRIEVER_MAX_WORKERS = int(os.getenv("RETRIEVER_MAX_WORKERS", "4"))
+        AGENT_AUTO_TOOLS = os.getenv("AGENT_AUTO_TOOLS", "true").lower() in {"1", "true", "yes", "on"}
+        AGENT_MAX_AUTO_TOOLS = int(os.getenv("AGENT_MAX_AUTO_TOOLS", "3"))
 
     class DialogueIntel:
         PERSONA_ENABLED = os.getenv("DOCWAIN_PERSONA_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -288,6 +290,8 @@ class Config:
         CRITICAL_SUPPORTED_RATIO_TH = float(os.getenv("QUALITY_CRITICAL_SUPPORTED_RATIO_TH", "0.75"))
         OVERALL_SCORE_TH = float(os.getenv("QUALITY_OVERALL_SCORE_TH", "0.72"))
         HIGH_CONFIDENCE_THRESHOLD = float(os.getenv("QUALITY_HIGH_CONFIDENCE_THRESHOLD", "0.75"))
+        GROUNDING_GATE_ENABLED = os.getenv("GROUNDING_GATE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        GROUNDING_GATE_CRITICAL_TH = float(os.getenv("GROUNDING_GATE_CRITICAL_TH", "0.30"))
 
     class Chat:
         MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "6"))
@@ -306,6 +310,26 @@ class Config:
         MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
         MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
         DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
+
+    class VLLM:
+        """vLLM serving config — SafeTensor models via OpenAI-compatible API."""
+        ENABLED = os.getenv("VLLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8000/v1/chat/completions")
+        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "gpt-oss")
+        API_KEY = os.getenv("VLLM_API_KEY", "")
+        TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "30"))
+
+    class MultiAgent:
+        ENABLED = os.getenv("MULTI_AGENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        CLASSIFIER_MODEL = os.getenv("MULTI_AGENT_CLASSIFIER", "llama3.2:latest")
+        EXTRACTOR_MODEL = os.getenv("MULTI_AGENT_EXTRACTOR", "mistral:latest")
+        GENERATOR_MODEL = os.getenv("MULTI_AGENT_GENERATOR", "gpt-oss:latest")
+        VERIFIER_MODEL = os.getenv("MULTI_AGENT_VERIFIER", "deepseek-r1:latest")
+        DEFAULT_MODEL = os.getenv("MULTI_AGENT_DEFAULT", "llama3.2:latest")
+        VERIFIER_ENABLED = os.getenv("MULTI_AGENT_VERIFIER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        CLASSIFIER_TIMEOUT = float(os.getenv("MULTI_AGENT_CLASSIFIER_TIMEOUT", "10.0"))
+        VERIFIER_TIMEOUT = float(os.getenv("MULTI_AGENT_VERIFIER_TIMEOUT", "30.0"))
+        CLASSIFIER_CONFIDENCE_THRESHOLD = float(os.getenv("MULTI_AGENT_CLASSIFIER_CONFIDENCE", "0.7"))
 
     class ModelArbitration:
         ENABLED = os.getenv("MODEL_ARBITRATION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}

@@ -184,9 +184,9 @@ class TestExtractionFixes:
         from src.rag_v3.extract import EXTRACT_TIMEOUT_MS
         assert EXTRACT_TIMEOUT_MS == 15000
 
-    def test_llm_response_below_30_chars_rejected(self):
+    def test_llm_response_below_10_chars_rejected(self):
         from src.rag_v3.llm_extract import _parse_response
-        result = _parse_response("Short answer.", [])
+        result = _parse_response("Too short", [])
         assert result is None
 
     def test_llm_response_metadata_garbage_rejected(self):

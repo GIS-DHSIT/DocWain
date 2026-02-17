@@ -69,6 +69,7 @@ from src.api.structured_extraction import StructuredDocument
 from src.api.pii_masking import mask_document_content
 from src.api.statuses import (
     STATUS_EMBEDDING_COMPLETED,
+    STATUS_EXTRACTION_COMPLETED,
     STATUS_EXTRACTION_OR_CHUNKING_FAILED,
     STATUS_SCREENING_COMPLETED,
     STATUS_TRAINING_FAILED,
@@ -1976,8 +1977,9 @@ def _process_blob(
             result["failed_reason"] = "training_failed"
             return result
 
-        if total_chunks != total_upserted:
-            error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
+        effective_expected = total_chunks - total_dropped
+        if effective_expected > 0 and effective_expected != total_upserted:
+            error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
             if telemetry:
                 telemetry.increment("embed_qdrant_upsert_fail_total")
             error_payload = _build_error_payload(
@@ -2206,11 +2208,20 @@ def _process_local_document(
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
         return _early_return(result)
-    if current_status != STATUS_SCREENING_COMPLETED:
+    if current_status not in (STATUS_SCREENING_COMPLETED, STATUS_EXTRACTION_COMPLETED):
         result["status"] = "SKIPPED"
         result["error"] = "screening_not_completed"
         result["failed_reason"] = "screening_not_completed"
         return _early_return(result)
+    if current_status == STATUS_EXTRACTION_COMPLETED:
+        # Screening was not triggered after extraction — run it now as a fallback
+        try:
+            from src.api.extraction_service import _run_auto_screening
+            _run_auto_screening(document_id)
+            logger.info("Fallback auto-screening completed for %s", document_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Fallback auto-screening failed for %s: %s; promoting to SCREENING_COMPLETED", document_id, exc)
+            _safe_set_document_status(document_id, STATUS_SCREENING_COMPLETED)
 
     try:
         subscription_id = resolve_subscription_id(
@@ -2247,6 +2258,7 @@ def _process_local_document(
         return _early_return(result)
 
     _set_document_status(document_id, STATUS_TRAINING_STARTED)
+    telemetry = _telemetry()
 
     update_stage(
         document_id,
@@ -2456,8 +2468,9 @@ def _process_local_document(
             result["failed_reason"] = "training_failed"
             return result
 
-        if total_chunks != total_upserted:
-            error_msg = f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}"
+        effective_expected = total_chunks - total_dropped
+        if effective_expected > 0 and effective_expected != total_upserted:
+            error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
             if telemetry:
                 telemetry.increment("embed_qdrant_upsert_fail_total")
             error_payload = _build_error_payload(
@@ -2509,7 +2522,7 @@ def _process_local_document(
             },
         )
 
-        _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
 
         post_count: Optional[int] = None
         cleanup_allowed = True
@@ -2519,11 +2532,11 @@ def _process_local_document(
                 post_count, cleanup_allowed = _verify_post_upsert_count(
                     subscription_id=subscription_id,
                     profile_id=profile_id,
-                    document_id=doc_id,
+                    document_id=document_id,
                     expected_chunks=total_chunks,
                 )
                 if post_count is not None:
-                    logger.info("Post-upsert Qdrant points for %s: %s", doc_id, post_count)
+                    logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
                 if not cleanup_allowed:
                     cleanup_error = (
                         {"message": "post_upsert_count_unavailable"}
@@ -2536,7 +2549,7 @@ def _process_local_document(
                     )
                     logger.warning(
                         "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
-                        doc_id,
+                        document_id,
                         post_count,
                         total_chunks,
                     )
@@ -2546,14 +2559,14 @@ def _process_local_document(
                 logger.warning(
                     "embed_request_id=%s doc=%s post-upsert count failed: %s",
                     embed_request_id,
-                    doc_id,
+                    document_id,
                     exc,
                 )
 
         deleted = False
         # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            logger.info("Skipping pickle deletion for %s (preserve enabled)", doc_id)
+            logger.info("Skipping pickle deletion for %s (preserve enabled)", document_id)
             if telemetry:
                 telemetry.increment("embed_pickles_retained_total")
             deleted = False
@@ -2569,7 +2582,7 @@ def _process_local_document(
                 details=cleanup_details,
             )
         _safe_update_stage(
-            doc_id,
+            document_id,
             "cleanup",
             {
                 "pickle_deleted": deleted,

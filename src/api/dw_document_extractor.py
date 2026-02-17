@@ -28,6 +28,46 @@ except Exception:  # noqa: BLE001
 
 _OCR_RETRY_THRESHOLD = 70.0
 _DIGIT_MASK_RE = re.compile(r"\d+")
+
+
+def _smart_decode(raw: bytes) -> str:
+    """Decode bytes to str with intelligent encoding detection.
+
+    Tries: BOM detection -> null-ratio heuristic -> charset_normalizer -> UTF-8 -> Latin-1.
+    """
+    # 1. BOM detection (UTF-16LE, UTF-16BE, UTF-8-sig)
+    if raw[:2] == b'\xff\xfe':
+        return raw.decode('utf-16-le', errors='replace')
+    if raw[:2] == b'\xfe\xff':
+        return raw.decode('utf-16-be', errors='replace')
+    if raw[:3] == b'\xef\xbb\xbf':
+        return raw.decode('utf-8-sig', errors='replace')
+
+    # 2. Check for UTF-16LE without BOM (common in .doc files):
+    #    ASCII chars encoded as char+\x00 -> every other byte is \x00
+    if len(raw) >= 20:
+        sample = raw[:100]
+        null_ratio = sample.count(b'\x00') / len(sample)
+        if null_ratio > 0.3:
+            try:
+                return raw.decode('utf-16', errors='replace')
+            except Exception:
+                pass
+
+    # 3. charset_normalizer auto-detection
+    try:
+        from charset_normalizer import from_bytes
+        result = from_bytes(raw).best()
+        if result is not None and result.encoding:
+            return str(result)
+    except Exception:
+        pass
+
+    # 4. UTF-8 fallback
+    try:
+        return raw.decode('utf-8', errors='replace')
+    except Exception:
+        return raw.decode('latin-1', errors='replace')
 _COPYRIGHT_RE = re.compile(r"(?:copyright|©|\(c\))\s*\d{4}", re.IGNORECASE)
 _CONFIDENTIAL_RE = re.compile(r"\b(?:confidential|proprietary|internal use only|do not distribute)\b", re.IGNORECASE)
 
@@ -1033,7 +1073,7 @@ class DocumentExtractor:
         errors: List[str] = []
         try:
             if isinstance(text_content, (bytes, bytearray)):
-                text = text_content.decode("utf-8", errors="ignore")
+                text = _smart_decode(text_content)
             else:
                 text = str(text_content)
         except Exception as exc:  # noqa: BLE001

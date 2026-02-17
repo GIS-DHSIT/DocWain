@@ -4,8 +4,6 @@ import json
 import logging
 from typing import Optional
 
-import ollama
-
 from src.observability.metrics import metrics_store
 from src.router.schema import RouterDecision
 
@@ -72,13 +70,18 @@ def route_with_ollama(
     profile_id: str,
     profile_name: str,
     model_name: Optional[str],
+    llm_client=None,
 ) -> Optional[RouterDecision]:
-    if not model_name:
+    if not model_name and llm_client is None:
         return None
     prompt = _build_prompt(query, subscription_id, profile_id, profile_name)
     try:
-        response = ollama.generate(model=model_name, prompt=prompt, options={"temperature": 0})
-        payload = json.loads((response.get("response") or "").strip())
+        if llm_client is not None:
+            text = llm_client.generate(prompt)
+        else:
+            from src.llm.gateway import get_llm_gateway
+            text = get_llm_gateway().generate(prompt)
+        payload = json.loads((text or "").strip())
         return RouterDecision.parse_obj(payload)
     except Exception as exc:  # noqa: BLE001
         metrics_store().increment("ollama_router_fail_count")

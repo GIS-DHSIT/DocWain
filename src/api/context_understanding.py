@@ -70,15 +70,15 @@ class ContextUnderstanding:
             return " ".join(sentences[:max_sentences])
 
     def _llm_summary(self, text: str, instruction: str) -> str:
-        if not self.model_name or not ollama:
+        if not self.model_name:
             return ""
         prompt = (
             f"{instruction}\n\nTEXT:\n{text}\n\nReturn 3-5 bullet points or a short paragraph."
         )
         try:
-            resp = ollama.generate(model=self.model_name, prompt=prompt, options={"temperature": 0.1})
-            content = (resp.get("response") or "").strip()
-            return content
+            from src.llm.gateway import get_llm_gateway
+            content = get_llm_gateway().generate(prompt)
+            return (content or "").strip()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Local model summary failed: %s", exc)
             return ""

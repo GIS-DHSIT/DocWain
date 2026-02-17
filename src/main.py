@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ollama
 import uvicorn
@@ -15,7 +15,7 @@ from bson.objectid import ObjectId
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, constr
+from pydantic import BaseModel, Field, constr, field_validator
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
@@ -73,22 +73,42 @@ from src.intelligence.redis_intel_cache import RedisIntelCache
 from src.api.learning_signals import LearningSignalStore
 from src import rag_v3
 from src.api import rag_state
-from src.screening.api import screening_router
 from src.screening.config import log_legacy_vetting_notice_if_missing
 from src.storage.azure_blob_client import validate_containers_once, validate_storage_configured_once
-from botbuilder.schema import Activity
+try:
+    from botbuilder.schema import Activity
+except ImportError:
+    Activity = None
+
 from src.nlp.dialogue_intel import route_message
 from src.prompting.persona import sanitize_response
 
-from src.teams import adapter as teams_adapter
-from src.teams.bot_app import (
-    BOT_CREDENTIALS_CONFIGURED,
-    bot_adapter,
-    docwain_teams_bot,
-    MICROSOFT_APP_ID,
-    MICROSOFT_APP_PASSWORD,
-)
-from src.tools.router import tools_router
+try:
+    from src.teams import adapter as teams_adapter
+    from src.teams.bot_app import (
+        BOT_CREDENTIALS_CONFIGURED,
+        bot_adapter,
+        docwain_teams_bot,
+        MICROSOFT_APP_ID,
+        MICROSOFT_APP_PASSWORD,
+    )
+except ImportError:
+    teams_adapter = None
+    BOT_CREDENTIALS_CONFIGURED = False
+    bot_adapter = None
+    docwain_teams_bot = None
+    MICROSOFT_APP_ID = None
+    MICROSOFT_APP_PASSWORD = None
+# Import tool modules to trigger @register_tool registration, then mount gateway only.
+# Screening is handled by /api/gateway/screen. Tools are invoked via /api/ask with the tools field.
+import src.tools.stt, src.tools.tts, src.tools.translator  # noqa: F401, E401
+import src.tools.tutor, src.tools.creator, src.tools.email_drafting  # noqa: F401, E401
+import src.tools.db_connector, src.tools.code_docs, src.tools.medical  # noqa: F401, E401
+import src.tools.lawhere, src.tools.resumes  # noqa: F401, E401
+import src.tools.jira_confluence, src.tools.web_extract  # noqa: F401, E401
+import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
+import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
+from src.gateway.api import gateway_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
 
@@ -125,11 +145,10 @@ app.add_middleware(
 # Add correlation ID middleware for request tracing
 app.add_middleware(CorrelationIdMiddleware)
 
-api_router.include_router(screening_router)
 api_router.include_router(documents_router, tags=["Documents"])
 api_router.include_router(profiles_router)
 api_router.include_router(profile_docs_router)
-api_router.include_router(tools_router, tags=["Tools"])
+api_router.include_router(gateway_router, tags=["Gateway"])
 api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
 
@@ -144,33 +163,7 @@ class FeedbackRequest(BaseModel):
 session_state_store = SessionStateStore()
 
 
-@app.on_event("startup")
-async def _startup_checks() -> None:
-    # Configure structured logging
-    configure_logging(
-        log_level=os.getenv("LOG_LEVEL", "INFO"),
-        json_format=os.getenv("JSON_LOGGING", "false").lower() in {"1", "true", "yes"},
-        include_correlation_id=True,
-    )
-    logger.info("DocWain API starting up")
-
-    try:
-        validate_storage_configured_once()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Azure blob storage configuration check skipped: %s", exc)
-    try:
-        validate_containers_once()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Azure blob container validation skipped: %s", exc)
-    try:
-        clear_legacy_vetting_metadata()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Legacy metadata cleanup skipped: %s", exc)
-    try:
-        log_legacy_vetting_notice_if_missing()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Legacy config notice skipped: %s", exc)
-    logger.info("Startup checks completed")
+## Startup checks migrated to lifespan handler in src/api/app_lifespan.py
 
 
 @app.exception_handler(HTTPException)
@@ -205,7 +198,19 @@ class QuestionRequest(BaseModel):
     agent_mode: Optional[bool] = None
     stream: bool = False  # When true, /ask returns a streaming response instead of JSON.
     debug: bool = False
-    tools: Optional[str] = None
+    tools: Optional[Union[str, List[str]]] = None
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _normalize_tools(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [t.strip() for t in v if isinstance(t, str) and t.strip()]
+        if isinstance(v, str):
+            parts = [t.strip() for t in v.split(",") if t.strip()]
+            return parts if parts else None
+        return None
     tool_inputs: Optional[Dict[str, Any]] = None
     use_tools: bool = False
 
@@ -596,6 +601,11 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
 @api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
+    if teams_adapter is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Teams integration is not available. Install botbuilder-core to enable it.",
+        )
     activity_payload, raw_body = await _parse_teams_activity(request)
     if activity_payload is None:
         return {
@@ -805,7 +815,11 @@ def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
     try:
         logging.info(f"Received single document extraction request for: {doc_id} (subscription: {subscription_id})")
         result = train_single_document(doc_id)
+        if isinstance(result, dict) and result.get("status") == "CONFLICT":
+            raise HTTPException(status_code=409, detail=result.get("reason", "duplicate_extraction"))
         return {"status": "success", "message": result}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Single extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Single document extraction failed")

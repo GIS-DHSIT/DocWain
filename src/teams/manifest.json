@@ -1,73 +1,20 @@
 {
-  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.14/MicrosoftTeams.schema.json",
-  "manifestVersion": "1.14",
-  "version": "1.0.0",
+  "_deprecated": "This manifest is superseded by teams-app/manifest.json (v1.16). Use that file for packaging and deployment.",
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.1.0",
   "id": "fd5d5c9d-12b9-441f-b72f-4e94a50da1af",
-  "packageName": "com.docwain.bot",
-  "name": {
-    "short": "DocWain",
-    "full": "DocWain Assistant"
-  },
-  "description": {
-    "short": "Ask DocWain questions from Microsoft Teams.",
-    "full": "Upload files in Teams, DocWain ingests them automatically, and you can chat or run tools (summaries, extraction, model/persona switch) right away. Configure the messaging endpoint to point at /teams/messages."
-  },
-  "accentColor": "#004578",
-  "icons": {
-    "color": "color.png",
-    "outline": "outline.png"
-  },
-  "bots": [
-    {
-      "botId": "fd5d5c9d-12b9-441f-b72f-4e94a50da1af",
-      "scopes": [
-        "personal"
-      ],
-      "supportsFiles": true,
-      "isNotificationOnly": false,
-      "commandLists": [
-        {
-          "scopes": [
-            "personal"
-          ],
-          "commands": [
-            {
-              "title": "Ask",
-              "description": "Ask DocWain a question"
-            },
-            {
-              "title": "Help",
-              "description": "Get usage tips"
-            },
-            {
-              "title": "Tools",
-              "description": "Show DocWain tools for this chat"
-            }
-          ]
-        }
-      ]
-    }
-  ],
-  "staticTabs": [
-    {
-      "entityId": "docwain-web",
-      "name": "DocWain",
-      "contentUrl": "https://www.docwain.ai",
-      "websiteUrl": "https://www.docwain.ai",
-      "scopes": ["personal"]
-    }
-  ],
-  "webApplicationInfo": {
-    "id": "fd5d5c9d-12b9-441f-b72f-4e94a50da1af",
-    "resource": "api://http://4.213.139.185:8000/teams/messages/botid-00000000-0000-0000-0000-000000000000"
-  },
-  "validDomains": [
-    "www.docwain.ai"
-  ],
+  "packageName": "ai.docwain.app",
+  "name": { "short": "DocWain", "full": "DocWain AI Assistant" },
+  "description": { "short": "Deprecated. See teams-app/manifest.json.", "full": "Deprecated. See teams-app/manifest.json." },
+  "icons": { "color": "color.png", "outline": "outline.png" },
+  "accentColor": "#1487c9",
+  "bots": [],
+  "validDomains": [],
   "developer": {
-    "name": "MSG",
-    "websiteUrl": "https://www.docwain.ai/home",
-    "privacyUrl": "https://www.docwain.ai/home",
-    "termsOfUseUrl": "https://www.docwain.ai/home"
+    "name": "DocWain",
+    "websiteUrl": "https://www.docwain.ai",
+    "privacyUrl": "https://www.docwain.ai/privacy",
+    "termsOfUseUrl": "https://www.docwain.ai/terms"
   }
 }

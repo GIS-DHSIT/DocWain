@@ -116,11 +116,23 @@ def _extract_text_from_extracted(extracted: Any) -> List[str]:
                 if value.strip():
                     texts.append(value.strip())
             elif isinstance(value, dict):
-                inner_text = value.get("text") or value.get("content")
-                if isinstance(inner_text, str) and inner_text.strip():
-                    texts.append(inner_text.strip())
-                elif isinstance(inner_text, list):
-                    texts.append(" ".join(str(item) for item in inner_text if item))
+                # Recurse into nested dicts — pickle structure can be
+                # {"raw": {"filename.pdf": ExtractedDocument(...)}, ...}
+                for inner_value in value.values():
+                    if isinstance(inner_value, ExtractedDocument):
+                        if inner_value.full_text:
+                            texts.append(inner_value.full_text)
+                        else:
+                            texts.extend([sec.text for sec in inner_value.sections if sec.text])
+                    elif isinstance(inner_value, str) and inner_value.strip():
+                        texts.append(inner_value.strip())
+                if not texts:
+                    # Fallback: check for "text"/"content" keys directly
+                    inner_text = value.get("text") or value.get("content")
+                    if isinstance(inner_text, str) and inner_text.strip():
+                        texts.append(inner_text.strip())
+                    elif isinstance(inner_text, list):
+                        texts.append(" ".join(str(item) for item in inner_text if item))
             elif isinstance(value, list):
                 texts.append(" ".join(str(item) for item in value if item))
     return texts
@@ -214,7 +226,7 @@ def _fetch_chunks_from_qdrant(
 def _combine_payload_texts(payloads: List[Dict[str, Any]]) -> List[str]:
     texts: List[str] = []
     for payload in payloads:
-        for key in ("text", "chunk", "content"):
+        for key in ("canonical_text", "embedding_text", "text", "chunk", "content"):
             value = payload.get(key)
             if isinstance(value, str) and value.strip():
                 texts.append(value.strip())
