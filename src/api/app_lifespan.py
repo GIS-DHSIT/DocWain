@@ -12,7 +12,7 @@ from src.api import dw_newron
 from src.api.config import Config
 from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, ensure_payload_indexes
 from src.api.rag_state import AppState, activate_singleton_guard, register_instance_ids, set_app_state
-from src.llm.gateway import create_llm_gateway, set_llm_gateway
+from src.llm.gateway import create_llSm_gateway, set_llm_gateway
 
 logger = logging.getLogger(__name__)
 
