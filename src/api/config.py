@@ -64,7 +64,7 @@ class Config:
 
     class KnowledgeGraph:
         QDRANT_COLLECTION = os.getenv("KG_QDRANT_COLLECTION", os.getenv("QDRANT_COLLECTION", "default"))
-        ENABLED = os.getenv("KG_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        ENABLED = os.getenv("KG_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         MAX_EXPANSION_ENTITIES = int(os.getenv("KG_MAX_EXPANSION_ENTITIES", "8"))
         MAX_GRAPH_SNIPPETS = int(os.getenv("KG_MAX_GRAPH_SNIPPETS", "10"))
         GRAPH_SCORE_ALPHA = float(os.getenv("KG_GRAPH_SCORE_ALPHA", "0.7"))
@@ -183,7 +183,7 @@ class Config:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
-        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "15e0c724-4de0-492e-9861-9e637b3f9076")
+        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
         DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")

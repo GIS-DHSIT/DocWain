@@ -152,7 +152,15 @@ async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: O
     correlation_id = correlation_id or get_correlation_id(activity=activity, headers=None)
     session_id = extract_session_id(activity)
     user_id = extract_user_id(activity)
-    context = TEAMS_CHAT_SERVICE.build_context(user_id=user_id, session_id=session_id)
+    pref_subscription = session_id if Config.Teams.SESSION_AS_SUBSCRIPTION else Config.Teams.DEFAULT_SUBSCRIPTION
+    pref_profile = user_id if Config.Teams.PROFILE_PER_USER else Config.Teams.DEFAULT_PROFILE
+    prefs = STATE_STORE.get_preferences(pref_subscription, pref_profile)
+    context = TEAMS_CHAT_SERVICE.build_context(
+        user_id=user_id,
+        session_id=session_id,
+        model_name=prefs.get("model_name") or Config.Teams.DEFAULT_MODEL,
+        persona=prefs.get("persona") or Config.Teams.DEFAULT_PERSONA,
+    )
     TEAMS_CHAT_SERVICE.ensure_collection(context.subscription_id)
     attachments = activity.get("attachments") or []
     image_only = all(

@@ -83,6 +83,13 @@ def initialize_app_state(app: FastAPI) -> AppState:
         set_llm_gateway(llm_gateway)
         # Backward compat: ollama_client points to the gateway (duck-typed)
         ollama_client = llm_gateway
+        # Warm up Ollama so the model is loaded before the first query
+        if hasattr(llm_gateway, "warm_up"):
+            try:
+                llm_gateway.warm_up()
+                logger.info("LLM model warm-up completed")
+            except Exception:  # noqa: BLE001
+                logger.debug("LLM warm-up skipped (model will load on first query)")
     except Exception as exc:  # noqa: BLE001
         logger.error("LLM gateway init failed, trying direct Ollama: %s", exc)
         try:
@@ -134,6 +141,18 @@ def initialize_app_state(app: FastAPI) -> AppState:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Multi-agent gateway init failed (continuing with single-model): %s", exc)
 
+    # Knowledge Graph augmenter (Neo4j-backed entity graph for retrieval)
+    graph_augmenter = None
+    if getattr(Config.KnowledgeGraph, "ENABLED", False):
+        try:
+            from src.kg.neo4j_store import Neo4jStore
+            from src.kg.retrieval import GraphAugmenter
+            neo4j_store = Neo4jStore()
+            graph_augmenter = GraphAugmenter(neo4j_store=neo4j_store, enabled=True)
+            logger.info("GraphAugmenter initialized with Neo4j backend")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Neo4j unavailable; KG augmentation disabled: %s", exc)
+
     state = AppState(
         embedding_model=embedding_model,
         reranker=cross_encoder,
@@ -143,6 +162,7 @@ def initialize_app_state(app: FastAPI) -> AppState:
         rag_system=rag_system,
         llm_gateway=llm_gateway,
         multi_agent_gateway=multi_agent_gateway,
+        graph_augmenter=graph_augmenter,
         qdrant_index_status=_bootstrap_qdrant_indexes(qdrant_client) if qdrant_client else {"__all__": {"status": "unhealthy", "error": "qdrant_unavailable"}},
     )
     register_instance_ids(state)
@@ -287,6 +307,32 @@ async def lifespan(app: FastAPI):
             _precreate_subscription_collections(state.qdrant_client)
         except Exception as exc:
             logger.debug("Subscription collection pre-creation skipped: %s", exc)
+
+    # Pre-load spaCy model for NLP entity extraction (avoids first-request race condition)
+    try:
+        from src.nlp.query_entity_extractor import preload_spacy
+        if preload_spacy():
+            logger.info("spaCy model pre-loaded at startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("spaCy pre-load skipped: %s", exc)
+
+    # Pre-train intent classifier (fast, <2s on CPU)
+    if state.embedding_model:
+        try:
+            from src.intent.intent_classifier import ensure_intent_classifier
+            ensure_intent_classifier(state.embedding_model)
+            logger.info("Intent classifier ready at startup")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Intent classifier startup training skipped: %s", exc)
+
+    # Pre-train line role classifier (fast, <3s on CPU)
+    if state.embedding_model:
+        try:
+            from src.rag_v3.line_classifier import ensure_line_classifier
+            ensure_line_classifier(state.embedding_model)
+            logger.info("Line role classifier ready at startup")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Line role classifier startup training skipped: %s", exc)
 
     # Kick off DPIE background training (non-blocking)
     if state.qdrant_client and state.embedding_model:

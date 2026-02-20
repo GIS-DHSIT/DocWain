@@ -244,15 +244,28 @@ _ORDINAL_RE = re.compile(
     r"\b(?:the\s+)?(first|second|third|1st|2nd|3rd)\s+(candidate|person|one|document|resume|invoice|file)\b", re.I,
 )
 
+# Follow-up reference patterns — "the previous answer contained X", "you mentioned X"
+_FOLLOWUP_REFERENCE_RE = re.compile(
+    r"\b(?:the\s+)?(?:previous|last|earlier|prior)\s+(?:answer|response|reply)\s+"
+    r"(?:contained|mentioned|said|included|had|showed|stated)\s+(.+?)(?:\s+but\b|\s+however\b|[.?!]|$)",
+    re.I,
+)
+_FOLLOWUP_MENTION_RE = re.compile(
+    r"\b(?:you\s+)?(?:mentioned|said|stated|told\s+me|showed)\s+(.+?)\s+(?:earlier|before|previously|in\s+the\s+last)",
+    re.I,
+)
+
 
 class ConversationContextResolver:
     """Resolves pronouns and references using the EntityRegister."""
 
-    def __init__(self, register: EntityRegister):
+    def __init__(self, register: EntityRegister, enriched_turns: Optional[List] = None):
         self.register = register
+        self.enriched_turns: List[EnrichedTurn] = enriched_turns if enriched_turns is not None else []
 
     def resolve(self, query: str) -> str:
         resolved = query
+        resolved = self._resolve_followup_references(resolved)
         resolved = self._resolve_ordinals(resolved)
         resolved = self._resolve_pronouns(resolved)
         resolved = self._resolve_demonstratives(resolved)
@@ -264,7 +277,37 @@ class ConversationContextResolver:
             return True
         if _ORDINAL_RE.search(query):
             return True
+        if _FOLLOWUP_REFERENCE_RE.search(query) or _FOLLOWUP_MENTION_RE.search(query):
+            return True
         return False
+
+    def _resolve_followup_references(self, query: str) -> str:
+        """Resolve follow-up references like 'the previous answer contained X'."""
+        match = _FOLLOWUP_REFERENCE_RE.search(query)
+        if not match:
+            match = _FOLLOWUP_MENTION_RE.search(query)
+        if not match:
+            return query
+        referenced_content = match.group(1).strip()
+        # Find the referenced content in prior turns
+        prior_context = self._find_prior_mention(referenced_content)
+        if prior_context:
+            # Append prior context as search context
+            return f"{query} [Context from prior answer: {prior_context}]"
+        return query
+
+    def _find_prior_mention(self, content: str) -> Optional[str]:
+        """Search prior enriched turns for a mention of *content*."""
+        content_lower = content.lower()
+        for turn in reversed(self.enriched_turns):
+            response_lower = (turn.assistant_response or "").lower()
+            if content_lower in response_lower:
+                # Return a snippet around the mention (up to 200 chars)
+                idx = response_lower.find(content_lower)
+                start = max(0, idx - 50)
+                end = min(len(turn.assistant_response), idx + len(content) + 100)
+                return turn.assistant_response[start:end].strip()
+        return None
 
     def _resolve_pronouns(self, query: str) -> str:
         result = query
@@ -336,8 +379,8 @@ class ConversationState:
         self.history = conversation_history
         self.entity_register = EntityRegister()
         self.extractor = ConversationEntityExtractor()
-        self.resolver = ConversationContextResolver(self.entity_register)
         self.enriched_turns: List[EnrichedTurn] = []
+        self.resolver = ConversationContextResolver(self.entity_register, self.enriched_turns)
         self.max_enriched_turns = max_enriched_turns
         self.current_topic: Optional[str] = None
         self.redis = redis_client
@@ -414,8 +457,8 @@ class ConversationState:
 
     def clear(self, namespace: str, user_id: str):
         self.entity_register = EntityRegister()
-        self.resolver = ConversationContextResolver(self.entity_register)
         self.enriched_turns.clear()
+        self.resolver = ConversationContextResolver(self.entity_register, self.enriched_turns)
         self.current_topic = None
         self._turn_counter = 0
         if self.history:
@@ -434,7 +477,7 @@ class ConversationState:
             if cached:
                 data = json.loads(cached)
                 self.entity_register = EntityRegister.from_dict(data.get("register", {}))
-                self.resolver = ConversationContextResolver(self.entity_register)
+                self.resolver = ConversationContextResolver(self.entity_register, self.enriched_turns)
                 self._turn_counter = data.get("turn_counter", 0)
                 self.current_topic = data.get("current_topic")
         except Exception:

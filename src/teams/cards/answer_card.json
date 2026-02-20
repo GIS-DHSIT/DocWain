@@ -3,10 +3,51 @@
   "type": "AdaptiveCard",
   "version": "1.5",
   "body": [
-    { "type": "TextBlock", "text": "{title}", "size": "Medium", "weight": "Bolder", "wrap": true },
-    { "type": "TextBlock", "text": "{text}", "wrap": true }
+    {
+      "type": "TextBlock",
+      "text": "{title}",
+      "size": "Medium",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "type": "TextBlock",
+      "text": "{text}",
+      "wrap": true
+    },
+    {
+      "type": "Container",
+      "id": "sourcesContainer",
+      "isVisible": false,
+      "separator": true,
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "Sources",
+          "weight": "Bolder",
+          "size": "Small",
+          "isSubtle": true
+        },
+        {
+          "type": "TextBlock",
+          "text": "{sources_text}",
+          "wrap": true,
+          "size": "Small",
+          "isSubtle": true
+        }
+      ]
+    }
   ],
   "actions": [
-    { "type": "Action.Submit", "title": "Tools", "data": { "action": "show_tools" } }
+    {
+      "type": "Action.ToggleVisibility",
+      "title": "Show sources",
+      "targetElements": ["sourcesContainer"]
+    },
+    {
+      "type": "Action.Submit",
+      "title": "Tools",
+      "data": { "action": "show_tools" }
+    }
   ]
 }

@@ -1,0 +1,109 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Welcome to DocWain!",
+      "weight": "Bolder",
+      "size": "Large",
+      "color": "Accent"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Your AI-powered document intelligence assistant. Here's how to get started:",
+      "wrap": true,
+      "spacing": "Small"
+    },
+    {
+      "type": "ColumnSet",
+      "spacing": "Medium",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            { "type": "TextBlock", "text": "1.", "weight": "Bolder", "color": "Accent" }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            { "type": "TextBlock", "text": "**Upload** a file (PDF, Word, image) using the attachment button", "wrap": true }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            { "type": "TextBlock", "text": "2.", "weight": "Bolder", "color": "Accent" }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            { "type": "TextBlock", "text": "**Ask** questions about your documents in natural language", "wrap": true }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            { "type": "TextBlock", "text": "3.", "weight": "Bolder", "color": "Accent" }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            { "type": "TextBlock", "text": "Use **Tools** for summaries, field extraction, and content generation", "wrap": true }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            { "type": "TextBlock", "text": "4.", "weight": "Bolder", "color": "Accent" }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            { "type": "TextBlock", "text": "Type **Help** at any time for more info", "wrap": true }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "Upload a document to get started!",
+      "wrap": true,
+      "spacing": "Medium",
+      "weight": "Bolder",
+      "horizontalAlignment": "Center"
+    }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Show tools", "data": { "action": "show_tools" } },
+    { "type": "Action.Submit", "title": "Help", "data": { "action": "help" } }
+  ]
+}

@@ -227,6 +227,50 @@ def _training_success_fields() -> Dict[str, Any]:
     }
 
 
+def _ingest_chunks_to_knowledge_graph(
+    document_id: str,
+    subscription_id: str,
+    profile_id: str,
+    doc_name: str,
+    extracted_docs: Dict[str, Any],
+) -> None:
+    """Non-blocking chunk-level KG ingestion after Qdrant upsert.
+
+    Builds a graph payload from the embedding texts+metadata and enqueues
+    for async processing.  KG failure must never block embedding.
+    """
+    try:
+        from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
+
+        texts: List[str] = []
+        chunk_metadata: List[Dict[str, Any]] = []
+        for fname, content in (extracted_docs or {}).items():
+            if isinstance(content, dict):
+                raw_texts = content.get("texts") or []
+                raw_meta = content.get("chunk_metadata") or []
+                if isinstance(raw_texts, list):
+                    texts.extend(raw_texts)
+                if isinstance(raw_meta, list):
+                    chunk_metadata.extend(raw_meta)
+
+        if not texts:
+            return
+
+        graph_payload = build_graph_payload(
+            embeddings_payload={"texts": texts, "chunk_metadata": chunk_metadata},
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            document_id=str(document_id),
+            doc_name=doc_name,
+        )
+        if graph_payload:
+            queue = get_graph_ingest_queue()
+            queue.enqueue(graph_payload)
+            logger.info("KG chunk-level ingestion enqueued for %s (%d texts)", document_id, len(texts))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("KG chunk ingestion skipped for %s: %s", document_id, exc)
+
+
 def _get_max_workers(total: int) -> int:
     max_workers_env = os.getenv("EMBEDDING_MAX_WORKERS")
     try:
@@ -1165,24 +1209,36 @@ def _normalize_extracted_docs(extracted: Any) -> Dict[str, Any]:
         structured = extracted.get("structured") or {}
         raw = extracted.get("raw") or {}
 
-        # Try to normalize structured first
-        if structured:
-            normalized = _normalize_structured_payload(structured)
-            # Validate that structured produced useful content
-            if _has_useful_content(normalized):
-                logger.debug("Using structured extraction with %d documents", len(normalized))
-                return normalized
-            else:
-                logger.warning(
-                    "Structured extraction produced no useful content; falling back to raw"
-                )
+        structured_norm = None
+        raw_norm = None
 
-        # Fall back to raw extraction
+        # Try to normalize structured
+        if structured:
+            structured_norm = _normalize_structured_payload(structured)
+            if not _has_useful_content(structured_norm):
+                structured_norm = None
+
+        # Also try raw extraction — it often has better section granularity
         if raw:
-            normalized = _normalize_raw_payload(raw)
-            if normalized:
-                logger.debug("Using raw extraction with %d documents", len(normalized))
-                return normalized
+            raw_norm = _normalize_raw_payload(raw)
+            if not raw_norm:
+                raw_norm = None
+
+        # Pick the better normalization: prefer the one with more texts (sections)
+        if structured_norm and raw_norm:
+            s_texts = sum(len(d.get("texts", [])) for d in structured_norm.values() if isinstance(d, dict))
+            r_texts = sum(len(d.get("texts", [])) for d in raw_norm.values() if isinstance(d, dict))
+            if r_texts > s_texts:
+                logger.info(
+                    "Raw extraction has better section granularity (%d vs %d); using raw",
+                    r_texts, s_texts,
+                )
+                return raw_norm
+            return structured_norm
+        if structured_norm:
+            return structured_norm
+        if raw_norm:
+            return raw_norm
 
         # Last resort: try to extract any usable content
         logger.warning("Both structured and raw extraction failed; attempting recovery")
@@ -1264,7 +1320,13 @@ def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
             chunk_meta = []
 
             for idx, sec in enumerate(sd.get("sections", [])):
-                text_val = _salvage_repr_text((sec.get("content") or sec.get("text") or "").strip())
+                raw_content = _salvage_repr_text((sec.get("content") or sec.get("text") or "").strip())
+                # Prepend section title to content for better embedding context
+                sec_title = (sec.get("title") or sec.get("heading") or sec.get("section_type") or "").strip()
+                if sec_title and raw_content and sec_title.lower() not in raw_content[:80].lower():
+                    text_val = f"{sec_title}\n{raw_content}"
+                else:
+                    text_val = raw_content
                 sections.append({
                     "text": text_val,
                     "start_page": sec.get("start_page") or 1,
@@ -1284,6 +1346,48 @@ def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
                         "doc_type": sd.get("document_type"),
                         "sentence_complete": text_val.endswith(('.', '?', '!')),
                     })
+
+            # Merge short adjacent sections to prevent content loss during chunking.
+            # The integrity enforcer groups by section_id, so very short sections
+            # (e.g. "Diagnosis: 43 chars") stay isolated and get dropped by the
+            # validity filter (min_chars=80). Merging them here preserves all content.
+            _MIN_SECTION_LEN = 200
+            if len(texts) > 1:
+                merged_texts = []
+                merged_sections = []
+                merged_meta = []
+                i = 0
+                while i < len(texts):
+                    current_text = texts[i]
+                    current_section = dict(sections[i])
+                    current_meta = dict(chunk_meta[i])
+                    # Keep merging forward while current chunk is short
+                    while len(current_text) < _MIN_SECTION_LEN and i + 1 < len(texts):
+                        i += 1
+                        current_text = f"{current_text}\n\n{texts[i]}"
+                        current_section["end_page"] = sections[i].get("end_page") or current_section.get("end_page", 1)
+                        combined_title = current_meta.get("section_title", "")
+                        next_title = chunk_meta[i].get("section_title", "")
+                        if next_title and next_title not in combined_title:
+                            current_meta["section_title"] = f"{combined_title} + {next_title}"
+                            current_meta["section_path"] = current_meta["section_title"]
+                    current_section["text"] = current_text
+                    current_meta["chunk_index"] = len(merged_texts)
+                    merged_texts.append(current_text)
+                    merged_sections.append(current_section)
+                    merged_meta.append(current_meta)
+                    i += 1
+                # Merge last chunk backward if still too short
+                if len(merged_texts) > 1 and len(merged_texts[-1]) < _MIN_SECTION_LEN:
+                    merged_texts[-2] = f"{merged_texts[-2]}\n\n{merged_texts[-1]}"
+                    merged_sections[-2]["text"] = merged_texts[-2]
+                    merged_sections[-2]["end_page"] = merged_sections[-1].get("end_page", 1)
+                    merged_texts.pop()
+                    merged_sections.pop()
+                    merged_meta.pop()
+                texts = merged_texts
+                sections = merged_sections
+                chunk_meta = merged_meta
 
             # If no section texts but we have full_text, use full_text as single chunk
             if not texts and full_text:
@@ -1347,6 +1451,90 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
         normalized: Dict[str, Any] = {}
         for name, content in raw.items():
             if isinstance(content, ExtractedDocument):
+                # Extract sections with titles from the ExtractedDocument
+                sections_list = getattr(content, "sections", None) or []
+                full_text = getattr(content, "full_text", None) or ""
+                if sections_list and len(sections_list) > 1:
+                    texts = []
+                    chunk_meta = []
+                    sections_data = []
+                    for idx, sec in enumerate(sections_list):
+                        sec_title = getattr(sec, "title", "") or ""
+                        sec_text = getattr(sec, "text", "") or getattr(sec, "content", "") or ""
+                        sec_text = sec_text.strip()
+                        if not sec_text:
+                            continue
+                        # Prepend section title for embedding context
+                        if sec_title and sec_title.lower() not in sec_text[:80].lower():
+                            text_val = f"{sec_title}\n{sec_text}"
+                        else:
+                            text_val = sec_text
+                        texts.append(text_val)
+                        sections_data.append({
+                            "text": text_val,
+                            "start_page": getattr(sec, "start_page", 1) or 1,
+                            "end_page": getattr(sec, "end_page", 1) or 1,
+                        })
+                        chunk_meta.append({
+                            "document_id": None,
+                            "section_title": sec_title or "Section",
+                            "section_path": sec_title or "Section",
+                            "page_start": getattr(sec, "start_page", 1) or 1,
+                            "page_end": getattr(sec, "end_page", 1) or 1,
+                            "page_number": getattr(sec, "start_page", 1) or 1,
+                            "chunk_index": idx,
+                            "chunk_type": "text",
+                            "doc_type": getattr(content, "doc_type", None),
+                            "sentence_complete": text_val.endswith((".", "?", "!")),
+                        })
+                    # Merge short adjacent sections so they survive validity filters
+                    _MIN_SECTION_LEN = 200  # noqa: N806
+                    if len(texts) > 1:
+                        merged_texts = []
+                        merged_sections = []
+                        merged_meta = []
+                        i = 0
+                        while i < len(texts):
+                            cur_text = texts[i]
+                            cur_sec = dict(sections_data[i])
+                            cur_meta = dict(chunk_meta[i])
+                            # Forward-merge while current chunk is too short
+                            while len(cur_text) < _MIN_SECTION_LEN and i + 1 < len(texts):
+                                i += 1
+                                cur_text = f"{cur_text}\n\n{texts[i]}"
+                                cur_sec["end_page"] = sections_data[i].get("end_page") or cur_sec.get("end_page", 1)
+                                next_title = chunk_meta[i].get("section_title", "")
+                                if next_title and next_title not in cur_meta.get("section_title", ""):
+                                    cur_meta["section_title"] = f"{cur_meta.get('section_title', '')} + {next_title}"
+                                    cur_meta["section_path"] = cur_meta["section_title"]
+                            cur_sec["text"] = cur_text
+                            cur_meta["chunk_index"] = len(merged_texts)
+                            merged_texts.append(cur_text)
+                            merged_sections.append(cur_sec)
+                            merged_meta.append(cur_meta)
+                            i += 1
+                        # Backward-merge last chunk if still too short
+                        if len(merged_texts) > 1 and len(merged_texts[-1]) < _MIN_SECTION_LEN:
+                            merged_texts[-2] = f"{merged_texts[-2]}\n\n{merged_texts[-1]}"
+                            merged_sections[-2]["text"] = merged_texts[-2]
+                            merged_sections[-2]["end_page"] = merged_sections[-1].get("end_page", 1)
+                            merged_texts.pop()
+                            merged_sections.pop()
+                            merged_meta.pop()
+                        texts = merged_texts
+                        sections_data = merged_sections
+                        chunk_meta = merged_meta
+
+                    if texts:
+                        normalized[name] = {
+                            "full_text": full_text or "\n\n".join(texts),
+                            "texts": texts,
+                            "sections": sections_data,
+                            "chunk_metadata": chunk_meta,
+                            "doc_type": getattr(content, "doc_type", None),
+                        }
+                        continue
+                # Fallback: store ExtractedDocument as-is for legacy handling
                 normalized[name] = content
             elif isinstance(content, dict):
                 # Extract text from various possible fields
@@ -1978,8 +2166,16 @@ def _process_blob(
             return result
 
         effective_expected = total_chunks - total_dropped
+        logger.info(
+            "embed_request_id=%s doc=%s mismatch_check: total_chunks=%s total_dropped=%s total_upserted=%s effective_expected=%s",
+            embed_request_id, doc_id, total_chunks, total_dropped, total_upserted, effective_expected,
+        )
         if effective_expected > 0 and effective_expected != total_upserted:
             error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
+            logger.error(
+                "embed_request_id=%s doc=%s MISMATCH: %s",
+                embed_request_id, doc_id, error_msg,
+            )
             if telemetry:
                 telemetry.increment("embed_qdrant_upsert_fail_total")
             error_payload = _build_error_payload(
@@ -2032,6 +2228,15 @@ def _process_blob(
         )
 
         _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+
+        # KG chunk-level ingestion (async, non-blocking)
+        _ingest_chunks_to_knowledge_graph(
+            document_id=doc_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            doc_name=file_name or doc_id,
+            extracted_docs=extracted_docs,
+        )
 
         post_count: Optional[int] = None
         cleanup_allowed = True
@@ -2208,20 +2413,13 @@ def _process_local_document(
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
         return _early_return(result)
-    if current_status not in (STATUS_SCREENING_COMPLETED, STATUS_EXTRACTION_COMPLETED):
+    _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED}
+    if current_status not in _EMBEDDING_ELIGIBLE_STATUSES:
         result["status"] = "SKIPPED"
         result["error"] = "screening_not_completed"
-        result["failed_reason"] = "screening_not_completed"
+        result["failed_reason"] = f"screening_not_completed (current: {current_status})"
+        logger.info("Embedding skipped for %s: screening not yet completed (status=%s). Run screening first.", document_id, current_status)
         return _early_return(result)
-    if current_status == STATUS_EXTRACTION_COMPLETED:
-        # Screening was not triggered after extraction — run it now as a fallback
-        try:
-            from src.api.extraction_service import _run_auto_screening
-            _run_auto_screening(document_id)
-            logger.info("Fallback auto-screening completed for %s", document_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Fallback auto-screening failed for %s: %s; promoting to SCREENING_COMPLETED", document_id, exc)
-            _safe_set_document_status(document_id, STATUS_SCREENING_COMPLETED)
 
     try:
         subscription_id = resolve_subscription_id(
@@ -2469,8 +2667,16 @@ def _process_local_document(
             return result
 
         effective_expected = total_chunks - total_dropped
+        logger.info(
+            "embed_request_id=%s doc=%s mismatch_check: total_chunks=%s total_dropped=%s total_upserted=%s effective_expected=%s",
+            embed_request_id, document_id, total_chunks, total_dropped, total_upserted, effective_expected,
+        )
         if effective_expected > 0 and effective_expected != total_upserted:
             error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
+            logger.error(
+                "embed_request_id=%s doc=%s MISMATCH: %s",
+                embed_request_id, document_id, error_msg,
+            )
             if telemetry:
                 telemetry.increment("embed_qdrant_upsert_fail_total")
             error_payload = _build_error_payload(
@@ -2523,6 +2729,15 @@ def _process_local_document(
         )
 
         _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+
+        # KG chunk-level ingestion (async, non-blocking)
+        _ingest_chunks_to_knowledge_graph(
+            document_id=document_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            doc_name=file_name or document_id,
+            extracted_docs=extracted_docs,
+        )
 
         post_count: Optional[int] = None
         cleanup_allowed = True

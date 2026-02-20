@@ -135,6 +135,58 @@ def normalize_entity_name(name: str) -> str:
 
 
 
+def _nlp_enrich(text: str, add_fn) -> bool:
+    """Use spaCy NER to extract PERSON, ORG, GPE/LOC entities.
+
+    Returns True if NLP produced at least one entity, False otherwise.
+    The *add_fn* callable has signature ``(type, name, confidence) -> None``.
+    """
+    try:
+        from src.nlp.query_entity_extractor import _get_nlp
+        nlp = _get_nlp()
+    except Exception:  # noqa: BLE001
+        return False
+    if nlp is None:
+        return False
+
+    doc = nlp(text[:5000])  # cap for performance
+    found = False
+
+    # spaCy NER entities
+    _SPACY_TYPE_MAP = {
+        "PERSON": "PERSON",
+        "ORG": "ORGANIZATION",
+        "GPE": "LOCATION",
+        "LOC": "LOCATION",
+        "FAC": "LOCATION",
+    }
+    for ent in doc.ents:
+        mapped = _SPACY_TYPE_MAP.get(ent.label_)
+        if mapped:
+            name = ent.text.strip()
+            if len(name) > 1:
+                add_fn(mapped, name, 0.75)
+                found = True
+
+    # DPIE entity recognizer (if available and trained)
+    try:
+        from src.intelligence.dpie_integration import DPIERegistry
+        registry = DPIERegistry.get()
+        if registry.is_loaded:
+            dpie_entities = registry.extract_entities(text[:5000])
+            for ent_dict in dpie_entities:
+                ent_type = str(ent_dict.get("type", "")).upper()
+                ent_name = str(ent_dict.get("entity", "")).strip()
+                ent_conf = float(ent_dict.get("confidence", 0.5))
+                if ent_name and ent_type in {"PERSON", "ORGANIZATION", "SKILL", "LOCATION"}:
+                    add_fn(ent_type, ent_name, max(ent_conf, 0.7))
+                    found = True
+    except Exception:  # noqa: BLE001
+        pass  # DPIE not available
+
+    return found
+
+
 class EntityExtractor:
     def __init__(
         self,
@@ -142,11 +194,13 @@ class EntityExtractor:
         skills: Optional[Iterable[str]] = None,
         stopwords: Optional[Set[str]] = None,
         max_keywords: int = 50,
+        use_nlp: bool = True,
     ):
         self.skills = [s.strip().lower() for s in (skills or DEFAULT_SKILLS) if s.strip()]
         self.skill_set = set(self.skills)
         self.stopwords = stopwords or DEFAULT_STOPWORDS
         self.max_keywords = max_keywords
+        self.use_nlp = use_nlp
         self._skill_patterns = self._compile_skill_patterns(self.skills)
 
     def _compile_skill_patterns(self, skills: List[str]) -> List[tuple[str, re.Pattern]]:
@@ -230,6 +284,7 @@ class EntityExtractor:
                 return
             entities[entity_id] = ExtractedEntity.build(entity_type, name, confidence)
 
+        # ── Regex-first for structured formats ───────────────────────
         for match in EMAIL_RE.findall(text):
             add("EMAIL", match.lower(), 0.95)
 
@@ -266,13 +321,23 @@ class EntityExtractor:
             if pattern.search(text):
                 add("SKILL", skill, 0.8)
 
-        for phrase in TITLECASE_ENTITY_RE.findall(text):
-            if ORG_SUFFIX_RE.search(phrase):
-                add("ORGANIZATION", phrase, 0.65)
-            elif LOCATION_SUFFIX_RE.search(phrase):
-                add("LOCATION", phrase, 0.55)
-            else:
-                add("PERSON", phrase, 0.55)
+        # ── NLP-first for semantic entities (PERSON, ORG, LOCATION) ──
+        nlp_enriched = False
+        if self.use_nlp:
+            try:
+                nlp_enriched = _nlp_enrich(text, add)
+            except Exception:  # noqa: BLE001
+                pass  # graceful degradation to regex
+
+        # ── Regex fallback for PERSON/ORG/LOCATION if NLP unavailable ─
+        if not nlp_enriched:
+            for phrase in TITLECASE_ENTITY_RE.findall(text):
+                if ORG_SUFFIX_RE.search(phrase):
+                    add("ORGANIZATION", phrase, 0.65)
+                elif LOCATION_SUFFIX_RE.search(phrase):
+                    add("LOCATION", phrase, 0.55)
+                else:
+                    add("PERSON", phrase, 0.55)
 
         keywords_added = 0
         for token in TOKEN_RE.findall(text):

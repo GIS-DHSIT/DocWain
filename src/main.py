@@ -105,7 +105,7 @@ import src.tools.stt, src.tools.tts, src.tools.translator  # noqa: F401, E401
 import src.tools.tutor, src.tools.creator, src.tools.email_drafting  # noqa: F401, E401
 import src.tools.db_connector, src.tools.code_docs, src.tools.medical  # noqa: F401, E401
 import src.tools.lawhere, src.tools.resumes  # noqa: F401, E401
-import src.tools.jira_confluence, src.tools.web_extract  # noqa: F401, E401
+import src.tools.jira_confluence, src.tools.web_extract, src.tools.image_analysis  # noqa: F401, E401
 import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
 import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
 from src.gateway.api import gateway_router

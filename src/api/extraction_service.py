@@ -68,6 +68,62 @@ from src.embedding.layout_graph import build_layout_graph
 logger = logging.getLogger(__name__)
 
 
+def _ingest_to_knowledge_graph(
+    document_id: str,
+    subscription_id: str,
+    profile_id: str,
+    source_name: str,
+    payload_to_save: Dict[str, Any],
+    redis_client: Any = None,
+) -> None:
+    """Non-blocking KG ingestion from extraction results.
+
+    Builds a graph payload from the extraction output and enqueues it
+    for async processing.  KG failure must never block extraction.
+    """
+    try:
+        from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
+
+        # Build an embeddings_payload-shaped dict from the extraction pickle
+        texts: List[str] = []
+        chunk_metadata: List[Dict[str, Any]] = []
+        structured = payload_to_save.get("structured") or {}
+        for fname, content in structured.items():
+            if isinstance(content, dict):
+                full_text = str(content.get("full_text") or content.get("text") or "")
+                if full_text:
+                    texts.append(full_text)
+                    chunk_metadata.append({
+                        "chunk_id": f"{document_id}::extraction::{fname}",
+                        "source_name": fname,
+                    })
+
+        if not texts:
+            return
+
+        doc_classification = payload_to_save.get("document_classification") or {}
+        graph_payload = build_graph_payload(
+            embeddings_payload={
+                "texts": texts,
+                "chunk_metadata": chunk_metadata,
+                "doc_metadata": {
+                    "document_type": doc_classification.get("document_type", "generic"),
+                    "doc_type": doc_classification.get("domain", "generic"),
+                },
+            },
+            subscription_id=str(subscription_id),
+            profile_id=str(profile_id),
+            document_id=str(document_id),
+            doc_name=source_name,
+        )
+        if graph_payload:
+            queue = get_graph_ingest_queue(redis_client)
+            queue.enqueue(graph_payload)
+            logger.info("KG ingestion enqueued for document %s", document_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("KG ingestion skipped for %s: %s", document_id, exc)
+
+
 def _persist_layout_graph(
     *,
     document_id: str,
@@ -248,7 +304,48 @@ def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> A
 
 
 def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract document type/classification from structured extraction results."""
+    """Extract document type/classification from structured extraction results.
+
+    Tries DPIE ML classifier first (if available and confident), then falls
+    back to the structured extraction metadata.
+    """
+    # ── Try DPIE first (ML-based classification) ─────────────────────
+    try:
+        from src.intelligence.dpie_integration import dpie_classify_document_type
+        # Gather raw text + filename for DPIE
+        raw_text = ""
+        fname = ""
+        for fn, value in (structured_docs or {}).items():
+            fname = fn
+            if isinstance(value, dict):
+                raw_text = str(value.get("full_text") or value.get("text") or "")[:2000]
+            elif isinstance(value, str):
+                raw_text = value[:2000]
+            if raw_text:
+                break
+        if raw_text:
+            dpie_type, dpie_confidence = dpie_classify_document_type(
+                text_sample=raw_text, tables_sample="", filename=fname,
+            )
+            if dpie_confidence > 0.5 and dpie_type != "other":
+                _DPIE_TYPE_TO_DOMAIN = {
+                    "resume": "resume", "invoice": "invoice",
+                    "contract": "legal", "policy": "legal",
+                    "report": "report", "statement": "financial",
+                    "purchase_order": "invoice", "presentation": "generic",
+                    "brochure": "generic",
+                }
+                return {
+                    "document_type": dpie_type.upper(),
+                    "domain": _DPIE_TYPE_TO_DOMAIN.get(dpie_type, "generic"),
+                    "confidence": dpie_confidence,
+                    "filename": fname,
+                    "classifier": "dpie",
+                }
+    except Exception:  # noqa: BLE001
+        pass  # DPIE unavailable, fall back to structured extraction
+
+    # ── Structured extraction metadata fallback ──────────────────────
     for fname, value in (structured_docs or {}).items():
         if isinstance(value, dict):
             return {
@@ -733,8 +830,17 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         }
         _set_document_status(doc_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
 
-        # Auto-screen after extraction so embedding can proceed
-        _run_auto_screening(doc_id, doc_type=doc_classification.get("document_type"))
+        # KG ingestion (async, non-blocking)
+        _ingest_to_knowledge_graph(
+            document_id=doc_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            source_name=doc_data.get("name", "Unknown"),
+            payload_to_save=payload_to_save,
+        )
+
+        # Screening and embedding are now separate phases — invoke via API
+        logger.info("Extraction completed for %s; screening/embedding deferred to user", doc_id)
 
         summary = _build_extraction_summary(masked_docs)
         return {
@@ -907,8 +1013,17 @@ def extract_uploaded_document(
     }
     _set_document_status(document_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
 
-    # Auto-screen after extraction so embedding can proceed
-    _run_auto_screening(document_id, doc_type=doc_classification.get("document_type"))
+    # KG ingestion (async, non-blocking)
+    _ingest_to_knowledge_graph(
+        document_id=document_id,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        source_name=filename,
+        payload_to_save=payload_to_save,
+    )
+
+    # Screening and embedding are now separate phases — invoke via API
+    logger.info("Extraction completed for %s; screening/embedding deferred to user", document_id)
 
     summary = _build_extraction_summary(extracted)
     return {

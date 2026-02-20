@@ -39,7 +39,13 @@ def _top_domains(catalog: Dict[str, Any], *, limit: int = 3) -> List[str]:
 
 
 def build_greeting_response(catalog: Optional[Dict[str, Any]] = None) -> str:
-    _ = catalog
+    try:
+        from src.intelligence.conversational_nlp import generate_conversational_response
+        resp = generate_conversational_response("hi", catalog=catalog)
+        if resp and resp.text:
+            return resp.text
+    except Exception:
+        pass
     return (
         "Hi! I am DocWain-Agent - a document intelligence assistant. "
         "I answer questions using the documents in your current profile."

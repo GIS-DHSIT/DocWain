@@ -328,9 +328,9 @@ class TestMedicalRecordNotHR:
     """End-to-end: medical record queries should NOT produce HR template output."""
 
     @patch("src.rag_v3.extract.Config.Features.DOMAIN_SPECIFIC_ENABLED", True)
-    def test_medical_chunks_produce_generic_schema(self):
+    def test_medical_chunks_produce_medical_schema(self):
         from src.rag_v3.extract import schema_extract
-        from src.rag_v3.types import HRSchema, GenericSchema, LLMBudget
+        from src.rag_v3.types import HRSchema, MedicalSchema, LLMBudget
 
         chunks = [
             _make_chunk("Patient Name: John Doe\nAge: 65\nDiagnosis: Chest discomfort", doc_domain="medical"),
@@ -346,10 +346,11 @@ class TestMedicalRecordNotHR:
         )
         assert not isinstance(result.schema, HRSchema), \
             f"Medical record should NOT produce HRSchema, got domain={result.domain}"
-        assert isinstance(result.schema, GenericSchema), \
-            f"Expected GenericSchema, got {type(result.schema).__name__}"
-        items = result.schema.facts.items or []
-        assert len(items) > 0, "GenericSchema should have extracted facts"
+        assert isinstance(result.schema, MedicalSchema), \
+            f"Expected MedicalSchema, got {type(result.schema).__name__}"
+        # Should have patient info extracted
+        patient_items = (result.schema.patient_info.items if result.schema.patient_info else None) or []
+        assert len(patient_items) > 0, "MedicalSchema should have extracted patient info"
 
     @patch("src.rag_v3.extract.Config.Features.DOMAIN_SPECIFIC_ENABLED", True)
     def test_medical_extraction_contains_patient_data(self):

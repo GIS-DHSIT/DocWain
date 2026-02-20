@@ -84,6 +84,12 @@ DOMAIN_KEYWORDS: Dict[str, List[str]] = {
         "implementation", "code", "function", "class", "method",
         "endpoint", "request", "response", "parameter", "schema",
     ],
+    "policy": [
+        "insurance", "policy", "premium", "coverage", "claim",
+        "deductible", "exclusion", "underwriting", "insured",
+        "beneficiary", "endorsement", "peril", "policyholder",
+        "indemnity", "natural calamity", "natural disaster",
+    ],
 }
 
 # Metadata fields that indicate specific domains
@@ -210,7 +216,7 @@ class DomainRouter:
         normalized = domain.strip().lower()
 
         # Direct matches
-        known_domains = {"resume", "legal", "financial", "technical", "generic", "medical"}
+        known_domains = {"resume", "legal", "financial", "technical", "generic", "medical", "policy"}
         if normalized in known_domains:
             return normalized
 
@@ -230,6 +236,8 @@ class DomainRouter:
             "clinical": "medical",
             "health": "medical",
             "hospital": "medical",
+            "insurance": "policy",
+            "underwriting": "policy",
         }
         return aliases.get(normalized, "generic")
 
@@ -365,6 +373,7 @@ _DOMAIN_DESCRIPTIONS: Dict[str, str] = {
     "medical": "Medical record with patient info, diagnoses, treatments, prescriptions, clinical notes",
     "financial": "Financial report with revenue, expenses, balance sheet, investment data, fiscal year",
     "technical": "Technical documentation with API specs, code, architecture, implementation details",
+    "policy": "Insurance policy document with coverage terms, premiums, exclusions, claims, deductibles, beneficiaries",
 }
 
 _CACHED_DOMAIN_EMBEDDINGS: Dict[str, Any] = {}

@@ -355,7 +355,15 @@ def build_evidence_ledger(chunks: Sequence[Any], sources: Sequence[Dict[str, Any
     return EvidenceLedger(entries=entries, by_source_id=by_source_id, source_names=tuple(source_names), source_name_variants=name_variants)
 
 
-def build_docwain_intro() -> str:
+def build_docwain_intro(*, query: str = "") -> str:
+    if query:
+        try:
+            from src.intelligence.conversational_nlp import generate_conversational_response
+            resp = generate_conversational_response(query)
+            if resp and resp.text:
+                return resp.text
+        except Exception:
+            pass
     return DOCWAIN_INTRO_SHORT
 
 

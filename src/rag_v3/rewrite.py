@@ -113,13 +113,14 @@ def rewrite_query(
             timeout_ms=rewrite_timeout_ms,
         )
         if timed_out:
+            fallback = _smart_timeout_fallback(normalized)
             logger.warning(
-                "RAG v3 rewrite timed out; using normalized query (original=%r)",
-                normalized[:200],
+                "RAG v3 rewrite timed out; using smart fallback (original=%r, fallback=%r)",
+                normalized[:200], fallback[:200],
                 extra={"stage": "rewrite", "correlation_id": correlation_id},
             )
-            _cache(redis_client, cache_key, normalized)
-            return normalized
+            _cache(redis_client, cache_key, fallback)
+            return fallback
         rewritten = _normalize(str(rewritten or ""))
         if not rewritten or rewritten == normalized:
             _cache(redis_client, cache_key, normalized)
@@ -136,6 +137,52 @@ def rewrite_query(
 
     _cache(redis_client, cache_key, normalized)
     return normalized
+
+
+# Conversational filler phrases to strip in smart fallback
+_FILLER_PATTERNS = [
+    re.compile(r"^(?:can\s+you\s+)?(?:please\s+)?tell\s+me\s+", re.I),
+    re.compile(r"^(?:can\s+you\s+)?(?:please\s+)?show\s+me\s+", re.I),
+    re.compile(r"^(?:i\s+would\s+like\s+to\s+know\s+)", re.I),
+    re.compile(r"^(?:i\s+want\s+to\s+know\s+)", re.I),
+    re.compile(r"^(?:could\s+you\s+(?:please\s+)?)", re.I),
+    re.compile(r"^(?:can\s+you\s+(?:please\s+)?)", re.I),
+    re.compile(r"^(?:please\s+)", re.I),
+    re.compile(r"^(?:i\s+need\s+(?:to\s+know|information\s+(?:about|on))\s+)", re.I),
+]
+
+# Pattern to detect quoted strings that should be preserved
+_QUOTED_RE = re.compile(r'"[^"]+"|\'[^\']+\'')
+
+
+def _smart_timeout_fallback(query: str) -> str:
+    """Produce a smarter fallback than raw normalized query when rewrite times out.
+
+    Strips conversational filler while preserving key phrases, proper nouns,
+    and quoted strings.
+    """
+    if not query or len(query.split()) <= 5:
+        return query  # Short queries don't need stripping
+
+    # Preserve quoted strings by replacing with placeholders
+    quoted_parts = _QUOTED_RE.findall(query)
+    working = query
+    for i, part in enumerate(quoted_parts):
+        working = working.replace(part, f"__QUOTED_{i}__", 1)
+
+    # Strip conversational filler from the beginning
+    for pattern in _FILLER_PATTERNS:
+        working = pattern.sub("", working, count=1)
+
+    # Restore quoted strings
+    for i, part in enumerate(quoted_parts):
+        working = working.replace(f"__QUOTED_{i}__", part, 1)
+
+    result = working.strip()
+    # Safety: if stripping removed too much, return original
+    if not result or len(result) < 3:
+        return query
+    return result
 
 
 def _normalize(text: str) -> str:

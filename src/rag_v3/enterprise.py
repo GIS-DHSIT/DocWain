@@ -6,7 +6,7 @@ from typing import Any, List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from .query_focus import QueryFocus
 
-from .types import GenericSchema, HRSchema, InvoiceSchema, LegalSchema, MISSING_REASON, MultiEntitySchema
+from .types import GenericSchema, HRSchema, InvoiceSchema, LegalSchema, MedicalSchema, MISSING_REASON, MultiEntitySchema, PolicySchema
 
 
 NO_ITEMS_MESSAGE = "Invoice pages retrieved don't show itemized products/services—only totals/parties."
@@ -71,6 +71,10 @@ def render_enterprise(schema: Any, intent: str, *, domain: str | None = None, st
         return _render_hr(schema, intent, strict=strict, query=query, query_focus=query_focus)
     if isinstance(schema, LegalSchema):
         return _render_legal(schema, intent, strict=strict, query=query, query_focus=query_focus)
+    if isinstance(schema, MedicalSchema):
+        return _render_medical(schema, intent, strict=strict, query=query, query_focus=query_focus)
+    if isinstance(schema, PolicySchema):
+        return _render_policy(schema, intent, strict=strict, query=query, query_focus=query_focus)
     if isinstance(schema, GenericSchema):
         return _render_generic(schema, intent, strict=strict, query=query, query_focus=query_focus)
     _ = domain
@@ -276,21 +280,33 @@ def _render_hr(schema: HRSchema, intent: str, strict: bool = False, query: str =
             return schema.candidates.missing_reason
         return ""
     if intent == "contact":
-        sections = []
-        for cand in candidates:
-            name = cand.name or "Candidate"
-            lines = [f"**Candidate:** {name}"]
-            emails = _render_contact_value(cand.emails)
-            if emails:
-                lines.append(f"- Email: {emails}")
-            phones = _render_contact_value(cand.phones)
-            if phones:
-                lines.append(f"- Phone: {phones}")
-            linkedins = _render_contact_value(cand.linkedins)
-            if linkedins:
-                lines.append(f"- LinkedIn: {linkedins}")
-            sections.append("\n".join(lines))
-        return "\n\n".join(sections).strip()
+        # Check if the query is asking for contact info ONLY, or is a comprehensive
+        # extraction request that happens to include contact among other fields.
+        _q_lower = (query or "").lower()
+        _comprehensive_signals = (
+            "experience" in _q_lower or "skills" in _q_lower or "education" in _q_lower
+            or "certification" in _q_lower or "summary" in _q_lower
+            or "extract each" in _q_lower or "all information" in _q_lower
+            or "complete profile" in _q_lower or "full profile" in _q_lower
+        )
+        if not _comprehensive_signals:
+            # Pure contact-only query — render contact fields only
+            sections = []
+            for cand in candidates:
+                name = cand.name or "Candidate"
+                lines = [f"**Candidate:** {name}"]
+                emails = _render_contact_value(cand.emails)
+                if emails:
+                    lines.append(f"- Email: {emails}")
+                phones = _render_contact_value(cand.phones)
+                if phones:
+                    lines.append(f"- Phone: {phones}")
+                linkedins = _render_contact_value(cand.linkedins)
+                if linkedins:
+                    lines.append(f"- LinkedIn: {linkedins}")
+                sections.append("\n".join(lines))
+            return "\n\n".join(sections).strip()
+        # Comprehensive query — fall through to detail rendering below
     if intent in {"rank", "compare"} and len(candidates) > 1:
         # --- Ranking: use neural schema for intelligent intent-aware ranking ---
         if intent == "rank":
@@ -326,44 +342,47 @@ def _render_hr(schema: HRSchema, intent: str, strict: bool = False, query: str =
 
         # --- Comparison: use comparator for side-by-side analysis ---
         if intent == "compare":
-            try:
-                from .neural_schema import (
-                    parse_query_intent as _pqi,
-                    build_profile_intelligence as _bpi,
-                    build_candidate_digest,
-                    format_comparison_response,
-                )
-                _cmp_intent = _pqi(query, candidate_names=[c.name for c in candidates if c.name])
-                _cmp_profile = _bpi(candidates)
-                # If entities specified, filter to those
-                if _cmp_intent.entities:
-                    entity_lower = {e.lower() for e in _cmp_intent.entities}
-                    filtered = [d for d in _cmp_profile.candidates if d.name.lower() in entity_lower]
-                    if len(filtered) >= 2:
-                        rendered = format_comparison_response(filtered, _cmp_intent, _cmp_profile)
-                        if rendered:
-                            return rendered
-                # Full comparison
-                rendered = format_comparison_response(_cmp_profile.candidates, _cmp_intent, _cmp_profile)
-                if rendered:
-                    return rendered
-            except Exception:
-                pass  # Fall through to legacy comparator
+            # For large candidate sets (>5), side-by-side comparison is useless
+            # (produces N/A matrices). Use detail listing instead.
+            if len(candidates) <= 5:
+                try:
+                    from .neural_schema import (
+                        parse_query_intent as _pqi,
+                        build_profile_intelligence as _bpi,
+                        build_candidate_digest,
+                        format_comparison_response,
+                    )
+                    _cmp_intent = _pqi(query, candidate_names=[c.name for c in candidates if c.name])
+                    _cmp_profile = _bpi(candidates)
+                    # If entities specified, filter to those
+                    if _cmp_intent.entities:
+                        entity_lower = {e.lower() for e in _cmp_intent.entities}
+                        filtered = [d for d in _cmp_profile.candidates if d.name.lower() in entity_lower]
+                        if len(filtered) >= 2:
+                            rendered = format_comparison_response(filtered, _cmp_intent, _cmp_profile)
+                            if rendered:
+                                return rendered
+                    # Full comparison
+                    rendered = format_comparison_response(_cmp_profile.candidates, _cmp_intent, _cmp_profile)
+                    if rendered:
+                        return rendered
+                except Exception:
+                    pass  # Fall through to legacy comparator
 
-            try:
-                from .comparator import compare_candidates_from_schema, render_comparison
-                comp_result = compare_candidates_from_schema(candidates, query)
-                rendered = render_comparison(comp_result, intent)
-                if rendered:
-                    return rendered
-            except Exception:
-                pass
+                try:
+                    from .comparator import compare_candidates_from_schema, render_comparison
+                    comp_result = compare_candidates_from_schema(candidates, query)
+                    rendered = render_comparison(comp_result, intent)
+                    if rendered:
+                        return rendered
+                except Exception:
+                    pass
 
             sections = []
             for cand in candidates:
                 sections.append(_format_candidate_detail(cand))
             if sections:
-                return "Here is a comparison of the candidates:\n\n" + "\n\n---\n\n".join(sections)
+                return f"Here is an overview of all {len(candidates)} candidates:\n\n" + "\n\n---\n\n".join(sections)
     if len(candidates) > 1:
         # Check if the query actually implies ranking even if intent wasn't "rank"
         # e.g., "who are the top 2?" or "best candidate"
@@ -611,14 +630,20 @@ def _format_rank_line(idx: int, cand: Any) -> str:
 
 def _format_candidate_detail(cand: Any) -> str:
     name = _sanitize_render_value(cand.name or "", max_length=80) or "Candidate"
-    lines = [f"**Candidate:** {name}"]
+    role = _sanitize_render_value(
+        (getattr(cand, "role", "") or getattr(cand, "designation", "") or ""), max_length=60
+    )
+    header = f"**{name}**"
+    if role:
+        header += f" — {role}"
+    lines = [header]
     years = _sanitize_render_value(cand.total_years_experience or '', max_length=30)
     if years:
         lines.append(f"- Total experience: {years}")
     summary = _sanitize_render_value(cand.experience_summary or '', max_length=500)
     if summary:
         lines.append(f"- Summary: {summary}")
-    tech = ", ".join(_sanitize_render_list((cand.technical_skills or [])[:6]))
+    tech = ", ".join(_sanitize_render_list((cand.technical_skills or [])[:8]))
     if tech:
         lines.append(f"- Technical skills: {tech}")
     func = ", ".join(_sanitize_render_list((cand.functional_skills or [])[:6]))
@@ -633,9 +658,19 @@ def _format_candidate_detail(cand: Any) -> str:
     awards = ", ".join(_sanitize_render_list((cand.achievements or [])[:3]))
     if awards:
         lines.append(f"- Achievements/Awards: {awards}")
+    # Contact info
+    emails = _render_contact_value(getattr(cand, "emails", None))
+    if emails:
+        lines.append(f"- Email: {emails}")
+    phones = _render_contact_value(getattr(cand, "phones", None))
+    if phones:
+        lines.append(f"- Phone: {phones}")
+    linkedins = _render_contact_value(getattr(cand, "linkedins", None))
+    if linkedins:
+        lines.append(f"- LinkedIn: {linkedins}")
     source = _sanitize_render_value(cand.source_type or '', max_length=50)
     if source:
-        lines.append(f"- Source type: {source}")
+        lines.append(f"- Source: {source}")
     return "\n".join(lines)
 
 
@@ -767,64 +802,233 @@ def _format_field(label: str | None, value: str) -> str:
 
 def _render_legal(schema: LegalSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     clauses_items = (schema.clauses.items if schema.clauses else None) or []
-    if not clauses_items:
+    parties_items = (schema.parties.items if schema.parties else None) or []
+    obligations_items = (schema.obligations.items if schema.obligations else None) or []
+
+    has_clauses = bool(clauses_items)
+    has_parties = bool(parties_items)
+    has_obligations = bool(obligations_items)
+
+    if not has_clauses and not has_parties and not has_obligations:
         if strict:
             return ""
         if schema.clauses and schema.clauses.missing_reason:
             return schema.clauses.missing_reason
         return ""
 
-    # Build structured clause entries
-    entries: list[tuple[str, str]] = []  # (title_or_empty, text)
-    for clause in clauses_items:
-        text = clause.text.strip() if clause.text else ""
-        title = (clause.title or "").strip()
-        if text:
-            entries.append((title, text))
+    parts: list[str] = []
 
-    if not entries:
+    # Parties section
+    if has_parties:
+        q_lower = (query or "").lower()
+        _want_parties = "part" in q_lower or "who" in q_lower or intent == "contact"
+        if _want_parties or not has_clauses:
+            party_lines = ["**Parties:**"]
+            for item in parties_items:
+                clean_val = _sanitize_render_value(item.value, max_length=300)
+                if clean_val:
+                    if item.label:
+                        clean_label = _sanitize_render_value(item.label, max_length=80)
+                        if clean_label:
+                            party_lines.append(f"- **{clean_label}:** {clean_val}")
+                        else:
+                            party_lines.append(f"- {clean_val}")
+                    else:
+                        party_lines.append(f"- {clean_val}")
+            if len(party_lines) > 1:
+                parts.append("\n".join(party_lines))
+
+    # Clauses section
+    if has_clauses:
+        entries: list[tuple[str, str]] = []
+        for clause in clauses_items:
+            text = clause.text.strip() if clause.text else ""
+            title = (clause.title or "").strip()
+            if text:
+                entries.append((title, text))
+
+        if entries:
+            # Query-focus clause relevance filtering
+            if query_focus and not query_focus.is_exhaustive and len(entries) > 3 and query_focus.keywords:
+                from .query_focus import score_fact_relevance
+                scored_entries = [
+                    (score_fact_relevance(title, text, query_focus), (title, text))
+                    for title, text in entries
+                ]
+                scored_entries.sort(key=lambda pair: pair[0], reverse=True)
+                relevant = [(s, e) for s, e in scored_entries if s >= 0.15]
+                if len(relevant) < 2:
+                    entries = [e for _, e in scored_entries[:2]]
+                else:
+                    entries = [e for _, e in relevant[:5]]
+
+            # Single clause with no other sections: render without heading
+            if len(entries) == 1 and not has_parties and not has_obligations:
+                title, text = entries[0]
+                cleaned = " ".join(text.split())
+                if title:
+                    parts.append(f"**{title}:** {cleaned}")
+                else:
+                    parts.append(cleaned)
+            else:
+                _LEGAL_HEADINGS = {
+                    "summary": "Legal Document Summary:",
+                    "contact": "Parties and Contact Information:",
+                    "facts": "Key Legal Provisions:",
+                }
+                heading = _LEGAL_HEADINGS.get(intent, "**Relevant Clauses:**")
+
+                clause_lines = [heading]
+                for title, text in entries:
+                    cleaned = " ".join(text.split())
+                    if title:
+                        clause_lines.append(f"- **{title}:** {cleaned}")
+                    else:
+                        clause_lines.append(f"- {cleaned}")
+                parts.append("\n".join(clause_lines))
+
+    # Obligations section
+    if has_obligations:
+        q_lower = (query or "").lower()
+        _want_obligations = "obligat" in q_lower or "responsib" in q_lower or "shall" in q_lower or "must" in q_lower or intent == "summary"
+        if _want_obligations or not has_clauses:
+            ob_lines = ["**Obligations:**"]
+            for item in obligations_items:
+                clean_val = _sanitize_render_value(item.value, max_length=400)
+                if clean_val:
+                    if item.label:
+                        clean_label = _sanitize_render_value(item.label, max_length=80)
+                        if clean_label:
+                            ob_lines.append(f"- **{clean_label}:** {clean_val}")
+                        else:
+                            ob_lines.append(f"- {clean_val}")
+                    else:
+                        ob_lines.append(f"- {clean_val}")
+            if len(ob_lines) > 1:
+                parts.append("\n".join(ob_lines))
+
+    return "\n\n".join(parts).strip()
+
+
+def _render_medical(schema: MedicalSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
+    """Render structured medical document intelligence."""
+    _SECTION_MAP = {
+        "patient_info": ("Patient Information", schema.patient_info),
+        "diagnoses": ("Diagnoses & Assessments", schema.diagnoses),
+        "medications": ("Medications & Prescriptions", schema.medications),
+        "procedures": ("Procedures & Treatments", schema.procedures),
+        "lab_results": ("Lab Results", schema.lab_results),
+        "vitals": ("Vital Signs", schema.vitals),
+    }
+
+    # Determine which sections are relevant based on query
+    q_lower = (query or "").lower()
+    focused_sections = set()
+    if any(k in q_lower for k in ("patient", "name", "age", "gender", "allerg")):
+        focused_sections.add("patient_info")
+    if any(k in q_lower for k in ("diagnos", "condition", "assessment", "complaint")):
+        focused_sections.add("diagnoses")
+    if any(k in q_lower for k in ("medicat", "drug", "prescription", "dose", "treatment")):
+        focused_sections.add("medications")
+    if any(k in q_lower for k in ("procedure", "surgery", "imaging", "mri", "x-ray", "ct scan")):
+        focused_sections.add("procedures")
+    if any(k in q_lower for k in ("lab", "test", "result", "blood", "hemoglobin", "glucose")):
+        focused_sections.add("lab_results")
+    if any(k in q_lower for k in ("vital", "blood pressure", "heart rate", "temperature", "spo2", "pulse")):
+        focused_sections.add("vitals")
+
+    parts: list[str] = []
+    for section_key, (heading, field) in _SECTION_MAP.items():
+        items = (field.items if field else None) or []
+        if not items:
+            continue
+        # Skip if query is focused and this section isn't relevant
+        if focused_sections and section_key not in focused_sections:
+            continue
+
+        section_lines = [f"**{heading}:**"]
+        for item in items:
+            clean_val = _sanitize_render_value(item.value, max_length=400)
+            if not clean_val:
+                continue
+            if item.label:
+                clean_label = _sanitize_render_value(item.label, max_length=80)
+                if clean_label:
+                    section_lines.append(f"- **{clean_label}:** {clean_val}")
+                else:
+                    section_lines.append(f"- {clean_val}")
+            else:
+                section_lines.append(f"- {clean_val}")
+        if len(section_lines) > 1:
+            parts.append("\n".join(section_lines))
+
+    if not parts:
+        # No focused sections matched — render all non-empty sections
+        if focused_sections:
+            return _render_medical(schema, intent, strict=strict, query="", query_focus=query_focus)
         if strict:
             return ""
         return ""
 
-    # Query-focus clause relevance filtering: keep top relevant clauses when >3
-    if query_focus and not query_focus.is_exhaustive and len(entries) > 3 and query_focus.keywords:
-        from .query_focus import score_fact_relevance
-        scored_entries = [
-            (score_fact_relevance(title, text, query_focus), (title, text))
-            for title, text in entries
-        ]
-        scored_entries.sort(key=lambda pair: pair[0], reverse=True)
-        # Keep top 5 most relevant, minimum 2
-        relevant = [(s, e) for s, e in scored_entries if s >= 0.15]
-        if len(relevant) < 2:
-            entries = [e for _, e in scored_entries[:2]]
-        else:
-            entries = [e for _, e in relevant[:5]]
+    return "\n\n".join(parts).strip()
 
-    # Intent-aware heading
-    _LEGAL_HEADINGS = {
-        "summary": "Legal Document Summary:",
-        "contact": "Parties and Contact Information:",
-        "facts": "Key Legal Provisions:",
+
+def _render_policy(schema: PolicySchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
+    """Render structured insurance policy intelligence."""
+    _SECTION_MAP = {
+        "policy_info": ("Policy Details", schema.policy_info),
+        "coverage": ("Coverage & Benefits", schema.coverage),
+        "premiums": ("Premium & Payment Details", schema.premiums),
+        "exclusions": ("Exclusions & Limitations", schema.exclusions),
+        "terms": ("Terms & Conditions", schema.terms),
     }
-    heading = _LEGAL_HEADINGS.get(intent, "Relevant Clauses:")
 
-    if len(entries) == 1:
-        title, text = entries[0]
-        cleaned = " ".join(text.split())
-        if title:
-            return f"**{title}:** {cleaned}"
-        return cleaned
+    # Determine which sections are relevant based on query
+    q_lower = (query or "").lower()
+    focused_sections = set()
+    if any(k in q_lower for k in ("policy", "insured", "vehicle", "plan", "idv", "sum")):
+        focused_sections.add("policy_info")
+    if any(k in q_lower for k in ("cover", "benefit", "protect", "scope", "accident", "damage")):
+        focused_sections.add("coverage")
+    if any(k in q_lower for k in ("premium", "amount", "payable", "gst", "tax", "cost", "price", "ncb", "discount")):
+        focused_sections.add("premiums")
+    if any(k in q_lower for k in ("exclusion", "not covered", "deductible", "limit", "waiting")):
+        focused_sections.add("exclusions")
+    if any(k in q_lower for k in ("term", "condition", "claim", "renewal", "cancel", "endorse")):
+        focused_sections.add("terms")
 
-    lines = [heading]
-    for title, text in entries:
-        cleaned = " ".join(text.split())
-        if title:
-            lines.append(f"- **{title}:** {cleaned}")
-        else:
-            lines.append(f"- {cleaned}")
-    return "\n".join(lines)
+    parts: list[str] = []
+    for section_key, (heading, field) in _SECTION_MAP.items():
+        items = (field.items if field else None) or []
+        if not items:
+            continue
+        if focused_sections and section_key not in focused_sections:
+            continue
+
+        section_lines = [f"**{heading}:**"]
+        for item in items:
+            clean_val = _sanitize_render_value(item.value, max_length=400)
+            if not clean_val:
+                continue
+            if item.label:
+                clean_label = _sanitize_render_value(item.label, max_length=80)
+                if clean_label:
+                    section_lines.append(f"- **{clean_label}:** {clean_val}")
+                else:
+                    section_lines.append(f"- {clean_val}")
+            else:
+                section_lines.append(f"- {clean_val}")
+        if len(section_lines) > 1:
+            parts.append("\n".join(section_lines))
+
+    if not parts:
+        if focused_sections:
+            return _render_policy(schema, intent, strict=strict, query="", query_focus=query_focus)
+        if strict:
+            return ""
+        return ""
+
+    return "\n\n".join(parts).strip()
 
 
 __all__ = ["render_enterprise"]

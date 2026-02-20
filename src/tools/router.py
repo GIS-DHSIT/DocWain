@@ -13,6 +13,7 @@ from src.tools import (  # noqa: F401
     stt,
     tts,
     translator,
+    image_analysis,
     tutor,
     creator,
     email_drafting,
@@ -73,6 +74,7 @@ async def run_tool(request: ToolRunRequest, x_correlation_id: str | None = Heade
 router.include_router(stt.router)
 router.include_router(tts.router)
 router.include_router(translator.router)
+router.include_router(image_analysis.router)
 router.include_router(tutor.router)
 router.include_router(creator.router)
 router.include_router(email_drafting.router)
@@ -86,4 +88,3 @@ router.include_router(web_extract.router)
 
 # Alias for import convenience
 tools_router = router
-

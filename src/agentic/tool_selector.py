@@ -37,6 +37,7 @@ _DOMAIN_TOOLS: Dict[str, List[str]] = {
     "legal": ["lawhere"],
     "medical": ["medical"],
     "invoice": ["content_generate"],
+    "image": ["image_analysis"],
 }
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,7 @@ _KEYWORD_TOOL_PATTERNS: List[tuple[re.Pattern, str]] = [
     (re.compile(r"\b(?:code\s+docs?|documentation|api\s+docs?)\b", re.IGNORECASE), "code_docs"),
     (re.compile(r"\b(?:tutor|teach|explain\s+(?:how|what|why)|learn)\b", re.IGNORECASE), "tutor"),
     (re.compile(r"\b(?:web\s*extract|scrape|fetch\s*url)\b", re.IGNORECASE), "web_extract"),
+    (re.compile(r"\b(?:ocr|image\s+analysis|analy[sz]e\s+(?:this\s+)?image|extract\s+text\s+from\s+(?:an?\s+)?image|screenshot)\b", re.IGNORECASE), "image_analysis"),
 ]
 
 # ---------------------------------------------------------------------------

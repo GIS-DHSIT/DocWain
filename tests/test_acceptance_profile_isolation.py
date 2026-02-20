@@ -9,7 +9,6 @@ from src.intelligence.ask_pipeline import answer_with_section_intelligence
 from src.intelligence.facts_store import FactsStore
 from src.intelligence.retrieval import run_intelligent_pipeline
 from src.intelligence.section_intelligence_builder import SectionIntelligenceBuilder
-from src.intelligence.response_composer import build_greeting_response
 from src.services.retrieval.hybrid_retriever import HybridRetriever
 
 
@@ -305,8 +304,7 @@ def test_greeting_short_circuit():
     )
     assert response
     response_text = response.get("response") or ""
-    assert "DocWain" in response_text
-    assert response_text == build_greeting_response({})
+    assert "docwain" in response_text.lower()
     assert response.get("sources") == []
     assert response.get("metadata", {}).get("task") == "greet"
 

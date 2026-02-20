@@ -17,7 +17,7 @@ from azure.core.exceptions import (
     ServiceRequestError,
     ServiceResponseError,
 )
-from azure.storage.blob import ContentSettings
+from azure.storage.blob import BlobLeaseClient, ContentSettings
 
 from src.storage.azure_blob_client import get_document_container_client, normalize_blob_name
 
@@ -104,7 +104,7 @@ def _release_lease_with_retry(
     """Release a blob lease with retry logic and short backoff."""
     for attempt in range(1, max_attempts + 1):
         try:
-            blob_client.release_lease(lease=lease_id)
+            BlobLeaseClient(blob_client, lease_id=lease_id).release()
             logger.info(
                 "Released blob lease document_id=%s blob=%s (attempt %d)",
                 document_id, blob_name, attempt,
