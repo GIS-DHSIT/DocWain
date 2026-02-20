@@ -23,7 +23,7 @@ from src.agentic.tool_selector import (
 _ALL_TOOLS = frozenset({
     "resumes", "content_generate", "lawhere", "medical", "screen_pii",
     "translator", "email_drafting", "jira_confluence", "code_docs",
-    "tutor", "web_extract", "tts", "stt", "db_connector",
+    "tutor", "web_extract", "image_analysis", "tts", "stt", "db_connector",
     "screen_ai_authorship", "screen_resume", "screen_readability",
     "content_types", "creator",
 })
@@ -161,6 +161,10 @@ class TestKeywordMapping:
     def test_web_extract_keyword(self):
         result = _selector().select_tools("web extract from the page")
         assert "web_extract" in result
+
+    def test_image_analysis_keyword(self):
+        result = _selector().select_tools("extract text from this image using ocr")
+        assert "image_analysis" in result
 
     def test_screen_keyword(self):
         result = _selector().select_tools("screen this for pii")

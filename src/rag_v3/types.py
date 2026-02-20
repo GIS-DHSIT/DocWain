@@ -129,6 +129,29 @@ class LegalSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     clauses: ClauseField = Field(default_factory=ClauseField)
+    parties: FieldValuesField = Field(default_factory=FieldValuesField)
+    obligations: FieldValuesField = Field(default_factory=FieldValuesField)
+
+
+class MedicalSchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    patient_info: FieldValuesField = Field(default_factory=FieldValuesField)
+    diagnoses: FieldValuesField = Field(default_factory=FieldValuesField)
+    medications: FieldValuesField = Field(default_factory=FieldValuesField)
+    procedures: FieldValuesField = Field(default_factory=FieldValuesField)
+    lab_results: FieldValuesField = Field(default_factory=FieldValuesField)
+    vitals: FieldValuesField = Field(default_factory=FieldValuesField)
+
+
+class PolicySchema(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    policy_info: FieldValuesField = Field(default_factory=FieldValuesField)
+    coverage: FieldValuesField = Field(default_factory=FieldValuesField)
+    premiums: FieldValuesField = Field(default_factory=FieldValuesField)
+    exclusions: FieldValuesField = Field(default_factory=FieldValuesField)
+    terms: FieldValuesField = Field(default_factory=FieldValuesField)
 
 
 class GenericSchema(BaseModel):

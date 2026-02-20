@@ -26,7 +26,9 @@ from .types import (
     LegalSchema,
     LLMBudget,
     MISSING_REASON,
+    MedicalSchema,
     MultiEntitySchema,
+    PolicySchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,7 @@ def schema_extract(
     domain_hint: Optional[str] = None,
     intent_hint: Optional[str] = None,
     query_focus: Optional[Any] = None,
+    embedder: Any = None,
 ) -> ExtractionResult:
     domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint, intent_hint=intent_hint)
 
@@ -87,7 +90,7 @@ def schema_extract(
         schema = GenericSchema(facts=FieldValuesField(items=[FieldValue(label=None, value=msg, evidence_spans=[])]))
         return ExtractionResult(domain=chunk_domain, intent=intent, schema=schema)
 
-    schema = _deterministic_extract(domain, intent, query, chunks, query_focus=query_focus)
+    schema = _deterministic_extract(domain, intent, query, chunks, query_focus=query_focus, embedder=embedder)
 
     if _schema_is_empty(schema) and llm_client and budget.consume():
         llm_schema = _llm_extract(domain, intent, query, chunks, llm_client, correlation_id)
@@ -108,6 +111,11 @@ _HR_CONTENT_HINTS = (
 )
 _INVOICE_CONTENT_HINTS = ("invoice", "amount due", "bill to", "total due", "payment terms")
 _LEGAL_CONTENT_HINTS = ("contract", "agreement", "clause", "liability", "parties")
+_POLICY_CONTENT_HINTS = (
+    "insurance", "policy", "premium", "coverage", "claim", "deductible",
+    "exclusion", "underwriting", "insured", "beneficiary", "endorsement",
+    "indemnity", "peril", "policyholder",
+)
 
 # Strong query signals that override chunk-based domain detection
 _QUERY_HR_STRONG = ("resume", "cv", "curriculum vitae", "candidate")
@@ -115,6 +123,8 @@ _QUERY_HR_WEAK = ("skills", "education", "certification", "certifications", "exp
                    "profile", "qualified", "suitable", "background", "career", "designation", "work history")
 _QUERY_INVOICE_STRONG = ("invoice", "invoices", "payment", "bill", "amount due")
 _QUERY_LEGAL_STRONG = ("contract", "agreement", "clause", "liability")
+_QUERY_POLICY_STRONG = ("insurance", "policy", "premium", "coverage", "claim", "deductible",
+                         "exclusion", "underwriting", "insured", "beneficiary")
 
 
 def _query_domain_override(query: str) -> Optional[str]:
@@ -128,6 +138,8 @@ def _query_domain_override(query: str) -> Optional[str]:
         return "invoice"
     if any(token in lowered for token in _QUERY_LEGAL_STRONG):
         return "legal"
+    if any(token in lowered for token in _QUERY_POLICY_STRONG):
+        return "policy"
     # Weak HR signals — a single match is sufficient (skills/education/etc. are unambiguously HR)
     if any(token in lowered for token in _QUERY_HR_WEAK):
         return "hr"
@@ -174,6 +186,8 @@ def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
         return "invoice"
     if any(h in sample for h in _LEGAL_CONTENT_HINTS):
         return "legal"
+    if any(h in sample for h in _POLICY_CONTENT_HINTS):
+        return "policy"
     return None
 
 
@@ -197,7 +211,7 @@ def _infer_domain_intent(
         query_domain = _query_domain_override(query)
         chunk_domain = _majority_chunk_domain(chunks)
         if query_domain and chunk_domain:
-            _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal"}
+            _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal", "policy": "policy"}
             q_family = _DOMAIN_FAMILY.get(query_domain, query_domain)
             c_family = _DOMAIN_FAMILY.get(chunk_domain, chunk_domain)
             if q_family != c_family and q_family != "hr":
@@ -245,10 +259,18 @@ def _looks_like_hr_total(text: str) -> bool:
     )
 
 
-def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[Any], *, query_focus: Optional[Any] = None):
+def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[Any], *, query_focus: Optional[Any] = None, embedder: Any = None):
     """Route to domain-specific extractor when domain is known, else generic."""
     if domain in ("hr", "resume"):
         return _extract_hr(chunks)
+    if domain == "invoice":
+        return _extract_invoice(chunks, embedder=embedder)
+    if domain in ("legal", "contract"):
+        return _extract_legal(chunks, embedder=embedder)
+    if domain == "policy":
+        return _extract_policy(chunks, embedder=embedder)
+    if domain == "medical":
+        return _extract_medical(chunks, embedder=embedder)
     return _extract_document_intelligence(query, chunks, query_focus=query_focus)
 
 
@@ -534,67 +556,93 @@ def _score_and_sort_facts(
     return sorted(facts, key=_fact_score, reverse=True)
 
 
-def _extract_invoice(chunks: List[Any]) -> InvoiceSchema:
+# ---------------------------------------------------------------------------
+# ML-based line classification helper (shared by all domain extractors)
+# ---------------------------------------------------------------------------
+
+def _ml_extract_lines(chunks, domain: str, embedder):
+    """Collect lines from chunks, classify with ML, return structured results.
+
+    Returns a list of (line_text, (chunk_id, meta), LineClassification) tuples.
+    When embedder is None, falls back to heuristic classification.
+    """
+    from .line_classifier import classify_lines as _classify_lines
+
+    all_lines: List[str] = []
+    line_meta: List[Tuple[str, dict]] = []
+
+    for chunk in chunks:
+        text = _extract_full_text_content(getattr(chunk, "text", "") or "")
+        chunk_id = getattr(chunk, "id", "")
+        meta = getattr(chunk, "meta", None) or getattr(chunk, "metadata", None) or {}
+        for line in _split_lines(text):
+            cleaned = line.strip()
+            if cleaned and len(cleaned) >= 3:
+                all_lines.append(cleaned)
+                line_meta.append((chunk_id, meta))
+
+    if not all_lines:
+        return []
+
+    classifications = _classify_lines(all_lines, domain, embedder)
+    return list(zip(all_lines, line_meta, classifications))
+
+
+def _extract_invoice(chunks: List[Any], embedder: Any = None) -> InvoiceSchema:
     items: List[InvoiceItem] = []
     totals: List[FieldValue] = []
     parties: List[FieldValue] = []
     terms: List[FieldValue] = []
     seen_items = set()
 
-    for chunk in chunks:
-        text = getattr(chunk, "text", "") or ""
-        chunk_id = getattr(chunk, "id", "")
-        for line in _split_lines(text):
-            cleaned = line.strip()
-            if not cleaned:
+    _CATEGORY_LISTS = {
+        "items": None,  # items uses InvoiceItem, handled separately
+        "totals": totals,
+        "parties": parties,
+        "terms": terms,
+    }
+
+    classified = _ml_extract_lines(chunks, "invoice", embedder)
+    for line, (chunk_id, meta), cls in classified:
+        if cls.role == "skip":
+            continue
+
+        key = _normalize_key(line)
+
+        if cls.category == "items" or cls.role == "bullet":
+            desc = cls.value or line
+            if cls.label:
+                desc = cls.value
+            item_key = _normalize_key(desc)
+            if desc and item_key not in seen_items:
+                seen_items.add(item_key)
+                items.append(InvoiceItem(
+                    description=desc,
+                    evidence_spans=[_span(chunk_id, line)],
+                ))
+            continue
+
+        if cls.role in ("kv_pair", "heading", "narrative"):
+            if key in seen_items:
                 continue
-            item_match = re.match(r"(?i)^\s*(?:item|product|service|description|line item)\s*[:\-]\s*(.+)$", cleaned)
-            if item_match:
-                desc = item_match.group(1).strip()
-                if desc:
-                    key = _normalize_key(desc)
-                    if key not in seen_items:
-                        seen_items.add(key)
-                        items.append(
-                            InvoiceItem(
-                                description=desc,
-                                evidence_spans=[_span(chunk_id, cleaned)],
-                            )
-                        )
+            seen_items.add(key)
+            label = cls.label or None
+            value = cls.value or line
+            if not value or len(value) < 2:
                 continue
 
-            if _is_bullet_item(cleaned):
-                desc = cleaned.lstrip("-• ").strip()
-                key = _normalize_key(desc)
-                if desc and key not in seen_items:
-                    seen_items.add(key)
-                    items.append(
-                        InvoiceItem(
-                            description=desc,
-                            evidence_spans=[_span(chunk_id, cleaned)],
-                        )
-                    )
-
-            total_match = re.match(r"(?i)^\s*(total|amount due|subtotal|balance due)\s*[:\-]\s*(.+)$", cleaned)
-            if total_match:
-                label = total_match.group(1).strip().title()
-                value = total_match.group(2).strip()
-                if value:
-                    totals.append(FieldValue(label=label, value=value, evidence_spans=[_span(chunk_id, cleaned)]))
-
-            party_match = re.match(r"(?i)^\s*(bill to|billed to|invoice to|from|vendor|customer)\s*[:\-]\s*(.+)$", cleaned)
-            if party_match:
-                label = party_match.group(1).strip().title()
-                value = party_match.group(2).strip()
-                if value:
-                    parties.append(FieldValue(label=label, value=value, evidence_spans=[_span(chunk_id, cleaned)]))
-
-            term_match = re.match(r"(?i)^\s*(payment terms|due date|terms)\s*[:\-]\s*(.+)$", cleaned)
-            if term_match:
-                label = term_match.group(1).strip().title()
-                value = term_match.group(2).strip()
-                if value:
-                    terms.append(FieldValue(label=label, value=value, evidence_spans=[_span(chunk_id, cleaned)]))
+            target = _CATEGORY_LISTS.get(cls.category)
+            if target is not None:
+                target.append(FieldValue(
+                    label=label, value=value,
+                    evidence_spans=[_span(chunk_id, line)],
+                ))
+            elif cls.category == "other" and cls.role == "kv_pair":
+                # Unclassified KV — put in terms as general info
+                terms.append(FieldValue(
+                    label=label, value=value,
+                    evidence_spans=[_span(chunk_id, line)],
+                ))
 
     return InvoiceSchema(
         items=_items_field(items),
@@ -902,19 +950,29 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
                     if contact.get("names") and not cand.name:
                         cand.name = contact["names"][0]
 
-        # Set source type based on document name/type
-        for section_chunks in sections.values():
-            if section_chunks:
-                _, _, section_title = section_chunks[0]
-                # Try to infer from section title
-                cand.source_type = _infer_source_type(section_title or "Resume")
-                break
-
+        # Set source type based on document name first, then content analysis
+        if doc_name:
+            cand.source_type = _infer_source_type(doc_name)
         if not cand.source_type:
-            if doc_name:
-                cand.source_type = _infer_source_type(doc_name) or "Document"
+            # Check all chunk text for LinkedIn indicators
+            _has_linkedin_markers = False
+            for section_chunks in sections.values():
+                for _, sec_text, _ in section_chunks:
+                    if sec_text and ("linkedin.com" in sec_text.lower() or "linkedin profile" in sec_text.lower()):
+                        _has_linkedin_markers = True
+                        break
+                if _has_linkedin_markers:
+                    break
+            if _has_linkedin_markers and not doc_name:
+                cand.source_type = "LinkedIn profile"
             else:
-                cand.source_type = "Document"
+                # HR domain with sections like skills/education/experience → Resume
+                _hr_sections = {"skills_technical", "education", "experience", "certifications",
+                                "skills_functional", "summary_objective", "professional_experience"}
+                if any(sk.split(":")[0] in _hr_sections for sk in sections):
+                    cand.source_type = "Resume"
+                else:
+                    cand.source_type = "Resume"  # Default for HR domain
 
         # CRITICAL FALLBACK: If no data extracted via section analysis,
         # scan ALL chunk content directly for relevant patterns
@@ -1221,6 +1279,20 @@ def _sanitize_field_list(items: Optional[List[str]], max_item_length: int = 100)
         # Skip items starting with conjunctions (split sentence fragments)
         if re.match(r"^(?:and|or|but|nor)\s+", item, re.IGNORECASE) and len(item) < 50:
             continue
+        # Skip education/location data that leaked into skill lists
+        item_lower = item.lower().strip()
+        if re.search(r'\b(?:cgpa|gpa)\b', item_lower):
+            continue
+        if re.search(r'\bproficiency\b', item_lower) and not re.search(r'\b(?:python|java|sql|sap|aws)\b', item_lower):
+            continue
+        # Indian states/cities that are NOT skills
+        _location_tokens = {
+            'tamil nadu', 'karnataka', 'maharashtra', 'delhi', 'mumbai', 'bangalore',
+            'bengaluru', 'chennai', 'hyderabad', 'pune', 'erode', 'coimbatore',
+            'kolkata', 'noida', 'gurugram', 'trivandrum', 'kerala', 'india',
+        }
+        if item_lower in _location_tokens:
+            continue
         # Skip very long entries (likely paragraphs)
         if len(item) > max_item_length:
             continue
@@ -1238,16 +1310,28 @@ def _sanitize_field_list(items: Optional[List[str]], max_item_length: int = 100)
 
 def _sanitize_candidate(cand: Candidate) -> None:
     """Sanitize all fields of a Candidate to remove metadata artifacts."""
-    # Clean name
+    # Clean name — reject names that are actually skill/keyword lists
     if cand.name:
         cleaned_name = _sanitize_field_value(cand.name, max_length=80)
+        # Reject comma-delimited lists (skill lists, not names)
+        if cleaned_name and ',' in cleaned_name:
+            cleaned_name = None
+        # Reject names containing non-name keywords
+        if cleaned_name and not _looks_like_name(cleaned_name):
+            cleaned_name = None
+        # Reject names starting with "Document Content" or similar metadata
+        if cleaned_name and re.match(r"(?i)^(?:document\s+content|section\s+\d)", cleaned_name):
+            cleaned_name = None
         cand.name = cleaned_name
 
     # Clean experience summary
     if cand.experience_summary:
         summary = cand.experience_summary
+        # Strip "Document Content" prefix (extraction artifact)
+        summary = re.sub(r"^Document\s+Content\s*", "", summary, flags=re.IGNORECASE).strip()
+        # Strip "Introduction" prefix
+        summary = re.sub(r"^Introduction\s+", "", summary).strip()
         # Strip leading "Projects" + everything up to first bullet point
-        # e.g., "Projects Stock Profit Classifier | Python,Flask,...ANN (OCT 2023 – NOV 2023) ●..." → "●..."
         summary = re.sub(
             r"^Projects?\b[^●•▪■]*(?=[●•▪■])",
             "", summary, count=1, flags=re.IGNORECASE,
@@ -1256,6 +1340,12 @@ def _sanitize_candidate(cand: Candidate) -> None:
         summary = re.sub(r"^[)\]}\s]+", "", summary).strip()
         # Strip leading bullet/action items
         summary = re.sub(r"^[●•▪■\-*]\s*", "", summary)
+        # Strip phone/email/contact prefix that leaked into summary
+        summary = re.sub(r"^(?:\+?\d[\d\s\-]{6,15}\s*)", "", summary).strip()
+        # Truncate at "(cid:" artifacts
+        cid_idx = summary.find("(cid:")
+        if cid_idx > 50:
+            summary = summary[:cid_idx].rstrip()
         cand.experience_summary = _sanitize_field_value(summary, max_length=500) if summary else None
 
     # Clean total years experience
@@ -1274,21 +1364,195 @@ def _sanitize_candidate(cand: Candidate) -> None:
     cand.achievements = _sanitize_field_list(cand.achievements, max_item_length=150)
 
 
-def _extract_legal(chunks: List[Any]) -> LegalSchema:
+def _extract_legal(chunks: List[Any], embedder: Any = None) -> LegalSchema:
+    """Extract structured legal/contract intelligence from chunks."""
     clauses: List[Clause] = []
-    for chunk in chunks:
-        text = getattr(chunk, "text", "") or ""
-        chunk_id = getattr(chunk, "id", "")
-        for line in _split_lines(text):
-            cleaned = line.strip()
-            if not cleaned:
+    parties: List[FieldValue] = []
+    obligations: List[FieldValue] = []
+    seen = set()
+
+    classified = _ml_extract_lines(chunks, "legal", embedder)
+    for line, (chunk_id, meta), cls in classified:
+        if cls.role == "skip" or len(line) < 5:
+            continue
+        key = _normalize_key(line)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if cls.category == "parties":
+            label = cls.label or "Party"
+            value = cls.value or line
+            parties.append(FieldValue(label=label, value=value, evidence_spans=[_span(chunk_id, line)]))
+        elif cls.category == "obligations":
+            obligations.append(FieldValue(label="Obligation", value=cls.value or line, evidence_spans=[_span(chunk_id, line)]))
+        elif cls.category == "clauses" or cls.role in ("kv_pair", "heading", "narrative"):
+            value = cls.value or line
+            if cls.role == "kv_pair" and cls.label:
+                title = cls.label
+            elif cls.role == "heading":
+                title = value
+                continue  # headings are structural, not content
+            else:
+                # Extract title from first sentence for narrative clauses
+                title_end = value.find(".")
+                title = value[:title_end].strip() if 0 < title_end < 80 else None
+            if value and len(value) > 2:
+                clauses.append(Clause(title=title, text=value, evidence_spans=[_span(chunk_id, line)]))
+
+    return LegalSchema(
+        clauses=_clauses_field(clauses),
+        parties=_field_values_field(parties),
+        obligations=_field_values_field(obligations),
+    )
+
+
+def _extract_medical(chunks: List[Any], embedder: Any = None) -> "MedicalSchema":
+    """Extract structured medical intelligence from patient records and clinical documents."""
+    patient_info: List[FieldValue] = []
+    diagnoses: List[FieldValue] = []
+    medications: List[FieldValue] = []
+    procedures: List[FieldValue] = []
+    lab_results: List[FieldValue] = []
+    vitals: List[FieldValue] = []
+    seen = set()
+
+    _CATEGORY_LISTS = {
+        "patient_info": patient_info,
+        "diagnoses": diagnoses,
+        "medications": medications,
+        "procedures": procedures,
+        "lab_results": lab_results,
+        "vitals": vitals,
+    }
+
+    current_heading_category = ""
+
+    classified = _ml_extract_lines(chunks, "medical", embedder)
+    for line, (chunk_id, meta), cls in classified:
+        if cls.role == "skip":
+            continue
+
+        # Track heading category for context propagation
+        if cls.role == "heading":
+            if cls.category != "other":
+                current_heading_category = cls.category
+            continue
+
+        key = _normalize_key(line)
+        if key in seen:
+            continue
+
+        if cls.role in ("kv_pair", "bullet", "narrative"):
+            label = cls.label if cls.role == "kv_pair" else None
+            value = cls.value or line
+
+            if not value or len(value) < 2:
                 continue
-            match = re.match(r"(?i)^\s*(clause|section)\s*[:\-]\s*(.+)$", cleaned)
-            if match:
-                title = match.group(1).strip().title()
-                body = match.group(2).strip()
-                clauses.append(Clause(title=title, text=body, evidence_spans=[_span(chunk_id, cleaned)]))
-    return LegalSchema(clauses=_clauses_field(clauses))
+            # Skip long values that look like paragraphs for KV pairs
+            if cls.role == "kv_pair" and len(value) > 300:
+                continue
+
+            seen.add(key)
+
+            # Route to category from ML classification
+            category = cls.category
+            if category == "other":
+                # Fall back to heading context or section_kind
+                section_kind = str(meta.get("section_kind", "")).lower()
+                if current_heading_category and current_heading_category in _CATEGORY_LISTS:
+                    category = current_heading_category
+                elif "diagnos" in section_kind or "procedure" in section_kind:
+                    category = "diagnoses"
+                elif "medicat" in section_kind:
+                    category = "medications"
+                elif "lab" in section_kind:
+                    category = "lab_results"
+                elif "identity" in section_kind or "contact" in section_kind:
+                    category = "patient_info"
+                else:
+                    category = "diagnoses"  # default for medical domain
+
+            target = _CATEGORY_LISTS.get(category)
+            if target is not None:
+                target.append(FieldValue(
+                    label=label, value=value,
+                    evidence_spans=[_span(chunk_id, line)],
+                ))
+
+    return MedicalSchema(
+        patient_info=_field_values_field(patient_info),
+        diagnoses=_field_values_field(diagnoses),
+        medications=_field_values_field(medications),
+        procedures=_field_values_field(procedures),
+        lab_results=_field_values_field(lab_results),
+        vitals=_field_values_field(vitals),
+    )
+
+
+def _extract_policy(chunks: List[Any], embedder: Any = None) -> "PolicySchema":
+    """Extract structured insurance policy intelligence from policy documents."""
+    policy_info: List[FieldValue] = []
+    coverage: List[FieldValue] = []
+    premiums: List[FieldValue] = []
+    exclusions: List[FieldValue] = []
+    terms: List[FieldValue] = []
+    seen = set()
+
+    _CATEGORY_LISTS = {
+        "policy_info": policy_info,
+        "coverage": coverage,
+        "premiums": premiums,
+        "exclusions": exclusions,
+        "terms": terms,
+    }
+
+    classified = _ml_extract_lines(chunks, "policy", embedder)
+    for line, (chunk_id, meta), cls in classified:
+        if cls.role == "skip":
+            continue
+        if cls.role == "heading":
+            continue  # headings are structural, not content
+
+        key = _normalize_key(line)
+        if key in seen:
+            continue
+
+        label = cls.label if cls.role == "kv_pair" else None
+        value = cls.value or line
+        if not value or len(value) < 2:
+            continue
+        if cls.role == "kv_pair" and len(value) > 300:
+            continue
+
+        seen.add(key)
+
+        # Route to category from ML classification
+        category = cls.category
+        if category == "other":
+            # Fall back to section_kind
+            section_kind = str(meta.get("section_kind", "")).lower()
+            if "financial" in section_kind or "premium" in section_kind:
+                category = "premiums"
+            elif "terms" in section_kind or "condition" in section_kind:
+                category = "terms"
+            else:
+                category = "policy_info"  # default for policy domain
+
+        target = _CATEGORY_LISTS.get(category)
+        if target is not None:
+            target.append(FieldValue(
+                label=label, value=value,
+                evidence_spans=[_span(chunk_id, line)],
+            ))
+
+    return PolicySchema(
+        policy_info=_field_values_field(policy_info),
+        coverage=_field_values_field(coverage),
+        premiums=_field_values_field(premiums),
+        exclusions=_field_values_field(exclusions),
+        terms=_field_values_field(terms),
+    )
 
 
 def _extract_generic(query: str, chunks: List[Any]) -> GenericSchema:
@@ -1351,7 +1615,7 @@ def _extract_generic(query: str, chunks: List[Any]) -> GenericSchema:
     return GenericSchema(facts=_field_values_field(facts))
 
 
-def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema) -> bool:
+def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema | MedicalSchema | PolicySchema) -> bool:
     if isinstance(schema, InvoiceSchema):
         return not (
             (schema.items.items if schema.items else None)
@@ -1363,7 +1627,28 @@ def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSch
         cands = (schema.candidates.items if schema.candidates else None) or []
         return not any(c.name or c.technical_skills or getattr(c, "experience_summary", None) for c in cands)
     if isinstance(schema, LegalSchema):
-        return not (schema.clauses.items if schema.clauses else None)
+        return not (
+            (schema.clauses.items if schema.clauses else None)
+            or (schema.parties.items if schema.parties else None)
+            or (schema.obligations.items if schema.obligations else None)
+        )
+    if isinstance(schema, MedicalSchema):
+        return not (
+            (schema.patient_info.items if schema.patient_info else None)
+            or (schema.diagnoses.items if schema.diagnoses else None)
+            or (schema.medications.items if schema.medications else None)
+            or (schema.procedures.items if schema.procedures else None)
+            or (schema.lab_results.items if schema.lab_results else None)
+            or (schema.vitals.items if schema.vitals else None)
+        )
+    if isinstance(schema, PolicySchema):
+        return not (
+            (schema.policy_info.items if schema.policy_info else None)
+            or (schema.coverage.items if schema.coverage else None)
+            or (schema.premiums.items if schema.premiums else None)
+            or (schema.exclusions.items if schema.exclusions else None)
+            or (schema.terms.items if schema.terms else None)
+        )
     if isinstance(schema, GenericSchema):
         facts = (schema.facts.items if schema.facts else None) or []
         return not any(f.value and len(str(f.value)) > 5 for f in facts)
@@ -1409,6 +1694,10 @@ def _llm_extract(
             return HRSchema.model_validate(cleaned)
         if domain == "legal":
             return LegalSchema.model_validate(cleaned)
+        if domain == "medical":
+            return MedicalSchema.model_validate(cleaned)
+        if domain == "policy":
+            return PolicySchema.model_validate(cleaned)
         return GenericSchema.model_validate(cleaned)
     except Exception:
         return None
@@ -1707,6 +1996,10 @@ def _clean_extraction_text(text: str) -> str:
     text = re.sub(r'(?m)^\s*(?:text|key)\s*:\s*', '', text)
     # Remove "Extracted Document full_text" partial repr artifacts
     text = re.sub(r'Extracted\s+Document\s+full_text\b', '', text)
+    # Remove "Document Content" prefix (extraction pipeline artifact)
+    text = re.sub(r'^Document\s+Content\s*', '', text, flags=re.IGNORECASE)
+    # Remove "Introduction" prefix when followed by the actual content (extraction artifact)
+    text = re.sub(r'^Introduction\s+(?=[A-Z])', '', text)
     # Remove leading 'n' artifacts from escaped newlines that became "n " (e.g., "n Certified SAP...")
     text = re.sub(r'(?:^|\n)\s*n\s+(?=[A-Z])', '\n', text)
 
@@ -2048,8 +2341,35 @@ def _extract_contact_fields_comprehensive(text: str) -> Dict[str, List[str]]:
     linkedins = []
     names = []
 
-    # Extract emails from entire text
-    emails = list(set(_EMAIL_RE.findall(text)))
+    # Pre-process: rejoin emails broken across whitespace/newlines.
+    # Strategy: find every email-like match, and if its local part starts with
+    # digits (e.g. "2003@gmail.com"), look backwards in the raw text for the
+    # alpha prefix that was broken off (e.g. "sabareesh 2003@gmail.com" →
+    # "sabareesh2003@gmail.com").  Digit-only local parts are almost never
+    # standalone valid emails.
+    raw_emails = list(set(_EMAIL_RE.findall(text)))
+    emails = []
+    for email in raw_emails:
+        local_part = email.split("@")[0]
+        if local_part and local_part[0].isdigit():
+            # Digit-leading email — look backwards for the alpha prefix
+            _prefix_pattern = re.compile(
+                r'([A-Za-z][A-Za-z0-9._%-]*)\s+' + re.escape(email)
+            )
+            _prefix_match = _prefix_pattern.search(text)
+            if _prefix_match:
+                emails.append(_prefix_match.group(1) + email)
+                continue
+            # Also check across newlines
+            _nl_prefix_pattern = re.compile(
+                r'([A-Za-z][A-Za-z0-9._%-]*)\s*[\n\r]+\s*' + re.escape(email)
+            )
+            _nl_match = _nl_prefix_pattern.search(text)
+            if _nl_match:
+                emails.append(_nl_match.group(1) + email)
+                continue
+        emails.append(email)
+    emails = list(set(emails))
 
     # Extract phones from entire text
     for match in _PHONE_RE.findall(text):
@@ -2062,6 +2382,8 @@ def _extract_contact_fields_comprehensive(text: str) -> Dict[str, List[str]]:
 
     # Normalize text for name extraction
     normalized_text = text.replace('\\n', '\n').replace(' n ', '\n').replace('--- Page 1 ---', '\n')
+    # Strip common garbage prefixes from extraction metadata
+    normalized_text = re.sub(r'^Document\s+Content\s+', '', normalized_text, flags=re.IGNORECASE)
 
     # Pattern 0: Look for name in "full_text='Name\n" format (Qdrant extracted docs)
     fulltext_match = re.search(r"full_text=['\"]([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]*){0,3})\n", normalized_text)
@@ -2155,9 +2477,88 @@ def _is_bullet_item(line: str) -> bool:
 
 
 def _extract_years_experience(text: str) -> Optional[str]:
-    match = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)\b", text, re.IGNORECASE)
+    """Extract years of experience — explicit mention first, then calculate from date ranges."""
+    # Strategy 1: Explicit "X years" / "X+ yrs" mention
+    match = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)\s*(?:of\s+)?(?:experience|exp)?\b", text, re.IGNORECASE)
     if match:
         return f"{match.group(1)} years"
+
+    # Strategy 2: Calculate from employment date ranges
+    # Match patterns like "Jan 2018 - Dec 2023", "2019 - Present", "06/2020 – 08/2024"
+    import datetime
+    _MONTH_MAP = {
+        "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+        "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6,
+        "jul": 7, "july": 7, "aug": 8, "august": 8, "sep": 9, "september": 9,
+        "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+    }
+    current_year = datetime.date.today().year
+    current_month = datetime.date.today().month
+
+    # Pattern: "Mon YYYY - Mon YYYY" or "Mon YYYY - Present"
+    date_range_re = re.compile(
+        r"(?:(?P<sm>[A-Za-z]{3,9})[\s.,]*)?(?P<sy>\d{4})\s*[-–—to]+\s*"
+        r"(?:(?P<em>[A-Za-z]{3,9})[\s.,]*)?(?P<ey>\d{4}|(?:present|current|till\s*date|now|ongoing))",
+        re.IGNORECASE,
+    )
+    # Also match MM/YYYY - MM/YYYY
+    numeric_date_re = re.compile(
+        r"(?P<sm>\d{1,2})/(?P<sy>\d{4})\s*[-–—to]+\s*"
+        r"(?:(?P<em>\d{1,2})/(?P<ey>\d{4})|(?P<present>present|current|till\s*date|now|ongoing))",
+        re.IGNORECASE,
+    )
+
+    spans = []  # List of (start_year, start_month, end_year, end_month)
+
+    for m in date_range_re.finditer(text):
+        try:
+            sy = int(m.group("sy"))
+            sm_str = (m.group("sm") or "").lower()[:3]
+            sm = _MONTH_MAP.get(sm_str, 1)
+            ey_str = (m.group("ey") or "").strip().lower()
+            if ey_str in ("present", "current", "now", "ongoing") or ey_str.startswith("till"):
+                ey, em = current_year, current_month
+            else:
+                ey = int(ey_str)
+                em_str = (m.group("em") or "").lower()[:3]
+                em = _MONTH_MAP.get(em_str, 12)
+            if 1970 <= sy <= current_year and 1970 <= ey <= current_year + 1 and ey >= sy:
+                spans.append((sy, sm, ey, em))
+        except (ValueError, TypeError):
+            continue
+
+    for m in numeric_date_re.finditer(text):
+        try:
+            sy = int(m.group("sy"))
+            sm = int(m.group("sm"))
+            if m.group("present"):
+                ey, em = current_year, current_month
+            else:
+                ey = int(m.group("ey"))
+                em = int(m.group("em"))
+            if 1970 <= sy <= current_year and 1970 <= ey <= current_year + 1 and ey >= sy and 1 <= sm <= 12 and 1 <= em <= 12:
+                spans.append((sy, sm, ey, em))
+        except (ValueError, TypeError):
+            continue
+
+    if spans:
+        # Merge overlapping spans and sum total months
+        spans.sort()
+        merged = []
+        for s in spans:
+            if merged and s[0] * 12 + s[1] <= merged[-1][2] * 12 + merged[-1][3]:
+                # Overlapping — extend end if this span ends later
+                if s[2] * 12 + s[3] > merged[-1][2] * 12 + merged[-1][3]:
+                    merged[-1] = (merged[-1][0], merged[-1][1], s[2], s[3])
+            else:
+                merged.append(s)
+        total_months = sum((ey * 12 + em) - (sy * 12 + sm) for sy, sm, ey, em in merged)
+        if total_months >= 6:  # At least 6 months to be meaningful
+            years = total_months / 12
+            if years == int(years):
+                return f"{int(years)} years"
+            return f"{years:.1f} years"
+
     return None
 
 
@@ -2170,13 +2571,6 @@ def _infer_section_kind_from_content(text: str, section_title: str) -> str:
     from src.embedding.pipeline.content_classifier import classify_section_kind
 
     return classify_section_kind(text, section_title)
-
-
-def _extract_years_experience(text: str) -> Optional[str]:
-    match = re.search(r"(\d+(?:\.\d+)?)\s*\+?\s*(?:years|yrs)\b", text, re.IGNORECASE)
-    if match:
-        return f"{match.group(1)} years"
-    return None
 
 
 def _normalize_intent_hint(value: Optional[str]) -> Optional[str]:
@@ -2295,6 +2689,17 @@ def _flatten_skill_block(lines: List[str]) -> List[str]:
         "Section(", "Table(", "'text':", "'title':", "'page':", "'csv':",
         'start_page', 'end_page', 'section_title', 'ensuring', 'collaborated',
         'oversaw', 'maintained', 'prepared', 'supporting',
+        # Education/grading context — not skills
+        'cgpa', 'gpa:', 'percentage', 'aggregate', 'marks',
+        'bachelor', 'master', 'b.e', 'b.tech', 'm.tech', 'mca', 'bca',
+        'degree', 'diploma', 'graduation',
+        # Language proficiency — not skills
+        'proficiency', 'fluency', 'native speaker', 'professional proficiency',
+        'fluent in', 'mother tongue',
+        # Location/personal context — not skills
+        'tamil nadu', 'karnataka', 'maharashtra', 'delhi', 'mumbai',
+        'bangalore', 'chennai', 'hyderabad', 'pune', 'erode', 'coimbatore',
+        'india', 'state:', 'city:', 'address:',
     ]
     for line in lines:
         cleaned = line.strip()
@@ -2316,6 +2721,12 @@ def _flatten_skill_block(lines: List[str]) -> List[str]:
             continue
         # Skip very long entries (likely paragraphs, not skills)
         if len(cleaned) > 100:
+            continue
+        # Skip lines that mix skills with education/location data
+        # e.g. "Tamil Nadu CGPA: 7.95 Languages, English: Professional Proficiency, Erode"
+        if re.search(r'\b(?:CGPA|GPA)\s*:\s*\d', cleaned, re.IGNORECASE):
+            continue
+        if re.search(r'\b(?:Languages?)\s*,\s*\w+\s*:\s*\w+\s+Proficiency\b', cleaned, re.IGNORECASE):
             continue
         items.extend(_split_list(cleaned))
     return items
@@ -2415,6 +2826,10 @@ def _looks_like_name(value: str) -> bool:
     if value.strip().endswith(':'):
         return False
 
+    # Names NEVER contain commas — comma-separated lists are skills/keywords
+    if ',' in value:
+        return False
+
     # Clean value - remove hyphens and extra spaces
     value_cleaned = re.sub(r'\s*-\s*', ' ', value).strip()
     parts = [p for p in value_cleaned.split() if p]
@@ -2495,7 +2910,8 @@ def _looks_like_name(value: str) -> bool:
         'application', 'platform', 'service', 'network', 'learning',
         'computing', 'database', 'storage', 'automation', 'integration',
     }
-    if any(part.lower() in non_name_words for part in parts):
+    # Strip trailing punctuation before matching (e.g. "Management." → "management")
+    if any(part.lower().rstrip('.,;:') in non_name_words for part in parts):
         return False
 
     if len(parts) == 1:
@@ -2520,32 +2936,62 @@ def _name_from_filename(doc_name: str) -> Optional[str]:
     if not doc_name:
         return None
     cleaned = re.sub(r"\.(pdf|docx?|rtf)$", "", doc_name, flags=re.IGNORECASE)
+
+    # Strip role/designation suffixes after " - " (e.g., "Sabareesh M B - AI Engineer" → "Sabareesh M B")
+    cleaned = re.sub(
+        r"\s*[-–—]\s*(?:AI|ML|Sr\.?|Jr\.?|Senior|Junior|Lead|Staff|Principal|Associate|Chief)?\s*"
+        r"(?:Engineer|Developer|Analyst|Consultant|Manager|Architect|Designer|"
+        r"Specialist|Coordinator|Administrator|Officer|Intern|Trainee|Executive|Director)"
+        r"(?:\s+.{0,30})?$",
+        "", cleaned, flags=re.IGNORECASE,
+    )
+
+    # Split CamelCase filenames — "ManavGuptaResume" → "Manav Gupta Resume"
+    cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
+
     cleaned = re.sub(r"[_\-]+", " ", cleaned)
     cleaned = re.sub(r"\b(resume|cv|profile|linkedin)\b", "", cleaned, flags=re.IGNORECASE)
     # Strip common filename noise BEFORE name check
     cleaned = re.sub(r"\b(?:update|version|rev)\d*\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\b(?:ip|prod|test|doc|file|scan|scanned)\b", "", cleaned, flags=re.IGNORECASE)
+    # Strip trailing 4-digit years — "SREELEKSHMI RESUME 2025" → "SREELEKSHMI"
+    cleaned = re.sub(r"\b(20\d{2}|19\d{2})\b", "", cleaned)
+    # Strip month names — "Raju July 2025" → "Raju" (after year already stripped)
+    cleaned = re.sub(
+        r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december"
+        r"|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b",
+        "", cleaned, flags=re.IGNORECASE,
+    )
     # Strip leading/trailing numbers and parenthesized dedup suffixes — "21 Gokul (1)" → "Gokul"
     cleaned = re.sub(r"^\d+\s*", "", cleaned)
     cleaned = re.sub(r"\s*\(\d+\)\s*", " ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if _looks_like_name(cleaned):
-        return _smart_title_case(cleaned)
 
-    # More aggressive cleaning: strip non-name words from filename
+    # Strip noise words early (role/tech terms that leak into filenames)
     _filename_noise = {
         "new", "old", "updated", "update", "final", "draft",
         "copy", "scm", "sap", "erp", "latest", "revised", "v1", "v2", "v3",
-        "ip", "dev", "prod", "test", "doc", "file", "scan", "scanned",
-        # SAP module abbreviations that leak into filenames
-        "ewm", "sd", "mm", "fi", "co", "wm", "bw", "abap", "hana", "scm",
+        "ip", "prod",
+        # SAP module abbreviations
+        "ewm", "sd", "fi", "co", "wm", "bw", "abap", "hana",
+        # Role/tech words that commonly leak into filenames
+        "ai", "ml", "engineer", "developer", "analyst", "consultant",
+        "manager", "architect", "designer", "specialist", "intern",
     }
     parts = cleaned.split()
-    name_parts = [p.title() for p in parts if p.lower() not in _filename_noise and len(p) > 1]
-    if name_parts:
-        candidate_name = " ".join(name_parts)
-        if _looks_like_name(candidate_name):
-            return candidate_name
+    # Keep single uppercase letters (initials like M, B) but drop noise words
+    name_parts = [p for p in parts if (
+        (len(p) == 1 and p.isupper()) or  # Single initial
+        (len(p) > 1 and p.lower() not in _filename_noise)
+    )]
+    cleaned = " ".join(name_parts)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Capitalize before checking (filenames may be lowercase like "raju", "aloysius")
+    # Use .title() for true capitalization, then _smart_title_case for ALL CAPS handling
+    capitalized = " ".join(p.capitalize() if p.islower() else p for p in cleaned.split())
+    capitalized = _smart_title_case(capitalized)
+    if _looks_like_name(capitalized):
+        return capitalized
 
     return None
 
@@ -2564,6 +3010,8 @@ def _extract_name_from_text(text: str) -> Optional[str]:
 
     # Normalize text - handle various newline representations
     normalized = cleaned_text.replace('\\n', '\n').replace(' n ', '\n')
+    # Strip "Document Content" prefix (artifact from extraction metadata)
+    normalized = re.sub(r'^Document\s+Content\s+', '', normalized, flags=re.IGNORECASE)
 
     # Also check if the original text has full_text format (before cleaning)
     if "full_text=" in text:
@@ -2933,7 +3381,7 @@ def _clauses_field(items: List[Clause]) -> ClauseField:
 
 def _detect_multi_entity_collision(
     domain: str,
-    schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema,
+    schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema | MedicalSchema | PolicySchema,
     chunks: List[Any],
     scope_document_id: Optional[str],
     intent: Optional[str] = None,
@@ -2942,6 +3390,10 @@ def _detect_multi_entity_collision(
     if isinstance(schema, GenericSchema):
         return False
     if domain == "hr" and isinstance(schema, HRSchema):
+        return False
+    # Domain-specific schemas aggregate from all chunks natively — they
+    # should NOT be collapsed into a shallow document listing.
+    if isinstance(schema, (MedicalSchema, PolicySchema, InvoiceSchema, LegalSchema)):
         return False
 
     doc_ids = {
@@ -3033,6 +3485,8 @@ def extract_schema(
     intent_hint: Optional[str] = None,
     document_data: Optional[Dict[str, Any]] = None,
     query_focus: Optional[Any] = None,
+    tool_domain: bool = False,
+    embedder: Any = None,
 ) -> ExtractionResult:
     """Extract structured data from chunks.
 
@@ -3040,13 +3494,22 @@ def extract_schema(
     1. LLM-first generic extraction — works for ANY document type.
        The LLM reads the chunks and produces a direct answer.
     2. Deterministic fallback — regex-based extraction when LLM is unavailable.
+
+    When ``tool_domain=True``, the ``domain`` was set by an explicit tool
+    selection (e.g. tools=resume-analysis → domain="hr").  This means:
+    - Skip domain mismatch checks (user chose the tool deliberately)
+    - Prefer deterministic structured extraction over LLM free-text
     """
     from .llm_extract import llm_extract_and_respond, _count_unique_documents
 
-    # Check for domain mismatch before any extraction
+    # When a tool explicitly sets the domain (e.g., tools=resume-analysis → domain="hr"),
+    # skip the mismatch check — the user chose this tool deliberately.
+    _tool_domain_active = tool_domain and bool(domain and domain not in ("generic", ""))
+
+    # Check for domain mismatch before any extraction (skip when tool domain is set)
     query_domain = _query_domain_override(query)
     chunk_domain = _majority_chunk_domain(chunks)
-    if query_domain and chunk_domain:
+    if not _tool_domain_active and query_domain and chunk_domain:
         _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal"}
         q_family = _DOMAIN_FAMILY.get(query_domain, query_domain)
         c_family = _DOMAIN_FAMILY.get(chunk_domain, chunk_domain)
@@ -3066,8 +3529,14 @@ def extract_schema(
         for kw in ("contact", "email", "phone", "linkedin", "reach", "call")
     )
 
-    # STRATEGY 1: LLM-first generic extraction (preferred for ALL document types)
-    if llm_client and budget.allow() and not _is_contact_query:
+    # When a tool explicitly sets the domain (e.g., tools=resume-analysis),
+    # prefer the structured deterministic extractor which produces typed schemas
+    # (HRSchema with Candidate objects, InvoiceSchema, etc.) instead of LLM
+    # free-text that loses structure.
+    _prefer_deterministic = _tool_domain_active
+
+    # STRATEGY 1: LLM-first generic extraction (preferred when no tool domain)
+    if llm_client and budget.allow() and not _is_contact_query and not _prefer_deterministic:
         try:
             llm_result = llm_extract_and_respond(
                 query=query,
@@ -3098,17 +3567,19 @@ def extract_schema(
                 extra={"stage": "extract", "correlation_id": correlation_id},
             )
 
-    # STRATEGY 2: Deterministic fallback (chunk-based, domain-aware)
+    # STRATEGY 2: Deterministic extraction (domain-aware, structured schemas)
+    # When tool domain is set, this is the preferred path (structured output).
     return schema_extract(
         query=query,
         chunks=chunks,
-        llm_client=llm_client,
+        llm_client=llm_client if not _prefer_deterministic else None,  # skip LLM retry in schema_extract when tool prefers deterministic
         budget=budget,
         correlation_id=correlation_id,
         scope_document_id=scope_document_id,
         domain_hint=domain,
         intent_hint=intent_hint,
         query_focus=query_focus,
+        embedder=embedder,
     )
 
 

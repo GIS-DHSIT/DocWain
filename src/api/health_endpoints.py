@@ -519,4 +519,103 @@ async def multi_agent_status() -> Dict[str, Any]:
         return {"enabled": True, "status": "error", "error": str(exc)[:200]}
 
 
+@health_router.get("/api/admin/intent-classifier/status")
+async def intent_classifier_status() -> Dict[str, Any]:
+    """Return the trained intent classifier status."""
+    try:
+        from src.intent.intent_classifier import get_intent_classifier
+        clf = get_intent_classifier()
+        if clf is None:
+            return {"status": "not_initialized", "trained": False}
+        return {
+            "status": "ready" if clf._trained else "untrained",
+            "trained": clf._trained,
+            "input_dim": clf.input_dim,
+            "hidden_dim": clf.hidden_dim,
+            "intent_classes": clf.intent_names,
+            "domain_classes": clf.domain_names,
+        }
+    except ImportError:
+        return {"status": "unavailable", "error": "intent_classifier module not found"}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)[:200]}
+
+
+@health_router.get("/api/admin/line-classifier/status")
+async def line_classifier_status() -> Dict[str, Any]:
+    """Return the trained line role classifier status."""
+    try:
+        from src.rag_v3.line_classifier import get_line_classifier, HEAD_NAMES
+        clf = get_line_classifier()
+        if clf is None:
+            return {"status": "not_initialized", "trained": False}
+        return {
+            "status": "ready" if clf._trained else "untrained",
+            "trained": clf._trained,
+            "input_dim": clf.input_dim,
+            "hidden_dim": clf.hidden_dim,
+            "heads": list(HEAD_NAMES.keys()),
+        }
+    except ImportError:
+        return {"status": "unavailable", "error": "line_classifier module not found"}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)[:200]}
+
+
+@health_router.get("/api/admin/kg/status")
+async def kg_status() -> Dict[str, Any]:
+    """Return Knowledge Graph status, connectivity, and statistics."""
+    from src.api.config import Config
+
+    enabled = getattr(Config.KnowledgeGraph, "ENABLED", False)
+    if not enabled:
+        return {"enabled": False, "status": "disabled"}
+
+    result: Dict[str, Any] = {"enabled": True}
+
+    try:
+        from src.kg.neo4j_store import Neo4jStore
+        store = Neo4jStore()
+
+        # Connection test
+        store.run_query("RETURN 1 AS ok")
+        result["neo4j_connected"] = True
+
+        # Entity and document counts
+        stats_rows = store.run_query(
+            "OPTIONAL MATCH (d:Document) "
+            "WITH count(d) AS doc_count "
+            "OPTIONAL MATCH (e:Entity) "
+            "WITH doc_count, count(e) AS entity_count "
+            "OPTIONAL MATCH ()-[r:MENTIONS]->() "
+            "RETURN doc_count, entity_count, count(r) AS mention_count"
+        )
+        if stats_rows:
+            row = stats_rows[0]
+            result["documents"] = row.get("doc_count", 0)
+            result["entities"] = row.get("entity_count", 0)
+            result["mentions"] = row.get("mention_count", 0)
+
+        # Last sync timestamp
+        try:
+            state = store.get_state("kg_sync")
+            result["last_sync_at"] = getattr(state, "last_sync_at", None)
+        except Exception:  # noqa: BLE001
+            result["last_sync_at"] = None
+
+        # Graph augmenter availability
+        from src.api.rag_state import get_app_state
+        app_state = get_app_state()
+        result["graph_augmenter_ready"] = getattr(app_state, "graph_augmenter", None) is not None
+
+        result["status"] = "healthy"
+        store.close()
+    except Exception as exc:  # noqa: BLE001
+        result["status"] = "unhealthy"
+        result["neo4j_connected"] = False
+        result["error"] = str(exc)[:200]
+
+    return result
+
+
 __all__ = ["health_router"]

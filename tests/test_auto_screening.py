@@ -40,26 +40,24 @@ class TestScreeningConfigDefaults:
 
 
 class TestAutoScreeningWiring:
-    """Verify _run_auto_screening is wired into both extraction paths."""
+    """Verify extraction does NOT auto-trigger screening (decoupled design)."""
 
-    def test_connector_path_calls_auto_screening(self):
-        """_extract_from_connector should call _run_auto_screening after extraction."""
+    def test_connector_path_does_not_auto_screen(self):
+        """_extract_from_connector should NOT call _run_auto_screening (decoupled)."""
         text = _EXTRACTION_SRC.read_text()
-        # Find the connector extraction function
         idx = text.find("def _extract_from_connector")
         assert idx > 0
-        # Find the end of the function (next top-level def)
         next_def = text.find("\ndef extract_documents", idx)
         connector_body = text[idx:next_def]
-        assert "_run_auto_screening(" in connector_body
+        assert "_run_auto_screening(" not in connector_body
 
-    def test_upload_path_calls_auto_screening(self):
-        """extract_uploaded_document should call _run_auto_screening after extraction."""
+    def test_upload_path_does_not_auto_screen(self):
+        """extract_uploaded_document should NOT call _run_auto_screening (decoupled)."""
         text = _EXTRACTION_SRC.read_text()
         idx = text.find("def extract_uploaded_document")
         assert idx > 0
         upload_body = text[idx:]
-        assert "_run_auto_screening(" in upload_body
+        assert "_run_auto_screening(" not in upload_body
 
     def test_auto_screening_function_exists(self):
         """_run_auto_screening function must be defined in extraction_service."""
@@ -104,24 +102,25 @@ class TestAutoScreeningWiring:
 
 
 class TestEmbeddingGateFallback:
-    """Verify the embedding gate accepts STATUS_EXTRACTION_COMPLETED as fallback."""
+    """Verify the embedding gate requires STATUS_SCREENING_COMPLETED (decoupled)."""
 
-    def test_embedding_gate_source(self):
-        """Embedding service should accept both SCREENING_COMPLETED and EXTRACTION_COMPLETED."""
+    def test_embedding_gate_requires_screening_completed(self):
+        """Embedding service should only accept SCREENING_COMPLETED (not EXTRACTION_COMPLETED)."""
         embed_src = Path(__file__).resolve().parent.parent / "src" / "api" / "embedding_service.py"
         text = embed_src.read_text()
-        # The gate should check against a tuple of both statuses
-        assert "STATUS_EXTRACTION_COMPLETED" in text
         assert "STATUS_SCREENING_COMPLETED" in text
+        # Should NOT auto-trigger screening as fallback
+        assert "from src.api.extraction_service import _run_auto_screening" not in text
 
-    def test_extraction_completed_not_rejected(self):
-        """STATUS_EXTRACTION_COMPLETED should be in the accepted set."""
-        accepted = (STATUS_SCREENING_COMPLETED, STATUS_EXTRACTION_COMPLETED)
-        assert STATUS_EXTRACTION_COMPLETED in accepted
+    def test_screening_completed_accepted(self):
+        """STATUS_SCREENING_COMPLETED should be the accepted status for embedding."""
+        accepted = (STATUS_SCREENING_COMPLETED,)
+        assert STATUS_SCREENING_COMPLETED in accepted
+        assert STATUS_EXTRACTION_COMPLETED not in accepted
 
     def test_other_status_rejected(self):
-        """Non-extraction statuses should still be rejected."""
-        accepted = (STATUS_SCREENING_COMPLETED, STATUS_EXTRACTION_COMPLETED)
+        """Non-screening statuses should be rejected."""
+        accepted = (STATUS_SCREENING_COMPLETED,)
         assert "UNDER_REVIEW" not in accepted
         assert "EXTRACTION_FAILED" not in accepted
 

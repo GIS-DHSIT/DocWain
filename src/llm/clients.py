@@ -101,6 +101,7 @@ class OllamaClient:
                     model=self.model_name,
                     prompt=prompt,
                     options=generation_options,
+                    keep_alive="60m",
                 )
                 last_response = response or {}
                 text = (last_response.get("response") or "").strip()

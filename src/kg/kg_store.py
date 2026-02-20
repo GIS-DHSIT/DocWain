@@ -170,8 +170,8 @@ class KGStore:
         if self.neo4j_store:
             doc_key = _doc_key(subscription_id, profile_id, document_id)
             query = (
-                "MERGE (d:Document {doc_key: $doc_key}) "
-                "SET d.document_id = $document_id, d.file_name = $file_name, "
+                "MERGE (d:Document {document_id: $document_id}) "
+                "SET d.doc_key = $doc_key, d.file_name = $file_name, "
                 "d.doc_domain = coalesce($doc_domain, d.doc_domain), "
                 "d.subscription_id = $subscription_id, d.profile_id = $profile_id"
             )
@@ -200,8 +200,8 @@ class KGStore:
                 "SET s.section_id = $section_id, s.document_id = $document_id, "
                 "s.subscription_id = $subscription_id, s.profile_id = $profile_id "
                 "WITH s "
-                "MERGE (d:Document {doc_key: $doc_key}) "
-                "SET d.document_id = $document_id, d.subscription_id = $subscription_id, d.profile_id = $profile_id "
+                "MERGE (d:Document {document_id: $document_id}) "
+                "SET d.doc_key = $doc_key, d.subscription_id = $subscription_id, d.profile_id = $profile_id "
                 "MERGE (d)-[:HAS_SECTION]->(s)"
             )
             self.neo4j_store.run_query(
@@ -279,7 +279,7 @@ class KGStore:
                 "MERGE (s:Section {section_key: $section_key}) "
                 "SET s.section_id = $section_id, s.document_id = $document_id, "
                 "s.subscription_id = $subscription_id, s.profile_id = $profile_id "
-                "MERGE (d:Document {doc_key: $doc_key}) "
+                "MERGE (d:Document {document_id: $document_id}) "
                 "SET d.document_id = $document_id, d.file_name = $file_name, "
                 "d.doc_domain = coalesce($doc_domain, d.doc_domain), "
                 "d.subscription_id = $subscription_id, d.profile_id = $profile_id "
@@ -338,7 +338,7 @@ class KGStore:
                 "SET b.entity_norm = $entity_norm_b, b.type = $entity_type_b, b.subscription_id = $subscription_id, b.profile_id = $profile_id "
                 "MERGE (s:Section {section_key: $section_key}) "
                 "SET s.section_id = $section_id, s.document_id = $document_id, s.subscription_id = $subscription_id, s.profile_id = $profile_id "
-                "MERGE (d:Document {doc_key: $doc_key}) "
+                "MERGE (d:Document {document_id: $document_id}) "
                 "SET d.document_id = $document_id, d.file_name = $file_name, d.doc_domain = coalesce($doc_domain, d.doc_domain), "
                 "d.subscription_id = $subscription_id, d.profile_id = $profile_id "
                 "MERGE (s)-[:IN_DOCUMENT]->(d) "

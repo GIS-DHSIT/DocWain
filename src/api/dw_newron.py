@@ -786,7 +786,7 @@ def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
 
-_METRICS_EMBED_SAMPLE_RATE = float(os.getenv("METRICS_EMBED_SAMPLE_RATE", "0.4"))
+_METRICS_EMBED_SAMPLE_RATE = float(os.getenv("METRICS_EMBED_SAMPLE_RATE", "0.0"))
 _METRICS_EMBED_MAX_CHARS = int(os.getenv("METRICS_EMBED_MAX_CHARS", "1200"))
 _FIRST_METRICS_REQUEST = True
 
@@ -3946,8 +3946,27 @@ class EnterpriseRAGSystem:
                 logger.warning(f"Could not count collection '{collection_name}': {diag_exc}")
 
             if self.greeting_handler.is_positive_feedback(query):
+                feedback_response = "You're welcome! If you want me to dig into another document or topic, just let me know."
+                try:
+                    from src.intelligence.conversational_nlp import generate_conversational_response
+                    _catalog = {}
+                    if self.redis_client:
+                        from src.intelligence.redis_intel_cache import RedisIntelCache
+                        _cache = RedisIntelCache(self.redis_client)
+                        _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
+                    _resp = generate_conversational_response(
+                        query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        collection_point_count=total_points,
+                        catalog=_catalog,
+                    )
+                    if _resp and _resp.text:
+                        feedback_response = _resp.text
+                except Exception:
+                    pass
                 return {
-                    "response": "You're welcome! If you want me to dig into another document or topic, just let me know.",
+                    "response": feedback_response,
                     "sources": [],
                     "user_id": user_id,
                     "collection": collection_name,
@@ -3967,6 +3986,19 @@ class EnterpriseRAGSystem:
                     cache = RedisIntelCache(self.redis_client)
                     catalog = cache.get_json(cache.catalog_key(subscription_id, profile_id)) or {}
                 greeting_response = build_greeting_response(catalog)
+                try:
+                    from src.intelligence.conversational_nlp import generate_conversational_response
+                    _resp = generate_conversational_response(
+                        query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        collection_point_count=total_points,
+                        catalog=catalog,
+                    )
+                    if _resp and _resp.text:
+                        greeting_response = _resp.text
+                except Exception:
+                    pass
                 self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
                 return {
@@ -3983,6 +4015,24 @@ class EnterpriseRAGSystem:
 
             if self.greeting_handler.is_farewell(query):
                 farewell_response = "Thanks for chatting. If you need anything else, come back anytime."
+                try:
+                    from src.intelligence.conversational_nlp import generate_conversational_response
+                    _catalog = {}
+                    if self.redis_client:
+                        from src.intelligence.redis_intel_cache import RedisIntelCache
+                        _cache = RedisIntelCache(self.redis_client)
+                        _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
+                    _resp = generate_conversational_response(
+                        query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        collection_point_count=total_points,
+                        catalog=_catalog,
+                    )
+                    if _resp and _resp.text:
+                        farewell_response = _resp.text
+                except Exception:
+                    pass
                 self.conversation_history.clear_history(namespace, user_id)
 
                 return {
@@ -3996,6 +4046,36 @@ class EnterpriseRAGSystem:
                     "query_type": "farewell",
                     "grounded": True
                 }
+
+            # General conversational intercept (document discovery, identity, etc.)
+            try:
+                from src.intelligence.conversational_nlp import generate_conversational_response
+                _catalog = {}
+                if self.redis_client:
+                    from src.intelligence.redis_intel_cache import RedisIntelCache
+                    _cache = RedisIntelCache(self.redis_client)
+                    _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
+                _conv_resp = generate_conversational_response(
+                    query,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    collection_point_count=total_points,
+                    catalog=_catalog,
+                )
+                if _conv_resp and _conv_resp.text:
+                    return {
+                        "response": _conv_resp.text,
+                        "sources": [],
+                        "user_id": user_id,
+                        "collection": collection_name,
+                        "request_id": request_id,
+                        "index_version": index_version,
+                        "context_found": True,
+                        "query_type": _conv_resp.intent.lower(),
+                        "grounded": True,
+                    }
+            except Exception:
+                pass
 
             if getattr(Config, "RAGV3", None) and getattr(Config.RAGV3, "ENABLED", False):
                 try:

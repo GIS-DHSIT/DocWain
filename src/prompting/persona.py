@@ -128,6 +128,13 @@ def enforce_docwain_identity(
 ) -> str:
     mode = response_mode or ResponseModeClassifier.classify(user_text)
     if mode == INFO_MODE or is_meta_question(user_text):
+        try:
+            from src.intelligence.conversational_nlp import generate_conversational_response
+            resp = generate_conversational_response(user_text)
+            if resp and resp.text:
+                return resp.text
+        except Exception:
+            pass
         return DOCWAIN_META_RESPONSE
     return response
 

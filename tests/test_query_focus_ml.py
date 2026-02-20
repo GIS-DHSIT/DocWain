@@ -326,22 +326,15 @@ class TestFieldClassifier:
 class TestDPIERouting:
     """Tests for DPIE-based section reclassification."""
 
-    def test_dpie_reclassifies_misc_chunk(self):
-        """Chunk with section_kind='misc' gets DPIE reclassification."""
-        global _fake_dpie_instance
-        _fake_dpie_instance = FakeDPIERegistry(kind="skills_technical", confidence=0.8)
-
+    def test_misc_chunk_gets_neutral_score(self):
+        """Chunk with section_kind='misc' gets neutral penalty (DPIE disabled at query time for GPU savings)."""
         chunk = _make_chunk("Python Java C++ skills", section_kind="misc")
         focus = QueryFocus(section_kinds=["skills_technical"])
 
-        with patch("src.intelligence.dpie_integration.DPIERegistry", FakeDPIERegistry):
-            # Import and call directly
-            from src.rag_v3.query_focus import _section_affinity_score
-            score = _section_affinity_score(chunk, focus)
-            # DPIE classifies as skills_technical → exact match → 1.0
-            assert score == 1.0
-
-        _fake_dpie_instance = None
+        from src.rag_v3.query_focus import _section_affinity_score
+        score = _section_affinity_score(chunk, focus)
+        # Generic/misc section_kind → neutral 0.3 penalty (no DPIE call)
+        assert score == 0.3
 
     def test_dpie_skipped_for_known_section(self):
         """Chunk with known section_kind doesn't trigger DPIE."""

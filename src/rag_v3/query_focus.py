@@ -331,14 +331,10 @@ def _section_affinity_score(chunk: Any, focus: QueryFocus) -> float:
 
     chunk_kind = _get_chunk_section_kind(chunk)
 
-    # Neural re-classification for missing/generic section_kind
+    # Skip expensive DPIE neural reclassification at query time — the 2
+    # encode() calls per chunk saturate the GPU and starve Ollama.
+    # Use a neutral score for generic/missing section_kinds instead.
     _is_generic = not chunk_kind or chunk_kind in ("misc", "other", "unknown")
-    if _is_generic:
-        dpie_kind, dpie_conf = _dpie_classify_chunk(chunk)
-        if dpie_conf >= 0.5:
-            chunk_kind = dpie_kind
-            _is_generic = False
-
     if _is_generic:
         return 0.3  # unknown/generic section — mild penalty
 
@@ -419,6 +415,52 @@ def _normalized_reranker_score(chunk: Any) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Batch encoding helper
+# ---------------------------------------------------------------------------
+
+def _batch_encode_chunks(chunks: List[Any], focus: QueryFocus) -> None:
+    """Pre-encode all chunk texts in a single batch call.
+
+    Populates the thread-local ``_chunk_embed_cache`` so that subsequent
+    ``_get_or_encode_chunk()`` calls are free cache hits — avoiding 16+
+    individual ``encode()`` calls that saturate the GPU.
+    """
+    if focus.query_embedding is None:
+        return  # No semantic scoring → nothing to encode
+
+    embedder = focus._embedder
+    if embedder is None:
+        return
+
+    cache = getattr(_chunk_embed_cache, "cache", None)
+    if cache is None:
+        _chunk_embed_cache.cache = {}
+        cache = _chunk_embed_cache.cache
+
+    # Collect texts that are not already cached
+    texts_to_encode: List[str] = []
+    text_indices: List[int] = []  # maps into texts_to_encode
+    chunk_texts: List[str] = []   # all chunk texts in order
+
+    for chunk in chunks:
+        text = (getattr(chunk, "text", "") or "")[:512]
+        chunk_texts.append(text)
+        if text and text not in cache:
+            texts_to_encode.append(text)
+            text_indices.append(len(chunk_texts) - 1)
+
+    if not texts_to_encode:
+        return
+
+    try:
+        embeddings = embedder.encode(texts_to_encode, normalize_embeddings=True)
+        for i, text in enumerate(texts_to_encode):
+            cache[text] = embeddings[i]
+    except Exception:
+        log.debug("Batch chunk encoding failed, falling back to per-chunk", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Chunk filtering
 # ---------------------------------------------------------------------------
 
@@ -436,6 +478,9 @@ def filter_chunks_by_focus(
     """
     if not chunks or not focus:
         return chunks
+
+    # Pre-encode all chunk texts in ONE batch call (instead of per-chunk)
+    _batch_encode_chunks(chunks, focus)
 
     scored = [(score_chunk_relevance(c, focus), c) for c in chunks]
     scored.sort(key=lambda pair: pair[0], reverse=True)

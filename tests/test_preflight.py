@@ -609,6 +609,7 @@ class TestPhase4Agentic:
         ("Summarize the medical report findings", {"medical"}),
         ("Generate API documentation for this module", {"code_docs"}),
         ("Check the JIRA ticket status", {"jira_confluence"}),
+        ("Extract text from this image using OCR", {"image_analysis"}),
         ("What is the weather today?", set()),  # no tools expected
     ]
 
@@ -620,7 +621,7 @@ class TestPhase4Agentic:
         known = frozenset({
             "content_generate", "content_types", "resumes", "lawhere", "medical",
             "translator", "tutor", "creator", "email_drafting", "screen_pii",
-            "code_docs", "web_extract", "jira_confluence", "stt", "tts", "db_connector",
+            "code_docs", "web_extract", "jira_confluence", "image_analysis", "stt", "tts", "db_connector",
         })
         selector = ToolSelector(registered_tools=known)
 

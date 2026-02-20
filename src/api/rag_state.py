@@ -21,6 +21,7 @@ class AppState:
     rag_system: Any
     llm_gateway: Any = None  # src.llm.gateway.LLMGateway — canonical LLM entry point
     multi_agent_gateway: Any = None  # src.llm.multi_agent.MultiAgentGateway — role-specific models
+    graph_augmenter: Any = None  # src.kg.retrieval.GraphAugmenter — KG-augmented retrieval
     instance_ids: Dict[str, str] = field(default_factory=dict)
     qdrant_index_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 

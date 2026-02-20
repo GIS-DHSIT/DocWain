@@ -12,6 +12,7 @@ DOMAIN_LABELS = [
     "bank_statement",
     "medical",
     "legal",
+    "policy",
     "generic",
 ]
 
@@ -110,6 +111,21 @@ DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {
         "whereas",
         "hereby",
     ),
+    "policy": (
+        "insurance",
+        "policy",
+        "premium",
+        "coverage",
+        "claim",
+        "deductible",
+        "exclusion",
+        "underwriting",
+        "insured",
+        "beneficiary",
+        "endorsement",
+        "peril",
+        "policyholder",
+    ),
     "generic": (),
 }
 
@@ -125,6 +141,8 @@ DOC_TYPE_HINTS = {
     "contract": "legal",
     "agreement": "legal",
     "tax": "tax",
+    "insurance": "policy",
+    "policy": "policy",
 }
 
 
@@ -154,6 +172,10 @@ _STRONG_INDICATORS: Dict[str, Tuple[str, ...]] = {
     "bank_statement": (
         "account statement", "available balance", "statement period",
         "opening balance", "closing balance",
+    ),
+    "policy": (
+        "insurance policy", "policy number", "sum insured",
+        "coverage period", "exclusions and conditions",
     ),
 }
 

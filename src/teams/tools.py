@@ -106,6 +106,10 @@ class TeamsToolRouter:
                 content_type=action_value.get("content_type"),
                 query=action_value.get("query") or action_value.get("text", ""),
             )
+        if action == "show_preferences":
+            return self._show_preferences(context)
+        if action == "set_preferences":
+            return self._set_preferences(context, action_value)
         if action in {"open_ui", "open_web"}:
             return self._open_ui()
         if action in {"help", "show_tools"}:
@@ -128,10 +132,8 @@ class TeamsToolRouter:
         answer = await self._ask_docwain(question, context)
         sources_text = _format_sources(answer.get("sources"))
         body_text = answer.get("response") or "I could not generate a summary."
-        if sources_text:
-            body_text = f"{body_text}\n\nSources:\n{sources_text}"
         return _card_activity(
-            build_card("answer_card", title="Summary", text=body_text),
+            build_card("answer_card", title="Summary", text=body_text, sources_text=sources_text or "No sources available."),
             text="Summary ready.",
         )
 
@@ -159,8 +161,9 @@ class TeamsToolRouter:
         )
         answer = await self._ask_docwain(question, context)
         body_text = answer.get("response") or "No fields were extracted."
+        sources_text = _format_sources(answer.get("sources"))
         return _card_activity(
-            build_card("answer_card", title="Extracted fields", text=body_text),
+            build_card("answer_card", title="Extracted fields", text=body_text, sources_text=sources_text or "No sources available."),
             text="Field extraction ready.",
         )
 
@@ -194,7 +197,7 @@ class TeamsToolRouter:
             )
 
         return _card_activity(
-            build_card("answer_card", title="Generated content", text=response_text),
+            build_card("answer_card", title="Generated content", text=response_text, sources_text=""),
             text="Content generation complete.",
         )
 
@@ -209,7 +212,7 @@ class TeamsToolRouter:
             docs = upload.get("documents_created") or 0
             lines.append(f"- {name} (tag: {tag}, docs: {docs})")
         return _card_activity(
-            build_card("answer_card", title="Recent uploads", text="\n".join(lines)),
+            build_card("answer_card", title="Recent uploads", text="\n".join(lines), sources_text=""),
             text="Recent uploads",
         )
 
@@ -218,7 +221,7 @@ class TeamsToolRouter:
             model = Config.Teams.DEFAULT_MODEL
         prefs = self.state_store.set_preferences(context.subscription_id, context.profile_id, model_name=model)
         return _card_activity(
-            build_card("answer_card", title="Model updated", text=f"Using model '{prefs.get('model_name')}' for this chat.")
+            build_card("answer_card", title="Model updated", text=f"Using model '{prefs.get('model_name')}' for this chat.", sources_text="")
         )
 
     def _set_persona(self, context: TeamsChatContext, persona: Optional[str]) -> Dict[str, Any]:
@@ -230,13 +233,42 @@ class TeamsToolRouter:
                 "answer_card",
                 title="Persona updated",
                 text=f"Using persona '{prefs.get('persona')}' for this chat.",
+                sources_text="",
             )
+        )
+
+    def _show_preferences(self, context: TeamsChatContext) -> Dict[str, Any]:
+        prefs = self.state_store.get_preferences(context.subscription_id, context.profile_id)
+        current_model = prefs.get("model_name") or context.model_name or Config.Teams.DEFAULT_MODEL
+        current_persona = prefs.get("persona") or context.persona or Config.Teams.DEFAULT_PERSONA
+        return _card_activity(
+            build_card("preferences_card", current_model=current_model, current_persona=current_persona)
+        )
+
+    def _set_preferences(self, context: TeamsChatContext, data: Dict[str, Any]) -> Dict[str, Any]:
+        model = data.get("model")
+        persona = data.get("persona")
+        kwargs: Dict[str, str] = {}
+        if model:
+            kwargs["model_name"] = model
+        if persona:
+            kwargs["persona"] = persona
+        if kwargs:
+            self.state_store.set_preferences(context.subscription_id, context.profile_id, **kwargs)
+        parts = []
+        if model:
+            parts.append(f"Model: **{model}**")
+        if persona:
+            parts.append(f"Persona: **{persona}**")
+        summary = ", ".join(parts) if parts else "No changes made."
+        return _card_activity(
+            build_card("answer_card", title="Preferences saved", text=summary, sources_text="")
         )
 
     def _open_ui(self) -> Dict[str, Any]:
         url = DEFAULT_WEB_URL
         return _card_activity(
-            build_card("answer_card", title="DocWain Web", text=f"Open DocWain in your browser: {url}"),
+            build_card("answer_card", title="DocWain Web", text=f"Open DocWain in your browser: {url}", sources_text=""),
             text=url,
         )
 

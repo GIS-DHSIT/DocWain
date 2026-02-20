@@ -92,8 +92,8 @@ class TestGroundingGate:
         from src.api.config import Config
         assert Config.Quality.GROUNDING_GATE_CRITICAL_TH == 0.30
 
-    def test_grounding_gate_blocks_ungrounded(self):
-        """When critical_support < threshold, the pipeline uses fallback."""
+    def test_grounding_gate_skips_llm_responses(self):
+        """LLM responses bypass grounding gate (already grounded against chunks)."""
         from src.rag_v3.pipeline import _extract_render_judge
         from src.rag_v3.types import LLMBudget, LLMResponseSchema
 
@@ -113,9 +113,8 @@ class TestGroundingGate:
         chunks = [FakeChunk()]
         budget = LLMBudget(llm_client=None, max_calls=2)
 
-        # Make it look like an LLM response and set very high threshold
-        with patch("src.rag_v3.pipeline._is_llm_response", return_value=True), \
-             patch("src.api.config.Config.Quality.GROUNDING_GATE_ENABLED", True), \
+        # LLM responses now bypass grounding gate (grounded by LLM context)
+        with patch("src.api.config.Config.Quality.GROUNDING_GATE_ENABLED", True), \
              patch("src.api.config.Config.Quality.GROUNDING_GATE_CRITICAL_TH", 0.99):
             sanitized, verdict = _extract_render_judge(
                 extraction=FakeLLMExtraction,
@@ -125,8 +124,8 @@ class TestGroundingGate:
                 budget=budget,
                 correlation_id="test-cid",
             )
-            # The sanitized answer should be the fallback, not the original
-            assert "fabricated" not in sanitized.lower()
+            # LLM response passes through without grounding gate blocking
+            assert "fabricated" in sanitized.lower()
 
 
 # ── Fix #3: LLM extract timeout handling ──────────────────────────────

@@ -135,12 +135,8 @@ class ScreeningExecutor:
         correlation_id: str,
         categories: List[str],
     ) -> None:
-        """Persist screening results to the ``screening`` MongoDB collection.
-
-        This does NOT change the document pipeline status — the gateway only
-        tags documents with screening results.  Document status transitions
-        (e.g. STATUS_SCREENING_COMPLETED) are handled by the dedicated
-        ingestion pipeline (extraction_service._run_auto_screening), not here.
+        """Persist screening results to the ``screening`` MongoDB collection
+        and promote document status to SCREENING_COMPLETED.
         """
         doc_entries = []
         for cat, cat_data in category_results.items():
@@ -161,6 +157,17 @@ class ScreeningExecutor:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to persist screening results for doc_id=%s: %s", doc_id, exc)
+
+        # Promote document status so embedding pipeline can proceed
+        any_succeeded = any(
+            e.get("status") == "succeeded" for e in doc_entries
+        )
+        if any_succeeded:
+            try:
+                from src.api.screening_service import promote_to_screening_completed
+                promote_to_screening_completed(doc_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to promote status for doc_id=%s: %s", doc_id, exc)
 
     # -- Public entry point -------------------------------------------------
 

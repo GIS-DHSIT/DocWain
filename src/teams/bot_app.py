@@ -194,13 +194,32 @@ class DocWainTeamsBot(TeamsActivityHandler):
             return
 
         try:
+            # Show processing card while we work
+            processing_card = build_card("processing_card", status_message="Analyzing your question...")
+            processing_activity = _as_activity(_card_activity(processing_card))
+            try:
+                processing_response = await turn_context.send_activity(processing_activity)
+            except Exception:  # noqa: BLE001
+                processing_response = None
+
             answer_result = self.chat_service.answer_question(question, context)
             answer = answer_result.answer
             response_text = answer.get("response") or "I could not generate a response."
             sources_text = legacy_adapter.format_sources(answer.get("sources") or [])
-            if sources_text:
-                response_text = f"{response_text}\n\n{sources_text}"
-            card = build_card("answer_card", title="Answer", text=response_text)
+
+            # Delete the processing card before sending the answer
+            if processing_response and getattr(processing_response, "id", None):
+                try:
+                    await turn_context.delete_activity(processing_response.id)
+                except Exception:  # noqa: BLE001
+                    pass  # Best-effort cleanup
+
+            card = build_card(
+                "answer_card",
+                title="Answer",
+                text=response_text,
+                sources_text=sources_text.replace("\n\nSources:\n", "") if sources_text else "No sources available.",
+            )
             await self._send_safe(turn_context, _as_activity(_card_activity(card)), log)
 
             # Persist conversation history for context-aware follow-ups

@@ -41,6 +41,13 @@ def answer_with_section_intelligence(
 
     if task_type == "greet":
         response_text = build_greeting_response(catalog)
+        try:
+            from src.intelligence.conversational_nlp import generate_conversational_response
+            _resp = generate_conversational_response(query, catalog=catalog)
+            if _resp and _resp.text:
+                response_text = _resp.text
+        except Exception:
+            pass
         return {
             "response": response_text,
             "sources": [],

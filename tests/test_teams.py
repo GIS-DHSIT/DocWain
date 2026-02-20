@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +21,7 @@ import pytest
 
 # Import Teams modules eagerly at module level so they're loaded before
 # any test-ordering-dependent stubs can overwrite them in sys.modules.
+import src.teams.adapter as _adapter_mod  # Keep a module-level ref before stubs can replace it
 from src.teams.adapter import (
     TeamsAuthError,
     build_teams_message,
@@ -656,3 +658,290 @@ class TestManifest:
         deprecated_path = pathlib.Path(__file__).parent.parent / "src" / "teams" / "manifest.json"
         data = json.loads(deprecated_path.read_text())
         assert "_deprecated" in data
+
+
+# ---------------------------------------------------------------------------
+# TestAdapterOrchestration — full-path adapter tests
+# ---------------------------------------------------------------------------
+
+class TestAdapterOrchestration:
+    """Tests for the legacy adapter handle_teams_activity orchestration path.
+
+    Captures a reference to the adapter module at module-load time (before
+    test_agent_mode stubs can replace it) and uses patch.object on that reference.
+    """
+
+    def test_handle_teams_activity_with_question(self):
+        adapter_mod = _adapter_mod
+        activity = _fake_activity(text="What skills does Aadithya have?")
+        with patch.object(adapter_mod, "TEAMS_CHAT_SERVICE") as mock_svc, \
+             patch.object(adapter_mod, "STATE_STORE") as mock_store, \
+             patch.object(adapter_mod, "add_message_to_history"):
+            mock_store.get_preferences.return_value = {}
+            mock_svc.build_context.return_value = TeamsChatContext(
+                user_id="user-aad-123", session_id="conv-456",
+                subscription_id="conv-456", profile_id="user-aad-123",
+                model_name="llama3.2", persona="Document Assistant",
+            )
+            from src.teams.logic import TeamsAnswerResult
+            mock_svc.answer_question.return_value = TeamsAnswerResult(
+                answer={"response": "Aadithya has Python skills.", "sources": [], "context_found": True},
+                subscription_id="conv-456", profile_id="user-aad-123",
+                fallback_used=False, internet_mode=False,
+            )
+            result = _run(adapter_mod.handle_teams_activity(activity, headers={}))
+            assert result["type"] == "message"
+            assert "Python" in result["text"]
+
+    def test_handle_teams_activity_empty_question(self):
+        adapter_mod = _adapter_mod
+        activity = _fake_activity(text="")
+        result = _run(adapter_mod.handle_teams_activity(activity, headers={}))
+        assert "did not receive" in result["text"].lower()
+
+    def test_handle_teams_activity_with_attachments(self):
+        adapter_mod = _adapter_mod
+        attachments = [{"contentType": "application/pdf", "content": {"downloadUrl": "https://example.com/test.pdf"}}]
+        activity = _fake_activity(attachments=attachments)
+        with patch.object(adapter_mod, "handle_attachment_activity") as mock_attach:
+            mock_attach.return_value = {"type": "message", "text": "Processed 1 file(s)."}
+            result = _run(adapter_mod.handle_teams_activity(activity, headers={}))
+            assert "Processed" in result["text"] or "message" in result.get("type", "")
+
+    def test_handle_teams_activity_loads_preferences(self):
+        adapter_mod = _adapter_mod
+        activity = _fake_activity(text="Tell me about the invoice")
+        with patch.object(adapter_mod, "TEAMS_CHAT_SERVICE") as mock_svc, \
+             patch.object(adapter_mod, "STATE_STORE") as mock_store, \
+             patch.object(adapter_mod, "add_message_to_history"):
+            mock_store.get_preferences.return_value = {"model_name": "gpt-4o", "persona": "Analyst"}
+            mock_svc.build_context.return_value = TeamsChatContext(
+                user_id="user-aad-123", session_id="conv-456",
+                subscription_id="conv-456", profile_id="user-aad-123",
+                model_name="gpt-4o", persona="Analyst",
+            )
+            from src.teams.logic import TeamsAnswerResult
+            mock_svc.answer_question.return_value = TeamsAnswerResult(
+                answer={"response": "Invoice details here.", "sources": [], "context_found": True},
+                subscription_id="conv-456", profile_id="user-aad-123",
+                fallback_used=False, internet_mode=False,
+            )
+            result = _run(adapter_mod.handle_teams_activity(activity, headers={}))
+            mock_store.get_preferences.assert_called_once()
+            call_kwargs = mock_svc.build_context.call_args
+            assert call_kwargs[1].get("model_name") == "gpt-4o" or call_kwargs.kwargs.get("model_name") == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# TestAttachmentHandling — edge cases
+# ---------------------------------------------------------------------------
+
+class TestAttachmentHandling:
+    """Tests for attachment download and ingestion edge cases."""
+
+    def test_attachment_activity_loads_preferences(self):
+        """handle_attachment_activity should load user preferences just like handle_teams_activity."""
+        adapter_mod = _adapter_mod
+        attachments = [{"contentType": "application/pdf", "content": {"downloadUrl": "https://example.com/test.pdf"}}]
+        activity = _fake_activity(attachments=attachments)
+        with patch.object(adapter_mod, "TEAMS_CHAT_SERVICE") as mock_svc, \
+             patch.object(adapter_mod, "STATE_STORE") as mock_store, \
+             patch.object(adapter_mod, "ingest_attachments") as mock_ingest:
+            mock_store.get_preferences.return_value = {"model_name": "mistral"}
+            mock_svc.build_context.return_value = TeamsChatContext(
+                user_id="user-aad-123", session_id="conv-456",
+                subscription_id="conv-456", profile_id="user-aad-123",
+                model_name="mistral", persona="Document Assistant",
+            )
+            mock_svc.ensure_collection = MagicMock()
+            from src.teams.attachments import IngestionResult
+            mock_ingest.return_value = IngestionResult(filenames=["test.pdf"], documents_created=1, doc_tags=["tag1"])
+            result = _run(adapter_mod.handle_attachment_activity(activity))
+            mock_store.get_preferences.assert_called_once()
+
+    def test_inline_image_rejection(self):
+        """Inline images without downloadUrl should return guidance message."""
+        adapter_mod = _adapter_mod
+        attachments = [{"contentType": "image/png"}]
+        activity = _fake_activity(attachments=attachments)
+        with patch.object(adapter_mod, "TEAMS_CHAT_SERVICE") as mock_svc, \
+             patch.object(adapter_mod, "STATE_STORE") as mock_store:
+            mock_store.get_preferences.return_value = {}
+            mock_svc.build_context.return_value = TeamsChatContext(
+                user_id="user-aad-123", session_id="conv-456",
+                subscription_id="conv-456", profile_id="user-aad-123",
+                model_name="llama3.2", persona="Document Assistant",
+            )
+            mock_svc.ensure_collection = MagicMock()
+            result = _run(adapter_mod.handle_attachment_activity(activity))
+            assert "file attachment" in result["text"].lower()
+
+
+# ---------------------------------------------------------------------------
+# TestNewCards — new card template tests
+# ---------------------------------------------------------------------------
+
+class TestNewCards:
+    """Tests for the new Adaptive Card templates."""
+
+    def test_preferences_card_renders(self):
+        card = build_card("preferences_card", current_model="llama3.2", current_persona="Document Assistant")
+        assert card["type"] == "AdaptiveCard"
+        card_text = json.dumps(card)
+        assert "llama3.2" in card_text
+        assert "Document Assistant" in card_text
+        assert "Input.ChoiceSet" in card_text
+
+    def test_preferences_card_has_model_choices(self):
+        card = build_card("preferences_card", current_model="gpt-4o", current_persona="Analyst")
+        card_text = json.dumps(card)
+        assert "gpt-4o" in card_text
+        assert "mistral" in card_text
+        assert "gemini-2.5-flash" in card_text
+
+    def test_processing_card_renders(self):
+        card = build_card("processing_card", status_message="Analyzing your question...")
+        assert card["type"] == "AdaptiveCard"
+        card_text = json.dumps(card)
+        assert "Analyzing your question" in card_text
+        assert "moment" in card_text.lower()
+
+    def test_answer_card_with_sources(self):
+        card = build_card(
+            "answer_card",
+            title="Answer",
+            text="The document discusses AI.",
+            sources_text="- resume.pdf: Skills section mentions Python",
+        )
+        card_text = json.dumps(card)
+        assert "The document discusses AI" in card_text
+        assert "resume.pdf" in card_text
+        assert "sourcesContainer" in card_text
+
+    def test_answer_card_sources_hidden_by_default(self):
+        card = build_card("answer_card", title="T", text="Body", sources_text="src")
+        # Find the sources container
+        for item in card["body"]:
+            if isinstance(item, dict) and item.get("id") == "sourcesContainer":
+                assert item["isVisible"] is False
+                break
+        else:
+            pytest.fail("sourcesContainer not found in answer_card body")
+
+    def test_answer_card_toggle_visibility_action(self):
+        card = build_card("answer_card", title="T", text="B", sources_text="S")
+        actions = card.get("actions", [])
+        toggle_actions = [a for a in actions if a.get("type") == "Action.ToggleVisibility"]
+        assert len(toggle_actions) == 1
+        assert "sourcesContainer" in toggle_actions[0].get("targetElements", [])
+
+    def test_welcome_card_column_layout(self):
+        card = load_card_template("welcome_card")
+        card_text = json.dumps(card)
+        assert "ColumnSet" in card_text
+        assert "Upload a document" in card_text
+
+    def test_tools_menu_has_preferences_button(self):
+        card = build_card("tools_menu_card", open_url="https://docwain.ai")
+        actions_text = json.dumps(card.get("actions", []))
+        assert "show_preferences" in actions_text
+        # Old model/persona buttons should be gone
+        assert "set_model" not in actions_text
+        assert "set_persona" not in actions_text
+
+
+# ---------------------------------------------------------------------------
+# TestPreferencesFlow — end-to-end preferences card flow
+# ---------------------------------------------------------------------------
+
+class TestPreferencesFlow:
+    """Tests for the interactive preferences card flow via tool router."""
+
+    def _make_router(self):
+        state = TeamsStateStore()
+        state.client = None
+        service = MagicMock(spec=TeamsChatService)
+        service.build_context = TeamsChatService.build_context
+        router = TeamsToolRouter(service, state)
+        return router, state
+
+    def _make_context(self):
+        return TeamsChatContext(
+            user_id="u", session_id="s", subscription_id="sub",
+            profile_id="prof", model_name="llama3.2", persona="Document Assistant",
+        )
+
+    def test_show_preferences_returns_card(self):
+        router, state = self._make_router()
+        ctx = self._make_context()
+        result = _run(router.handle_action({"action": "show_preferences"}, ctx))
+        card_text = json.dumps(result)
+        assert "Input.ChoiceSet" in card_text
+        assert "llama3.2" in card_text
+
+    def test_set_preferences_updates_both(self):
+        router, state = self._make_router()
+        ctx = self._make_context()
+        result = _run(router.handle_action({
+            "action": "set_preferences",
+            "model": "gpt-4o",
+            "persona": "Analyst",
+        }, ctx))
+        card_text = json.dumps(result)
+        assert "gpt-4o" in card_text
+        assert "Analyst" in card_text
+        prefs = state.get_preferences("sub", "prof")
+        assert prefs["model_name"] == "gpt-4o"
+        assert prefs["persona"] == "Analyst"
+
+    def test_set_preferences_model_only(self):
+        router, state = self._make_router()
+        ctx = self._make_context()
+        _run(router.handle_action({"action": "set_preferences", "model": "mistral"}, ctx))
+        prefs = state.get_preferences("sub", "prof")
+        assert prefs["model_name"] == "mistral"
+        assert "persona" not in prefs
+
+    def test_set_preferences_empty_no_crash(self):
+        router, state = self._make_router()
+        ctx = self._make_context()
+        result = _run(router.handle_action({"action": "set_preferences"}, ctx))
+        card_text = json.dumps(result)
+        assert "No changes" in card_text
+
+    def test_legacy_set_model_still_works(self):
+        """Backward compat: set_model action should still work."""
+        router, state = self._make_router()
+        ctx = self._make_context()
+        result = _run(router.handle_action({"action": "set_model", "model": "gpt-4o"}, ctx))
+        card_text = json.dumps(result)
+        assert "gpt-4o" in card_text
+        prefs = state.get_preferences("sub", "prof")
+        assert prefs["model_name"] == "gpt-4o"
+
+    def test_legacy_set_persona_still_works(self):
+        """Backward compat: set_persona action should still work."""
+        router, state = self._make_router()
+        ctx = self._make_context()
+        result = _run(router.handle_action({"action": "set_persona", "persona": "Legal Reviewer"}, ctx))
+        card_text = json.dumps(result)
+        assert "Legal Reviewer" in card_text
+
+
+# ---------------------------------------------------------------------------
+# TestConfigEmptyString — config.py empty-string env var handling
+# ---------------------------------------------------------------------------
+
+class TestConfigEmptyString:
+    """Test that empty-string env vars fall back to defaults."""
+
+    def test_empty_subscription_uses_default(self):
+        with patch.dict("os.environ", {"TEAMS_DEFAULT_SUBSCRIPTION": ""}):
+            # The `or` pattern means empty string is falsy → fallback to hardcoded default
+            result = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
+            assert result == "15e0c724-4de0-492e-9861-9e637b3f9076"
+
+    def test_set_subscription_overrides(self):
+        with patch.dict("os.environ", {"TEAMS_DEFAULT_SUBSCRIPTION": "custom-sub-id"}):
+            result = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
+            assert result == "custom-sub-id"

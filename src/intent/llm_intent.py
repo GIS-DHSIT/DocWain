@@ -206,6 +206,8 @@ def _sanitize_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         output_format = "bullets"
 
     domain = str(payload.get("domain") or "generic").strip().lower()
+    if domain == "insurance":
+        domain = "policy"
     if domain not in {"resume", "invoice", "legal", "policy", "report", "generic"}:
         domain = "generic"
 
@@ -242,7 +244,178 @@ def _clean_list(values: Any) -> List[str]:
     return deduped[:12]
 
 
+# ── Trained MLP intent + domain classifier ─────────────────────────────
+#
+# Uses a trained multi-head MLP (IntentDomainClassifier) for intent and
+# domain classification.  The classifier learns decision boundaries from
+# self-supervised training data instead of static cosine-similarity against
+# prototype embeddings.
+#
+# Field detection delegates to FieldImportanceClassifier (separate module).
+# Entity extraction uses NLP-based extractor (separate module).
+#
+# Falls back to minimal regex when the trained classifier is unavailable.
+
+import threading
+
+
+def _get_embedder():
+    """Return the app-wide embedding model, or lazy-load a standalone one."""
+    try:
+        from src.api.rag_state import get_app_state
+        state = get_app_state()
+        if state and state.embedding_model is not None:
+            return state.embedding_model
+    except Exception:  # noqa: BLE001
+        pass
+    # Standalone fallback (e.g. during tests or when app_state not ready)
+    return _get_standalone_embedder()
+
+
+_standalone_embedder = None
+_standalone_embedder_attempted = False
+_standalone_embedder_lock = threading.Lock()
+
+
+def _get_standalone_embedder():
+    """Lazy-load sentence-transformer embedder as last resort."""
+    global _standalone_embedder, _standalone_embedder_attempted
+    if _standalone_embedder is not None:
+        return _standalone_embedder
+    if _standalone_embedder_attempted:
+        return None
+    with _standalone_embedder_lock:
+        if _standalone_embedder is not None:
+            return _standalone_embedder
+        if _standalone_embedder_attempted:
+            return None
+        _standalone_embedder_attempted = True
+        try:
+            from sentence_transformers import SentenceTransformer
+            _standalone_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
+            logger.info("Loaded standalone sentence-transformer for intent classification")
+            return _standalone_embedder
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not load sentence-transformer for intent classification: %s", exc)
+            return None
+
+
+def _extract_entity_hints(query: str) -> List[str]:
+    """Extract entity hints from query using NLP extractor."""
+    entity_hints = []
+    try:
+        from src.nlp.query_entity_extractor import extract_entity_from_query
+        entity = extract_entity_from_query(query)
+        if entity:
+            entity_hints.append(entity)
+    except Exception:  # noqa: BLE001
+        pass
+    return entity_hints
+
+
+def _detect_fields_from_embedding(query: str, embedder: Optional[Any] = None) -> List[str]:
+    """Detect requested fields using FieldImportanceClassifier."""
+    try:
+        from src.rag_v3.field_classifier import get_field_classifier
+        fc = get_field_classifier()
+        if fc is None or embedder is None:
+            return []
+        query_vec = embedder.encode([query], normalize_embeddings=True)[0]
+        probs = fc.predict(query_vec, threshold=0.3)
+        return list(probs.keys())
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _detect_output_format(query: str) -> str:
+    """Detect output format from query text (simple structural check)."""
+    lowered = query.lower()
+    if "table" in lowered:
+        return "table"
+    if "json" in lowered:
+        return "json"
+    if "paragraph" in lowered:
+        return "paragraph"
+    if "markdown" in lowered:
+        return "markdown"
+    return "bullets"
+
+
+def _neural_parse(query: str) -> Optional[Dict[str, Any]]:
+    """Classify intent + domain using the trained MLP classifier.
+
+    Returns a fully populated parse dict or None if classifier unavailable.
+    """
+    try:
+        from src.intent.intent_classifier import get_intent_classifier, ensure_intent_classifier
+    except ImportError:
+        return None
+
+    clf = get_intent_classifier()
+    embedder = _get_embedder()
+
+    # Try to ensure classifier is ready (auto-train if needed)
+    if clf is None and embedder is not None:
+        try:
+            clf = ensure_intent_classifier(embedder)
+        except Exception:  # noqa: BLE001
+            pass
+
+    if clf is None or not getattr(clf, "_trained", False):
+        return None
+    if embedder is None:
+        return None
+
+    try:
+        query_vec = embedder.encode([query], normalize_embeddings=True)[0]
+    except Exception:  # noqa: BLE001
+        return None
+
+    result = clf.predict(query_vec)
+    if not result:
+        return None
+
+    # Apply confidence gates
+    intent = result.get("intent", "qa")
+    intent_conf = result.get("intent_confidence", 0.0)
+    domain = result.get("domain", "generic")
+    domain_conf = result.get("domain_confidence", 0.0)
+
+    if intent_conf < 0.45:
+        intent = "qa"
+    if domain_conf < 0.40:
+        domain = "generic"
+
+    logger.debug(
+        "Trained intent classifier: intent=%s (%.2f), domain=%s (%.2f)",
+        intent, intent_conf, domain, domain_conf,
+    )
+
+    return {
+        "intent": intent,
+        "output_format": _detect_output_format(query),
+        "requested_fields": _detect_fields_from_embedding(query, embedder),
+        "domain": domain,
+        "constraints": {},
+        "entity_hints": _extract_entity_hints(query),
+    }
+
+
 def _heuristic_parse(query: str) -> Dict[str, Any]:
+    """Parse intent using trained MLP first, minimal regex fallback.
+
+    Strategy:
+    1. Trained MLP classifier (primary)
+    2. Minimal regex fallback only when classifier is unavailable
+    """
+    # ── Strategy 1: Trained MLP classification (primary) ──────────────
+    neural = _neural_parse(query)
+    if neural is not None:
+        return neural
+
+    # ── Strategy 2: Minimal regex fallback (degraded mode) ───────────
+    # Only reached when trained classifier is not available.
+    logger.debug("Trained intent classifier unavailable; using regex fallback")
     lowered = query.lower()
     intent = "qa"
     if re.search(r"\b(summary|summarize|overview|recap)\b", lowered):
@@ -260,66 +433,26 @@ def _heuristic_parse(query: str) -> Dict[str, Any]:
     elif re.search(r"\b(generate|write|draft|create|compose|prepare)\b", lowered):
         intent = "generate"
 
+    # Minimal domain detection for fallback
     domain = "generic"
-    if any(tok in lowered for tok in ("resume", "cv", "candidate", "experience", "skills", "qualifications")):
+    if re.search(r"\b(resume|candidate|skills|experience|qualifications?|certifications?|education)\b", lowered):
         domain = "resume"
-    elif any(tok in lowered for tok in ("invoice", "amount due", "billing", "payment", "total amount")):
+    elif re.search(r"\b(invoice|billing|payment|amount\s+due|line\s+items?)\b", lowered):
         domain = "invoice"
-    elif any(tok in lowered for tok in ("contract", "agreement", "clause", "legal", "terms and conditions")):
+    elif re.search(r"\b(contract|clause|agreement|legal|termination|liability)\b", lowered):
         domain = "legal"
-
-    output_format = "bullets"
-    if "table" in lowered:
-        output_format = "table"
-    elif "json" in lowered:
-        output_format = "json"
-    elif "paragraph" in lowered:
-        output_format = "paragraph"
-    elif "markdown" in lowered:
-        output_format = "markdown"
-
-    fields = []
-    if re.search(r"\b(email|emails)\b", lowered):
-        fields.append("email")
-    if re.search(r"\b(phone|phones|contact)\b", lowered):
-        fields.append("phone")
-    if "linkedin" in lowered:
-        fields.append("linkedin")
-    if "skills" in lowered:
-        fields.append("skills")
-    if re.search(r"\b(education|degree|university|college)\b", lowered):
-        fields.append("education")
-    if re.search(r"\b(certification|certificate|certified)\b", lowered):
-        fields.append("certifications")
-    if re.search(r"\b(experience|work history|employment)\b", lowered):
-        fields.append("experience")
-
-    # Extract entity hints — find capitalized names that aren't common English words
-    entity_hints = []
-    _COMMON_STARTS = {
-        "The", "This", "That", "What", "How", "Can", "Will", "Should", "Does",
-        "Which", "Where", "When", "Who", "Why", "Are", "Is", "Do", "Has", "Have",
-        "Get", "Set", "Show", "List", "Find", "All", "Any", "Each", "Every",
-        "Compare", "Rank", "Top", "Best", "Most", "Summary", "Summarize",
-        "Extract", "Identify", "Review", "Describe", "Fetch", "Please",
-        "Document", "Resume", "Invoice", "Profile", "Report", "Details",
-        "Contact", "Email", "Phone", "Skills", "Experience", "Education",
-    }
-    # Match capitalized words (2+ chars) that look like proper names
-    name_matches = re.findall(r'\b([A-Z][a-z]{1,}(?:\s+[A-Z][a-z]{1,}){0,2})\b', query)
-    for name in name_matches:
-        first_word = name.split()[0]
-        if first_word not in _COMMON_STARTS:
-            entity_hints.append(name)
-            break
+    elif re.search(r"\b(insurance|policy|coverage|premium|deductible|claim|underwriting)\b", lowered):
+        domain = "policy"
+    elif re.search(r"\b(report|analysis|findings|quarterly|annual\s+report)\b", lowered):
+        domain = "report"
 
     return {
         "intent": intent,
-        "output_format": output_format,
-        "requested_fields": fields,
+        "output_format": _detect_output_format(query),
+        "requested_fields": [],
         "domain": domain,
         "constraints": {},
-        "entity_hints": entity_hints,
+        "entity_hints": _extract_entity_hints(query),
     }
 
 

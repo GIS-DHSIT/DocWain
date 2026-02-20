@@ -44,7 +44,9 @@ from .types import (
     LLMBudget,
     LLMResponseSchema,
     MISSING_REASON,
+    MedicalSchema,
     MultiEntitySchema,
+    PolicySchema,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,24 +88,15 @@ _ALL_DOCS_PATTERNS = [
     r"\bamong\s+(?:all\s+)?(?:candidates?|resumes?|documents?|profiles?)\b",
     # "of candidates" (e.g. "linkedin profiles of candidates")
     r"\b(?:profiles?|info|information|details)\s+of\s+(?:all\s+)?(?:candidates?|resumes?)\b",
+    # Superlative/ranking queries imply comparison across all candidates
+    r"\bwho\s+(?:has|is|are)\s+(?:the\s+)?(?:most|best|highest|longest|strongest|top)\b",
+    r"\b(?:most|best|highest|longest|strongest|top)\s+(?:experienced?|skilled|qualified|suitable)\b",
 ]
 
 _DOCUMENT_ID_PATTERN = r"document_id\s*[:=]\s*([A-Za-z0-9_-]+)"
 
-_SPECIFIC_ENTITY_PATTERNS = [
-    r"\b(?:about|for|of|from)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b",  # "about John Doe"
-    r"(?:invoice|order|po)\s*#?\s*(\d+)",  # "invoice #12345"
-    # Possessive: "Dhayal's profile/resume/details/certifications/education"
-    r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})'s\s+(?:profile|resume|cv|document|details|info|summary|report|experience|skills|background|certifications?|certificates?|education|qualifications?|achievements?|contact|role|designation|position|career|phone|email|linkedin|projects?|work|tools?|technologies|degrees?|achievements?)\b",
-    # Verb + Name (no preposition): "summarize Dhayal", "show Dhayal"
-    r"\b(?:summarize|summarise|show|get|fetch|find|describe|review)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b",
-    # "by Name" — "held by Gokul", "earned by Swapnil"
-    r"\b(?:held|earned|obtained|completed|done|by)\s+(?:by\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b",
-    # "reach/contact Name" — "reach Abinaya", "contact Gokul"
-    r"\b(?:reach|contact)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\b",
-    # "has/does/is/did Name verb" — "has Gokul worked", "does Swapnil have", "is Gokul qualified"
-    r"\b(?:has|does|did|can|is|will|would)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3})\s+\w+",
-]
+# Invoice/order number pattern (retained — this is a structured format, not entity name)
+_INVOICE_NUMBER_RE = re.compile(r"(?:invoice|order|po)\s*#?\s*(\d+)", re.IGNORECASE)
 
 
 def _infer_query_scope(
@@ -140,13 +133,21 @@ def _infer_query_scope(
     if re.search(r"\b(?:compare|rank|vs\.?|versus|between)\b", lowered):
         return QueryScope(mode="all_profile")
 
-    # Check for specific entity mentions
-    for pattern in _SPECIFIC_ENTITY_PATTERNS:
-        match = re.search(pattern, query or "")
-        if match:
-            entity = match.group(1).strip()
-            if len(entity) > 2:
-                return QueryScope(mode="targeted", entity_hint=entity)
+    # Check for invoice/order numbers (structured format, not a name)
+    inv_match = _INVOICE_NUMBER_RE.search(query or "")
+    if inv_match:
+        return QueryScope(mode="targeted", entity_hint=inv_match.group(1).strip())
+
+    # NLP-based entity extraction (spaCy dependency parsing + DPIE ML models)
+    # Replaces all regex-based entity name patterns for robustness
+    try:
+        from src.nlp.query_entity_extractor import extract_entity_from_query
+        entity = extract_entity_from_query(query or "")
+        logger.debug("NLP entity extraction result: query=%r entity=%r", query, entity)
+        if entity and len(entity) > 2:
+            return QueryScope(mode="targeted", entity_hint=entity)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("NLP entity extraction failed: %s", exc)
 
     # Default: targeted vector retrieval (standard behavior)
     return QueryScope(mode="targeted")
@@ -174,7 +175,58 @@ def _has_valid_deterministic_extraction(schema: Any) -> bool:
         ]
         # Require >= 2 facts with value > 10 chars, OR 1 fact with value > 50 chars
         return len(substantial) >= 2 or any(len(str(f.value or "")) > 50 for f in substantial)
+    if isinstance(schema, (MedicalSchema, PolicySchema)):
+        # Check if any field has items
+        for field_name in type(schema).model_fields:
+            field_val = getattr(schema, field_name, None)
+            if field_val and getattr(field_val, "items", None):
+                return True
+        return False
+    if isinstance(schema, InvoiceSchema):
+        return bool(
+            (schema.items and schema.items.items)
+            or (schema.totals and schema.totals.items)
+            or (schema.parties and schema.parties.items)
+        )
+    if isinstance(schema, LegalSchema):
+        return bool(
+            (schema.clauses and schema.clauses.items)
+            or (schema.parties and schema.parties.items)
+            or (schema.obligations and schema.obligations.items)
+        )
     return False
+
+
+# ── Tool-to-Domain mapping ─────────────────────────────────────────────────
+# When /ask receives tools=["resume-analysis"], the pipeline uses this to
+# set an authoritative domain_hint that overrides query/chunk-based inference.
+
+_TOOL_DOMAIN_MAP: Dict[str, str] = {
+    "resume-analysis": "hr",
+    "resume_analysis": "hr",
+    "resumes": "hr",
+    "resume": "hr",
+    "medical": "medical",
+    "lawhere": "legal",
+    "legal": "legal",
+    "invoice": "invoice",
+    "policy": "policy",
+    "insurance": "policy",
+}
+
+
+def _resolve_domain_from_tools(tools: Optional[List[str]]) -> Optional[str]:
+    """Map tool names to an authoritative domain hint.
+
+    Returns the first matching domain or None if no tool maps to a domain.
+    """
+    if not tools:
+        return None
+    for tool in tools:
+        domain = _TOOL_DOMAIN_MAP.get((tool or "").strip().lower())
+        if domain:
+            return domain
+    return None
 
 
 # ── Tool Dispatch ──────────────────────────────────────────────────────────
@@ -354,9 +406,11 @@ def _extract_render_judge(
         sanitized = sanitize(rendered)
 
     # Post-generation grounding verification — optionally blocks ungrounded answers
+    # Skip grounding gate when extraction produced valid structured data (already grounded)
+    _skip_grounding = _has_valid_deterministic_extraction(extraction.schema) or _is_llm_response(extraction)
     chunk_texts = [c.text for c in chunks if hasattr(c, "text") and c.text]
     grounding_blocked = False
-    if sanitized and chunk_texts:
+    if sanitized and chunk_texts and not _skip_grounding:
         try:
             from src.quality.fast_grounding import evaluate_grounding
             from src.api.config import Config as _Cfg
@@ -385,6 +439,8 @@ def _extract_render_judge(
                     )
         except Exception as exc:
             logger.debug("Grounding check error: %s", exc)
+    elif _skip_grounding:
+        logger.debug("Grounding gate skipped: valid deterministic extraction present")
 
     verdict = judge(
         answer=sanitized,
@@ -597,6 +653,7 @@ def _run_all_profile_analysis(
     intent_parse: Optional[IntentParse],
     correlation_id: Optional[str],
     request_id: Optional[str],
+    tool_domain: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Retrieve ALL profile chunks, group by document, extract per-doc, then synthesize."""
     collection = build_collection_name(subscription_id)
@@ -704,7 +761,10 @@ def _run_all_profile_analysis(
     # NOTE: ranking is deliberately excluded — it benefits from the full
     # HR extraction path which produces structured Candidate objects with
     # names, skills, and scoring.  The comparator only has raw chunk fields.
-    if intent_type == "comparison" and len(doc_contexts) > 1:
+    if intent_type == "comparison" and 1 < len(doc_contexts) <= 5:
+        # Only use comparator for small document sets (2-5 docs).
+        # For large sets (>5), fall through to HR extraction + enterprise
+        # rendering which creates structured Candidate objects per document.
         from .comparator import compare_documents, render_comparison
 
         # Try LLM-enhanced comparison first
@@ -762,22 +822,34 @@ def _run_all_profile_analysis(
     # extraction path (Strategy 0) and returns 1 candidate.  By omitting it we fall
     # through to _extract_hr(), which groups chunks by doc_id and creates one
     # candidate PER document — exactly what multi-document queries need.
-    domain_hint = None  # unified extractor handles all document types
+    # When a tool is selected (e.g., tools=resume-analysis), use the tool domain
+    # as an authoritative hint to route extraction correctly.
+    domain_hint = tool_domain  # None when no tool, "hr"/"legal"/etc. when tool-specified
 
     from .query_focus import build_query_focus as _bqf
     _all_profile_focus = _bqf(query, intent_hint=intent_parse.intent if intent_parse else None)
+
+    # For multi-document all-profile queries (>5 docs), skip LLM extraction.
+    # LLMs can't reliably process 10+ documents in a single context window —
+    # they truncate and only return 1-3 candidates. Deterministic extraction
+    # creates one Candidate PER document from chunks, which is exactly what
+    # multi-doc queries (compare, rank, list) need.
+    _all_profile_llm = llm_client if len(doc_chunks) <= 5 else None
+    _all_profile_budget = budget if len(doc_chunks) <= 5 else LLMBudget(llm_client=None, max_calls=0)
 
     extraction = extract_schema(
         domain_hint,
         query=query,
         chunks=quality_chunks,
-        llm_client=llm_client,
-        budget=budget,
+        llm_client=_all_profile_llm,
+        budget=_all_profile_budget,
         correlation_id=correlation_id,
         scope_document_id=None,
         intent_hint=intent_parse.intent if intent_parse else None,
         document_data=None,  # intentionally None for multi-doc
         query_focus=_all_profile_focus,
+        tool_domain=bool(tool_domain),
+        embedder=embedder,
     )
 
     sanitized, verdict = _extract_render_judge(
@@ -843,6 +915,13 @@ def run(
     if qdrant_client is None or embedder is None:
         raise ValueError("RAG v3 dependencies missing: qdrant_client and embedder are required")
 
+    # ── Clear per-request caches to prevent cross-request contamination ──
+    try:
+        clear_chunk_embed_cache()
+        clear_dpie_cache()
+    except Exception:  # noqa: BLE001
+        pass
+
     # Lazy DPIE initialization — train on first query if not already ready.
     # Non-blocking: if training is already in progress from startup thread,
     # this returns immediately via the DPIERegistry lock.
@@ -889,6 +968,24 @@ def run(
         except Exception:
             pass  # classifier is optional
 
+    # Lazy-init trained intent classifier
+    if embedder is not None:
+        try:
+            from src.intent.intent_classifier import get_intent_classifier, ensure_intent_classifier
+            if get_intent_classifier() is None:
+                ensure_intent_classifier(embedder)
+        except Exception:
+            pass  # intent classifier is optional
+
+    # Lazy-init line role classifier (ML-based KV extraction)
+    if embedder is not None:
+        try:
+            from .line_classifier import get_line_classifier, ensure_line_classifier
+            if get_line_classifier() is None:
+                ensure_line_classifier(embedder)
+        except Exception:
+            pass  # line classifier is optional
+
     # ── Multi-agent classifier (advisory, never blocks) ─────────────
     _multi_agent_classification = None
     try:
@@ -913,6 +1010,15 @@ def run(
     except Exception as _ma_exc:
         logger.debug("Multi-agent classifier skipped: %s", _ma_exc)
 
+    # ── Resolve authoritative domain from tools ──────────────────────
+    tool_domain = _resolve_domain_from_tools(tools)
+    if tool_domain:
+        logger.info(
+            "Tool domain resolved: tools=%s → domain=%s",
+            tools, tool_domain,
+            extra={"stage": "tool_domain", "correlation_id": correlation_id},
+        )
+
     # ── All-profile path: multi-document analysis ────────────────────
     if scope.mode == "all_profile":
         return _run_all_profile_analysis(
@@ -927,6 +1033,7 @@ def run(
             intent_parse=intent_parse,
             correlation_id=correlation_id,
             request_id=request_id,
+            tool_domain=tool_domain,
         )
 
     stage_start = time.time()
@@ -993,7 +1100,7 @@ def run(
             reranked = _augment_chunks_with_contact_info(reranked, document_data)
 
             extraction = extract_schema(
-                None,  # unified extractor handles all document types
+                tool_domain,  # None when no tool, authoritative domain when tool-specified
                 query=original_query,
                 chunks=reranked,
                 llm_client=llm_client,
@@ -1003,6 +1110,8 @@ def run(
                 intent_hint=intent_parse.intent if intent_parse else None,
                 document_data=document_data,
                 query_focus=focus,
+                tool_domain=bool(tool_domain),
+                embedder=embedder,
             )
             _log_stage("profile_scan_extract", stage_start, correlation_id)
 
@@ -1076,7 +1185,7 @@ def run(
             document_data = _load_document_data_for_extraction(reranked, original_query, correlation_id)
             reranked = _augment_chunks_with_contact_info(reranked, document_data)
             extraction = extract_schema(
-                None,  # unified extractor handles all document types
+                tool_domain,  # None when no tool, authoritative domain when tool-specified
                 query=original_query,
                 chunks=reranked,
                 llm_client=llm_client,
@@ -1086,6 +1195,8 @@ def run(
                 intent_hint=intent_parse.intent if intent_parse else None,
                 document_data=document_data,
                 query_focus=focus,
+                tool_domain=bool(tool_domain),
+                embedder=embedder,
             )
             _log_stage("unscoped_scan_extract", stage_start, correlation_id)
 
@@ -1119,6 +1230,30 @@ def run(
                 metadata=metadata,
                 query=original_query,
             )
+    # ── Knowledge Graph augmentation (non-blocking) ─────────────────
+    graph_hints = None
+    try:
+        _kg_state = rag_state.get_app_state()
+        _kg_augmenter = getattr(_kg_state, "graph_augmenter", None) if _kg_state else None
+        if _kg_augmenter is not None:
+            graph_hints = _kg_augmenter.augment(
+                original_query,
+                str(subscription_id),
+                str(profile_id),
+            )
+            if graph_hints and graph_hints.query_expansion_terms:
+                rewritten = f"{rewritten} {' '.join(graph_hints.query_expansion_terms)}"
+                logger.info(
+                    "KG expanded query with %d terms | cid=%s",
+                    len(graph_hints.query_expansion_terms), correlation_id,
+                )
+            # Use KG doc_ids to improve entity-hint filtering
+            if graph_hints and graph_hints.doc_ids and not scope.entity_hint:
+                # KG knows which docs contain the entities — use as soft hint
+                logger.debug("KG provided %d candidate doc_ids | cid=%s", len(graph_hints.doc_ids), correlation_id)
+    except Exception as _kg_exc:  # noqa: BLE001
+        logger.debug("KG augmentation skipped: %s", _kg_exc)
+
     # ── Query decomposition for complex queries ──
     # Skip decomposition for specific_document scope — the iterative retriever
     # doesn't pass document_id, so decomposed retrieval would lose scoping.
@@ -1209,12 +1344,76 @@ def run(
         if filtered_by_entity:
             reranked = filtered_by_entity
         else:
-            # Soft fallback: keep all reranked chunks rather than returning empty.
-            # The entity name may not appear verbatim in chunk text (e.g. generic resume sections).
+            # Entity not found in vector-retrieved chunks — the vector search likely
+            # returned semantically-similar but wrong-candidate chunks.
+            # Redirect to profile scan to search ALL documents for the entity.
             logger.info(
-                "Entity filter for '%s' returned empty — keeping all %d reranked chunks | cid=%s",
-                scope.entity_hint, len(reranked), correlation_id,
+                "Entity filter for '%s' returned empty in vector results — trying profile scan | cid=%s",
+                scope.entity_hint, correlation_id,
             )
+            try:
+                profile_chunks = expand_full_scan_by_profile(
+                    qdrant_client=qdrant_client,
+                    collection=build_collection_name(subscription_id),
+                    subscription_id=str(subscription_id),
+                    profile_id=str(profile_id),
+                    correlation_id=correlation_id,
+                )
+                if profile_chunks:
+                    entity_filtered = _filter_chunks_by_entity_hint(
+                        profile_chunks, scope.entity_hint, correlation_id,
+                    )
+                    if entity_filtered:
+                        logger.info(
+                            "Entity '%s' found via profile scan: %d chunks | cid=%s",
+                            scope.entity_hint, len(entity_filtered), correlation_id,
+                        )
+                        # Rerank the entity-filtered chunks
+                        entity_reranked = rerank(
+                            query=original_query, chunks=entity_filtered,
+                            cross_encoder=cross_encoder, top_k=16,
+                            correlation_id=correlation_id, min_score=-100.0,
+                        )
+                        reranked = entity_reranked or entity_filtered[:16]
+            except Exception:  # noqa: BLE001
+                logger.debug("Profile scan fallback for entity '%s' failed", scope.entity_hint)
+
+    # ── KG score boosting: boost chunks supported by knowledge graph ──
+    if graph_hints and reranked:
+        try:
+            from src.kg.score import GraphSupportScorer
+
+            class _ChunkAdapter:
+                """Adapt rag_v3 Chunk (.meta) to KG scorer (.metadata)."""
+                __slots__ = ("_chunk",)
+                def __init__(self, chunk):
+                    self._chunk = chunk
+                @property
+                def text(self):
+                    return self._chunk.text
+                @property
+                def score(self):
+                    return self._chunk.score
+                @score.setter
+                def score(self, value):
+                    self._chunk.score = value
+                @property
+                def metadata(self):
+                    return self._chunk.meta or {}
+                @metadata.setter
+                def metadata(self, value):
+                    self._chunk.meta = value
+
+            scorer = GraphSupportScorer(
+                alpha=getattr(Config.KnowledgeGraph, "GRAPH_SCORE_ALPHA", 0.7),
+            )
+            adapted = [_ChunkAdapter(c) for c in reranked]
+            scorer.score_chunks(adapted, graph_hints)
+            # Scores are written back via the adapter — chunks are now re-sorted
+            reranked.sort(key=lambda c: float(c.score), reverse=True)
+            logger.info("KG score boosting applied to %d chunks | cid=%s", len(reranked), correlation_id)
+        except Exception as _kg_score_exc:  # noqa: BLE001
+            logger.debug("KG score boosting skipped: %s", _kg_score_exc)
 
     sufficiency = None  # Evidence sufficiency — will be set if evaluator succeeds
 
@@ -1274,7 +1473,7 @@ def run(
     document_data = _load_document_data_for_extraction(reranked, original_query, correlation_id)
     reranked = _augment_chunks_with_contact_info(reranked, document_data)
     extraction = extract_schema(
-        None,  # unified extractor handles all document types
+        tool_domain,  # None when no tool, authoritative domain when tool-specified
         query=original_query,
         chunks=reranked,
         llm_client=llm_client,
@@ -1284,6 +1483,8 @@ def run(
         intent_hint=intent_parse.intent if intent_parse else None,
         document_data=document_data,
         query_focus=focus,
+        tool_domain=bool(tool_domain),
+        embedder=embedder,
     )
     _log_stage("extract", stage_start, correlation_id)
 
@@ -1316,7 +1517,7 @@ def run(
                     correlation_id=correlation_id,
                 ) or reranked
             extraction = extract_schema(
-                extraction.domain,
+                tool_domain or extraction.domain,
                 query=original_query,
                 chunks=reranked,
                 llm_client=None,
@@ -1326,6 +1527,8 @@ def run(
                 intent_hint=intent_parse.intent if intent_parse else None,
                 document_data=document_data,
                 query_focus=focus,
+                tool_domain=bool(tool_domain),
+                embedder=embedder,
             )
             _log_stage("full_scan_re_extract", stage_start, correlation_id)
 
@@ -1407,6 +1610,18 @@ def run(
     if sufficiency is not None and sufficiency.overall_score < 0.35:
         metadata["grounded"] = False
         metadata["evidence_score"] = sufficiency.overall_score
+
+    # KG debug metadata
+    if graph_hints:
+        kg_debug = {}
+        if graph_hints.entities_in_query:
+            kg_debug["entities"] = [e.name for e in graph_hints.entities_in_query[:5]]
+        if graph_hints.query_expansion_terms:
+            kg_debug["expansion_terms"] = graph_hints.query_expansion_terms[:5]
+        if graph_hints.doc_ids:
+            kg_debug["doc_ids"] = graph_hints.doc_ids[:5]
+        if kg_debug:
+            metadata["kg"] = kg_debug
 
     # ── Multi-agent verifier (advisory, never blocks) ──────────────
     try:
@@ -1719,12 +1934,17 @@ def _filter_chunks_by_entity_hint(
         text_lower = ((getattr(chunk, "text", "") or "").lower())
         source = getattr(chunk, "source", None)
         doc_name_lower = ((getattr(source, "document_name", "") or "").lower()) if source else ""
-        # Also check metadata fields: source_name, filename, embedding_text
+        # Also check metadata fields: source_name, filename, embedding_text, section_summary
         meta = getattr(chunk, "meta", None) or {}
         meta_source = (str(meta.get("source_name") or "")).lower()
         meta_filename = (str(meta.get("filename") or "")).lower()
         meta_embed = (str(meta.get("embedding_text") or "")).lower()
-        searchable = f"{text_lower} {doc_name_lower} {meta_source} {meta_filename} {meta_embed}"
+        meta_doc_summary = (str(meta.get("doc_summary") or "")).lower()
+        meta_sec_summary = (str(meta.get("section_summary") or "")).lower()
+        searchable = (
+            f"{text_lower} {doc_name_lower} {meta_source} {meta_filename} "
+            f"{meta_embed} {meta_doc_summary} {meta_sec_summary}"
+        )
         for term in search_terms:
             if term in searchable:
                 entity_doc_ids.add(doc_id)

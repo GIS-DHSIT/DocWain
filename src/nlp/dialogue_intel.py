@@ -187,7 +187,17 @@ def analyze_sentiment(text: str) -> SentimentResult:
     )
 
 
-def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentResult], response_mode: str) -> str:
+def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentResult], response_mode: str, user_text: str = "") -> str:
+    # Try dynamic engine first.
+    if user_text:
+        try:
+            from src.intelligence.conversational_nlp import generate_conversational_response
+            resp = generate_conversational_response(user_text)
+            if resp and resp.text:
+                return resp.text
+        except Exception:
+            pass
+
     if intent.intent == "GREETING":
         response = build_docwain_intro()
     elif intent.intent == "THANKS_OR_PRAISE":
@@ -202,7 +212,7 @@ def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentRe
         response = build_docwain_intro()
     elif intent.intent == "SMALL_TALK":
         response = (
-            "Hi! If you have a document task, I’m ready to help."
+            "Hi! If you have a document task, I'm ready to help."
         )
     elif intent.intent == "CLARIFICATION":
         response = (
@@ -241,7 +251,7 @@ def route_message(user_text: str, state: Optional[dict] = None) -> RouteDecision
     response_text = None
     policy = "task"
     if direct_response:
-        response_text = _build_direct_response(intent, sentiment, response_mode)
+        response_text = _build_direct_response(intent, sentiment, response_mode, user_text=user_text)
         if persona_enabled:
             persona_text = get_docwain_persona(
                 profile_id=state.get("profile_id"),

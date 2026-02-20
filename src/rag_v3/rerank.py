@@ -120,8 +120,12 @@ def _move_to_cpu(encoder: Any) -> Any:
         import torch
         if hasattr(encoder, "model") and hasattr(encoder.model, "to"):
             encoder.model.to("cpu")
-            if hasattr(encoder, "device"):
-                encoder.device = torch.device("cpu")
+            # Update internal device tracking — CrossEncoder.device is read-only
+            # so we set the private attribute directly.
+            try:
+                encoder._target_device = torch.device("cpu")
+            except Exception:  # noqa: BLE001
+                pass
             logger.info("RAG v3 rerank moved cross-encoder to CPU for fallback")
             return encoder
     except Exception as exc:  # noqa: BLE001

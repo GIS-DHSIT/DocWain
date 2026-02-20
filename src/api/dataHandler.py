@@ -1417,7 +1417,19 @@ def save_embeddings_to_qdrant(
         collection_name = build_collection_name(subscription_id)
         ensure_qdrant_collection(collection_name, vector_size)
 
+        # Delete old points for this document before upserting to prevent duplicates
+        try:
+            store = get_vector_store()
+            store.delete_document(subscription_id, profile_id, doctag)
+            logging.info(
+                "Cleaned old embeddings for document_id=%s before re-embedding",
+                doctag,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.debug("Old embedding cleanup skipped for %s: %s", doctag, exc)
+
         # Apply embedding enhancement for better retrieval
+        dropped_dedup = 0
         try:
             from src.embedding.pipeline_enhancement import enhance_chunks_for_embedding
 
@@ -1432,13 +1444,34 @@ def save_embeddings_to_qdrant(
                 domain=doc_domain or "generic",
             )
 
-            # Update chunk metadata with enhanced data
-            if enhancement_result.enhanced_metadata:
-                for idx, enhanced_meta in enumerate(enhancement_result.enhanced_metadata):
-                    if idx < len(chunk_metadata):
-                        chunk_metadata[idx].update(enhanced_meta)
-                    else:
-                        chunk_metadata.append(enhanced_meta)
+            # Apply deduplicated texts and metadata from enhancement
+            dropped_dedup = enhancement_result.original_count - enhancement_result.deduplicated_count
+            if enhancement_result.deduplicated_count < enhancement_result.original_count:
+                deduped_texts = enhancement_result.enhanced_texts
+                deduped_meta = enhancement_result.enhanced_metadata
+                # Re-embed since the count changed after deduplication
+                deduped_vectors, _ = normalize_embedding_matrix(
+                    encode_with_fallback(
+                        deduped_texts,
+                        convert_to_numpy=True,
+                        normalize_embeddings=True,
+                    )
+                )
+                deduped_sparse = build_sparse_vectors(deduped_texts)
+                # Atomic swap: only replace if re-encoding succeeded
+                texts = deduped_texts
+                chunk_metadata = deduped_meta
+                normalized_vectors = deduped_vectors
+                sparse_vectors = deduped_sparse
+                max_len = len(texts)
+            else:
+                # No dedup needed — just update metadata in-place
+                if enhancement_result.enhanced_metadata:
+                    for idx, enhanced_meta in enumerate(enhancement_result.enhanced_metadata):
+                        if idx < len(chunk_metadata):
+                            chunk_metadata[idx].update(enhanced_meta)
+                        else:
+                            chunk_metadata.append(enhanced_meta)
 
             logging.info(
                 f"Embedding enhancement: {enhancement_result.original_count} -> "
@@ -1668,6 +1701,7 @@ def save_embeddings_to_qdrant(
             "status": "success",
             "points_saved": saved,
             "dropped_invalid": len(invalid_samples),
+            "dropped_dedup": dropped_dedup,
             "invalid_samples": invalid_samples[:5],
         }
 
@@ -2556,9 +2590,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             result = save_embeddings_to_qdrant(text, subscription_id, profile_id, doc_tag, doc_name)
             saved = result.get("points_saved", 0)
             upsert_dropped = int(result.get("dropped_invalid", 0))
-            dropped_chunks += upsert_dropped
+            upsert_dedup = int(result.get("dropped_dedup", 0))
+            dropped_chunks += upsert_dropped + upsert_dedup
             # Post-pipeline expected count accounts for chunks dropped during upsert
-            expected_points = pre_upsert_count - upsert_dropped
+            expected_points = pre_upsert_count - upsert_dropped - upsert_dedup
             if upsert_dropped:
                 logging.warning(
                     "Embedding upsert dropped %d/%d chunks for %s (below min_chars/min_tokens)",
@@ -2573,7 +2608,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 "status": "success",
                 "points_saved": saved,
                 "chunks": pre_upsert_count,
-                "dropped_chunks": dropped_chunks,
+                "dropped_chunks": upsert_dropped + upsert_dedup,  # only upsert-level drops; prepare/validity already excluded from pre_upsert_count
                 "coverage_ratio": None,
             }
         elif isinstance(text, ExtractedDocument):
@@ -3049,8 +3084,11 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
 
             logging.info(f"=" * 80)
             saved = result.get("points_saved", 0)
-            expected_points = len(chunks)
-            if saved != expected_points:
+            upsert_dropped_ed = int(result.get("dropped_invalid", 0))
+            upsert_dedup_ed = int(result.get("dropped_dedup", 0))
+            dropped_chunks += upsert_dropped_ed + upsert_dedup_ed
+            expected_points = len(chunks) - upsert_dropped_ed - upsert_dedup_ed
+            if expected_points and saved != expected_points:
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
                 )
@@ -3062,8 +3100,8 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             return {
                 "status": "success",
                 "points_saved": saved,
-                "chunks": expected_points,
-                "dropped_chunks": dropped_chunks,
+                "chunks": len(chunks),  # pre-dedup count
+                "dropped_chunks": upsert_dropped_ed + upsert_dedup_ed,  # only upsert-level drops
                 "coverage_ratio": coverage_ratio,
             }
 
@@ -3282,8 +3320,11 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
 
             logging.info(f"=" * 80)
             saved = result.get("points_saved", 0)
-            expected_points = len(chunks)
-            if saved != expected_points:
+            upsert_dropped_ed = int(result.get("dropped_invalid", 0))
+            upsert_dedup_ed = int(result.get("dropped_dedup", 0))
+            dropped_chunks += upsert_dropped_ed + upsert_dedup_ed
+            expected_points = len(chunks) - upsert_dropped_ed - upsert_dedup_ed
+            if expected_points and saved != expected_points:
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
                 )
@@ -3295,8 +3336,8 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             return {
                 "status": "success",
                 "points_saved": saved,
-                "chunks": expected_points,
-                "dropped_chunks": dropped_chunks,
+                "chunks": len(chunks),  # pre-dedup count
+                "dropped_chunks": upsert_dropped_ed + upsert_dedup_ed,  # only upsert-level drops
                 "coverage_ratio": coverage_ratio,
             }
 

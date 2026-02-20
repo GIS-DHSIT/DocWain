@@ -33,6 +33,13 @@ _TITLE_MAP = [
     (("recital", "preamble", "whereas"), "legal_preamble"),
     (("definition",), "legal_definitions"),
     (("signature", "execution", "attestation"), "legal_signatures"),
+    # Insurance/Policy section kinds (map to existing legal/financial kinds)
+    (("coverage", "covered peril", "scope of coverage"), "legal_clauses"),
+    (("exclusion", "excluded peril", "not covered"), "legal_clauses"),
+    (("premium", "premium schedule", "premium calculation"), "financial_summary"),
+    (("claim", "claims procedure", "how to claim"), "terms_conditions"),
+    (("deductible", "excess"), "terms_conditions"),
+    (("beneficiary", "insured", "policyholder"), "parties_addresses"),
     # Medical section kinds
     (("diagnosis", "assessment", "impression"), "medical_findings"),
     (("medication", "prescription", "drug"), "medical_medications"),
@@ -267,9 +274,23 @@ def classify_section_kind_with_source(
     """Classify chunk content into a section kind and return confidence source.
 
     Returns ``(kind, source)`` where *source* is ``"title"`` when the kind
-    was derived from a clear section title match (high confidence) or
+    was derived from a clear section title match (high confidence),
+    ``"dpie"`` when classified by the DPIE ML model, or
     ``"content"`` when it was derived from keyword scoring (lower confidence).
     """
+    # Priority 0 — DPIE ML classifier (if available and confident)
+    try:
+        from src.intelligence.dpie_integration import DPIERegistry
+        registry = DPIERegistry.get()
+        if registry.is_loaded:
+            dpie_kind, dpie_conf = registry.classify_section_kind(
+                title=section_title or "", content=text or "",
+            )
+            if dpie_conf >= 0.5 and dpie_kind not in {"misc", "other", "unknown", "section_text"}:
+                return dpie_kind, "dpie"
+    except Exception:  # noqa: BLE001
+        pass  # DPIE unavailable, fall through
+
     # Priority 1 — title-based (fast, high-confidence)
     if section_title:
         title_kind = _title_match(section_title)

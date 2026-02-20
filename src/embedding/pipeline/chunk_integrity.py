@@ -123,6 +123,7 @@ def is_valid_chunk_text(
 
 def _split_bullets(lines: List[str], page_start: Optional[int], page_end: Optional[int]) -> List[AtomicUnit]:
     units: List[AtomicUnit] = []
+    non_bullet_buf: List[str] = []
     idx = 0
     while idx < len(lines):
         line = lines[idx]
@@ -131,6 +132,12 @@ def _split_bullets(lines: List[str], page_start: Optional[int], page_end: Option
             idx += 1
             continue
         if _BULLET_RE.match(stripped):
+            # Flush any buffered non-bullet text first
+            if non_bullet_buf:
+                text = "\n".join(non_bullet_buf).strip()
+                if text:
+                    units.append(AtomicUnit(text, "sentence", page_start, page_end))
+                non_bullet_buf = []
             bullet_lines = [line]
             idx += 1
             while idx < len(lines):
@@ -147,7 +154,14 @@ def _split_bullets(lines: List[str], page_start: Optional[int], page_end: Option
             bullet_text = "\n".join(bullet_lines).strip()
             units.append(AtomicUnit(bullet_text, "bullet", page_start, page_end))
             continue
+        # Non-bullet line: buffer it to preserve as content
+        non_bullet_buf.append(line)
         idx += 1
+    # Flush remaining non-bullet text
+    if non_bullet_buf:
+        text = "\n".join(non_bullet_buf).strip()
+        if text:
+            units.append(AtomicUnit(text, "sentence", page_start, page_end))
     return units
 
 

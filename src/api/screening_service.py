@@ -58,11 +58,34 @@ def filter_doc_ids_by_status(
     for doc_id in doc_ids:
         record = get_document_record(doc_id) or {}
         status = record.get("status")
-        if status == required_status:
+        if status in SCREENING_ELIGIBLE_STATUSES:
             eligible.append(doc_id)
         else:
             skipped.append({"document_id": doc_id, "status": status})
     return eligible, skipped
+
+
+def promote_to_screening_completed(document_id: str) -> None:
+    """Advance document status to SCREENING_COMPLETED if currently eligible.
+
+    Called after any successful screening endpoint (security, integrity, etc.).
+    Respects the status hierarchy: never downgrades from embedding/training states.
+    """
+    record = get_document_record(document_id) or {}
+    current_status = record.get("status")
+    if current_status in DONT_DOWNGRADE_STATUSES:
+        logger.debug(
+            "Skipping status promotion for %s; already at %s",
+            document_id, current_status,
+        )
+        return
+    if current_status in SCREENING_ELIGIBLE_STATUSES:
+        _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
+    else:
+        logger.debug(
+            "Skipping status promotion for %s; status %s not eligible",
+            document_id, current_status,
+        )
 
 
 def _set_document_status(

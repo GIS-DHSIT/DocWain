@@ -18,6 +18,7 @@ from src.api.screening_service import (
     apply_security_results_for_endpoint,
     apply_security_results_for_run,
     filter_doc_ids_by_status,
+    promote_to_screening_completed,
 )
 from src.api.statuses import STATUS_EXTRACTION_COMPLETED
 from .engine import ScreeningEngine
@@ -553,6 +554,10 @@ def _run_doc_based_screening(endpoint: str, options: MultiDocOptions) -> Dict[st
     }
     if endpoint == "security":
         apply_security_results_for_endpoint(doc_entries)
+    # Promote successfully-screened docs to SCREENING_COMPLETED for all endpoints
+    for entry in doc_entries:
+        if entry.get("status") == "succeeded" and entry.get("doc_id"):
+            promote_to_screening_completed(entry["doc_id"])
     persist_result = _persist_screening_reports(run_id, endpoint, options_payload, doc_entries)
     response.update(persist_result)
     logger.info(
@@ -744,6 +749,14 @@ def run_screening(
         documents = [ScreeningDocumentResult(**res) for res in doc_results]
         if "security" in categories:
             apply_security_results_for_run(doc_results)
+        # Promote successfully-screened docs to SCREENING_COMPLETED
+        # so embedding can proceed regardless of which categories were run
+        for task_item in tasks:
+            _doc_id = task_item.get("doc_id")
+            if _doc_id:
+                matching = [r for r in doc_results if r.get("doc_id") == _doc_id and not r.get("errors")]
+                if matching:
+                    promote_to_screening_completed(_doc_id)
         summary = _summary_from_results(documents)
         status_text = "success"
         if summary.failed and summary.succeeded == 0:
