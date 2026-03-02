@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Large binaries
+*.zip
+*.tar.gz
+*.rar
+agentsplayground
+agentsplayground.sig
+
+# Cache
+.pytest_cache/
+.cache/
+.mypy_cache/
+.ruff_cache/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+src/docs-db/.lock
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.tox/
+.nox/
+
+# Type checking
+.dmypy.json
+dmypy.json
+
+# Documentation build
+site/
+_build/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
