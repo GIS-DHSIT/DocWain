@@ -13,9 +13,10 @@ from qdrant_client import QdrantClient
 
 from src.api.config import Config
 from src.finetune.dataset_builder import _sample_chunks, build_dataset_from_qdrant
-from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest, FinetuneStatus
+from src.finetune.models import CollectionOnlyFinetuneRequest, FinetuneRequest
 from src.finetune.unsloth_trainer import get_finetune_manager
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
+from src.utils.payload_utils import get_source_name
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +137,7 @@ class NemotronOrchestratorAgent:
             meta = ch.get("metadata") or {}
             examples.append(
                 {
-                    "source_file": meta.get("source_file"),
+                    "source_name": get_source_name(meta),
                     "document_id": meta.get("document_id"),
                     "chunk_index": meta.get("chunk_index"),
                     "profile_id": meta.get("profile_id"),
@@ -364,7 +365,7 @@ class AgenticFinetuneOrchestrator:
                     "collection_name": collection_name,
                     "profile_id": profile_id,
                     "document_id": metadata.get("document_id"),
-                    "source_file": metadata.get("source_file"),
+                    "source_name": get_source_name(metadata),
                     "chunk_id": metadata.get("chunk_id"),
                     "page": metadata.get("page"),
                     "chunk_index": metadata.get("chunk_index"),

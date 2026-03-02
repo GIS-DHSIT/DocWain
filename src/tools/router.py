@@ -1,5 +1,12 @@
+"""Agent router — backward-compatible /api/tools/run endpoint.
+
+Individual tool HTTP endpoints have been replaced by the unified agent API
+at /api/agents/{agent_name}/execute. This router maintains /api/tools/run
+for backward compatibility and delegates to the agent registry.
+"""
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header
@@ -8,11 +15,13 @@ from pydantic import BaseModel, Field
 
 from src.tools.base import ToolError, generate_correlation_id, registry, standard_response
 
-# Import tool modules so their routers + handlers are registered.
+# Import agent modules so their handlers are registered via @register_agent.
+# The handlers are still used by the RAG pipeline internally.
 from src.tools import (  # noqa: F401
     stt,
     tts,
     translator,
+    image_analysis,
     tutor,
     creator,
     email_drafting,
@@ -25,12 +34,15 @@ from src.tools import (  # noqa: F401
     web_extract,
 )
 
-router = APIRouter(prefix="/tools", tags=["Tools"])
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/tools", tags=["Agents"])
 
 
 class ToolRunRequest(BaseModel):
-    tool_name: str = Field(..., description="Registered tool name to execute")
-    input: Dict[str, Any] | None = Field(default=None, description="Input payload for the tool")
+    tool_name: str = Field(default="", description="Registered tool/agent name to execute (deprecated, use agent_name)")
+    agent_name: Optional[str] = Field(default=None, description="Agent name to execute (takes priority over tool_name)")
+    input: Dict[str, Any] | None = Field(default=None, description="Input payload for the agent")
     context: Dict[str, Any] | None = Field(default=None, description="Context (documents, urls, text)")
     options: Dict[str, Any] | None = Field(default=None, description="Execution options")
     subscription_id: Optional[str] = None
@@ -38,9 +50,20 @@ class ToolRunRequest(BaseModel):
     user_id: Optional[str] = None
 
 
+# Alias: callers may use AgentRunRequest as the canonical name
+AgentRunRequest = ToolRunRequest
+
+
 @router.post("/run")
 async def run_tool(request: ToolRunRequest, x_correlation_id: str | None = Header(None)):
+    """Execute a registered agent by name.
+
+    .. deprecated::
+        This endpoint is maintained for backward compatibility.
+        Prefer ``POST /api/agents/{agent_name}/execute`` for new integrations.
+    """
     correlation_id = generate_correlation_id(x_correlation_id)
+    resolved_name = request.agent_name or request.tool_name
     payload = {
         "input": request.input or {},
         "context": request.context or {},
@@ -51,14 +74,14 @@ async def run_tool(request: ToolRunRequest, x_correlation_id: str | None = Heade
     }
     try:
         result = await registry.invoke(
-            request.tool_name,
+            resolved_name,
             payload,
             correlation_id=correlation_id,
         )
         return result
     except ToolError as exc:
         error_response = standard_response(
-            request.tool_name,
+            resolved_name,
             status="error",
             grounded=False,
             context_found=False,
@@ -69,21 +92,5 @@ async def run_tool(request: ToolRunRequest, x_correlation_id: str | None = Heade
         return JSONResponse(status_code=exc.status_code, content=error_response)
 
 
-# Mount individual routers under /tools/<name>/...
-router.include_router(stt.router)
-router.include_router(tts.router)
-router.include_router(translator.router)
-router.include_router(tutor.router)
-router.include_router(creator.router)
-router.include_router(email_drafting.router)
-router.include_router(db_connector.router)
-router.include_router(code_docs.router)
-router.include_router(medical.router)
-router.include_router(lawhere.router)
-router.include_router(resumes.router)
-router.include_router(jira_confluence.router)
-router.include_router(web_extract.router)
-
 # Alias for import convenience
 tools_router = router
-

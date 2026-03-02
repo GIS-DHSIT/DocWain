@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 from collections import defaultdict
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     from zoneinfo import ZoneInfo

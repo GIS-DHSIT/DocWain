@@ -1,0 +1,15 @@
+[project]
+name = "docwain-gptoss-finetune-pipeline"
+version = "0.1.0"
+description = "DocWain gpt-oss LoRA fine-tune -> Ollama private model pipeline"
+requires-python = ">=3.12"
+
+[project.scripts]
+docwain-gen-dataset = "docwain_ft.dataset_gen:main"
+docwain-train-lora = "docwain_ft.train_lora:main"
+docwain-export-adapter = "docwain_ft.export_adapter:main"
+docwain-package-ollama = "docwain_ft.ollama_packager:main"
+docwain-eval = "docwain_ft.eval_harness:main"
+
+[tool.pytest.ini_options]
+addopts = "-q"

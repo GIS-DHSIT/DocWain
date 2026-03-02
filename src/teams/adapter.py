@@ -147,24 +147,53 @@ def answer_question(*args, **kwargs):
     return _answer_question(*args, **kwargs)
 
 
-async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: str) -> Dict[str, Any]:
+async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     """Handle Teams activities that include file attachments."""
+    correlation_id = correlation_id or get_correlation_id(activity=activity, headers=None)
     session_id = extract_session_id(activity)
     user_id = extract_user_id(activity)
-    context = TEAMS_CHAT_SERVICE.build_context(user_id=user_id, session_id=session_id)
-    TEAMS_CHAT_SERVICE.ensure_collection(context.subscription_id)
-    result: IngestionResult = await ingest_attachments(
-        activity,
-        turn_context=None,
-        context=context,
-        correlation_id=correlation_id,
-        state_store=STATE_STORE,
+    pref_subscription = session_id if Config.Teams.SESSION_AS_SUBSCRIPTION else Config.Teams.DEFAULT_SUBSCRIPTION
+    pref_profile = user_id if Config.Teams.PROFILE_PER_USER else Config.Teams.DEFAULT_PROFILE
+    prefs = STATE_STORE.get_preferences(pref_subscription, pref_profile)
+    context = TEAMS_CHAT_SERVICE.build_context(
+        user_id=user_id,
+        session_id=session_id,
+        model_name=prefs.get("model_name") or Config.Teams.DEFAULT_MODEL,
+        persona=prefs.get("persona") or Config.Teams.DEFAULT_PERSONA,
     )
+    TEAMS_CHAT_SERVICE.ensure_collection(context.subscription_id)
+    attachments = activity.get("attachments") or []
+    image_only = all(
+        (att.get("contentType") or "").lower().startswith("image/") and not att.get("contentUrl")
+        for att in attachments
+    )
+    if attachments and image_only:
+        return {
+            "type": "message",
+            "text": "Please upload the image using the file attachment option so DocWain can ingest it.",
+        }
+
+    try:
+        result: IngestionResult = await ingest_attachments(
+            activity,
+            turn_context=None,
+            context=context,
+            correlation_id=correlation_id,
+            state_store=STATE_STORE,
+        )
+    except AttachmentIngestError as exc:
+        message = str(exc)
+        if "download URL" in message:
+            message = "Attachment could not be processed because the download link was missing."
+        elif "Unsupported attachment type" in message:
+            message = "Unsupported attachment type. Please upload the image or file using the attachment picker."
+        return {"type": "message", "text": message}
+
     filenames = ", ".join(result.filenames)
     return {
         "type": "message",
         "text": (
-            f"Processed file(s): {filenames}. "
+            f"Successfully processed: {filenames}. "
             f"Ingested {result.documents_created} document(s). "
             "You can start chatting now."
         ),
@@ -186,7 +215,7 @@ async def handle_teams_activity(
 
     if activity.get("attachments"):
         try:
-            return await handle_attachment_activity(activity, correlation_id)
+            return await handle_attachment_activity(activity)
         except AttachmentIngestError as exc:
             log.error("Teams attachment ingest error: %s", exc)
             return {"type": "message", "text": str(exc)}
@@ -221,7 +250,7 @@ async def handle_teams_activity(
             add_message_to_history(
                 user_id=user_id,
                 query=question,
-                answer=answer,
+                response=answer,
                 session_id=context.session_id,
                 new_session=False,
             )

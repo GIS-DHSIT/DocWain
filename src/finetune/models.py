@@ -100,6 +100,19 @@ class AutoFinetuneRequest(FinetuneRequest):
         return payload
 
 
+class AutoFinetuneRunRequest(BaseModel):
+    collection_name: Optional[str] = Field(None, description="Optional collection to target for the run")
+    profile_id: Optional[str] = Field(None, description="Optional profile to target")
+    dry_run: bool = Field(False, description="When true, only plan the run without executing jobs")
+    max_profiles_per_run: Optional[int] = Field(
+        None,
+        description="Optional cap on number of profiles processed per run",
+    )
+    max_points: int = Field(120, ge=1, description="Max chunks to sample from Qdrant")
+    questions_per_chunk: int = Field(2, ge=1, le=5, description="QA pairs per chunk")
+    generation_model: Optional[str] = Field(None, description="Model used to generate synthetic QA")
+
+
 class CollectionFinetuneRequest(AutoFinetuneRequest):
     """
     Request model for end-to-end finetuning driven solely by a Qdrant collection name.

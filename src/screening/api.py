@@ -18,6 +18,7 @@ from src.api.screening_service import (
     apply_security_results_for_endpoint,
     apply_security_results_for_run,
     filter_doc_ids_by_status,
+    promote_to_screening_completed,
 )
 from src.api.statuses import STATUS_EXTRACTION_COMPLETED
 from .engine import ScreeningEngine
@@ -43,6 +44,14 @@ def _decode_raw_bytes(raw_bytes_base64: Optional[str]) -> Optional[bytes]:
         return base64.b64decode(raw_bytes_base64.encode("utf-8"))
     except Exception:
         return None
+
+
+def _require_domain_specific() -> None:
+    if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Domain-specific screening is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
+        )
 
 
 def _error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -545,6 +554,10 @@ def _run_doc_based_screening(endpoint: str, options: MultiDocOptions) -> Dict[st
     }
     if endpoint == "security":
         apply_security_results_for_endpoint(doc_entries)
+    # Promote successfully-screened docs to SCREENING_COMPLETED for all endpoints
+    for entry in doc_entries:
+        if entry.get("status") == "succeeded" and entry.get("doc_id"):
+            promote_to_screening_completed(entry["doc_id"])
     persist_result = _persist_screening_reports(run_id, endpoint, options_payload, doc_entries)
     response.update(persist_result)
     logger.info(
@@ -585,6 +598,7 @@ def screen_resume(
     request: Union[MultiDocOptions, ScreenResumeRequest] = Body(...),
     engine: ScreeningEngine = Depends(get_screening_engine),
 ):
+    _require_domain_specific()
     if isinstance(request, MultiDocOptions):
         return _run_doc_based_screening("resume", request)
 
@@ -647,6 +661,7 @@ def screen_security(options: MultiDocOptions = Body(...)):
 
 @screening_router.post("/legality", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_legality(options: MultiDocLegalityOptions = Body(...)):
+    _require_domain_specific()
     return _run_doc_based_screening("legality", options)
 
 
@@ -734,6 +749,14 @@ def run_screening(
         documents = [ScreeningDocumentResult(**res) for res in doc_results]
         if "security" in categories:
             apply_security_results_for_run(doc_results)
+        # Promote successfully-screened docs to SCREENING_COMPLETED
+        # so embedding can proceed regardless of which categories were run
+        for task_item in tasks:
+            _doc_id = task_item.get("doc_id")
+            if _doc_id:
+                matching = [r for r in doc_results if r.get("doc_id") == _doc_id and not r.get("errors")]
+                if matching:
+                    promote_to_screening_completed(_doc_id)
         summary = _summary_from_results(documents)
         status_text = "success"
         if summary.failed and summary.succeeded == 0:

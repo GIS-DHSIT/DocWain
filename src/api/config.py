@@ -34,10 +34,54 @@ class Config:
         MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "10"))
         MAX_AGENT_EVIDENCE = int(os.getenv("MAX_AGENT_EVIDENCE", "20"))
         AGENT_MODEL_NAME = os.getenv("AGENT_MODEL_NAME", "nemotron-3-nano")
+        RETRIEVER_MAX_WORKERS = int(os.getenv("RETRIEVER_MAX_WORKERS", "4"))
+        AGENT_AUTO_TOOLS = os.getenv("AGENT_AUTO_TOOLS", "true").lower() in {"1", "true", "yes", "on"}
+        AGENT_MAX_AUTO_TOOLS = int(os.getenv("AGENT_MAX_AUTO_TOOLS", "3"))
+
+    class DialogueIntel:
+        PERSONA_ENABLED = os.getenv("DOCWAIN_PERSONA_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SENTIMENT_ENABLED = os.getenv("DOCWAIN_SENTIMENT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SMALLTALK_MODEL = os.getenv("DOCWAIN_SMALLTALK_MODEL", "")
+        INTENT_THRESHOLD = float(os.getenv("DOCWAIN_INTENT_THRESHOLD", "0.65"))
+
+    class Features:
+        DOMAIN_SPECIFIC_ENABLED = os.getenv("DOCWAIN_DOMAIN_SPECIFIC_ENABLED", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     class Qdrant:
         URL = os.getenv("QDRANT_URL", 'https://89f776c3-76fb-493f-8509-c583d9579329.europe-west3-0.gcp.cloud.qdrant.io')
         API = os.getenv("QDRANT_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.-cJ2HVTYcH3u5KNuZuxZRNJhhTFfZwqkoVacNCKBYkY")
+
+    class Neo4j:
+        URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+        USER = os.getenv("NEO4J_USER", "neo4j")
+        PASSWORD = os.getenv("NEO4J_PASSWORD", "dhs@welcome01")
+        DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
+
+    class KnowledgeGraph:
+        QDRANT_COLLECTION = os.getenv("KG_QDRANT_COLLECTION", os.getenv("QDRANT_COLLECTION", "default"))
+        ENABLED = os.getenv("KG_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MAX_EXPANSION_ENTITIES = int(os.getenv("KG_MAX_EXPANSION_ENTITIES", "8"))
+        MAX_GRAPH_SNIPPETS = int(os.getenv("KG_MAX_GRAPH_SNIPPETS", "10"))
+        GRAPH_SCORE_ALPHA = float(os.getenv("KG_GRAPH_SCORE_ALPHA", "0.7"))
+        MAX_GRAPH_RESULTS = int(os.getenv("KG_MAX_GRAPH_RESULTS", "200"))
+
+    class Intelligence:
+        ENABLED = os.getenv("DWX_INTEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SESSION_TTL_SECONDS = int(os.getenv("DWX_SESSION_TTL_SECONDS", "604800"))
+        CATALOG_TTL_SECONDS = int(os.getenv("DWX_CATALOG_TTL_SECONDS", "2592000"))
+        SUMMARY_TTL_SECONDS = int(os.getenv("DWX_SUMMARY_TTL_SECONDS", "2592000"))
+        ENTITIES_TTL_SECONDS = int(os.getenv("DWX_ENTITIES_TTL_SECONDS", "2592000"))
+        ROUTE_HISTORY_MAX = int(os.getenv("DWX_ROUTE_HISTORY_MAX", "20"))
+        ENTITY_HISTORY_MAX = int(os.getenv("DWX_ENTITY_HISTORY_MAX", "50"))
+        SECTION_SUMMARY_VECTORS_ENABLED = os.getenv("DWX_SECTION_SUMMARY_VECTORS", "true").lower() in {"1", "true", "yes", "on"}
+        SECTION_SUMMARY_MAX_CHARS = int(os.getenv("DWX_SECTION_SUMMARY_MAX_CHARS", "700"))
+        SECTION_SUMMARY_TOPK = int(os.getenv("DWX_SECTION_SUMMARY_TOPK", "6"))
+        SECTION_RETRIEVAL_ENABLED = os.getenv("DWX_SECTION_RETRIEVAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
     class Gemini:
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
@@ -46,13 +90,14 @@ class Config:
     class Model:
         EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")
         EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1024"))
+        OLLAMA_EMBEDDING_MODEL = os.getenv("OLLAMA_EMBEDDING_MODEL", "bge-m3")
         SENTENCE_TRANSFORMERS = EMBEDDING_MODEL
         SENTENCE_TRANSFORMERS_FALLBACK = SENTENCE_TRANSFORMERS
         SENTENCE_TRANSFORMERS_CANDIDATES = [
             EMBEDDING_MODEL,
-            os.getenv("EMBEDDING_FALLBACK_MODEL", "sentence-transformers/all-mpnet-base-v2"),
+            os.getenv("EMBEDDING_FALLBACK_MODEL", "BAAI/bge-base-en-v1.5"),
         ]
-        RERANKER_MODEL = os.getenv("RERANKER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+        RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
         OCR_ENGINE = os.getenv("OCR_ENGINE", "pytesseract")
         AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
         AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
@@ -62,7 +107,28 @@ class Config:
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
         GEMINI_MODEL_NAME = "gemini-2.5-flash"
+        HF_HUB_READ_TIMEOUT = int(os.getenv("HF_HUB_READ_TIMEOUT", "30"))
+        HF_HUB_CONNECT_TIMEOUT = int(os.getenv("HF_HUB_CONNECT_TIMEOUT", "10"))
+        HF_HUB_MAX_RETRIES = int(os.getenv("HF_HUB_MAX_RETRIES", "3"))
+        HF_DISABLE_TELEMETRY = os.getenv("HF_HUB_DISABLE_TELEMETRY", "false").lower() in {"1", "true", "yes", "on"}
+        TRANSFORMERS_OFFLINE = os.getenv("TRANSFORMERS_OFFLINE", "false").lower() in {"1", "true", "yes", "on"}
+        DISABLE_HF = os.getenv("DISABLE_HF", "false").lower() in {"1", "true", "yes", "on"}
+        OFFLINE_ONLY = os.getenv("DOCWAIN_OFFLINE_ONLY", "true").lower() in {"1", "true", "yes", "on"}
 
+    class VisionOCR:
+        ENABLED = os.getenv("VISION_OCR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MODEL = os.getenv("VISION_OCR_MODEL", "glm-ocr:latest")
+        MIN_IMAGE_WIDTH = int(os.getenv("VISION_OCR_MIN_WIDTH", "100"))
+        MIN_IMAGE_HEIGHT = int(os.getenv("VISION_OCR_MIN_HEIGHT", "100"))
+        FALLBACK_TO_TRADITIONAL = os.getenv("VISION_OCR_FALLBACK", "true").lower() in {"1", "true", "yes", "on"}
+        OCR_CONTENT_IMAGES = os.getenv("VISION_OCR_CONTENT_IMAGES", "true").lower() in {"1", "true", "yes", "on"}
+
+    class Azure:
+        AZURE_SUBSCRIPTION_ID = "249bb11f-9b6e-4c0e-a844-500d627b80b3"
+        AZURE_RESOURCE_GROUP = "rg-docwain-dev"
+        AZURE_PROJECT_NAME = "dhs-ai-competency"
+        AZURE_AI_ENDPOINT = "https://dhs-ai-competency-resource.services.ai.azure.com/api/projects/dhs-ai-competency"
+        AZURE_AI_KEY = "CpQaDiSSIBQBXcIysi5DpdoalYW8ghtDLwU8nGOsagVlkulbKvCsJQQJ99CAAC77bzfXJ3w3AAAAACOGG3Yu"
 
     class AzureGpt4o:
         AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
@@ -116,12 +182,16 @@ class Config:
         DB = 0
         SSL = True
         ABORT_CONNECT = False
+        CLEAR_UNSAFE_ON_STARTUP = os.getenv("REDIS_CLEAR_UNSAFE_ON_STARTUP", "true").lower() in {"1", "true", "yes", "on"}
+        UNSAFE_KEY_PATTERNS = os.getenv("REDIS_UNSAFE_KEY_PATTERNS", "dw:plan:*,rag:*").strip()
+        CLEAR_SCAN_COUNT = int(os.getenv("REDIS_CLEAR_SCAN_COUNT", "200"))
+        CLEAR_MAX_KEYS = int(os.getenv("REDIS_CLEAR_MAX_KEYS", "5000"))
 
     class Teams:
         SHARED_SECRET = os.getenv("TEAMS_SHARED_SECRET", "")
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
-        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION", "15e0c724-4de0-492e-9861-9e637b3f9076")
+        DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
         DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
@@ -140,16 +210,51 @@ class Config:
         WEB_APP_URL = os.getenv("DOCWAIN_WEB_URL", os.getenv("TEAMS_WEB_APP_URL", "https://www.docwain.ai"))
         DIAG_MODE = os.getenv("TEAMS_DIAG_MODE", "").lower() in {"1", "true", "yes", "on"}
 
+    class Tools:
+        LLM_ENABLED = os.getenv("TOOLS_LLM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        LLM_TIMEOUT = float(os.getenv("TOOLS_LLM_TIMEOUT", "30.0"))
+        LLM_MAX_INPUT_CHARS = int(os.getenv("TOOLS_LLM_MAX_INPUT_CHARS", "3500"))
+
     class Retrieval:
         CHUNK_SIZE = int(os.getenv("RETRIEVAL_CHUNK_SIZE", "800"))
         CHUNK_OVERLAP = int(os.getenv("RETRIEVAL_CHUNK_OVERLAP", "200"))
         MIN_CHUNK_SIZE = int(os.getenv("RETRIEVAL_MIN_CHUNK_SIZE", "150"))
+        MIN_CHUNK_CHARS = int(os.getenv("RETRIEVAL_MIN_CHUNK_CHARS", "40"))
+
+    class Reranker:
+        DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
+        TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "12.0"))
+
+    class RagV3:
+        DEBUG_LOGS = os.getenv("DOCWAIN_RAG_V3_DEBUG_LOGS", "false").lower() in {"1", "true", "yes", "on"}
+        DEBUG_SCHEMA = os.getenv("DOCWAIN_RAG_V3_DEBUG_SCHEMA", "false").lower() in {"1", "true", "yes", "on"}
+        MIN_CHARS = int(os.getenv("RETRIEVAL_MIN_CHARS", "80"))
+        MIN_TOKENS = int(os.getenv("RETRIEVAL_MIN_TOKENS", "15"))
+        MIN_REQUIRED_CHUNKS = int(
+            os.getenv("RETRIEVAL_MIN_REQUIRED_CHUNKS", os.getenv("RETRIEVAL_MIN_VALID_CHUNKS_PER_DOC", "3"))
+        )
+        MIN_VALID_CHUNKS_PER_DOC = MIN_REQUIRED_CHUNKS
+        FALLBACK_CHUNK_SIZE = int(os.getenv("RETRIEVAL_FALLBACK_CHUNK_SIZE", "600"))
+        FALLBACK_OVERLAP = int(os.getenv("RETRIEVAL_FALLBACK_CHUNK_OVERLAP", "80"))
+        MIN_CHUNK_QUALITY = float(os.getenv("RETRIEVAL_MIN_CHUNK_QUALITY", "0.2"))
+        MAX_SYMBOL_RATIO = float(os.getenv("RETRIEVAL_MAX_SYMBOL_RATIO", "0.6"))
         CHUNK_COVERAGE_THRESHOLD = float(os.getenv("CHUNK_COVERAGE_THRESHOLD", "0.98"))
+        TOPK_DENSE = int(os.getenv("TOPK_DENSE", "50"))
+        TOPK_RERANK = int(os.getenv("TOPK_RERANK", "20"))
+        FINAL_CONTEXT_CHUNKS = int(os.getenv("FINAL_CONTEXT_CHUNKS", "8"))
+        HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.75"))
+        MIN_CONFIDENCE_TO_ANSWER = float(os.getenv("MIN_CONFIDENCE_TO_ANSWER", "0.62"))
+        DEDUP_THRESHOLD = float(os.getenv("RETRIEVAL_DEDUP_THRESHOLD", "0.92"))
+        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2048"))
         MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
+        MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
         SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
         USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
         USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"
         NEIGHBOR_WINDOW = int(os.getenv("RETRIEVAL_NEIGHBOR_WINDOW", "2"))
+        RETRIEVAL_PLANNER_ENABLED = os.getenv("RETRIEVAL_PLANNER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        RETRIEVAL_PLANNER_MAX_RETRIES = int(os.getenv("RETRIEVAL_PLANNER_MAX_RETRIES", "2"))
+        RETRIEVAL_PLANNER_BACKOFF = float(os.getenv("RETRIEVAL_PLANNER_BACKOFF", "0.4"))
         NEIGHBOR_MAX_NEW = int(os.getenv("RETRIEVAL_NEIGHBOR_MAX_NEW", "10"))
         BROAD_RECALL_MULTIPLIER = float(os.getenv("RETRIEVAL_BROAD_RECALL_MULTIPLIER", "1.5"))
         BROAD_RECALL_THRESHOLD = float(os.getenv("RETRIEVAL_BROAD_RECALL_THRESHOLD", "0.02"))
@@ -166,12 +271,129 @@ class Config:
             "sparse": float(os.getenv("HYBRID_WEIGHT_SPARSE", "0.4")),
         }
         RERANKER_ENABLED = os.getenv("RETRIEVAL_RERANKER_ENABLED", "true").lower() == "true"
+        METADATA_FALLBACK_LIMIT = int(os.getenv("RETRIEVAL_METADATA_FALLBACK_LIMIT", "200"))
+        EVIDENCE_SYNTHESIZER_ENABLED = os.getenv("EVIDENCE_SYNTHESIZER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        EVIDENCE_SYNTHESIZER_MAX_RETRIES = int(os.getenv("EVIDENCE_SYNTHESIZER_MAX_RETRIES", "1"))
+        EVIDENCE_SYNTHESIZER_BACKOFF = float(os.getenv("EVIDENCE_SYNTHESIZER_BACKOFF", "0.3"))
+        EVIDENCE_SYNTHESIZER_MAX_EXCERPTS_PER_FILE = int(os.getenv("EVIDENCE_SYNTHESIZER_MAX_EXCERPTS_PER_FILE", "6"))
+        EVIDENCE_SYNTHESIZER_EXCERPT_CHARS = int(os.getenv("EVIDENCE_SYNTHESIZER_EXCERPT_CHARS", "800"))
+        METADATA_FALLBACK_MIN_SCORE = float(os.getenv("RETRIEVAL_METADATA_FALLBACK_MIN_SCORE", "0.02"))
+        MIN_QUERY_OVERLAP = float(os.getenv("RETRIEVAL_MIN_QUERY_OVERLAP", "0.06"))
+        RELEVANCE_KEEP_TOP_K = int(os.getenv("RETRIEVAL_RELEVANCE_KEEP_TOP_K", "12"))
+        MIN_COMPARISON_DOCS = int(os.getenv("RETRIEVAL_MIN_COMPARISON_DOCS", "2"))
+        RETRIEVAL_GUARD_BUDGET_MS = int(os.getenv("RETRIEVAL_GUARD_BUDGET_MS", "40"))
+        RETRIEVAL_QUALITY_THRESH_HIGH = float(os.getenv("RETRIEVAL_QUALITY_THRESH_HIGH", "0.75"))
+        RETRIEVAL_QUALITY_THRESH_LOW = float(os.getenv("RETRIEVAL_QUALITY_THRESH_LOW", "0.45"))
+        RETRIEVAL_EVIDENCE_MIN_COVERAGE = float(os.getenv("RETRIEVAL_EVIDENCE_MIN_COVERAGE", "0.6"))
+        RETRIEVAL_EVIDENCE_STRICT_COVERAGE = float(os.getenv("RETRIEVAL_EVIDENCE_STRICT_COVERAGE", "0.75"))
+        RETRIEVAL_RERANK_ON_LOW_QUALITY = os.getenv("RETRIEVAL_RERANK_ON_LOW_QUALITY", "true").lower() == "true"
+        RETRIEVAL_RERANK_ON_HIGH_STAKES = os.getenv("RETRIEVAL_RERANK_ON_HIGH_STAKES", "true").lower() == "true"
+        KG_PROBE_TIMEOUT_MS = int(os.getenv("KG_PROBE_TIMEOUT_MS", "80"))
+        KG_PROBE_TTL_SECONDS = int(os.getenv("KG_PROBE_TTL_SECONDS", "1200"))
+        KG_PROBE_LIMIT = int(os.getenv("KG_PROBE_LIMIT", "20"))
+        KG_DOC_FILTER_LIMIT = int(os.getenv("KG_DOC_FILTER_LIMIT", "8"))
+        KG_RETRIEVAL_CACHE_TTL_SECONDS = int(os.getenv("KG_RETRIEVAL_CACHE_TTL_SECONDS", "240"))
+        RETRIEVAL_FALLBACK_REWRITE = os.getenv("RETRIEVAL_FALLBACK_REWRITE", "true").lower() == "true"
+        RETRIEVAL_FALLBACK_MAX_ATTEMPTS = int(os.getenv("RETRIEVAL_FALLBACK_MAX_ATTEMPTS", "1"))
+
+    class Quality:
+        ENABLED = os.getenv("QUALITY_EVAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        AUTO_REPAIR_ENABLED = os.getenv("QUALITY_AUTO_REPAIR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        EVAL_BUDGET_MS = int(os.getenv("QUALITY_EVAL_BUDGET_MS", "40"))
+        REPAIR_BUDGET_MS = int(os.getenv("QUALITY_REPAIR_BUDGET_MS", "500"))
+        MAX_REPAIR_ATTEMPTS = int(os.getenv("QUALITY_MAX_REPAIR_ATTEMPTS", "2"))
+        LEX_SUPPORT_TH = float(os.getenv("QUALITY_LEX_SUPPORT_TH", "0.18"))
+        SUPPORTED_RATIO_TH = float(os.getenv("QUALITY_SUPPORTED_RATIO_TH", "0.60"))
+        CRITICAL_SUPPORTED_RATIO_TH = float(os.getenv("QUALITY_CRITICAL_SUPPORTED_RATIO_TH", "0.75"))
+        OVERALL_SCORE_TH = float(os.getenv("QUALITY_OVERALL_SCORE_TH", "0.72"))
+        HIGH_CONFIDENCE_THRESHOLD = float(os.getenv("QUALITY_HIGH_CONFIDENCE_THRESHOLD", "0.75"))
+        GROUNDING_GATE_ENABLED = os.getenv("GROUNDING_GATE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        GROUNDING_GATE_CRITICAL_TH = float(os.getenv("GROUNDING_GATE_CRITICAL_TH", "0.30"))
+
+    class Chat:
+        MAX_HISTORY_TURNS = int(os.getenv("CHAT_MAX_HISTORY_TURNS", "6"))
+        SUMMARY_TURNS = int(os.getenv("CHAT_SUMMARY_TURNS", "6"))
+        CONTEXT_TURNS = int(os.getenv("CHAT_CONTEXT_TURNS", "4"))
+
+    class Companion:
+        CLASSIFIER_TTL_SECONDS = int(os.getenv("COMPANION_CLASSIFIER_TTL_SECONDS", "600"))
+        CLASSIFIER_USE_LLM = os.getenv("COMPANION_CLASSIFIER_USE_LLM", "false").lower() in {"1", "true", "yes", "on"}
+        CLASSIFIER_MODEL = os.getenv("COMPANION_CLASSIFIER_MODEL", "")
+        CLASSIFIER_TIMEOUT_SEC = float(os.getenv("COMPANION_CLASSIFIER_TIMEOUT_SEC", "0.4"))
 
     class LLM:
         TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
         TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
         MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
         MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
+        DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
+
+    class VLLM:
+        """vLLM serving config — SafeTensor models via OpenAI-compatible API."""
+        ENABLED = os.getenv("VLLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8000/v1/chat/completions")
+        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "gpt-oss")
+        API_KEY = os.getenv("VLLM_API_KEY", "")
+        TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "30"))
+
+    class TaskRouting:
+        ENABLED = os.getenv("TASK_ROUTING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        QUERY_REWRITE_MODEL = os.getenv("TASK_ROUTE_QUERY_REWRITE", "")
+        INTENT_PARSE_MODEL = os.getenv("TASK_ROUTE_INTENT_PARSE", "")
+        RESPONSE_GENERATION_MODEL = os.getenv("TASK_ROUTE_RESPONSE_GENERATION", "")
+        STRUCTURED_EXTRACTION_MODEL = os.getenv("TASK_ROUTE_STRUCTURED_EXTRACTION", "")
+        TOOL_EXECUTION_MODEL = os.getenv("TASK_ROUTE_TOOL_EXECUTION", "")
+        ANSWER_JUDGING_MODEL = os.getenv("TASK_ROUTE_ANSWER_JUDGING", "")
+        GROUNDING_VERIFY_MODEL = os.getenv("TASK_ROUTE_GROUNDING_VERIFY", "")
+        CONTENT_GENERATION_MODEL = os.getenv("TASK_ROUTE_CONTENT_GENERATION", "")
+        QUERY_CLASSIFICATION_MODEL = os.getenv("TASK_ROUTE_QUERY_CLASSIFICATION", "")
+        CONVERSATION_SUMMARY_MODEL = os.getenv("TASK_ROUTE_CONVERSATION_SUMMARY", "")
+        DOCUMENT_UNDERSTANDING_MODEL = os.getenv("TASK_ROUTE_DOCUMENT_UNDERSTANDING", "")
+        GENERAL_MODEL = os.getenv("TASK_ROUTE_GENERAL", "")
+        FALLBACK_MODEL = os.getenv("TASK_ROUTE_FALLBACK", "gpt-oss:latest")
+
+    class MultiAgent:
+        ENABLED = os.getenv("MULTI_AGENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        CLASSIFIER_MODEL = os.getenv("MULTI_AGENT_CLASSIFIER", "gpt-oss:latest")
+        EXTRACTOR_MODEL = os.getenv("MULTI_AGENT_EXTRACTOR", "gpt-oss:latest")
+        GENERATOR_MODEL = os.getenv("MULTI_AGENT_GENERATOR", "gpt-oss:latest")
+        VERIFIER_MODEL = os.getenv("MULTI_AGENT_VERIFIER", "gpt-oss:latest")
+        DEFAULT_MODEL = os.getenv("MULTI_AGENT_DEFAULT", "gpt-oss:latest")
+        VERIFIER_ENABLED = os.getenv("MULTI_AGENT_VERIFIER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        CLASSIFIER_TIMEOUT = float(os.getenv("MULTI_AGENT_CLASSIFIER_TIMEOUT", "15.0"))
+        VERIFIER_TIMEOUT = float(os.getenv("MULTI_AGENT_VERIFIER_TIMEOUT", "30.0"))
+        CLASSIFIER_CONFIDENCE_THRESHOLD = float(os.getenv("MULTI_AGENT_CLASSIFIER_CONFIDENCE", "0.7"))
+
+    class ModelArbitration:
+        ENABLED = os.getenv("MODEL_ARBITRATION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        MAX_PARALLEL = int(os.getenv("MODEL_ARBITRATION_MAX_PARALLEL", "3"))
+        MODELS_RAW = os.getenv("MODEL_ARBITRATION_MODELS", "").strip()
+        MODELS = []
+        if MODELS_RAW:
+            try:
+                MODELS = json.loads(MODELS_RAW)
+            except Exception:
+                MODELS = []
+        EMBEDDING_MAP_RAW = os.getenv("MODEL_EMBEDDING_MAP", "").strip()
+        EMBEDDING_MAP = {}
+        if EMBEDDING_MAP_RAW:
+            try:
+                EMBEDDING_MAP = json.loads(EMBEDDING_MAP_RAW)
+            except Exception:
+                EMBEDDING_MAP = {}
+        INDEX_SUFFIX_MAP_RAW = os.getenv("EMBEDDING_INDEX_SUFFIX_MAP", "").strip()
+        INDEX_SUFFIX_MAP = {}
+        if INDEX_SUFFIX_MAP_RAW:
+            try:
+                INDEX_SUFFIX_MAP = json.loads(INDEX_SUFFIX_MAP_RAW)
+            except Exception:
+                INDEX_SUFFIX_MAP = {}
+
+    class RAGV2:
+        ENABLED = os.getenv("DOCWAIN_RAG_V2_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
+    class RAGV3:
+        ENABLED = os.getenv("RAG_V3_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
     class Finetune:
         AUTO_ENABLED = os.getenv("FINETUNE_AUTO_ENABLED", "false").lower() == "true"
@@ -201,3 +423,120 @@ class Config:
         AGENT_FALLBACK_TO_LEGACY = os.getenv("FINETUNE_AGENT_FALLBACK_TO_LEGACY", "true").lower() == "true"
         OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         OLLAMA_API = os.getenv("OLLAMA_API", "455d65a864a84e3bba92c0faea74f027.t3cJBT6-bjULKiySSIZQx4Dg")
+
+    class FollowUp:
+        ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MAX_SUGGESTIONS = int(os.getenv("FOLLOWUP_MAX_SUGGESTIONS", "3"))
+        LLM_TIMEOUT = float(os.getenv("FOLLOWUP_LLM_TIMEOUT", "3.0"))
+
+    class QueryPlanner:
+        ENABLED = os.getenv("QUERY_PLANNER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MAX_STEPS = int(os.getenv("QUERY_PLANNER_MAX_STEPS", "3"))
+        LLM_TIMEOUT = float(os.getenv("QUERY_PLANNER_LLM_TIMEOUT", "5.0"))
+
+    class HallucinationCorrector:
+        ENABLED = os.getenv("HALLUCINATION_CORRECTOR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        SCORE_THRESHOLD = float(os.getenv("HALLUCINATION_SCORE_THRESHOLD", "0.5"))
+        MAX_CORRECTIONS = int(os.getenv("HALLUCINATION_MAX_CORRECTIONS", "3"))
+
+    class Confidence:
+        ENABLED = os.getenv("CONFIDENCE_SCORING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
+    class WebSearch:
+        ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        ENGINE = os.getenv("WEB_SEARCH_ENGINE", "duckduckgo")
+        TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
+        MAX_RESULTS = int(os.getenv("WEB_SEARCH_MAX_RESULTS", "5"))
+        TIMEOUT = float(os.getenv("WEB_SEARCH_TIMEOUT", "30.0"))
+        MAX_URL_FETCH_CHARS = int(os.getenv("WEB_SEARCH_MAX_URL_FETCH_CHARS", "6000"))
+        FALLBACK_ON_NO_RESULTS = os.getenv("WEB_SEARCH_FALLBACK_ON_NO_RESULTS", "true").lower() in {"1", "true", "yes", "on"}
+
+    class Synthesis:
+        ENABLED = os.getenv("SYNTHESIS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        TIMEOUT = float(os.getenv("SYNTHESIS_TIMEOUT", "10.0"))
+        MIN_DOCUMENTS = int(os.getenv("SYNTHESIS_MIN_DOCUMENTS", "2"))
+
+    class Verification:
+        ENABLED = os.getenv("VERIFICATION_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+    class LLMCache:
+        ENABLED = os.getenv("LLM_CACHE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        TTL_SECONDS = int(os.getenv("LLM_CACHE_TTL_SECONDS", "3600"))
+
+    class DomainKnowledge:
+        ENABLED = os.getenv("DOMAIN_KNOWLEDGE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        WEB_ENRICHMENT = os.getenv("DOMAIN_KNOWLEDGE_WEB_ENRICHMENT", "false").lower() in {"1", "true", "yes", "on"}
+        CACHE_TTL = int(os.getenv("DOMAIN_KNOWLEDGE_CACHE_TTL", "3600"))
+        INJECT_INTO_PROMPTS = os.getenv("DOMAIN_KNOWLEDGE_INJECT_PROMPTS", "true").lower() in {"1", "true", "yes", "on"}
+
+    class CloudLLM:
+        ENABLED = os.getenv("DOCWAIN_CLOUD_LLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+        AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+        AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
+        CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+        GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+        COMPLEXITY_THRESHOLD_T2 = float(os.getenv("CLOUD_THRESHOLD_T2", "0.4"))
+        COMPLEXITY_THRESHOLD_T3 = float(os.getenv("CLOUD_THRESHOLD_T3", "0.7"))
+        CIRCUIT_BREAKER_FAILURES = int(os.getenv("CLOUD_CIRCUIT_BREAKER_FAILURES", "3"))
+        CIRCUIT_BREAKER_COOLDOWN = int(os.getenv("CLOUD_CIRCUIT_BREAKER_COOLDOWN", "60"))
+
+    class DocumentProcessing:
+        MAX_CONCURRENT_DEEP_ANALYSIS = int(os.getenv("DOC_PROCESSING_MAX_CONCURRENT", "2"))
+        KG_INGEST_ASYNC = os.getenv("KG_INGEST_ASYNC", "true").lower() in {"1", "true", "yes", "on"}
+
+    class DeepAnalysis:
+        ENABLED = os.getenv("DEEP_ANALYSIS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        BACKGROUND_ENABLED = os.getenv("DEEP_ANALYSIS_BACKGROUND_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MAX_ENTITIES = int(os.getenv("DEEP_ANALYSIS_MAX_ENTITIES", "100"))
+        QUALITY_GRADING = os.getenv("DEEP_ANALYSIS_QUALITY_GRADING", "true").lower() in {"1", "true", "yes", "on"}
+
+    class ProfileDomain:
+        ENABLED = os.getenv("PROFILE_DOMAIN_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MAJORITY_THRESHOLD = float(os.getenv("PROFILE_DOMAIN_MAJORITY_THRESHOLD", "0.80"))
+        MIN_SIGNAL_SCORE = float(os.getenv("PROFILE_DOMAIN_MIN_SIGNAL_SCORE", "0.25"))
+
+    class ExtractionPipeline:
+        ENABLED = os.getenv("EXTRACTION_PIPELINE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        DEFAULT_STORE = os.getenv("EXTRACTION_PIPELINE_DEFAULT_STORE", "all")
+        MAX_FILE_SIZE_MB = int(os.getenv("EXTRACTION_PIPELINE_MAX_FILE_SIZE_MB", "100"))
+
+    class DiagramExtraction:
+        ENABLED = os.getenv("DIAGRAM_EXTRACTION_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        DETECTION_THRESHOLD = float(os.getenv("DIAGRAM_DETECTION_THRESHOLD", "0.5"))
+        USE_THINKING = os.getenv("DIAGRAM_USE_THINKING", "true").lower() in {"1", "true", "yes", "on"}
+
+    class ThinkingModel:
+        """lfm2.5-thinking — fast reasoning sub-agent for MoE routing."""
+        ENABLED = os.getenv("THINKING_MODEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MODEL = os.getenv("THINKING_MODEL", "lfm2.5-thinking:latest")
+        KEEP_ALIVE = os.getenv("THINKING_MODEL_KEEP_ALIVE", "24h")
+        DEFAULT_TEMPERATURE = float(os.getenv("THINKING_MODEL_TEMPERATURE", "0.05"))
+        MAX_PREDICT = int(os.getenv("THINKING_MODEL_MAX_PREDICT", "512"))
+        USE_FOR_JUDGING = os.getenv("THINKING_MODEL_USE_FOR_JUDGING", "true").lower() in {"1", "true", "yes", "on"}
+        USE_FOR_AGENT_STEPS = os.getenv("THINKING_MODEL_USE_FOR_AGENT_STEPS", "true").lower() in {"1", "true", "yes", "on"}
+        USE_FOR_VERIFICATION = os.getenv("THINKING_MODEL_USE_FOR_VERIFICATION", "true").lower() in {"1", "true", "yes", "on"}
+
+    class VisionAnalysis:
+        """glm-ocr extended for rich image analysis (charts, tables, diagrams)."""
+        ENABLED = os.getenv("VISION_ANALYSIS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MODEL = os.getenv("VISION_ANALYSIS_MODEL", "glm-ocr:latest")
+        CHART_ANALYSIS = os.getenv("VISION_ANALYSIS_CHART", "true").lower() in {"1", "true", "yes", "on"}
+        TABLE_ANALYSIS = os.getenv("VISION_ANALYSIS_TABLE", "true").lower() in {"1", "true", "yes", "on"}
+        DIAGRAM_ANALYSIS = os.getenv("VISION_ANALYSIS_DIAGRAM", "true").lower() in {"1", "true", "yes", "on"}
+        PHOTO_ANALYSIS = os.getenv("VISION_ANALYSIS_PHOTO", "true").lower() in {"1", "true", "yes", "on"}
+        MAX_IMAGE_TOKENS = int(os.getenv("VISION_ANALYSIS_MAX_IMAGE_TOKENS", "4096"))
+
+    class Agents:
+        """Per-agent feature flags for enhanced agent capabilities."""
+        RESUMES_INTERNET_ENABLED = os.getenv("DOCWAIN_RESUMES_INTERNET_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MEDICAL_NICE_ENABLED = os.getenv("DOCWAIN_MEDICAL_NICE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        MEDICAL_NICE_MAX_LOOKUPS = int(os.getenv("DOCWAIN_MEDICAL_NICE_MAX_LOOKUPS", "3"))
+
+    class CloudPlatform:
+        """SharePoint + cloud platform integration settings."""
+        SHAREPOINT_ENABLED = os.getenv("DOCWAIN_SHAREPOINT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        SHAREPOINT_TENANT_ID = os.getenv("DOCWAIN_SHAREPOINT_TENANT_ID", "")
+        SHAREPOINT_CLIENT_ID = os.getenv("DOCWAIN_SHAREPOINT_CLIENT_ID", "")
+        SHAREPOINT_CLIENT_SECRET = os.getenv("DOCWAIN_SHAREPOINT_CLIENT_SECRET", "")

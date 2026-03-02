@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -29,6 +29,7 @@ class RequestContext:
     tools: Optional[list[str]] = None
     use_tools: bool = False
     tool_inputs: Optional[Dict[str, Any]] = None
+    enable_internet: bool = False
 
     @classmethod
     def build(
@@ -48,6 +49,7 @@ class RequestContext:
         tools: Optional[list[str]] = None,
         use_tools: bool = False,
         tool_inputs: Optional[Dict[str, Any]] = None,
+        enable_internet: bool = False,
     ) -> "RequestContext":
         return cls(
             request_id=str(uuid.uuid4()),
@@ -66,4 +68,12 @@ class RequestContext:
             tools=tools,
             use_tools=use_tools,
             tool_inputs=tool_inputs,
+            enable_internet=enable_internet,
         )
+
+    def with_tools(self, tool_names: List[str]) -> None:
+        """Inject auto-selected tools into this context."""
+        existing = self.tools or []
+        self.tools = list(dict.fromkeys(existing + tool_names))
+        if self.tools:
+            self.use_tools = True

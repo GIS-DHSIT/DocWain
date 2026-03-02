@@ -2,7 +2,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from qdrant_client import QdrantClient
 
@@ -218,4 +218,3 @@ def load_or_probe(
     run_dir.mkdir(parents=True, exist_ok=True)
     schema_path.write_text(json.dumps(result.to_json(), indent=2))
     return result
-

@@ -24,10 +24,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
-from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.storage.blob import BlobServiceClient
 
 from src.api.config import Config
 from src.storage.azure_blob_client import get_blob_service_client, get_document_container_client, has_blob_credentials
+from src.storage.blob_persistence import save_pickle_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,6 @@ class BlobStore:
     ) -> Dict[str, Any]:
         payload = pickle.dumps(extracted_obj, protocol=pickle.HIGHEST_PROTOCOL)
         blob_name = self.build_blob_name(document_id)
-        blob_client = self._container_client.get_blob_client(blob_name)
         meta = {
             "docwain_artifact": "true",
             "document_id": str(document_id),
@@ -169,24 +169,14 @@ class BlobStore:
         }
         if metadata:
             meta.update({str(k): str(v) for k, v in metadata.items() if v is not None})
-
-        blob_client.upload_blob(
+        sha256 = hashlib.sha256(payload).hexdigest()
+        meta["sha256"] = sha256
+        return save_pickle_atomic(
+            blob_name,
             payload,
-            overwrite=True,
-            metadata=meta,
-            content_settings=ContentSettings(content_type="application/octet-stream"),
+            meta,
+            content_type="application/octet-stream",
         )
-        try:
-            props = blob_client.get_blob_properties()
-            etag = getattr(props, "etag", None)
-        except Exception:  # noqa: BLE001
-            etag = None
-        return {
-            "blob_name": blob_name,
-            "etag": etag,
-            "size": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
 
     def download_blob(self, blob_name: str, *, lease: Optional[str] = None) -> bytes:
         blob_client = self._container_client.get_blob_client(blob_name)
@@ -196,6 +186,13 @@ class BlobStore:
     def try_acquire_lease(self, blob_name: str, lease_duration: int = 60) -> Optional[str]:
         blob_client = self._container_client.get_blob_client(blob_name)
         try:
+            lease = blob_client.acquire_lease(lease_duration=lease_duration)
+            return lease.id
+        except ResourceNotFoundError:
+            try:
+                blob_client.upload_blob(b"", overwrite=False)
+            except ResourceExistsError:
+                pass
             lease = blob_client.acquire_lease(lease_duration=lease_duration)
             return lease.id
         except ResourceExistsError:

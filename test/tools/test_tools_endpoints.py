@@ -84,6 +84,51 @@ def test_smoke_ask_endpoint(monkeypatch, client: TestClient):
     assert response.json()["answer"]["response"] == "ok"
 
 
+def test_smoke_ask_persists_chat_turn(monkeypatch, client: TestClient):
+    class DummyMode:
+        value = "normal"
+
+    class DummyResult:
+        def __init__(self):
+            self.answer = {
+                "response": "persist me",
+                "sources": [],
+                "grounded": True,
+                "context_found": True,
+                "metadata": {},
+            }
+            self.mode = DummyMode()
+            self.stream = None
+            self.debug = {}
+
+    def fake_execute(request: Any, session_state: Any, ctx: Any, stream: bool = False, debug: bool = False):
+        return DummyResult()
+
+    captured = {}
+
+    def fake_add_message_to_history(user_id: str, query: str, response: Any = None, session_id: str | None = None, new_session: bool = False, **kwargs: Any):
+        captured["user_id"] = user_id
+        captured["query"] = query
+        captured["response"] = response
+        captured["session_id"] = session_id
+        captured["new_session"] = new_session
+        return {"sessions": []}, "persisted-session-1"
+
+    monkeypatch.setattr(docwain_api, "execute_request", fake_execute)
+    monkeypatch.setattr(docwain_api, "add_message_to_history", fake_add_message_to_history)
+
+    response = client.post(
+        "/api/ask",
+        json={"query": "hello", "profile_id": "p1", "user_id": "u1", "subscription_id": "s1"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"]["response"] == "persist me"
+    assert body["current_session_id"] == "persisted-session-1"
+    assert captured["user_id"] == "u1"
+    assert captured["query"] == "hello"
+
+
 def test_smoke_teams_endpoint(monkeypatch, client: TestClient):
     docwain_api.activity_payload = {"type": "message", "text": "hi", "conversation": {"id": "c1"}}
     docwain_api.raw_body = b"{}"

@@ -2,8 +2,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.append(str(Path(__file__).resolve().parents[3]))
 
 from src.screening import storage_adapter
@@ -20,10 +18,11 @@ Users may contact us for any questions.
 
 
 def _patch_storage(monkeypatch, text=SAMPLE_PRIVACY_TEXT, doc_type="PRIVACY_NOTICE"):
-    monkeypatch.setattr(storage_adapter, "get_document_text", lambda doc_id: text)
-    monkeypatch.setattr(storage_adapter, "get_document_metadata", lambda doc_id: {"doc_type": doc_type})
-    monkeypatch.setattr(storage_adapter, "get_document_bytes", lambda doc_id: None)
-    monkeypatch.setattr(storage_adapter, "get_document_doc_type", lambda doc_id: doc_type)
+    monkeypatch.setattr(storage_adapter, "get_document_text", lambda doc_id, **kwargs: text)
+    monkeypatch.setattr(storage_adapter, "get_document_metadata", lambda doc_id, **kwargs: {"doc_type": doc_type})
+    monkeypatch.setattr(storage_adapter, "get_document_bytes", lambda doc_id, **kwargs: None)
+    monkeypatch.setattr(storage_adapter, "get_document_doc_type", lambda doc_id, **kwargs: doc_type)
+    monkeypatch.setattr(storage_adapter, "get_document_subscription_id", lambda doc_id, **kwargs: "sub-test")
 
 
 def test_legality_route_registered_once():

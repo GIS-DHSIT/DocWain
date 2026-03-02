@@ -15,6 +15,15 @@
 - Local development: `docker-compose up --build` now starts a Redis 7 container and wires the app to it with no auth and SSL disabled. Verify it is running with `docker compose exec redis redis-cli ping`.
 - If you point at your own Redis instance, update the env vars above and restart the service so the client reinitializes with the new settings.
 
+### Dialogue intelligence (persona + sentiment)
+Enable DocWain's conversation intelligence layer and tune routing sensitivity with:
+```bash
+export DOCWAIN_PERSONA_ENABLED=true
+export DOCWAIN_SENTIMENT_ENABLED=true
+export DOCWAIN_SMALLTALK_MODEL=llama3.2   # optional: model used for intent/sentiment fallback
+export DOCWAIN_INTENT_THRESHOLD=0.65
+```
+
 ## Embedding Pickles from Blob Storage
 
 How to run:
@@ -29,6 +38,29 @@ curl -X POST http://localhost:8000/api/documents/embed \\
   -H \"Content-Type: application/json\" \\
   -d '{\"max_blobs\": 5}'
 ```
+
+## Embedding Pipeline Notes
+
+### Canonical Qdrant payload schema
+- Identifiers: `subscription_id`, `profile_id`, `document_id`.
+- Source: `source.name`, `source.uri`.
+- Document: `document.type`.
+- Chunk: `chunk.id`, `chunk.index`, `chunk.count`, `chunk.type`, `chunk.role`, `chunk.hash`, `chunk.size.chars`, `chunk.links.prev`, `chunk.links.next`, `chunk.sentence_complete`.
+- Section: `section.id`, `section.title`, `section.path[]`.
+- Provenance: `provenance.page_start`, `provenance.page_end`, `provenance.section_title`.
+- Text: `text` (clean for retrieval), plus `text_data.clean`/`text_data.raw` when available.
+
+### Chunking parameters
+- Target tokens: 250–450 per chunk, hard max 520.
+- Minimum chars: 300 (except headers/captions).
+- Overlap: 60 tokens (only within the same section, trailing tail of previous chunk).
+
+### Dedupe gate thresholds
+- Simhash64 similarity threshold: ≥0.92 for near-duplicate detection.
+- Overlap ratio cap: overlap tokens / chunk tokens ≤0.20.
+
+### Tests
+- `pytest tests/test_embedding_pipeline_fix.py`
 
 ### Fine-tuning with Unsloth (LLama 3.2) from a Qdrant collection
 
@@ -74,3 +106,78 @@ curl -X POST http://localhost:8000/finetune -H "Content-Type: application/json" 
   `curl -X POST http://localhost:8000/api/tools/tutor/lesson -H "Content-Type: application/json" -d '{"topic":"network security","learning_level":"beginner"}'`  
   `curl -X POST http://localhost:8000/api/tools/email/draft -H "Content-Type: application/json" -d '{"intent":"follow up","recipient_role":"customer","tone":"concise"}'`
 - Connectors and analysis: `/api/tools/db/query`, `/api/tools/code/docs`, `/api/tools/web/analyze`, `/api/tools/jira_confluence/summarize`, `/api/tools/resumes/analyze`, `/api/tools/medical/summarize`, `/api/tools/lawhere/analyze`.
+
+## Profile-Isolated Document Understanding (Ollama)
+
+DocWain now supports profile-isolated ingestion and a 3-stage Document Understanding pipeline:
+1) Document Identification (doc name/type/properties)
+2) Content Identification (sections, tables, images)
+3) Content Understanding (summaries, entities, intent tags)
+
+### Updated file tree
+```
+src/
+  api/
+    document_understanding_service.py
+    profile_documents_api.py
+    profiles_api.py
+  doc_understanding/
+    __init__.py
+    content_map.py
+    identify.py
+    understand.py
+  profiles/
+    profile_store.py
+  retrieval/
+    intent_router.py
+    profile_query.py
+```
+
+### API contracts & examples
+
+#### Create profile
+```
+POST /api/profiles
+{
+  "subscription_id": "sub-123",
+  "profile_name": "Finance",
+  "profile_id": "optional-uuid"
+}
+```
+
+#### Upload document under profile (extract + understand + embed)
+```
+POST /api/profiles/{profile_id}/documents/upload
+FormData:
+  subscription_id: sub-123
+  profile_name: Finance
+  file: @invoice.pdf
+```
+
+#### Run understanding for an existing document
+```
+POST /api/profiles/{profile_id}/documents/{document_id}/understand
+{
+  "subscription_id": "sub-123",
+  "profile_name": "Finance",
+  "model_name": "llama3.2",
+  "embed_after": true
+}
+```
+
+#### Query with explicit profile_id
+```
+POST /api/profiles/{profile_id}/query
+{
+  "subscription_id": "sub-123",
+  "query": "Summarize the latest invoice totals",
+  "model_name": "llama3.2",
+  "top_k": 6
+}
+```
+
+### Migration guide (existing data)
+1) Backfill `profile_name` for all documents in MongoDB (copy from profiles or set a default).
+2) Backfill `document_type` (run `/profiles/{profile_id}/documents/{document_id}/understand` or batch understand).
+3) Re-embed documents so Qdrant payloads include `profile_name`, `document_type`, and `chunk_kind`.
+4) Validate retrieval filters: ensure all profile queries include `subscription_id` + `profile_id` filters.

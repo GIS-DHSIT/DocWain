@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.api.config import Config
 from .models import compute_config_hash
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,19 @@ DEFAULT_POLICY_RULES = {
     "RESUME": {"forbidden_phrases": ["lorem ipsum"], "required_keywords": ["experience", "education"]},
 }
 
+DOMAIN_SPECIFIC_TOOLS = {
+    "resume_extractor_tool",
+    "company_validator_tool",
+    "institution_validator_tool",
+    "certification_verifier_tool",
+    "authenticity_analyzer_tool",
+    "resume_entity_validation",
+    "resume_screening",
+    "legality_agent",
+    "template_conformance",
+    "policy_compliance",
+}
+
 
 def _parse_bool(value: str | bool | None, default: bool = False) -> bool:
     if value is None:
@@ -93,7 +107,7 @@ class ScreeningConfig:
     doc_type_templates: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_TEMPLATES))
     policy_rules: Dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_POLICY_RULES))
     sensitive_keywords: List[str] = field(default_factory=lambda: ["confidential", "proprietary"])
-    auto_attach_on_ingest: bool = False
+    auto_attach_on_ingest: bool = True
     block_high_risk: bool = False
     config_source: str = "defaults"
     config_hash: str = ""
@@ -151,7 +165,7 @@ class ScreeningConfig:
             os.getenv("SCREENING_INTERNET_ENABLED"),
             default=internet_from_file,
         )
-        auto_attach_default = _parse_bool(data.get("auto_attach_on_ingest"), default=False)
+        auto_attach_default = _parse_bool(data.get("auto_attach_on_ingest"), default=True)
         auto_attach = _parse_bool(
             os.getenv("SCREENING_AUTO_ATTACH_ON_INGEST"),
             default=auto_attach_default,
@@ -198,6 +212,12 @@ class ScreeningConfig:
             search_provider["api_key"] = os.getenv("SCREENING_SEARCH_API_KEY")
         if os.getenv("SCREENING_SEARCH_ENDPOINT"):
             search_provider["endpoint"] = os.getenv("SCREENING_SEARCH_ENDPOINT")
+
+        if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
+            enabled_tools = [tool for tool in enabled_tools if tool not in DOMAIN_SPECIFIC_TOOLS]
+            weights = {key: value for key, value in weights.items() if key not in DOMAIN_SPECIFIC_TOOLS}
+            templates = {}
+            policy_rules = {}
 
         config = cls(
             enabled_tools=enabled_tools,

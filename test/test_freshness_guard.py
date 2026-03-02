@@ -4,7 +4,10 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from src.mode.execution_mode import ExecutionMode
-from src.mode.session_state import SessionState
+try:
+    from src.mode.session_state import SessionState
+except ImportError:
+    from src.mode import SessionState
 from src.runtime.chain_factory import build_chain
 from src.runtime.freshness_guard import FreshnessGuard
 from src.runtime.request_context import RequestContext

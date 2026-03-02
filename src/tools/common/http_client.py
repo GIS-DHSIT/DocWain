@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
@@ -77,4 +76,3 @@ async def fetch_text(
     except Exception:
         decoded = raw.decode("latin-1", errors="ignore")
     return {"url": url, "content": decoded, "bytes": len(raw)}
-

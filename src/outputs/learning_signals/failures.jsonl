@@ -1,3 +1,0 @@
-{"query": "tell me about the education of the person", "reason": "no_results", "metadata": {"profile_id": "6971f00513aa753c66426abb", "subscription_id": "67e6920588f8ff4644d2dfb1", "processed_query": "tell me about the education of the person"}}
-{"query": "summarize the content", "reason": "no_results", "metadata": {"profile_id": "69724446329f98a472568e3e", "subscription_id": "67fde0754e36c00b14cea7f5", "processed_query": "summarize the content"}}
-{"query": "what is present", "reason": "no_results", "metadata": {"profile_id": "69724446329f98a472568e3e", "subscription_id": "67fde0754e36c00b14cea7f5", "processed_query": "what is present ; context: User: summarize the content"}}

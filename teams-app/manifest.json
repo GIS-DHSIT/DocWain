@@ -1,7 +1,7 @@
 {
   "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
   "manifestVersion": "1.16",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "id": "fd5d5c9d-12b9-441f-b72f-4e94a50da1af",
   "packageName": "ai.docwain.app",
   "developer": {
@@ -16,7 +16,7 @@
   },
   "description": {
     "short": "Ask questions and upload documents to DocWain directly from Teams.",
-    "full": "DocWain connects your Teams workspace to DocWain's document AI so you can upload files, train them, and ask questions in personal, group, or team chats."
+    "full": "DocWain connects your Teams workspace to DocWain's document AI so you can upload files, train them, and ask questions in personal, group, or team chats. Use tools to summarize, extract fields, generate content, or switch models."
   },
   "icons": {
     "color": "color.png",
@@ -34,10 +34,22 @@
           "scopes": ["personal", "team", "groupchat"],
           "commands": [
             {"title": "Ask", "description": "Ask a question about your documents."},
-            {"title": "Upload", "description": "Upload a file and make it searchable."}
+            {"title": "Upload", "description": "Upload a file and make it searchable."},
+            {"title": "Help", "description": "Get usage tips and available commands."},
+            {"title": "Tools", "description": "Show DocWain tool actions."},
+            {"title": "Generate", "description": "Generate content from your documents."}
           ]
         }
       ]
+    }
+  ],
+  "staticTabs": [
+    {
+      "entityId": "docwain-web",
+      "name": "DocWain",
+      "contentUrl": "https://www.docwain.ai",
+      "websiteUrl": "https://www.docwain.ai",
+      "scopes": ["personal"]
     }
   ],
   "permissions": ["identity", "messageTeamMembers"],

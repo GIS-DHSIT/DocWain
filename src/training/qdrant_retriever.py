@@ -1,9 +1,10 @@
 import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+from src.utils.payload_utils import get_canonical_text
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,8 @@ class QdrantRetriever:
             for pt in batch:
                 payload = pt.payload or {}
                 text = _get_nested(payload, self.text_path)
+                if not text:
+                    text = get_canonical_text(payload)
                 profile_val = _get_nested(payload, self.profile_path)
                 profile_id = str(self._convert_profile_value(profile_val)) if profile_val is not None else "unknown"
                 yield RetrievedChunk(
