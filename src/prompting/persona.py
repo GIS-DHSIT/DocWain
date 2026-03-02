@@ -58,7 +58,13 @@ _DOCWAIN_PERSONA = (
     "QUALITY\n"
     "- Be concise but complete.\n"
     "- Be professional and clear.\n"
-    "- No hallucination; accuracy over coverage.\n"
+    "- No hallucination; accuracy over coverage.\n\n"
+    "ANALYTICAL INTELLIGENCE\n"
+    "- When analyzing multiple documents, provide statistical summaries (counts, averages, ranges, percentages).\n"
+    "- When comparing, identify both commonalities and differentiators.\n"
+    "- When ranking, explain criteria and provide justification.\n"
+    "- Proactively surface patterns, outliers, and anomalies.\n"
+    "- Start multi-document responses with a synthesis statement before details.\n"
 )
 
 DOCWAIN_META_RESPONSE = build_docwain_intro()
@@ -100,6 +106,11 @@ META_QUESTION_PATTERNS = [
     re.compile(r"\bwhat\s+are\s+you\b"),
     re.compile(r"\bwhat\s+is\s+docwain\b"),
     re.compile(r"\bwhat\s+can\s+you\s+do\b"),
+    re.compile(r"\bwhat\s+else\s+can\s+you\s+do\b"),
+    re.compile(r"\bwhat\s+all\s+can\s+(?:you|docwain)\s+do\b"),
+    re.compile(r"\bwhat\s+else\s+can\s+you\s+help\s+with\b"),
+    re.compile(r"\bhow\s+can\s+(?:you|docwain)\s+help(?:\s+me)?\b"),
+    re.compile(r"\bshow\s+(?:me\s+)?what\s+(?:you|docwain)\s+can\s+do\b"),
     re.compile(r"\bhow\s+do\s+you\s+work\b"),
 ]
 
@@ -153,10 +164,21 @@ _INTERNAL_PATTERNS = [
 ]
 
 
+_AI_DISCLAIMER_PATTERNS = [
+    # Only match "As an AI" followed by disclaimer words, not job titles like "AI Engineer"
+    re.compile(r"\bAs an AI(?:\s+(?:language\s+model|assistant|model|chatbot|system))\b[^.]*\.", re.IGNORECASE),
+    re.compile(r"\bAs a language model\b[^.]*\.", re.IGNORECASE),
+    re.compile(r"\bI(?:'m| am) (?:just )?an? AI(?:\s+(?:language\s+model|assistant|model|chatbot))\b[^.]*\.", re.IGNORECASE),
+]
+
+
 def sanitize_response(text: str) -> str:
     sanitized = text or ""
     sanitized = re.sub(r"\[SOURCE[^\]]*\]", "", sanitized, flags=re.IGNORECASE)
     sanitized = re.sub(r"(?i)citations?:", "", sanitized)
+    # Strip AI disclaimer sentences that leak from LLM responses
+    for pat in _AI_DISCLAIMER_PATTERNS:
+        sanitized = pat.sub("", sanitized)
     for pattern in _INTERNAL_PATTERNS:
         sanitized = pattern.sub("[redacted]", sanitized)
     lines = sanitized.splitlines()

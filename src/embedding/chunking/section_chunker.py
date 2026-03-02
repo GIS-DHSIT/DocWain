@@ -118,51 +118,12 @@ def _is_heading_line(line: str) -> bool:
 
 
 def _infer_sections_from_text(text: str, *, fallback_title: str) -> List[Section]:
-    """Infer sections using heading-like lines when explicit sections are missing.
-
-    Strategy 1: DPIE ML-based section detection (if available).
-    Strategy 2: Regex-based heading detection (always available).
-    """
+    """Infer sections using heading-like lines when explicit sections are missing."""
     normalized = normalize_text(text)
     if not normalized:
         return []
 
-    # ── Strategy 1: DPIE ML section detection ──────────────────────────
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-
-        registry = DPIERegistry.get_instance()
-        if registry.is_loaded:
-            dpie_sections = registry.detect_sections(normalized[:10000])
-            if dpie_sections:
-                all_lines = normalized.splitlines()
-                sections: List[Section] = []
-                for sec in dpie_sections:
-                    start = sec.get("start_line", 0)
-                    end = sec.get("end_line", len(all_lines) - 1)
-                    heading = sec.get("heading", fallback_title) or fallback_title
-                    body = "\n".join(all_lines[start : end + 1]).strip()
-                    if not body:
-                        continue
-                    section_id = hashlib.sha1(
-                        f"{heading}|1".encode("utf-8")
-                    ).hexdigest()[:12]
-                    sections.append(
-                        Section(
-                            section_id=section_id,
-                            title=heading,
-                            level=1,
-                            start_page=1,
-                            end_page=1,
-                            text=body,
-                        )
-                    )
-                if sections:
-                    return sections
-    except Exception:  # noqa: BLE001
-        pass
-
-    # ── Strategy 2: Regex heading detection (fallback) ─────────────────
+    # ── Regex heading detection ───────────────────────────────────────
     sections = []
     current_title = fallback_title
     current_lines: List[str] = []

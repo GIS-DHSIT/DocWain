@@ -3,7 +3,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.dataHandler import update_security_screening
-from src.api.document_status import get_document_record, update_document_fields
+from src.api.document_status import get_document_record, update_document_fields, update_stage
 from src.api.statuses import (
     STATUS_EMBEDDING_COMPLETED,
     STATUS_EXTRACTION_COMPLETED,
@@ -27,9 +27,6 @@ DONT_DOWNGRADE_STATUSES = {
 }
 
 SCREENING_ELIGIBLE_STATUSES = {
-    None,
-    "",
-    STATUS_UNDER_REVIEW,
     STATUS_EXTRACTION_COMPLETED,
     STATUS_SCREENING_COMPLETED,
 }
@@ -81,6 +78,7 @@ def promote_to_screening_completed(document_id: str) -> None:
         return
     if current_status in SCREENING_ELIGIBLE_STATUSES:
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
+        update_stage(document_id, "screening", {"status": "COMPLETED", "completed_at": time.time(), "error": None})
     else:
         logger.debug(
             "Skipping status promotion for %s; status %s not eligible",
@@ -129,24 +127,22 @@ def _update_pickle_with_screening(document_id: str, screening_report: Dict[str, 
 
 def apply_security_result(document_id: str, report: Dict[str, Any]) -> None:
     status_text = _status_from_security_report(report)
+    update_stage(document_id, "screening", {"status": "IN_PROGRESS", "started_at": time.time(), "error": None})
     update_security_screening(document_id, report, status_text)
     _update_pickle_with_screening(document_id, {
         "status": status_text,
         "risk_level": str(report.get("overall_risk_level") or report.get("risk_level") or ""),
         "report": report,
     })
+    update_stage(document_id, "screening", {
+        "status": "COMPLETED",
+        "completed_at": time.time(),
+        "result": status_text,
+        "error": None,
+    })
     record = get_document_record(document_id) or {}
     current_status = record.get("status")
     if status_text == "passed":
-        if _embedding_already_completed(record) and current_status not in DONT_DOWNGRADE_STATUSES:
-            logger.info(
-                "Security screening passed for %s; promoting stale status %s to %s based on embedding evidence",
-                document_id,
-                current_status,
-                STATUS_TRAINING_COMPLETED,
-            )
-            _set_document_status(document_id, STATUS_TRAINING_COMPLETED)
-            return
         if current_status in DONT_DOWNGRADE_STATUSES:
             logger.info(
                 "Security screening passed for %s; keeping existing status %s",
@@ -162,6 +158,8 @@ def apply_security_result(document_id: str, report: Dict[str, Any]) -> None:
             )
             return
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
+        # HITL: Screening only sets SCREENING_COMPLETED.
+        # User must manually trigger embedding (POST /api/documents/embed).
     else:
         _set_document_status(document_id, STATUS_TRAINING_BLOCKED_SECURITY, "Security screening failed")
 

@@ -25,16 +25,25 @@ class AgentRole(str, Enum):
     EXTRACTOR = "extractor"
     GENERATOR = "generator"
     VERIFIER = "verifier"
+    REASONER = "reasoner"
+    VISION = "vision"
     DEFAULT = "default"
 
 
-# Default model assignments per role
+# Default model assignments per role — MoE routing
+# CRITICAL: On a single T4 16GB GPU, Ollama can only keep ONE large model loaded.
+# Routing CLASSIFIER/DEFAULT to a different model than GENERATOR triggers model
+# swaps (500 "loading model" errors + 10-30s swap delay).  Route ALL roles to
+# gpt-oss to eliminate swap contention.  lfm2.5-thinking is only used for
+# REASONER/VERIFIER (infrequent, can absorb the swap cost).
 _DEFAULT_ROLE_MODELS: Dict[str, str] = {
-    AgentRole.CLASSIFIER: "llama3.2:latest",
-    AgentRole.EXTRACTOR: "mistral:latest",
+    AgentRole.CLASSIFIER: "gpt-oss:latest",            # Same as generator — no model swap
+    AgentRole.EXTRACTOR: "gpt-oss:latest",             # Same as generator — no model swap
     AgentRole.GENERATOR: "gpt-oss:latest",
-    AgentRole.VERIFIER: "deepseek-r1:latest",
-    AgentRole.DEFAULT: "llama3.2:latest",
+    AgentRole.VERIFIER: "gpt-oss:latest",              # Avoid swap on verification
+    AgentRole.REASONER: "gpt-oss:latest",              # Avoid swap on reasoning
+    AgentRole.VISION: "glm-ocr:latest",                # Vision/OCR sub-agent
+    AgentRole.DEFAULT: "gpt-oss:latest",               # Default — no model swap
 }
 
 
@@ -236,16 +245,30 @@ class MultiAgentGateway:
     # ── Convenience methods ────────────────────────────────────────
 
     def classify(self, prompt: str, **kwargs) -> str:
-        """Classification uses the fast CLASSIFIER role (llama3.2)."""
-        return self.generate_for_role(AgentRole.CLASSIFIER, prompt, max_retries=1, backoff=0.2, **kwargs)
+        """Classification uses CLASSIFIER role (gpt-oss — same model, no swap)."""
+        return self.generate_for_role(AgentRole.CLASSIFIER, prompt, max_retries=2, backoff=0.5, **kwargs)
 
     def extract(self, prompt: str, **kwargs) -> str:
         """Extraction uses the EXTRACTOR role (mistral)."""
         return self.generate_for_role(AgentRole.EXTRACTOR, prompt, **kwargs)
 
     def verify(self, prompt: str, **kwargs) -> str:
-        """Verification uses the VERIFIER role (deepseek-r1)."""
+        """Verification uses the VERIFIER role (lfm2.5-thinking)."""
         return self.generate_for_role(AgentRole.VERIFIER, prompt, **kwargs)
+
+    def reason(self, prompt: str, **kwargs) -> str:
+        """Reasoning uses the REASONER role (lfm2.5-thinking)."""
+        return self.generate_for_role(AgentRole.REASONER, prompt, **kwargs)
+
+    def analyze_vision(self, prompt: str, *, images: Optional[List[Any]] = None, **kwargs) -> str:
+        """Vision analysis uses the VISION role (glm-ocr).
+
+        If ``images`` is provided, passes them to the Ollama images parameter
+        for multimodal analysis.
+        """
+        if images:
+            kwargs["images"] = images
+        return self.generate_for_role(AgentRole.VISION, prompt, **kwargs)
 
     # ── Stats & health ─────────────────────────────────────────────
 
@@ -271,6 +294,160 @@ class MultiAgentGateway:
         pass
 
 
+class TaskAwareGateway(MultiAgentGateway):
+    """Extends MultiAgentGateway with task-type-aware model routing.
+
+    When a ``task_scope`` context is active (via thread-local), ``generate()``
+    automatically selects the optimal model for the current task.  Otherwise
+    falls back to the standard role-based routing.
+    """
+
+    def __init__(
+        self,
+        router: Any,
+        fallback_gateway: Any = None,
+        role_models: Optional[Dict[str, str]] = None,
+    ):
+        super().__init__(role_models=role_models, fallback_gateway=fallback_gateway)
+        self._router = router
+        self._task_stats: Dict[str, _RoleStats] = {}
+        self._model_clients: Dict[str, Any] = {}
+        self._model_client_lock = threading.Lock()
+        self.backend = "task_aware"
+        self.model_name = "task-aware-multi-model"
+        logger.info("TaskAwareGateway initialized with TaskRouter")
+
+    def _get_client_by_model(self, model_name: str) -> Any:
+        """Lazy-create an OllamaClient keyed by model name."""
+        if model_name in self._model_clients:
+            return self._model_clients[model_name]
+
+        with self._model_client_lock:
+            if model_name in self._model_clients:
+                return self._model_clients[model_name]
+            try:
+                from src.llm.clients import OllamaClient
+                client = OllamaClient(model_name=model_name)
+                self._model_clients[model_name] = client
+                logger.info("TaskAwareGateway created OllamaClient for model=%s", model_name)
+                return client
+            except Exception as exc:
+                logger.warning("TaskAwareGateway failed to create client for model=%s: %s", model_name, exc)
+                return None
+
+    def _get_or_create_task_stats(self, task_value: str) -> _RoleStats:
+        if task_value not in self._task_stats:
+            self._task_stats[task_value] = _RoleStats()
+        return self._task_stats[task_value]
+
+    def generate_for_task(self, task: Any, prompt: str, **kwargs) -> str:
+        """Generate text using the model selected for *task*."""
+        from src.llm.task_router import TaskType
+        if not isinstance(task, TaskType):
+            task = TaskType(task)
+
+        start = time.time()
+        stats = self._get_or_create_task_stats(task.value)
+        model = self._router.select_model(task)
+        options = {**self._router.get_options(task), **kwargs.pop("options", {})}
+
+        client = self._get_client_by_model(model)
+        if client is not None:
+            try:
+                text = client.generate(prompt, options=options, **kwargs)
+                stats.record_call((time.time() - start) * 1000)
+                logger.debug("TaskRouter: %s → %s (%dms)", task.value, model,
+                             int((time.time() - start) * 1000))
+                return text
+            except Exception as exc:
+                stats.record_error()
+                logger.warning("Task %s (model=%s) failed: %s — trying fallback", task.value, model, exc)
+
+        # Fallback to parent's GENERATOR role
+        if self._fallback is not None:
+            text = self._fallback.generate(prompt, **kwargs)
+            stats.record_call((time.time() - start) * 1000)
+            return text
+
+        return super().generate(prompt, **kwargs)
+
+    def generate_with_metadata_for_task(
+        self, task: Any, prompt: str, **kwargs
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate text + metadata using the model selected for *task*."""
+        from src.llm.task_router import TaskType
+        if not isinstance(task, TaskType):
+            task = TaskType(task)
+
+        start = time.time()
+        stats = self._get_or_create_task_stats(task.value)
+        model = self._router.select_model(task)
+        options = {**self._router.get_options(task), **kwargs.pop("options", {})}
+
+        client = self._get_client_by_model(model)
+        if client is not None:
+            try:
+                if hasattr(client, "generate_with_metadata"):
+                    text, meta = client.generate_with_metadata(prompt, options=options, **kwargs)
+                    if not isinstance(meta, dict):
+                        meta = {"_raw": str(meta)}
+                else:
+                    text = client.generate(prompt, options=options, **kwargs)
+                    meta = {"response": text}
+                meta["task_type"] = task.value
+                meta["task_model"] = model
+                stats.record_call((time.time() - start) * 1000)
+                return text, meta
+            except Exception as exc:
+                stats.record_error()
+                logger.warning("Task %s (model=%s) failed: %s", task.value, model, exc)
+
+        # Fallback
+        if self._fallback is not None:
+            if hasattr(self._fallback, "generate_with_metadata"):
+                text, meta = self._fallback.generate_with_metadata(prompt, **kwargs)
+                if not isinstance(meta, dict):
+                    meta = {"_raw": str(meta)}
+            else:
+                text = self._fallback.generate(prompt, **kwargs)
+                meta = {"response": text}
+            meta["task_type"] = task.value
+            meta["task_model"] = "fallback"
+            stats.record_call((time.time() - start) * 1000)
+            return text, meta
+
+        return "", {"task_type": task.value, "error": "no_client_available"}
+
+    # ── Override duck-typed interface to use task context ──────────
+
+    def generate(self, prompt: str, **kwargs) -> str:
+        from src.llm.task_router import get_current_task
+        task = get_current_task()
+        if task is not None:
+            return self.generate_for_task(task, prompt, **kwargs)
+        return super().generate(prompt, **kwargs)
+
+    def generate_with_metadata(self, prompt: str, **kwargs) -> Tuple[str, Dict[str, Any]]:
+        from src.llm.task_router import get_current_task
+        task = get_current_task()
+        if task is not None:
+            return self.generate_with_metadata_for_task(task, prompt, **kwargs)
+        return super().generate_with_metadata(prompt, **kwargs)
+
+    # ── Stats ─────────────────────────────────────────────────────
+
+    def get_task_stats(self) -> Dict[str, Any]:
+        """Return per-task call statistics."""
+        return {t: s.to_dict() for t, s in self._task_stats.items()}
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return combined role + task statistics."""
+        base = super().get_stats()
+        base["task_routing"] = self.get_task_stats()
+        base["model_clients"] = list(self._model_clients.keys())
+        return base
+
+
 def create_multi_agent_gateway(
     fallback_gateway: Any = None,
 ) -> MultiAgentGateway:
@@ -286,6 +463,8 @@ def create_multi_agent_gateway(
         AgentRole.EXTRACTOR: getattr(ma_cfg, "EXTRACTOR_MODEL", _DEFAULT_ROLE_MODELS[AgentRole.EXTRACTOR]),
         AgentRole.GENERATOR: getattr(ma_cfg, "GENERATOR_MODEL", _DEFAULT_ROLE_MODELS[AgentRole.GENERATOR]),
         AgentRole.VERIFIER: getattr(ma_cfg, "VERIFIER_MODEL", _DEFAULT_ROLE_MODELS[AgentRole.VERIFIER]),
+        AgentRole.REASONER: getattr(ma_cfg, "REASONER_MODEL", _DEFAULT_ROLE_MODELS[AgentRole.REASONER]),
+        AgentRole.VISION: getattr(ma_cfg, "VISION_MODEL", _DEFAULT_ROLE_MODELS[AgentRole.VISION]),
         AgentRole.DEFAULT: getattr(ma_cfg, "DEFAULT_MODEL", _DEFAULT_ROLE_MODELS[AgentRole.DEFAULT]),
     }
 

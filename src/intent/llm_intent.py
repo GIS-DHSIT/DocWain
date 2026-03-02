@@ -81,7 +81,7 @@ def parse_intent(
         _local_cache_set(key, parsed)
         return IntentParse(**parsed, source="llm")
 
-    fallback = _heuristic_parse(normalized)
+    fallback = _fallback_parse(normalized)
     _cache_set(redis_client, key, fallback)
     _local_cache_set(key, fallback)
     return IntentParse(**fallback, source="heuristic")
@@ -401,7 +401,7 @@ def _neural_parse(query: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def _heuristic_parse(query: str) -> Dict[str, Any]:
+def _fallback_parse(query: str) -> Dict[str, Any]:
     """Parse intent using trained MLP first, minimal regex fallback.
 
     Strategy:

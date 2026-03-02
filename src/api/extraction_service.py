@@ -1,4 +1,6 @@
 import logging
+import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -51,7 +53,7 @@ except Exception as _datahandler_exc:  # noqa: BLE001
     update_layout_graph_metadata = _datahandler_unavailable
     update_pii_stats = _datahandler_unavailable
 from src.api.layout_graph_store import save_layout_graph, save_layout_graph_local
-from src.api.document_status import init_document_record, set_error, update_document_fields, update_stage
+from src.api.document_status import emit_progress, init_document_record, set_error, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
 from src.api.statuses import (
     STATUS_DELETED,
@@ -67,6 +69,25 @@ from src.embedding.layout_graph import build_layout_graph
 
 logger = logging.getLogger(__name__)
 
+# Semaphore to limit concurrent deep_analyze() calls — prevents CPU starvation
+# when multiple documents are uploaded simultaneously.
+_DOC_PROCESSING_SEMAPHORE = threading.Semaphore(
+    int(os.getenv("DOC_PROCESSING_MAX_CONCURRENT", "2"))
+)
+
+
+def _mark_intelligence_ready(document_id: str) -> None:
+    """Set intelligence_ready=true in MongoDB after understanding + deep analysis complete."""
+    try:
+        from src.api.document_status import update_document_fields
+        update_document_fields(document_id, {
+            "intelligence_ready": True,
+            "intelligence_completed_at": time.time(),
+        })
+        logger.info("Document %s marked intelligence_ready", document_id)
+    except Exception as exc:
+        logger.warning("Failed to mark intelligence_ready for %s: %s", document_id, exc)
+
 
 def _ingest_to_knowledge_graph(
     document_id: str,
@@ -75,11 +96,22 @@ def _ingest_to_knowledge_graph(
     source_name: str,
     payload_to_save: Dict[str, Any],
     redis_client: Any = None,
+    deep_result: Any = None,
 ) -> None:
     """Non-blocking KG ingestion from extraction results.
 
     Builds a graph payload from the extraction output and enqueues it
     for async processing.  KG failure must never block extraction.
+
+    Parameters
+    ----------
+    deep_result:
+        Optional :class:`~src.doc_understanding.deep_analyzer.DeepAnalysisResult`
+        produced during extraction.  When provided, ``entities``,
+        ``typed_relationships``, and ``temporal_spans`` from the deep analysis
+        are forwarded to the KG ingest layer to activate the previously-dead
+        ``create_entity_relationship()`` and ``create_timeline_node()`` store
+        methods.  If *None*, the existing behaviour is preserved.
     """
     try:
         from src.kg.ingest import build_graph_payload, get_graph_ingest_queue
@@ -101,6 +133,24 @@ def _ingest_to_knowledge_graph(
         if not texts:
             return
 
+        # Extract deep analysis artifacts when available
+        deep_entities: Optional[List[Dict[str, Any]]] = None
+        typed_relationships: Optional[List[Dict[str, Any]]] = None
+        temporal_spans: Optional[List[Dict[str, Any]]] = None
+        if deep_result is not None:
+            try:
+                deep_entities = [e.to_dict() for e in (deep_result.entities or [])]
+            except Exception:
+                deep_entities = None
+            try:
+                typed_relationships = list(deep_result.typed_relationships or [])
+            except Exception:
+                typed_relationships = None
+            try:
+                temporal_spans = list(deep_result.temporal_spans or [])
+            except Exception:
+                temporal_spans = None
+
         doc_classification = payload_to_save.get("document_classification") or {}
         graph_payload = build_graph_payload(
             embeddings_payload={
@@ -115,8 +165,13 @@ def _ingest_to_knowledge_graph(
             profile_id=str(profile_id),
             document_id=str(document_id),
             doc_name=source_name,
+            deep_entities=deep_entities,
+            typed_relationships=typed_relationships,
         )
         if graph_payload:
+            # Attach temporal spans so ingest_graph_payload can create timeline nodes
+            if temporal_spans:
+                graph_payload.temporal_spans = temporal_spans
             queue = get_graph_ingest_queue(redis_client)
             queue.enqueue(graph_payload)
             logger.info("KG ingestion enqueued for document %s", document_id)
@@ -198,6 +253,63 @@ def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
         "chars": total_chars,
         "language": None,
     }
+
+
+def _update_understanding_fields(document_id: str, understanding: Dict[str, Any]) -> None:
+    """Persist document understanding / deep-analysis fields to MongoDB."""
+    from src.api.config import Config
+    from src.api.dataHandler import db
+    from bson import ObjectId
+
+    if db is None:
+        logger.warning("_update_understanding_fields: MongoDB unavailable for %s", document_id)
+        return
+    coll = db[Config.MongoDB.DOCUMENTS]
+    if ObjectId.is_valid(str(document_id)):
+        filt = {"_id": ObjectId(str(document_id))}
+    else:
+        filt = {"_id": str(document_id)}
+
+    # --- understanding fields ---
+    update_fields: Dict[str, Any] = {}
+    if understanding.get("document_type"):
+        update_fields["understanding_doc_type"] = understanding["document_type"]
+    if understanding.get("document_summary"):
+        update_fields["document_summary"] = str(understanding["document_summary"])[:2000]
+    if understanding.get("key_entities"):
+        update_fields["key_entities"] = understanding["key_entities"][:50]
+    if understanding.get("key_facts"):
+        update_fields["key_facts"] = understanding["key_facts"][:50]
+    if understanding.get("intent_tags"):
+        update_fields["doc_intent_tags"] = understanding["intent_tags"][:20]
+
+    # --- deep-analysis fields ---
+    if understanding.get("quality_grade"):
+        update_fields["quality_grade"] = understanding["quality_grade"]
+    if understanding.get("quality_score") is not None:
+        update_fields["quality_score"] = understanding["quality_score"]
+    if understanding.get("complexity_score") is not None:
+        update_fields["complexity_score"] = understanding["complexity_score"]
+    if understanding.get("entity_mentions"):
+        update_fields["entity_mentions"] = understanding["entity_mentions"][:100]
+    if understanding.get("chronological_span"):
+        update_fields["chronological_span"] = understanding["chronological_span"][:20]
+    if understanding.get("section_roles"):
+        update_fields["section_roles"] = understanding["section_roles"]
+    if understanding.get("domain_signals"):
+        update_fields["domain_signals"] = understanding["domain_signals"]
+
+    if not update_fields:
+        logger.warning("_update_understanding_fields: no fields to write for %s (keys=%s)",
+                       document_id, list(understanding.keys()))
+        return
+
+    result = coll.update_one(filt, {"$set": update_fields}, upsert=False)
+    if result.matched_count == 0:
+        logger.warning("_update_understanding_fields: no MongoDB doc matched for %s (filter=%s), retrying with upsert",
+                       document_id, filt)
+        coll.update_one(filt, {"$set": update_fields}, upsert=True)
+    logger.info("Persisted %d understanding fields for document %s", len(update_fields), document_id)
 
 
 def _process_document_intelligence(
@@ -306,46 +418,9 @@ def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> A
 def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> Dict[str, Any]:
     """Extract document type/classification from structured extraction results.
 
-    Tries DPIE ML classifier first (if available and confident), then falls
-    back to the structured extraction metadata.
+    Falls back to the structured extraction metadata.
     """
-    # ── Try DPIE first (ML-based classification) ─────────────────────
-    try:
-        from src.intelligence.dpie_integration import dpie_classify_document_type
-        # Gather raw text + filename for DPIE
-        raw_text = ""
-        fname = ""
-        for fn, value in (structured_docs or {}).items():
-            fname = fn
-            if isinstance(value, dict):
-                raw_text = str(value.get("full_text") or value.get("text") or "")[:2000]
-            elif isinstance(value, str):
-                raw_text = value[:2000]
-            if raw_text:
-                break
-        if raw_text:
-            dpie_type, dpie_confidence = dpie_classify_document_type(
-                text_sample=raw_text, tables_sample="", filename=fname,
-            )
-            if dpie_confidence > 0.5 and dpie_type != "other":
-                _DPIE_TYPE_TO_DOMAIN = {
-                    "resume": "resume", "invoice": "invoice",
-                    "contract": "legal", "policy": "legal",
-                    "report": "report", "statement": "financial",
-                    "purchase_order": "invoice", "presentation": "generic",
-                    "brochure": "generic",
-                }
-                return {
-                    "document_type": dpie_type.upper(),
-                    "domain": _DPIE_TYPE_TO_DOMAIN.get(dpie_type, "generic"),
-                    "confidence": dpie_confidence,
-                    "filename": fname,
-                    "classifier": "dpie",
-                }
-    except Exception:  # noqa: BLE001
-        pass  # DPIE unavailable, fall back to structured extraction
-
-    # ── Structured extraction metadata fallback ──────────────────────
+    # ── Structured extraction metadata ───────────────────────────────
     for fname, value in (structured_docs or {}).items():
         if isinstance(value, dict):
             return {
@@ -493,13 +568,149 @@ def _validate_extraction_fields(
             logger.warning("extraction_validation: invoice missing line items/total — doc=%s file=%s", filename, doc_type)
 
 
+# ---------------------------------------------------------------------------
+# Authoritative per-document domain assignment
+# ---------------------------------------------------------------------------
+
+_DOC_TYPE_TO_DOMAIN = {
+    "resume": "hr", "invoice": "invoice", "purchase_order": "invoice",
+    "contract": "legal", "policy": "legal", "statement": "financial",
+    "report": "generic", "brochure": "generic", "presentation": "generic",
+    "other": "generic",
+}
+
+
+def _resolve_authoritative_domain(
+    domain_signals: Dict[str, float],
+    doc_type: str,
+    structured_domain: str = "",
+    doc_type_confidence: float = 0.0,
+) -> Dict[str, Any]:
+    """Pick authoritative domain from signals.
+
+    Priority:
+    1. LLM doc_type classification when confidence >= 0.80 (most accurate — full context)
+    2. Highest domain_signal if score >= 0.35 AND clearly dominant (gap >= 0.10 over runner-up)
+    3. Fallback to structured_domain
+    4. Fallback to doc_type mapped via _DOC_TYPE_TO_DOMAIN
+    5. Fallback to "generic"
+    """
+    result: Dict[str, Any] = {"domain": "generic", "confidence": 0.0, "source": "fallback"}
+
+    # Signal 1: LLM document type classification (most reliable — reads full text)
+    doc_type_lower = (doc_type or "").lower()
+    mapped = _DOC_TYPE_TO_DOMAIN.get(doc_type_lower)
+    if mapped and mapped != "generic" and doc_type_confidence >= 0.80:
+        logger.info("Domain resolved via LLM doc_type: %s → %s (confidence=%.2f)", doc_type, mapped, doc_type_confidence)
+        return {"domain": mapped, "confidence": doc_type_confidence, "source": "llm_doc_type"}
+
+    # Signal 2: deep analysis domain signals (only if clearly dominant)
+    if domain_signals:
+        sorted_domains = sorted(domain_signals.items(), key=lambda x: x[1], reverse=True)
+        best_domain, best_score = sorted_domains[0]
+        runner_up_score = sorted_domains[1][1] if len(sorted_domains) > 1 else 0.0
+        gap = best_score - runner_up_score
+        if best_score >= 0.35 and gap >= 0.10:
+            # Cross-check: if LLM doc_type disagrees, trust LLM for known types
+            if mapped and mapped != "generic" and mapped != best_domain:
+                logger.info("Domain signal %s (%.2f) overridden by LLM doc_type %s → %s",
+                            best_domain, best_score, doc_type, mapped)
+                return {"domain": mapped, "confidence": max(doc_type_confidence, 0.5), "source": "llm_doc_type_override"}
+            result = {"domain": best_domain, "confidence": best_score, "source": "deep_analysis"}
+            return result
+
+    # Signal 3: structured extraction domain
+    if structured_domain and structured_domain != "generic":
+        result = {"domain": structured_domain, "confidence": 0.6, "source": "structured_extraction"}
+        return result
+
+    # Signal 4: document type mapping (lower confidence LLM or heuristic)
+    if mapped and mapped != "generic":
+        result = {"domain": mapped, "confidence": max(doc_type_confidence, 0.5), "source": "doc_type_mapping"}
+        return result
+
+    return result
+
+
+def _persist_document_domain(document_id: str, domain_result: Dict[str, Any]) -> None:
+    """Persist authoritative document domain to MongoDB."""
+    try:
+        from bson import ObjectId
+        from src.api.dataHandler import db
+        if db is None:
+            return
+        coll = db[Config.MongoDB.DOCUMENTS]
+        filt = {"_id": ObjectId(str(document_id))} if ObjectId.is_valid(str(document_id)) else {"_id": str(document_id)}
+        coll.update_one(filt, {"$set": {
+            "document_domain": domain_result.get("domain", "generic"),
+            "domain_confidence": domain_result.get("confidence", 0.0),
+            "domain_source": domain_result.get("source", "fallback"),
+        }}, upsert=False)
+    except Exception as exc:
+        logger.warning("Failed to persist document domain for %s: %s", document_id, exc)
+
+
+def _extract_text_from_extracted_document(doc: "ExtractedDocument") -> str:
+    """Extract usable text from an ExtractedDocument, trying all available fields.
+
+    Priority: full_text → sections → chunk_candidates → tables.
+    Never falls back to str(doc) which produces garbage repr strings.
+    """
+    text = (doc.full_text or "").strip()
+    if text:
+        return text
+
+    # Try sections
+    section_texts = [sec.text.strip() for sec in (doc.sections or []) if (sec.text or "").strip()]
+    if section_texts:
+        return "\n\n".join(section_texts)
+
+    # Try chunk_candidates
+    candidate_texts = [cand.text.strip() for cand in (doc.chunk_candidates or []) if (cand.text or "").strip()]
+    if candidate_texts:
+        return "\n\n".join(candidate_texts)
+
+    # Try tables
+    table_texts = [t.text.strip() for t in (doc.tables or []) if (t.text or "").strip()]
+    if table_texts:
+        return "\n\n".join(table_texts)
+
+    # Try canonical_json
+    canonical = getattr(doc, "canonical_json", None) or {}
+    if isinstance(canonical, dict):
+        text_parts = []
+        for k, v in canonical.items():
+            if isinstance(v, str) and v.strip():
+                text_parts.append(f"{k}: {v.strip()}")
+        if text_parts:
+            return "\n".join(text_parts)
+
+    logger.warning("ExtractedDocument has no usable text content")
+    return ""
+
+
 def _sanitize_raw_text_fields(docs: Any) -> Any:
     """Ensure no stringified repr or dict garbage in text fields."""
     if not isinstance(docs, dict):
         return docs
     from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
 
-    for fname, content in docs.items():
+    for fname, content in list(docs.items()):
+        # Convert ExtractedDocument objects to dict for downstream compatibility
+        if isinstance(content, ExtractedDocument):
+            text = _extract_text_from_extracted_document(content)
+            if text:
+                docs[fname] = {
+                    "full_text": text,
+                    "sections": [{"text": sec.text, "start_page": sec.start_page, "end_page": sec.end_page, "title": sec.title} for sec in (content.sections or []) if sec.text],
+                    "pages": max(1, max((sec.end_page for sec in content.sections if sec.end_page), default=1)) if content.sections else 1,
+                    "texts": [text],
+                    "doc_type": content.doc_type,
+                }
+                logger.info("Converted ExtractedDocument to dict for %s (%d chars)", fname, len(text))
+            else:
+                logger.warning("ExtractedDocument for %s has no extractable text", fname)
+            continue
         if not isinstance(content, dict):
             continue
         # Sanitize full_text
@@ -645,6 +856,9 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
     pii_masking_enabled = get_subscription_pii_setting(subscription_id)
     logger.info("Document %s (subscription %s): PII masking=%s", doc_id, subscription_id, pii_masking_enabled)
 
+    update_stage(doc_id, "extraction", {"status": "IN_PROGRESS", "started_at": time.time(), "error": None})
+    emit_progress(doc_id, "extraction", 0.05, "Starting document extraction")
+
     try:
         all_extracted_docs: Dict[str, Any] = {}
         try:
@@ -703,9 +917,11 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             else:
                 raise ValueError(f"Unsupported connector type: {doc_data.get('type')}")
         except CredentialError as exc:
+            set_error(doc_id, "extraction", exc)
             _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"CredentialError: {exc}")
             raise
         except BlobDownloadError as exc:
+            set_error(doc_id, "extraction", exc)
             _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"{exc.__class__.__name__}: {exc}")
             return {
                 "document_id": doc_id,
@@ -713,10 +929,13 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                 "error": f"{exc.__class__.__name__}: {exc}",
             }
         except Exception as exc:  # noqa: BLE001
+            set_error(doc_id, "extraction", exc)
             _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, str(exc))
             return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
         if not all_extracted_docs:
+            _no_content_exc = ValueError("No content extracted")
+            set_error(doc_id, "extraction", _no_content_exc)
             _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, "No content extracted")
             return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": "No content extracted"}
 
@@ -753,6 +972,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             extracted_docs=masked_docs,
         )
 
+        emit_progress(doc_id, "extraction", 0.08, "Text extracted from document")
+
         # Structured extraction: build structured JSON from masked/raw text and persist alongside raw extraction
         try:
             engine = get_extraction_engine()
@@ -768,8 +989,11 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                             [sec.get("text") for sec in (content.get("sections") or []) if sec.get("text")]
                         )
                         page_count = content.get("pages") or (len(content.get("sections") or []) or 1)
+                    elif isinstance(content, ExtractedDocument):
+                        raw_text = _extract_text_from_extracted_document(content)
+                        page_count = max(1, max((sec.end_page for sec in content.sections if sec.end_page), default=1)) if content.sections else 1
                     else:
-                        raw_text = str(content)
+                        raw_text = str(content) if not hasattr(content, "full_text") else (getattr(content, "full_text", "") or "")
                         page_count = 1
 
                     structured = engine.extract_document(
@@ -804,21 +1028,107 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             profile_id=profile_id,
         )
 
+        # Document understanding (summary, entities, facts) — runs inline for pickle enrichment
+        understanding_result = None
+        try:
+            from src.doc_understanding import identify_document, understand_document, build_content_map
+            for _fname, _content in (masked_docs or {}).items():
+                identification = identify_document(extracted=_content, filename=_fname)
+                content_map = build_content_map(_content)
+                understanding = understand_document(extracted=_content, doc_type=identification.document_type)
+                understanding_result = {
+                    "document_type": identification.document_type,
+                    "doc_type_confidence": identification.confidence,
+                    "document_summary": understanding.get("document_summary"),
+                    "section_summaries": understanding.get("section_summaries"),
+                    "key_entities": understanding.get("key_entities"),
+                    "key_facts": understanding.get("key_facts"),
+                    "intent_tags": understanding.get("intent_tags"),
+                    "content_map": content_map,
+                }
+                # Store in MongoDB for fast lookups during retrieval
+                try:
+                    update_extraction_metadata(doc_id, subscription_id, None, None)
+                    _update_understanding_fields(doc_id, understanding_result)
+                except Exception as exc:
+                    logger.warning("Failed to persist understanding for connector %s: %s", doc_id, exc)
+                break  # Process first document only
+        except Exception as exc:
+            logger.warning("Document understanding skipped for %s: %s", doc_id, exc)
+
+        # Deep document analysis (entity extraction, quality grading, temporal analysis)
+        deep_result = None
+        try:
+            from src.api.config import Config as _Cfg
+            if getattr(_Cfg, "DeepAnalysis", None) and getattr(_Cfg.DeepAnalysis, "ENABLED", True):
+                from src.doc_understanding.deep_analyzer import deep_analyze
+                for _fname, _content in (masked_docs or {}).items():
+                    with _DOC_PROCESSING_SEMAPHORE:
+                        deep_result = deep_analyze(
+                            _content,
+                            identification=understanding_result,
+                            content_map=understanding_result.get("content_map") if understanding_result else None,
+                        )
+                    # Store deep analysis fields in MongoDB
+                    try:
+                        _deep_fields = {
+                            "quality_grade": deep_result.quality_grade,
+                            "quality_score": deep_result.quality_score,
+                            "complexity_score": deep_result.complexity_score,
+                            "entity_mentions": [e.to_dict() for e in deep_result.entities[:100]],
+                            "chronological_span": deep_result.temporal_spans[:20],
+                            "section_roles": deep_result.section_roles,
+                            "domain_signals": deep_result.domain_signals,
+                        }
+                        _update_understanding_fields(doc_id, _deep_fields)
+                    except Exception as exc:
+                        logger.warning("Failed to persist deep analysis for connector %s: %s", doc_id, exc)
+                    # Enqueue background analysis for heavy processing
+                    try:
+                        from src.doc_understanding.background_analyzer import get_background_analyzer
+                        bg = get_background_analyzer()
+                        if bg and getattr(_Cfg.DeepAnalysis, "BACKGROUND_ENABLED", True):
+                            bg.enqueue(doc_id, subscription_id, profile_id)
+                    except Exception:
+                        pass
+                    break
+        except Exception as exc:
+            logger.warning("Deep analysis skipped for %s: %s", doc_id, exc)
+
         try:
             # Persist raw, structured extraction and intelligence in the pickle for source-of-truth
             doc_classification = _extract_classification_from_structured(structured_docs)
             entity_meta = _extract_entity_metadata(masked_docs, doc_data.get("name", ""))
             _validate_extraction_fields(doc_classification, masked_docs, doc_data.get("name", ""))
+
+            # Resolve authoritative document domain
+            document_domain = _resolve_authoritative_domain(
+                domain_signals=deep_result.domain_signals if deep_result else {},
+                doc_type=(understanding_result or {}).get("document_type", ""),
+                structured_domain=doc_classification.get("domain", ""),
+                doc_type_confidence=(understanding_result or {}).get("doc_type_confidence", 0.0),
+            )
+            _persist_document_domain(doc_id, document_domain)
+
             payload_to_save = {
                 "raw": masked_docs,
                 "structured": structured_docs,
                 "intelligence": intelligence_result,
                 "document_classification": doc_classification,
                 "entity_metadata": entity_meta,
+                "understanding": understanding_result,
+                "document_domain": document_domain,
+                "deep_analysis": {
+                    "quality_grade": deep_result.quality_grade if deep_result else None,
+                    "quality_score": deep_result.quality_score if deep_result else None,
+                    "complexity_score": deep_result.complexity_score if deep_result else None,
+                    "domain_signals": deep_result.domain_signals if deep_result else None,
+                } if deep_result else None,
             }
             save_info = save_extracted_pickle(doc_id, payload_to_save)
             update_extraction_metadata(doc_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
         except Exception as exc:  # noqa: BLE001
+            set_error(doc_id, "extraction", exc)
             _set_document_status(doc_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
             return {"document_id": doc_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
@@ -829,18 +1139,45 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             "extracted_hash": save_info.get("sha256"),
         }
         _set_document_status(doc_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
+        update_stage(doc_id, "extraction", {"status": "COMPLETED", "completed_at": time.time(), "error": None})
 
-        # KG ingestion (async, non-blocking)
-        _ingest_to_knowledge_graph(
-            document_id=doc_id,
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-            source_name=doc_data.get("name", "Unknown"),
-            payload_to_save=payload_to_save,
-        )
+        # KG ingestion (async, non-blocking — run in daemon thread to avoid stalling extraction)
+        _kg_async = getattr(getattr(Config, "DocumentProcessing", None), "KG_INGEST_ASYNC", True)
+        if _kg_async:
+            threading.Thread(
+                target=_ingest_to_knowledge_graph,
+                kwargs=dict(
+                    document_id=doc_id,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    source_name=doc_data.get("name", "Unknown"),
+                    payload_to_save=payload_to_save,
+                    deep_result=deep_result,
+                ),
+                daemon=True,
+            ).start()
+        else:
+            _ingest_to_knowledge_graph(
+                document_id=doc_id,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                source_name=doc_data.get("name", "Unknown"),
+                payload_to_save=payload_to_save,
+                deep_result=deep_result,
+            )
 
-        # Screening and embedding are now separate phases — invoke via API
-        logger.info("Extraction completed for %s; screening/embedding deferred to user", doc_id)
+        # HITL: No auto-embedding. Document stays at EXTRACTION_COMPLETED.
+        # User must manually trigger screening then embedding.
+        _mark_intelligence_ready(doc_id)
+        logger.info("Extraction completed for %s; awaiting manual screening/embedding", doc_id)
+
+        # Refresh profile-level domain tag
+        try:
+            from src.profiles.profile_domain_tagger import refresh_profile_domain_on_document_change
+            if subscription_id and profile_id:
+                refresh_profile_domain_on_document_change(subscription_id, profile_id)
+        except Exception:
+            pass
 
         summary = _build_extraction_summary(masked_docs)
         return {
@@ -928,6 +1265,7 @@ def extract_uploaded_document(
         update_document_fields(document_id, {"profile_name": profile_name, "metadata.profile_name": profile_name})
 
     update_stage(document_id, "extraction", {"status": "IN_PROGRESS", "started_at": time.time(), "error": None})
+    emit_progress(document_id, "extraction", 0.05, "Starting document extraction")
 
     try:
         extracted = fileProcessor(file_bytes, filename)
@@ -937,6 +1275,8 @@ def extract_uploaded_document(
         set_error(document_id, "extraction", exc)
         _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
         raise
+
+    emit_progress(document_id, "extraction", 0.08, "Text extracted from document")
 
     extracted = _normalize_extracted_metadata(extracted, document_id=document_id)
     extracted = _sanitize_raw_text_fields(extracted)
@@ -960,8 +1300,11 @@ def extract_uploaded_document(
                         [sec.get("text") for sec in (content.get("sections") or []) if sec.get("text")]
                     )
                     page_count = content.get("pages") or (len(content.get("sections") or []) or 1)
+                elif isinstance(content, ExtractedDocument):
+                    raw_text = _extract_text_from_extracted_document(content)
+                    page_count = max(1, max((sec.end_page for sec in content.sections if sec.end_page), default=1)) if content.sections else 1
                 else:
-                    raw_text = str(content)
+                    raw_text = str(content) if not hasattr(content, "full_text") else (getattr(content, "full_text", "") or "")
                     page_count = 1
 
                 structured = engine.extract_document(
@@ -987,17 +1330,100 @@ def extract_uploaded_document(
         profile_id=profile_id,
     )
 
+    # Document understanding (summary, entities, facts) — runs inline for pickle enrichment
+    understanding_result = None
+    try:
+        from src.doc_understanding import identify_document, understand_document, build_content_map
+        _docs_for_understanding = extracted if isinstance(extracted, dict) else {filename: extracted}
+        for _fname, _content in _docs_for_understanding.items():
+            identification = identify_document(extracted=_content, filename=_fname)
+            content_map = build_content_map(_content)
+            understanding = understand_document(extracted=_content, doc_type=identification.document_type)
+            understanding_result = {
+                "document_type": identification.document_type,
+                "doc_type_confidence": identification.confidence,
+                "document_summary": understanding.get("document_summary"),
+                "section_summaries": understanding.get("section_summaries"),
+                "key_entities": understanding.get("key_entities"),
+                "key_facts": understanding.get("key_facts"),
+                "intent_tags": understanding.get("intent_tags"),
+                "content_map": content_map,
+            }
+            try:
+                _update_understanding_fields(document_id, understanding_result)
+            except Exception as exc:
+                logger.warning("Failed to persist understanding for upload %s: %s", document_id, exc)
+            break
+    except Exception as exc:
+        logger.warning("Document understanding skipped for %s: %s", document_id, exc)
+
+    # Deep document analysis (upload path)
+    deep_result = None
+    try:
+        from src.api.config import Config as _Cfg
+        if getattr(_Cfg, "DeepAnalysis", None) and getattr(_Cfg.DeepAnalysis, "ENABLED", True):
+            from src.doc_understanding.deep_analyzer import deep_analyze
+            _docs_for_deep = extracted if isinstance(extracted, dict) else {filename: extracted}
+            for _fname, _content in _docs_for_deep.items():
+                with _DOC_PROCESSING_SEMAPHORE:
+                    deep_result = deep_analyze(
+                        _content,
+                        identification=understanding_result,
+                        content_map=understanding_result.get("content_map") if understanding_result else None,
+                    )
+                try:
+                    _deep_fields = {
+                        "quality_grade": deep_result.quality_grade,
+                        "quality_score": deep_result.quality_score,
+                        "complexity_score": deep_result.complexity_score,
+                        "entity_mentions": [e.to_dict() for e in deep_result.entities[:100]],
+                        "chronological_span": deep_result.temporal_spans[:20],
+                        "section_roles": deep_result.section_roles,
+                        "domain_signals": deep_result.domain_signals,
+                    }
+                    _update_understanding_fields(document_id, _deep_fields)
+                except Exception as exc:
+                    logger.warning("Failed to persist deep analysis for upload %s: %s", document_id, exc)
+                try:
+                    from src.doc_understanding.background_analyzer import get_background_analyzer
+                    bg = get_background_analyzer()
+                    if bg and getattr(_Cfg.DeepAnalysis, "BACKGROUND_ENABLED", True):
+                        bg.enqueue(document_id, subscription_id, profile_id)
+                except Exception:
+                    pass
+                break
+    except Exception as exc:
+        logger.warning("Deep analysis skipped for upload %s: %s", document_id, exc)
+
     try:
         # Persist uploaded file extraction (raw, structured, intelligence, classification) in the pickle
         doc_classification = _extract_classification_from_structured(structured_docs)
         entity_meta = _extract_entity_metadata(extracted, filename)
         _validate_extraction_fields(doc_classification, extracted, filename)
+
+        # Resolve authoritative document domain
+        document_domain = _resolve_authoritative_domain(
+            domain_signals=deep_result.domain_signals if deep_result else {},
+            doc_type=(understanding_result or {}).get("document_type", ""),
+            structured_domain=doc_classification.get("domain", ""),
+            doc_type_confidence=(understanding_result or {}).get("doc_type_confidence", 0.0),
+        )
+        _persist_document_domain(document_id, document_domain)
+
         payload_to_save = {
             "raw": extracted,
             "structured": structured_docs,
             "intelligence": intelligence_result,
             "document_classification": doc_classification,
             "entity_metadata": entity_meta,
+            "understanding": understanding_result,
+            "document_domain": document_domain,
+            "deep_analysis": {
+                "quality_grade": deep_result.quality_grade if deep_result else None,
+                "quality_score": deep_result.quality_score if deep_result else None,
+                "complexity_score": deep_result.complexity_score if deep_result else None,
+                "domain_signals": deep_result.domain_signals if deep_result else None,
+            } if deep_result else None,
         }
         save_info = save_extracted_pickle(document_id, payload_to_save)
         update_extraction_metadata(document_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
@@ -1012,18 +1438,45 @@ def extract_uploaded_document(
         "extracted_hash": save_info.get("sha256"),
     }
     _set_document_status(document_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
+    update_stage(document_id, "extraction", {"status": "COMPLETED", "completed_at": time.time(), "error": None})
 
-    # KG ingestion (async, non-blocking)
-    _ingest_to_knowledge_graph(
-        document_id=document_id,
-        subscription_id=subscription_id,
-        profile_id=profile_id,
-        source_name=filename,
-        payload_to_save=payload_to_save,
-    )
+    # KG ingestion (async, non-blocking — run in daemon thread to avoid stalling extraction)
+    _kg_async = getattr(getattr(Config, "DocumentProcessing", None), "KG_INGEST_ASYNC", True)
+    if _kg_async:
+        threading.Thread(
+            target=_ingest_to_knowledge_graph,
+            kwargs=dict(
+                document_id=document_id,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                source_name=filename,
+                payload_to_save=payload_to_save,
+                deep_result=deep_result,
+            ),
+            daemon=True,
+        ).start()
+    else:
+        _ingest_to_knowledge_graph(
+            document_id=document_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            source_name=filename,
+            payload_to_save=payload_to_save,
+            deep_result=deep_result,
+        )
 
-    # Screening and embedding are now separate phases — invoke via API
-    logger.info("Extraction completed for %s; screening/embedding deferred to user", document_id)
+    # HITL: No auto-embedding. Document stays at EXTRACTION_COMPLETED.
+    # User must manually trigger screening then embedding.
+    _mark_intelligence_ready(document_id)
+    logger.info("Extraction completed for %s; awaiting manual screening/embedding", document_id)
+
+    # Refresh profile-level domain tag
+    try:
+        from src.profiles.profile_domain_tagger import refresh_profile_domain_on_document_change
+        if subscription_id and profile_id:
+            refresh_profile_domain_on_document_change(subscription_id, profile_id)
+    except Exception:
+        pass
 
     summary = _build_extraction_summary(extracted)
     return {

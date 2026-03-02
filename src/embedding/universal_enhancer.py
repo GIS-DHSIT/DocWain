@@ -184,6 +184,45 @@ class ContentTypeDetector:
             logger.warning("Embedder encode failed in detect_ml, falling back to regex", exc_info=True)
             return self.detect(text, section_title)
 
+        return self._classify_vector(vec, text)
+
+    def detect_ml_batch(
+        self, texts: List[str], section_titles: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Batch ML content type detection — encodes all texts in one call.
+
+        Falls back to per-item regex ``detect()`` when embedder is unavailable.
+        """
+        if not texts:
+            return []
+        self._ensure_prototypes()
+        if not self._prototypes or self._embedder is None or not _HAS_NUMPY:
+            titles = section_titles or [""] * len(texts)
+            return [self.detect(t, s) for t, s in zip(texts, titles)]
+
+        titles = section_titles or [""] * len(texts)
+        input_texts = [
+            f"{title}: {text[:500]}" if title else text[:500]
+            for text, title in zip(texts, titles)
+        ]
+        try:
+            vecs = np.asarray(
+                self._embedder.encode(
+                    input_texts,
+                    normalize_embeddings=True,
+                    convert_to_numpy=True,
+                    batch_size=32,
+                ),
+                dtype=np.float32,
+            )
+        except Exception:
+            logger.warning("Batch encode failed in detect_ml_batch, falling back to regex", exc_info=True)
+            return [self.detect(t, s) for t, s in zip(texts, titles)]
+
+        return [self._classify_vector(vecs[i], texts[i]) for i in range(len(texts))]
+
+    def _classify_vector(self, vec: Any, text: str) -> Dict[str, Any]:
+        """Classify a single pre-encoded vector against prototypes."""
         # Cosine similarity to each prototype
         scores: Dict[str, float] = {}
         for ctype, centroid in self._prototypes.items():
@@ -846,6 +885,7 @@ class UniversalEmbeddingEnhancer:
         section_path: str = "",
         document_type: str = "",
         document_domain: str = "",
+        _content_info: Optional[Dict[str, Any]] = None,
     ) -> EnhancedEmbeddingResult:
         """
         Enhance a single chunk for embedding.
@@ -856,12 +896,15 @@ class UniversalEmbeddingEnhancer:
             section_path: Full section hierarchy
             document_type: Document type (resume, invoice, etc.)
             document_domain: Document domain classification
+            _content_info: Pre-computed content type info (from batch detection)
 
         Returns:
             EnhancedEmbeddingResult with all enhancements
         """
-        # Detect content type — ML when embedder available, regex fallback
-        if self.content_detector._embedder is not None:
+        # Use pre-computed content info if provided, otherwise detect
+        if _content_info is not None:
+            content_info = _content_info
+        elif self.content_detector._embedder is not None:
             content_info = self.content_detector.detect_ml(text, section_title)
         else:
             content_info = self.content_detector.detect(text, section_title)

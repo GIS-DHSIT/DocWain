@@ -132,7 +132,13 @@ def _enhance_with_universal_enhancer(
             similarity_threshold=0.85,
         )
 
-        # Enhance each chunk with universal enhancer
+        # Batch-detect content types (single encode call instead of per-chunk)
+        section_titles_list = [c.get("section_title", "") for c in deduped_chunks]
+        content_infos = enhancer.content_detector.detect_ml_batch(
+            deduped_texts, section_titles_list,
+        )
+
+        # Enhance each chunk with universal enhancer (content type pre-computed)
         enhanced_texts = []
         enhanced_metadata = []
         quality_scores = []
@@ -141,13 +147,14 @@ def _enhance_with_universal_enhancer(
         doc_type = document_metadata.get("document_type", domain)
 
         for idx, (text, meta, chunk) in enumerate(zip(deduped_texts, deduped_metadata, deduped_chunks)):
-            # Enhance chunk
+            # Enhance chunk with pre-computed content info
             result = enhancer.enhance_chunk(
                 text=text,
                 section_title=chunk.get("section_title", ""),
                 section_path=chunk.get("section_path", ""),
                 document_type=doc_type,
                 document_domain=domain,
+                _content_info=content_infos[idx] if idx < len(content_infos) else None,
             )
 
             # Use context-enriched embedding text for vector generation

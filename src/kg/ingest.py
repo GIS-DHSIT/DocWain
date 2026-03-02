@@ -59,6 +59,8 @@ class GraphIngestPayload:
     mentions: List[GraphMention]
     fields: List[GraphField]
     attempts: int = 0
+    typed_relationships: List[Dict[str, Any]] = field(default_factory=list)
+    temporal_spans: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -67,6 +69,8 @@ class GraphIngestPayload:
             "mentions": [mention.__dict__ for mention in self.mentions],
             "fields": [field.__dict__ for field in self.fields],
             "attempts": self.attempts,
+            "typed_relationships": self.typed_relationships,
+            "temporal_spans": self.temporal_spans,
         }
 
     @staticmethod
@@ -96,6 +100,8 @@ class GraphIngestPayload:
             mentions=[_coerce_mention(mention) for mention in payload.get("mentions", [])],
             fields=[_coerce_field(field) for field in payload.get("fields", [])],
             attempts=int(payload.get("attempts", 0)),
+            typed_relationships=payload.get("typed_relationships") or [],
+            temporal_spans=payload.get("temporal_spans") or [],
         )
 
 
@@ -214,6 +220,30 @@ def get_graph_ingest_queue(redis_client: Optional[Any] = None) -> GraphIngestQue
     return _graph_ingest_queue
 
 
+def _deep_entities_to_graph_entities(deep_entities: list) -> list:
+    """Convert deep analysis EntityMention dicts to GraphEntity-compatible dicts.
+
+    Each incoming dict is expected to have at least ``text`` and ``type`` keys.
+    Returns a list of dicts with ``text``, ``type``, ``confidence``, and
+    optional ``page`` — ready for conversion to :class:`GraphEntity` instances
+    during graph payload construction.
+    """
+    result: List[Dict[str, Any]] = []
+    for ent in (deep_entities or []):
+        if not isinstance(ent, dict):
+            continue
+        text = (ent.get("text") or "").strip()
+        if not text:
+            continue
+        result.append({
+            "text": text,
+            "type": ent.get("type", "UNKNOWN"),
+            "confidence": float(ent.get("confidence", 0.5)),
+            "page": ent.get("page"),
+        })
+    return result
+
+
 def build_graph_payload(
     *,
     embeddings_payload: Dict[str, Any],
@@ -222,6 +252,8 @@ def build_graph_payload(
     document_id: str,
     doc_name: str,
     doc_metadata: Optional[Dict[str, Any]] = None,
+    deep_entities: Optional[List[Dict[str, Any]]] = None,
+    typed_relationships: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[GraphIngestPayload]:
     if not embeddings_payload:
         return None
@@ -320,6 +352,47 @@ def build_graph_payload(
                     )
                 )
 
+    # ── Deep analysis entities (from document understanding pipeline) ──
+    deep_ents = _deep_entities_to_graph_entities(deep_entities)
+    for dent in deep_ents:
+        ent_type = dent["type"]
+        ent_name = dent["text"]
+        confidence = dent["confidence"]
+        normalized = normalize_entity_name(ent_name)
+        if not normalized:
+            continue
+        entity_id = f"{tenant_prefix}{ent_type}::{normalized}"
+        entities.setdefault(
+            entity_id,
+            GraphEntity(
+                entity_id=entity_id,
+                name=ent_name,
+                type=ent_type,
+                normalized_name=normalized,
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+            ),
+        )
+        # Deep entities are document-level — link to the document via a
+        # synthetic mention using the first available chunk_id (or doc_id).
+        first_chunk_id = None
+        if chunk_metadata:
+            first_chunk_id = chunk_metadata[0].get("chunk_id")
+        ref_id = first_chunk_id or str(document_id)
+        edge_key = f"deep::{document_id}::{entity_id}"
+        mentions.append(
+            GraphMention(
+                doc_id=str(document_id),
+                entity_id=entity_id,
+                chunk_id=ref_id,
+                evidence_span=None,
+                confidence=confidence,
+                edge_key=edge_key,
+                subscription_id=str(subscription_id),
+                profile_id=str(profile_id),
+            )
+        )
+
     if not mentions and not fields:
         return None
 
@@ -328,6 +401,8 @@ def build_graph_payload(
         entities=list(entities.values()),
         mentions=mentions,
         fields=fields,
+        typed_relationships=list(typed_relationships) if typed_relationships else [],
+        temporal_spans=[],  # Populated by callers that pass deep_result.temporal_spans
     )
 
 
@@ -383,7 +458,12 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
             "FOREACH (_ IN CASE WHEN ent.type = 'LOCATION' THEN [1] ELSE [] END | SET e:Location) "
             "FOREACH (_ IN CASE WHEN ent.type = 'DATE' THEN [1] ELSE [] END | SET e:Date) "
             "FOREACH (_ IN CASE WHEN ent.type = 'AMOUNT' THEN [1] ELSE [] END | SET e:Amount) "
-            "FOREACH (_ IN CASE WHEN ent.type IN ['CLAUSE','TERM'] THEN [1] ELSE [] END | SET e:Clause)"
+            "FOREACH (_ IN CASE WHEN ent.type IN ['CLAUSE','TERM'] THEN [1] ELSE [] END | SET e:Clause) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'PRODUCT' THEN [1] ELSE [] END | SET e:Product) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'LAW' THEN [1] ELSE [] END | SET e:Law) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'EVENT' THEN [1] ELSE [] END | SET e:Event) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'MEDICAL_TERM' THEN [1] ELSE [] END | SET e:MedicalTerm) "
+            "FOREACH (_ IN CASE WHEN ent.type = 'FINANCIAL_INSTRUMENT' THEN [1] ELSE [] END | SET e:FinancialInstrument)"
         )
         store.run_query(entity_query, {"entities": entities})
 
@@ -411,6 +491,76 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
             "    r.chunk_id = row.chunk_id"
         )
         store.run_query(field_query, {"fields": fields})
+
+    # ── Typed relationships from deep analysis ──
+    # Build a lookup of entity normalized name → entity_id from the just-ingested entities.
+    typed_rels = payload.typed_relationships or []
+    if typed_rels:
+        # Map normalized entity names to entity_ids for lookup
+        entity_name_to_id: Dict[str, str] = {}
+        for ent in payload.entities:
+            key = ent.normalized_name.lower() if ent.normalized_name else ent.name.lower()
+            entity_name_to_id[key] = ent.entity_id
+            # Also map by raw name in case normalized differs
+            entity_name_to_id[ent.name.lower()] = ent.entity_id
+
+        created_rels = 0
+        for rel in typed_rels:
+            e1_text = (rel.get("entity1") or "").lower()
+            e2_text = (rel.get("entity2") or "").lower()
+            relation_type = rel.get("relation_type", "RELATED_TO")
+
+            e1_id = entity_name_to_id.get(e1_text)
+            e2_id = entity_name_to_id.get(e2_text)
+
+            if e1_id and e2_id and e1_id != e2_id:
+                try:
+                    store.create_entity_relationship(
+                        entity1_id=e1_id,
+                        entity2_id=e2_id,
+                        relation_type=relation_type,
+                        frequency=1,
+                    )
+                    created_rels += 1
+                except Exception as _rel_exc:  # noqa: BLE001
+                    logger.debug("KG typed relationship creation skipped: %s", _rel_exc)
+
+        if created_rels:
+            logger.info(
+                "KG: created %d typed relationship(s) for doc_id=%s",
+                created_rels,
+                payload.document.get("doc_id"),
+            )
+
+    # ── Timeline nodes from temporal spans ──
+    temporal_spans = payload.temporal_spans or []
+    doc_id_for_tl = payload.document.get("doc_id", "")
+    if temporal_spans and doc_id_for_tl:
+        created_tl = 0
+        for span in temporal_spans:
+            start = span.get("start_date") or span.get("raw_text") or ""
+            end = span.get("end_date") or span.get("raw_text") or start
+            description = span.get("description") or span.get("raw_text") or ""
+            if not start or not description:
+                continue
+            try:
+                store.create_timeline_node(
+                    document_id=doc_id_for_tl,
+                    start_date=str(start),
+                    end_date=str(end),
+                    description=str(description),
+                    entity_ids=None,
+                )
+                created_tl += 1
+            except Exception as _tl_exc:  # noqa: BLE001
+                logger.debug("KG timeline node creation skipped: %s", _tl_exc)
+
+        if created_tl:
+            logger.info(
+                "KG: created %d timeline node(s) for doc_id=%s",
+                created_tl,
+                doc_id_for_tl,
+            )
 
 
 def _extract_evidence_span(text: str, name: str, window: int = 48) -> Optional[str]:

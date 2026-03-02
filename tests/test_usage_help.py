@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from src.intelligence.conversational_nlp import (
+    CAPABILITY,
     USAGE_HELP,
     ConversationalContext,
     classify_conversational_intent,
@@ -18,6 +19,7 @@ from src.intelligence.conversational_nlp import (
 )
 from src.intelligence.usage_help import (
     ADVANCED_FEATURES,
+    CAPABILITY_OVERVIEW,
     CONTENT_GENERATION_HELP,
     DOMAIN_EXAMPLES,
     FILE_TYPES,
@@ -126,6 +128,10 @@ class TestHelpSubIntentClassifier:
     def test_content_generation_help(self):
         result = classify_help_sub_intent("how can I generate content?")
         assert result.name == CONTENT_GENERATION_HELP
+
+    def test_capability_overview(self):
+        result = classify_help_sub_intent("what else can you do?")
+        assert result.name == CAPABILITY_OVERVIEW
 
     def test_advanced_features(self):
         result = classify_help_sub_intent("advanced features")
@@ -295,6 +301,14 @@ class TestResponseComposition:
         resp = compose_usage_help_response("advanced features", ctx)
         assert "Fine-Tuning" in resp or "fine-tuning" in resp.lower()
 
+    def test_capability_overview_response(self):
+        ctx = _ctx(doc_count=3, domains=["resume"])
+        resp = compose_usage_help_response("what else can you do?", ctx)
+        low = resp.lower()
+        assert "docwain" in low
+        assert "what docwain can do" in low or "capabilities" in low
+        assert "try these queries" in low
+
     def test_task_help_compare(self):
         ctx = _ctx(doc_count=5, domains=["resume"])
         resp = compose_usage_help_response("how do I compare documents?", ctx)
@@ -342,6 +356,12 @@ class TestIntegrationWithConversationalNLP:
         assert result is not None
         intent, _conf = result
         assert intent == USAGE_HELP
+
+    def test_what_else_can_you_do_classified_as_capability(self):
+        result = classify_conversational_intent("what else can you do?")
+        assert result is not None
+        intent, _conf = result
+        assert intent == CAPABILITY
 
     def test_compose_response_delegates_to_usage_help(self):
         ctx = _ctx(doc_count=5, domains=["resume"])

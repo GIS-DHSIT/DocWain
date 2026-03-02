@@ -1,11 +1,7 @@
 """NLP-based entity extraction from user queries.
 
-Replaces regex-based entity patterns with spaCy dependency parsing and DPIE ML
-models.  The approach is:
-
-1. **DPIE** (trained ML model) — primary, when models are trained.
-2. **spaCy dependency parsing** — always available, case-insensitive.
-3. No regex patterns for entity name detection.
+Uses spaCy dependency parsing for entity extraction.
+No regex patterns for entity name detection.
 
 The key NLP signals used:
 - ``pobj`` of prepositions (of / for / about / from / by)
@@ -78,7 +74,8 @@ _DOMAIN_STOPWORDS = frozenset({
     # Contact fields
     "email", "phone", "linkedin", "contact",
     # Common nouns / determiners
-    "details", "data", "info", "list", "table", "output", "result",
+    "details", "data", "info", "list", "table", "output", "result", "results",
+    "plan", "plans", "treatment", "medications", "diagnosis", "findings",
     "format", "type", "name", "number", "date", "year", "years",
     "all", "each", "every", "many", "some", "other", "most",
     "best", "top", "total", "average", "count",
@@ -86,6 +83,41 @@ _DOMAIN_STOPWORDS = frozenset({
     # Abstract domain terms (too generic as entity names)
     "conditions", "terms", "clauses", "requirements", "provisions",
     "procedures", "policy", "coverage", "exclusions",
+    # Language names (translation queries — never valid entity hints)
+    "french", "spanish", "german", "italian", "portuguese", "dutch",
+    "russian", "chinese", "japanese", "korean", "arabic", "hindi",
+    "turkish", "polish", "swedish", "norwegian", "danish", "finnish",
+    "greek", "czech", "romanian", "hungarian", "thai", "vietnamese",
+    "indonesian", "malay", "hebrew", "ukrainian", "tamil", "telugu",
+    "bengali", "urdu", "persian", "swahili", "catalan", "english",
+    "translate", "translation", "translator",
+    # Tool-action words that should never be entities
+    "draft", "compose", "generate", "create", "write", "build",
+    "search", "internet", "online", "web",
+    # Adjectives/fragments that should never be entities
+    "non", "available", "highlevel", "high", "level", "brief",
+    # Generic document/file nouns — never valid entity hints
+    "file", "files", "product", "products", "manual", "manuals",
+    "version", "versions", "page", "pages", "section", "sections",
+    "item", "items", "record", "records", "entry", "entries",
+    "content", "contents", "attachment", "attachments",
+    "convert", "conversion", "highlight", "highlevel",
+    # Plural forms of existing stopwords (spaCy treats them as different tokens)
+    "documents", "reports", "profiles", "invoices", "resumes",
+    "candidates", "positions", "roles", "summaries", "overviews",
+    # Medical document types and terms — NOT person names
+    "patient", "patients", "pathology", "radiology", "clinical",
+    "progress", "note", "notes", "lab", "laboratory", "medication",
+    "medications", "prescription", "prescriptions", "vital", "signs",
+    "authorized", "signature", "signatures", "dosage", "prognosis",
+    "discharge", "admission", "consultation", "referral", "imaging",
+    "procedure", "procedures", "surgical", "operative", "specimen",
+    # Legal document types
+    "clause", "clauses", "agreement", "agreements", "contract", "contracts",
+    "liability", "indemnification", "arbitration", "jurisdiction",
+    # Invoice/financial terms
+    "subtotal", "balance", "remittance", "payable", "receivable",
+    "vendor", "vendors", "supplier", "suppliers",
 })
 
 # Dependency labels that indicate entity position
@@ -257,37 +289,16 @@ def _extract_via_dependency_parse(query: str) -> Optional[str]:
     return candidates[0]
 
 
-def _extract_via_dpie(query: str) -> Optional[str]:
-    """Extract entity name using DPIE ML model (when trained)."""
-    try:
-        from src.intelligence.dpie_integration import dpie_detect_person_name
-        name = dpie_detect_person_name(query)
-        if name:
-            logger.debug("DPIE detected person name: %s", name)
-            return name
-    except Exception:  # noqa: BLE001
-        pass
-    return None
-
-
 def extract_entity_from_query(query: str) -> Optional[str]:
     """Extract the target entity name from a user query.
 
-    Uses NLP algorithms (no regex patterns):
-    1. DPIE ML model (primary, when trained)
-    2. spaCy dependency parsing (always available)
+    Uses spaCy dependency parsing.
 
     Returns the entity name string or None if no entity detected.
     """
     if not query or not query.strip():
         return None
 
-    # Try DPIE first (ML-trained, domain-specific)
-    entity = _extract_via_dpie(query)
-    if entity:
-        return entity
-
-    # Fallback: spaCy dependency parsing
     entity = _extract_via_dependency_parse(query)
     if entity:
         return entity
@@ -306,21 +317,7 @@ def extract_all_entities(query: str) -> List[str]:
 
     entities: List[str] = []
 
-    # Try DPIE for all entities
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-        registry = DPIERegistry.get()
-        if registry and registry._loaded:
-            dpie_entities = registry.extract_entities(query)
-            for ent in dpie_entities:
-                if ent.get("type") == "PERSON" and ent.get("entity"):
-                    entities.append(ent["entity"])
-            if entities:
-                return entities
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Fallback: spaCy
+    # spaCy
     nlp = _get_nlp()
     if nlp is None:
         return entities

@@ -33,7 +33,7 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-EXTRACT_TIMEOUT_MS = 15000
+EXTRACT_TIMEOUT_MS = 30000
 
 @dataclass
 class ExtractionResult:
@@ -76,26 +76,37 @@ def schema_extract(
     intent_hint: Optional[str] = None,
     query_focus: Optional[Any] = None,
     embedder: Any = None,
+    intent_parse: Any = None,
 ) -> ExtractionResult:
-    domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint, intent_hint=intent_hint)
+    domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint,
+                                          intent_hint=intent_hint, intent_parse=intent_parse)
 
     # Handle domain mismatch: query asks for a domain that doesn't match the actual chunks
     if domain == "mismatch":
-        query_domain = _query_domain_override(query) or "unknown"
+        query_domain = _ml_query_domain(query, intent_parse=intent_parse) or "unknown"
         chunk_domain = _majority_chunk_domain(chunks) or "unknown"
-        _DOMAIN_LABEL = {"hr": "resumes", "resume": "resumes", "invoice": "invoices", "legal": "legal documents"}
+        _DOMAIN_LABEL = {"hr": "resumes", "resume": "resumes", "invoice": "invoices",
+                         "legal": "legal documents", "medical": "medical records",
+                         "policy": "policy documents", "insurance": "insurance documents"}
         asked = _DOMAIN_LABEL.get(query_domain, query_domain)
         available = _DOMAIN_LABEL.get(chunk_domain, chunk_domain)
-        msg = f"No {asked} found in this profile. The available documents are {available}."
+        msg = (f"No {asked} found in this profile. The available documents are {available}. "
+               f"To analyze {asked}, please upload the relevant {asked} documents to this profile.")
         schema = GenericSchema(facts=FieldValuesField(items=[FieldValue(label=None, value=msg, evidence_spans=[])]))
         return ExtractionResult(domain=chunk_domain, intent=intent, schema=schema)
 
     schema = _deterministic_extract(domain, intent, query, chunks, query_focus=query_focus, embedder=embedder)
 
-    if _schema_is_empty(schema) and llm_client and budget.consume():
+    completeness = _schema_completeness(schema)
+    if completeness < 0.4 and llm_client and budget.consume():
         llm_schema = _llm_extract(domain, intent, query, chunks, llm_client, correlation_id)
         if llm_schema is not None:
-            schema = llm_schema
+            if completeness == 0.0:
+                # Fully empty — use LLM result directly
+                schema = llm_schema
+            else:
+                # Partially populated — merge (deterministic values preserved, LLM fills gaps)
+                schema = _merge_schemas(schema, llm_schema)
 
     if _detect_multi_entity_collision(domain, schema, chunks, scope_document_id, intent):
         schema = _build_multi_entity_schema(domain, schema, chunks)
@@ -104,91 +115,140 @@ def schema_extract(
     return ExtractionResult(domain=domain, intent=intent, schema=schema)
 
 
-_HR_CONTENT_HINTS = (
-    "resume", "candidate", "skills", "experience", "education", "certification",
-    "employment", "designation", "qualification", "career", "profile summary",
-    "work history", "professional", "objective", "achievements",
+# Content validators: multi-word phrases that MUST appear in chunk text
+# for a metadata domain tag to be trusted.  Single generic words like
+# "total", "policy", "experience" cause massive false positives on
+# technical manuals, product docs, etc.  Only multi-word phrases here.
+_INVOICE_CONTENT_VALIDATORS = (
+    "invoice number", "amount due", "bill to", "total due", "payment terms",
+    "purchase order", "remittance", "balance due", "unit price", "invoice total",
+    "invoice date", "net amount",
 )
-_INVOICE_CONTENT_HINTS = ("invoice", "amount due", "bill to", "total due", "payment terms")
-_LEGAL_CONTENT_HINTS = ("contract", "agreement", "clause", "liability", "parties")
-_POLICY_CONTENT_HINTS = (
-    "insurance", "policy", "premium", "coverage", "claim", "deductible",
-    "exclusion", "underwriting", "insured", "beneficiary", "endorsement",
-    "indemnity", "peril", "policyholder",
+_HR_CONTENT_VALIDATORS = (
+    "work experience", "professional experience", "career objective",
+    "curriculum vitae", "resume", "professional summary", "work history",
+    "years of experience", "technical skills", "key skills",
+    "skills:", "education:", "experience:",
+)
+_LEGAL_CONTENT_VALIDATORS = (
+    "governing law", "indemnification", "in witness whereof",
+    "terms and conditions", "hereinafter", "contract",
+)
+_MEDICAL_CONTENT_VALIDATORS = (
+    "patient", "diagnosis", "diagnoses", "medication", "prescription",
+    "clinical", "symptoms", "vitals", "blood pressure",
+    "lab result", "medical history", "allerg", "dosage",
+)
+_POLICY_CONTENT_VALIDATORS = (
+    "insurance policy", "policy number", "coverage period",
+    "premium", "deductible", "policyholder", "sum insured",
 )
 
-# Strong query signals that override chunk-based domain detection
-_QUERY_HR_STRONG = ("resume", "cv", "curriculum vitae", "candidate")
-_QUERY_HR_WEAK = ("skills", "education", "certification", "certifications", "experience", "achievements",
-                   "profile", "qualified", "suitable", "background", "career", "designation", "work history")
-_QUERY_INVOICE_STRONG = ("invoice", "invoices", "payment", "bill", "amount due")
-_QUERY_LEGAL_STRONG = ("contract", "agreement", "clause", "liability")
-_QUERY_POLICY_STRONG = ("insurance", "policy", "premium", "coverage", "claim", "deductible",
-                         "exclusion", "underwriting", "insured", "beneficiary")
+# ALL structured domains need content validation to prevent misclassification
+_DOMAIN_CONTENT_VALIDATORS: Dict[str, tuple] = {
+    "medical": _MEDICAL_CONTENT_VALIDATORS,
+    "invoice": _INVOICE_CONTENT_VALIDATORS,
+    "hr": _HR_CONTENT_VALIDATORS,
+    "legal": _LEGAL_CONTENT_VALIDATORS,
+    "policy": _POLICY_CONTENT_VALIDATORS,
+}
+
+_DOMAIN_MAP = {"resume": "hr", "invoice": "invoice", "legal": "legal",
+               "policy": "policy", "report": "report"}
 
 
-def _query_domain_override(query: str) -> Optional[str]:
-    """Detect domain from query keywords — strong signals override chunk majority."""
-    lowered = (query or "").lower()
-    # Strong HR signals — a single match is sufficient
-    if any(token in lowered for token in _QUERY_HR_STRONG):
-        return "hr"
-    # Strong invoice/legal signals
-    if any(token in lowered for token in _QUERY_INVOICE_STRONG):
-        return "invoice"
-    if any(token in lowered for token in _QUERY_LEGAL_STRONG):
-        return "legal"
-    if any(token in lowered for token in _QUERY_POLICY_STRONG):
-        return "policy"
-    # Weak HR signals — a single match is sufficient (skills/education/etc. are unambiguously HR)
-    if any(token in lowered for token in _QUERY_HR_WEAK):
-        return "hr"
-    if not query:
-        return None
-    # Person-name possessive: "Gaurav's profile", "Dhayal's career"
-    if re.search(r"\b[A-Z][a-z]+(?:'s)\s+(?:profile|summary|background|details|career|role|strengths|weaknesses)", query):
-        return "hr"
-    # Reasoning about a person: "Is Gokul qualified for...", "Can Dev handle..."
-    if re.search(r"\b(?:is|does|can|would)\s+[A-Z][a-z]+\b.*\b(?:qualified|suitable|fit|capable|eligible|ready)\b", query, re.I):
-        return "hr"
-    # Summarize/describe a person: "Summarize Gaurav", "Describe Dev's experience"
-    # Use case-insensitive for verb, but require capitalized name (proper noun)
-    if re.search(r"(?i:summarize|describe|tell\s+me\s+about)\s+[A-Z][a-z]+", query):
-        return "hr"
+def _ml_query_domain(query: str, intent_parse: Any = None) -> Optional[str]:
+    """Detect query domain using trained ML classifier.
+
+    Strategy:
+    1. Use intent_parse.domain if available and confident
+    2. Fall back to semantic domain classifier
+    """
+    # 1. Use intent_parse.domain if available and confident
+    if intent_parse and getattr(intent_parse, "domain", None) not in ("generic", None, ""):
+        mapped = _DOMAIN_MAP.get(intent_parse.domain)
+        if mapped:
+            return mapped
+
+    # 2. Use semantic domain classifier for the query itself
+    try:
+        from src.intelligence.domain_classifier import classify_domain
+        result = classify_domain(query)
+        if result and not result.uncertain and result.domain not in ("generic",):
+            mapped = _DOMAIN_MAP.get(result.domain, result.domain)
+            return mapped if mapped in ("hr", "invoice", "legal", "policy", "medical") else None
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 3. Fall back to IntentDomainClassifier
+    try:
+        from src.intent.intent_classifier import get_intent_classifier
+        clf = get_intent_classifier()
+        if clf is not None and getattr(clf, "_trained", False):
+            from src.intent.llm_intent import _get_embedder
+            embedder = _get_embedder()
+            if embedder is not None:
+                vec = embedder.encode([query], normalize_embeddings=True)[0]
+                result = clf.predict(vec)
+                if result and result.get("domain_confidence", 0) >= 0.70:
+                    return _DOMAIN_MAP.get(result.get("domain"))
+    except Exception:  # noqa: BLE001
+        pass
     return None
 
 
 def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
-    """Determine domain from chunk metadata majority vote, with content fallback."""
+    """Determine domain from chunk metadata with mandatory content validation.
+
+    Every structured domain tag from metadata is validated against the actual
+    chunk text.  If the text lacks domain-specific phrases, the tag is
+    rejected and the domain falls back to None (→ generic extraction).
+    This prevents technical manuals tagged as "invoice" or "medical" from
+    being rendered with the wrong schema.
+    """
     domain_counts: Dict[str, int] = {}
     for chunk in chunks:
         meta = getattr(chunk, "meta", None) or {}
         d = str(meta.get("doc_domain") or meta.get("doc_type") or "").lower().strip()
         if d and d not in ("generic", ""):
             domain_counts[d] = domain_counts.get(d, 0) + 1
-    if domain_counts:
-        best = max(domain_counts, key=domain_counts.get)
-        domain_map = {"resume": "hr", "hr": "hr", "invoice": "invoice", "legal": "legal"}
-        mapped = domain_map.get(best, best)
-        # Content-based correction: if metadata says non-HR but content looks like a resume,
-        # override to HR (handles misclassified resume data, e.g., SAP EWM resume → purchase_order)
-        if mapped not in ("hr", "invoice", "legal"):
-            sample = " ".join((getattr(c, "text", "") or "")[:500] for c in chunks[:10]).lower()
-            if any(h in sample for h in _HR_CONTENT_HINTS):
-                return "hr"
-        return mapped
+    if not domain_counts:
+        return None
 
-    # Content-based fallback when metadata is missing
-    sample = " ".join((getattr(c, "text", "") or "")[:500] for c in chunks[:5]).lower()
-    if any(h in sample for h in _HR_CONTENT_HINTS):
-        return "hr"
-    if any(h in sample for h in _INVOICE_CONTENT_HINTS):
-        return "invoice"
-    if any(h in sample for h in _LEGAL_CONTENT_HINTS):
-        return "legal"
-    if any(h in sample for h in _POLICY_CONTENT_HINTS):
-        return "policy"
-    return None
+    best = max(domain_counts, key=domain_counts.get)
+    domain_map = {
+        "resume": "hr", "hr": "hr", "cv": "hr",
+        "invoice": "invoice", "billing": "invoice", "purchase_order": "invoice",
+        "legal": "legal", "contract": "legal",
+        "medical": "medical", "clinical": "medical", "patient": "medical",
+        "policy": "policy", "insurance": "policy",
+    }
+    mapped = domain_map.get(best, best)
+
+    # Content validation: EVERY structured domain must be confirmed by
+    # actual content OR filename.  This is the core guard against misclassification.
+    validators = _DOMAIN_CONTENT_VALIDATORS.get(mapped)
+    if validators:
+        sample = " ".join((getattr(c, "text", "") or "")[:500] for c in chunks[:10]).lower()
+        # Also check source filenames — "Resume.pdf", "Invoice_123.pdf" are strong signals
+        source_names = " ".join(
+            str((getattr(c, "meta", None) or {}).get("source_name") or "")
+            for c in chunks[:10]
+        ).lower()
+        content_match = any(phrase in sample for phrase in validators)
+        filename_match = any(phrase in source_names for phrase in validators)
+        if not content_match and not filename_match:
+            logger.debug(
+                "Domain tag '%s' rejected — no content validators matched in chunk text or filenames",
+                mapped,
+            )
+            return None  # Domain tag not confirmed by content
+
+    # For domains not in the validator map, don't trust metadata alone
+    if mapped not in _DOMAIN_CONTENT_VALIDATORS:
+        return None
+
+    return mapped
 
 
 def _infer_domain_intent(
@@ -196,30 +256,52 @@ def _infer_domain_intent(
     chunks: List[Any],
     domain_hint: Optional[str] = None,
     intent_hint: Optional[str] = None,
+    intent_parse: Any = None,
 ) -> Tuple[str, str]:
     """Infer domain from chunk metadata and query intent from keywords.
 
-    Domain detection uses chunk metadata majority vote so that resume chunks
-    route through the structured HR extractor instead of the generic one.
+    Domain detection uses ML classifier first, then chunk metadata majority
+    vote so that resume chunks route through the structured HR extractor
+    instead of the generic one.
     """
-    # Detect domain: query signals first, then chunk metadata majority
+    # Detect domain: ML classifier first, then chunk metadata majority
     # Cross-check: flag mismatch when query asks for invoice/legal but chunks are HR
     # (prevents InvoiceSchema extraction from resume text)
     # Trust query override when it says HR — user may be correcting misclassified chunks
     domain = (domain_hint or "").strip().lower()
     if not domain or domain == "generic":
-        query_domain = _query_domain_override(query)
+        query_domain = _ml_query_domain(query, intent_parse=intent_parse)
         chunk_domain = _majority_chunk_domain(chunks)
         if query_domain and chunk_domain:
-            _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal", "policy": "policy"}
-            q_family = _DOMAIN_FAMILY.get(query_domain, query_domain)
-            c_family = _DOMAIN_FAMILY.get(chunk_domain, chunk_domain)
-            if q_family != c_family and q_family != "hr":
-                # Query asks for invoice/legal but chunks are a different domain → mismatch
+            _DOMAIN_FAMILY = {
+                "hr": "hr", "resume": "hr",
+                "invoice": "invoice",
+                "legal": "legal_policy", "policy": "legal_policy",
+                "insurance": "legal_policy",
+                "medical": "medical",
+                "report": "generic", "generic": "generic",
+            }
+            q_family = _DOMAIN_FAMILY.get(query_domain, "generic")
+            c_family = _DOMAIN_FAMILY.get(chunk_domain, "generic")
+            # Only flag mismatch for genuinely incompatible specific domains.
+            # Invoice mismatch is reliable (invoice vs non-invoice is clear).
+            # Legal/policy mismatch is unreliable — "terms", "treatment plan"
+            # etc. trigger false positives across medical/policy domains.
+            _MISMATCH_DOMAINS = {"invoice"}
+            _any_matching = False
+            for _c in (chunks or []):
+                _cm = getattr(_c, "meta", None) or {}
+                _cd = str(_cm.get("doc_domain") or _cm.get("doc_type") or "").lower().strip()
+                if _DOMAIN_FAMILY.get(_cd, "generic") == q_family:
+                    _any_matching = True
+                    break
+            if q_family != c_family and q_family in _MISMATCH_DOMAINS and not _any_matching:
+                # Query asks for invoice/legal but NO chunks match that domain → mismatch
                 domain = "mismatch"
             else:
-                # Query says HR, or domains match — trust query
-                domain = query_domain
+                # Domains match, or query says HR/generic/report — prefer chunk domain
+                # when query domain is ambiguous (report/generic), otherwise trust query
+                domain = chunk_domain if q_family == "generic" else query_domain
         elif query_domain:
             domain = query_domain
         elif chunk_domain:
@@ -239,6 +321,10 @@ def _infer_domain_intent(
         intent = "compare"
     elif intent == "summary" and ("list" in lowered_query or "candidates" in lowered_query):
         intent = "list"
+    elif intent == "summary" and any(word in lowered_query for word in _TOTAL_INTENTS):
+        intent = "totals"
+    elif intent == "summary" and any(word in lowered_query for word in _PRODUCT_INTENTS):
+        intent = "products_list"
     elif intent == "summary":
         intent = "facts"
 
@@ -557,6 +643,60 @@ def _score_and_sort_facts(
 
 
 # ---------------------------------------------------------------------------
+# OCR text normalization — cleans up common OCR artifacts before ML classification
+# ---------------------------------------------------------------------------
+
+_OCR_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_OCR_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+_OCR_BULLET_ARTIFACT_RE = re.compile(r"^[•·▪■□◦‣⁃]\s*")
+_OCR_SEMICOLON_LABEL_RE = re.compile(r"^([A-Z][A-Za-z\s]{2,30});(\s)")
+
+
+def _normalize_ocr_line(line: str) -> str:
+    """Normalize a single OCR-extracted line: strip control chars, collapse whitespace,
+    remove bullet artifacts, fix semicolons misread as colons after labels."""
+    line = _OCR_CONTROL_CHARS_RE.sub("", line)
+    line = _OCR_MULTI_SPACE_RE.sub(" ", line)
+    line = _OCR_BULLET_ARTIFACT_RE.sub("", line)
+    line = _OCR_SEMICOLON_LABEL_RE.sub(r"\1:\2", line)
+    return line.strip()
+
+
+def _is_table_chunk(text: str) -> bool:
+    """Detect if text looks like a pipe-delimited or tab-delimited table."""
+    lines = text.strip().splitlines()
+    if len(lines) < 2:
+        return False
+    pipe_count = sum(1 for l in lines if l.count("|") >= 2)
+    tab_count = sum(1 for l in lines if l.count("\t") >= 2)
+    return (pipe_count >= 2) or (tab_count >= 2)
+
+
+def _table_to_kv_pairs(text: str) -> List[str]:
+    """Convert pipe/tab-delimited table rows into 'label: value' pairs for classification."""
+    pairs: List[str] = []
+    lines = text.strip().splitlines()
+    headers: List[str] = []
+    for line in lines:
+        if "|" in line:
+            cells = [c.strip() for c in line.split("|") if c.strip()]
+        elif "\t" in line:
+            cells = [c.strip() for c in line.split("\t") if c.strip()]
+        else:
+            continue
+        # Skip separator lines (e.g., "---|---|---")
+        if all(set(c) <= {"-", ":", " "} for c in cells):
+            continue
+        if not headers:
+            headers = cells
+            continue
+        for i, cell in enumerate(cells):
+            if i < len(headers) and cell:
+                pairs.append(f"{headers[i]}: {cell}")
+    return pairs
+
+
+# ---------------------------------------------------------------------------
 # ML-based line classification helper (shared by all domain extractors)
 # ---------------------------------------------------------------------------
 
@@ -575,8 +715,16 @@ def _ml_extract_lines(chunks, domain: str, embedder):
         text = _extract_full_text_content(getattr(chunk, "text", "") or "")
         chunk_id = getattr(chunk, "id", "")
         meta = getattr(chunk, "meta", None) or getattr(chunk, "metadata", None) or {}
+
+        # Table-aware extraction: convert table rows to "label: value" pairs
+        if _is_table_chunk(text):
+            for pair in _table_to_kv_pairs(text):
+                if pair and len(pair) >= 3:
+                    all_lines.append(pair)
+                    line_meta.append((chunk_id, meta))
+
         for line in _split_lines(text):
-            cleaned = line.strip()
+            cleaned = _normalize_ocr_line(line)
             if cleaned and len(cleaned) >= 3:
                 all_lines.append(cleaned)
                 line_meta.append((chunk_id, meta))
@@ -593,6 +741,7 @@ def _extract_invoice(chunks: List[Any], embedder: Any = None) -> InvoiceSchema:
     totals: List[FieldValue] = []
     parties: List[FieldValue] = []
     terms: List[FieldValue] = []
+    invoice_metadata: List[FieldValue] = []
     seen_items = set()
 
     _CATEGORY_LISTS = {
@@ -600,6 +749,7 @@ def _extract_invoice(chunks: List[Any], embedder: Any = None) -> InvoiceSchema:
         "totals": totals,
         "parties": parties,
         "terms": terms,
+        "invoice_metadata": invoice_metadata,
     }
 
     classified = _ml_extract_lines(chunks, "invoice", embedder)
@@ -649,6 +799,7 @@ def _extract_invoice(chunks: List[Any], embedder: Any = None) -> InvoiceSchema:
         totals=_field_values_field(totals),
         parties=_field_values_field(parties),
         terms=_field_values_field(terms),
+        invoice_metadata=_field_values_field(invoice_metadata),
     )
 
 
@@ -1371,28 +1522,39 @@ def _extract_legal(chunks: List[Any], embedder: Any = None) -> LegalSchema:
     obligations: List[FieldValue] = []
     seen = set()
 
+    current_heading_category = ""
+
     classified = _ml_extract_lines(chunks, "legal", embedder)
     for line, (chunk_id, meta), cls in classified:
         if cls.role == "skip" or len(line) < 5:
             continue
+
+        # Track heading category for context propagation
+        if cls.role == "heading":
+            if cls.category != "other":
+                current_heading_category = cls.category
+            continue
+
         key = _normalize_key(line)
         if key in seen:
             continue
         seen.add(key)
 
-        if cls.category == "parties":
+        # Use heading context when ML category is ambiguous
+        category = cls.category
+        if category == "other" and current_heading_category:
+            category = current_heading_category
+
+        if category == "parties":
             label = cls.label or "Party"
             value = cls.value or line
             parties.append(FieldValue(label=label, value=value, evidence_spans=[_span(chunk_id, line)]))
-        elif cls.category == "obligations":
+        elif category == "obligations":
             obligations.append(FieldValue(label="Obligation", value=cls.value or line, evidence_spans=[_span(chunk_id, line)]))
-        elif cls.category == "clauses" or cls.role in ("kv_pair", "heading", "narrative"):
+        elif category == "clauses" or cls.role in ("kv_pair", "narrative"):
             value = cls.value or line
             if cls.role == "kv_pair" and cls.label:
                 title = cls.label
-            elif cls.role == "heading":
-                title = value
-                continue  # headings are structural, not content
             else:
                 # Extract title from first sentence for narrative clauses
                 title_end = value.find(".")
@@ -1507,12 +1669,18 @@ def _extract_policy(chunks: List[Any], embedder: Any = None) -> "PolicySchema":
         "terms": terms,
     }
 
+    current_heading_category = ""
+
     classified = _ml_extract_lines(chunks, "policy", embedder)
     for line, (chunk_id, meta), cls in classified:
         if cls.role == "skip":
             continue
+
+        # Track heading category for context propagation
         if cls.role == "heading":
-            continue  # headings are structural, not content
+            if cls.category != "other":
+                current_heading_category = cls.category
+            continue
 
         key = _normalize_key(line)
         if key in seen:
@@ -1530,14 +1698,18 @@ def _extract_policy(chunks: List[Any], embedder: Any = None) -> "PolicySchema":
         # Route to category from ML classification
         category = cls.category
         if category == "other":
-            # Fall back to section_kind
-            section_kind = str(meta.get("section_kind", "")).lower()
-            if "financial" in section_kind or "premium" in section_kind:
-                category = "premiums"
-            elif "terms" in section_kind or "condition" in section_kind:
-                category = "terms"
+            # Propagate heading category to content lines under that heading
+            if current_heading_category:
+                category = current_heading_category
             else:
-                category = "policy_info"  # default for policy domain
+                # Fall back to section_kind
+                section_kind = str(meta.get("section_kind", "")).lower()
+                if "financial" in section_kind or "premium" in section_kind:
+                    category = "premiums"
+                elif "terms" in section_kind or "condition" in section_kind:
+                    category = "terms"
+                else:
+                    category = "policy_info"  # default for policy domain
 
         target = _CATEGORY_LISTS.get(category)
         if target is not None:
@@ -1622,6 +1794,7 @@ def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSch
             or (schema.totals.items if schema.totals else None)
             or (schema.parties.items if schema.parties else None)
             or (schema.terms.items if schema.terms else None)
+            or (getattr(schema, "invoice_metadata", None) and schema.invoice_metadata.items)
         )
     if isinstance(schema, HRSchema):
         cands = (schema.candidates.items if schema.candidates else None) or []
@@ -1655,6 +1828,121 @@ def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSch
     if isinstance(schema, MultiEntitySchema):
         return not (schema.entities or [])
     return True
+
+
+def _schema_completeness(schema) -> float:
+    """Return ratio of populated fields (0.0=empty, 1.0=full).
+
+    Used to decide whether LLM should fill gaps in a partially-populated
+    deterministic extraction.
+    """
+    if isinstance(schema, InvoiceSchema):
+        fields = [
+            bool(schema.items and schema.items.items),
+            bool(schema.totals and schema.totals.items),
+            bool(schema.parties and schema.parties.items),
+            bool(schema.terms and schema.terms.items),
+            bool(getattr(schema, "invoice_metadata", None) and schema.invoice_metadata.items),
+        ]
+    elif isinstance(schema, HRSchema):
+        cands = (schema.candidates.items if schema.candidates else None) or []
+        has_name = any(c.name for c in cands)
+        has_skills = any(c.technical_skills for c in cands)
+        has_exp = any(getattr(c, "experience_summary", None) for c in cands)
+        fields = [has_name, has_skills, has_exp, bool(cands)]
+    elif isinstance(schema, LegalSchema):
+        fields = [
+            bool(schema.clauses and schema.clauses.items),
+            bool(schema.parties and schema.parties.items),
+            bool(schema.obligations and schema.obligations.items),
+        ]
+    elif isinstance(schema, MedicalSchema):
+        fields = [
+            bool(schema.patient_info and schema.patient_info.items),
+            bool(schema.diagnoses and schema.diagnoses.items),
+            bool(schema.medications and schema.medications.items),
+            bool(schema.procedures and schema.procedures.items),
+            bool(schema.lab_results and schema.lab_results.items),
+            bool(schema.vitals and schema.vitals.items),
+        ]
+    elif isinstance(schema, PolicySchema):
+        fields = [
+            bool(schema.policy_info and schema.policy_info.items),
+            bool(schema.coverage and schema.coverage.items),
+            bool(schema.premiums and schema.premiums.items),
+            bool(schema.exclusions and schema.exclusions.items),
+            bool(schema.terms and schema.terms.items),
+        ]
+    elif isinstance(schema, GenericSchema):
+        facts = (schema.facts.items if schema.facts else None) or []
+        populated = sum(1 for f in facts if f.value and len(str(f.value)) > 5)
+        return min(1.0, populated / 3.0) if facts else 0.0
+    elif isinstance(schema, MultiEntitySchema):
+        return 1.0 if (schema.entities or []) else 0.0
+    else:
+        return 0.0
+
+    total = len(fields)
+    if total == 0:
+        return 0.0
+    return sum(1 for f in fields if f) / total
+
+
+def _merge_schemas(deterministic, llm_result):
+    """Merge LLM result into deterministic schema — deterministic values take priority.
+
+    For GenericSchema, keep the one with more content.
+    For typed schemas, preserve deterministic fields, fill gaps from LLM.
+    """
+    if llm_result is None:
+        return deterministic
+    if _schema_is_empty(deterministic):
+        return llm_result
+
+    # For GenericSchema — keep the richer one
+    if isinstance(deterministic, GenericSchema) and isinstance(llm_result, GenericSchema):
+        det_facts = (deterministic.facts.items if deterministic.facts else None) or []
+        llm_facts = (llm_result.facts.items if llm_result.facts else None) or []
+        det_total = sum(len(str(f.value or "")) for f in det_facts)
+        llm_total = sum(len(str(f.value or "")) for f in llm_facts)
+        return llm_result if llm_total > det_total else deterministic
+
+    # For typed schemas, merge field lists (deterministic items preserved, LLM fills gaps)
+    def _merge_field_values(det_field, llm_field):
+        """Merge two FieldValuesField objects, keeping deterministic items and adding LLM-only."""
+        det_items = (det_field.items if det_field else None) or []
+        llm_items = (llm_field.items if llm_field else None) or []
+        if not det_items:
+            return llm_field
+        if not llm_items:
+            return det_field
+        # Keep all deterministic items, add LLM items whose labels don't overlap
+        det_labels = {(f.label or "").lower().strip() for f in det_items if f.label}
+        for item in llm_items:
+            if item.label and (item.label.lower().strip()) not in det_labels:
+                det_items.append(item)
+        return det_field
+
+    if isinstance(deterministic, InvoiceSchema) and isinstance(llm_result, InvoiceSchema):
+        deterministic.items = _merge_field_values(deterministic.items, llm_result.items) if hasattr(deterministic.items, 'items') else deterministic.items or llm_result.items
+        deterministic.totals = _merge_field_values(deterministic.totals, llm_result.totals)
+        deterministic.parties = _merge_field_values(deterministic.parties, llm_result.parties)
+        deterministic.terms = _merge_field_values(deterministic.terms, llm_result.terms)
+    elif isinstance(deterministic, MedicalSchema) and isinstance(llm_result, MedicalSchema):
+        deterministic.patient_info = _merge_field_values(deterministic.patient_info, llm_result.patient_info)
+        deterministic.diagnoses = _merge_field_values(deterministic.diagnoses, llm_result.diagnoses)
+        deterministic.medications = _merge_field_values(deterministic.medications, llm_result.medications)
+        deterministic.procedures = _merge_field_values(deterministic.procedures, llm_result.procedures)
+        deterministic.lab_results = _merge_field_values(deterministic.lab_results, llm_result.lab_results)
+        deterministic.vitals = _merge_field_values(deterministic.vitals, llm_result.vitals)
+    elif isinstance(deterministic, PolicySchema) and isinstance(llm_result, PolicySchema):
+        deterministic.policy_info = _merge_field_values(deterministic.policy_info, llm_result.policy_info)
+        deterministic.coverage = _merge_field_values(deterministic.coverage, llm_result.coverage)
+        deterministic.premiums = _merge_field_values(deterministic.premiums, llm_result.premiums)
+        deterministic.exclusions = _merge_field_values(deterministic.exclusions, llm_result.exclusions)
+        deterministic.terms = _merge_field_values(deterministic.terms, llm_result.terms)
+
+    return deterministic
 
 
 def _llm_extract(
@@ -2431,8 +2719,34 @@ def _extract_contact_fields_comprehensive(text: str) -> Dict[str, List[str]]:
     }
 
 
+# Known invoice/document field labels — when found inline, split before them
+# to create separate "label: value" lines for the ML classifier
+_INVOICE_LABEL_RE = re.compile(
+    r"(?<=[a-z0-9.)\]]) (?="
+    r"(?:Invoice\s*(?:No|Number|Date|#|Amount)|"
+    r"Due\s*Date|Bill\s*To|Ship\s*To|"
+    r"Subtotal|Total|Balance\s*Due|Amount\s*Due|"
+    r"Payment\s*(?:Terms|Method|Instructions)|"
+    r"Purchase\s*Order|PO\s*(?:No|Number|#)|"
+    r"Tax|Discount|Qty|Quantity|"
+    r"Unit\s*Price|Rate|Description|"
+    r"Sl\.?|Sr\.?|S\.?No\.?)"
+    r"\s*[:.]?\s)",
+    re.IGNORECASE,
+)
+
+
 def _split_lines(text: str) -> List[str]:
-    return [line for line in text.splitlines() if line.strip()]
+    lines = [line for line in text.splitlines() if line.strip()]
+    # For long single lines (OCR'd invoices), try splitting at label boundaries
+    result = []
+    for line in lines:
+        if len(line) > 80 and _INVOICE_LABEL_RE.search(line):
+            parts = _INVOICE_LABEL_RE.split(line)
+            result.extend(p.strip() for p in parts if p.strip())
+        else:
+            result.append(line)
+    return result
 
 
 def _split_sentences(text: str) -> List[str]:
@@ -3461,18 +3775,6 @@ def _chunk_document_id(chunk: Any) -> Optional[str]:
     return None
 
 
-def _query_is_hr_like(query: str) -> bool:
-    """Check if a query is related to HR/resume content."""
-    lowered = (query or "").lower()
-    # Strong HR signals — a single match is sufficient
-    strong = ("resume", "cv", "candidate")
-    if any(kw in lowered for kw in strong):
-        return True
-    # Weak HR signals — need at least 2 to count
-    weak = ("skills", "experience", "education", "certification")
-    return sum(1 for kw in weak if kw in lowered) >= 2
-
-
 def extract_schema(
     domain: Optional[str],
     *,
@@ -3487,13 +3789,17 @@ def extract_schema(
     query_focus: Optional[Any] = None,
     tool_domain: bool = False,
     embedder: Any = None,
+    tool_context: Optional[str] = None,
+    intent_parse: Any = None,
+    redis_client: Any = None,
+    use_thinking: bool = False,
 ) -> ExtractionResult:
     """Extract structured data from chunks.
 
     Strategy:
     1. LLM-first generic extraction — works for ANY document type.
        The LLM reads the chunks and produces a direct answer.
-    2. Deterministic fallback — regex-based extraction when LLM is unavailable.
+    2. Deterministic fallback — structured extraction when LLM is unavailable.
 
     When ``tool_domain=True``, the ``domain`` was set by an explicit tool
     selection (e.g. tools=resume-analysis → domain="hr").  This means:
@@ -3507,18 +3813,40 @@ def extract_schema(
     _tool_domain_active = tool_domain and bool(domain and domain not in ("generic", ""))
 
     # Check for domain mismatch before any extraction (skip when tool domain is set)
-    query_domain = _query_domain_override(query)
+    query_domain = _ml_query_domain(query, intent_parse=intent_parse)
     chunk_domain = _majority_chunk_domain(chunks)
     if not _tool_domain_active and query_domain and chunk_domain:
-        _DOMAIN_FAMILY = {"hr": "hr", "resume": "hr", "invoice": "invoice", "legal": "legal"}
-        q_family = _DOMAIN_FAMILY.get(query_domain, query_domain)
-        c_family = _DOMAIN_FAMILY.get(chunk_domain, chunk_domain)
-        if q_family != c_family and q_family != "hr":
-            # Query asks for invoice/legal but chunks are a different domain
-            _DOMAIN_LABEL = {"hr": "resumes", "resume": "resumes", "invoice": "invoices", "legal": "legal documents"}
+        _DOMAIN_FAMILY = {
+            "hr": "hr", "resume": "hr",
+            "invoice": "invoice",
+            "legal": "legal_policy", "policy": "legal_policy",
+            "insurance": "legal_policy",
+            "medical": "medical",
+            "report": "generic", "generic": "generic",
+        }
+        q_family = _DOMAIN_FAMILY.get(query_domain, "generic")
+        c_family = _DOMAIN_FAMILY.get(chunk_domain, "generic")
+        # Only flag mismatch for genuinely incompatible specific domains.
+        # Invoice mismatch is reliable (invoice vs non-invoice is clear).
+        # Legal/policy mismatch is unreliable — "terms", "treatment plan"
+        # etc. trigger false positives across medical/policy domains.
+        _MISMATCH_DOMAINS = {"invoice"}
+        _any_matching = False
+        for _c in (chunks or []):
+            _cm = getattr(_c, "meta", None) or {}
+            _cd = str(_cm.get("doc_domain") or _cm.get("doc_type") or "").lower().strip()
+            if _DOMAIN_FAMILY.get(_cd, "generic") == q_family:
+                _any_matching = True
+                break
+        if q_family != c_family and q_family in _MISMATCH_DOMAINS and not _any_matching:
+            # Query asks for invoice/legal but NO chunks match that domain
+            _DOMAIN_LABEL = {"hr": "resumes", "resume": "resumes", "invoice": "invoices",
+                             "legal": "legal documents", "medical": "medical records",
+                             "policy": "policy documents", "insurance": "insurance documents"}
             asked = _DOMAIN_LABEL.get(query_domain, query_domain)
             available = _DOMAIN_LABEL.get(chunk_domain, chunk_domain)
-            msg = f"No {asked} found in this profile. The available documents are {available}."
+            msg = (f"No {asked} found in this profile. The available documents are {available}. "
+                   f"To analyze {asked}, please upload the relevant {asked} documents to this profile.")
             schema = GenericSchema(facts=FieldValuesField(items=[FieldValue(label=None, value=msg, evidence_spans=[])]))
             return ExtractionResult(domain=chunk_domain, intent=intent_hint or "answer", schema=schema)
 
@@ -3533,7 +3861,61 @@ def extract_schema(
     # prefer the structured deterministic extractor which produces typed schemas
     # (HRSchema with Candidate objects, InvoiceSchema, etc.) instead of LLM
     # free-text that loses structure.
-    _prefer_deterministic = _tool_domain_active
+    # When domain is confidently detected from chunks (structured document types),
+    # prefer the deterministic extractor which produces typed schemas and avoids
+    # slow/unreliable LLM calls. This is generic — any structured domain
+    # (invoice, medical, legal, policy, hr) benefits from deterministic extraction
+    # when chunks clearly belong to that domain.
+    _structured_domains = {"invoice", "medical", "legal", "policy", "hr"}
+    _domain_confident = chunk_domain in _structured_domains
+    # Also trust query_domain when it explicitly names a structured domain
+    # (e.g., "total amounts on all invoices" → query_domain="invoice")
+    _query_domain_confident = query_domain in _structured_domains
+    _prefer_deterministic = _tool_domain_active or _domain_confident or _query_domain_confident
+
+    # ── ML-based context understanding (enriches LLM prompts) ──────────
+    # Skip when deterministic extraction is preferred — context understanding
+    # only enriches LLM prompts, which are skipped for deterministic paths.
+    # This saves ~5-15s of embedding + clustering overhead on large chunk sets.
+    _context_intelligence = None
+    if embedder and chunks and not _is_contact_query and not _prefer_deterministic:
+        try:
+            from src.intelligence.context_understanding import understand_context_for_prompt
+            _context_intelligence = understand_context_for_prompt(
+                query=query,
+                chunks=chunks,
+                embedder=embedder,
+                domain_hint=chunk_domain or query_domain or domain,
+            )
+            if _context_intelligence:
+                logger.info(
+                    "Context understanding: %d chars injected into prompt",
+                    len(_context_intelligence),
+                    extra={"stage": "context_understanding", "correlation_id": correlation_id},
+                )
+        except Exception as _cu_exc:
+            logger.debug("Context understanding skipped: %s", _cu_exc)
+
+    # ── Multi-resolution context: extract doc/section-level summaries ───────
+    # When chunks include doc-level or section-level resolution metadata, build
+    # a structured context dict that enriches the LLM prompt with hierarchical
+    # document understanding.  This is additive — if no resolution data exists,
+    # _multi_res_ctx is None and behavior is unchanged.
+    _multi_res_ctx = None
+    if chunks and not _is_contact_query and not _prefer_deterministic:
+        try:
+            from .llm_extract import _build_multi_resolution_context
+            _multi_res_ctx = _build_multi_resolution_context(chunks)
+            if _multi_res_ctx:
+                _doc_count = len(_multi_res_ctx.get("doc_context") or [])
+                _sec_count = len(_multi_res_ctx.get("section_context") or [])
+                logger.info(
+                    "Multi-resolution context built: %d doc summaries, %d section summaries",
+                    _doc_count, _sec_count,
+                    extra={"stage": "multi_resolution", "correlation_id": correlation_id},
+                )
+        except Exception as _mr_exc:
+            logger.debug("Multi-resolution context skipped: %s", _mr_exc)
 
     # STRATEGY 1: LLM-first generic extraction (preferred when no tool domain)
     if llm_client and budget.allow() and not _is_contact_query and not _prefer_deterministic:
@@ -3546,6 +3928,12 @@ def extract_schema(
                 correlation_id=correlation_id,
                 intent=intent_hint,
                 num_documents=_count_unique_documents(chunks),
+                tool_context=tool_context,
+                domain=chunk_domain or query_domain or domain or "generic",
+                redis_client=redis_client,
+                context_intelligence=_context_intelligence,
+                use_thinking=use_thinking,
+                multi_resolution_context=_multi_res_ctx,
             )
             if llm_result is not None:
                 # Use chunk-based domain (more reliable than query override)
@@ -3569,18 +3957,65 @@ def extract_schema(
 
     # STRATEGY 2: Deterministic extraction (domain-aware, structured schemas)
     # When tool domain is set, this is the preferred path (structured output).
-    return schema_extract(
+    # Use query_domain as domain_hint when chunk metadata disagrees but query is clear
+    _det_domain = domain or (query_domain if _query_domain_confident else None) or ""
+    deterministic_result = schema_extract(
         query=query,
         chunks=chunks,
-        llm_client=llm_client if not _prefer_deterministic else None,  # skip LLM retry in schema_extract when tool prefers deterministic
+        llm_client=None,  # deterministic only — no LLM in first pass
         budget=budget,
         correlation_id=correlation_id,
         scope_document_id=scope_document_id,
-        domain_hint=domain,
+        domain_hint=_det_domain,
         intent_hint=intent_hint,
         query_focus=query_focus,
         embedder=embedder,
+        intent_parse=intent_parse,
     )
+
+    # STRATEGY 3: LLM fallback when deterministic extraction produced nothing
+    # Deterministic extraction relies on line-segmented text; it fails on OCR blobs
+    # without line breaks.  In that case, let the LLM synthesize from raw chunks.
+    from src.rag_v3.pipeline import _has_valid_deterministic_extraction
+    _det_ok = _has_valid_deterministic_extraction(deterministic_result.schema)
+    if _det_ok or not llm_client or not budget.allow():
+        return deterministic_result
+
+    logger.info(
+        "Deterministic extraction empty for domain=%s; falling back to LLM synthesis",
+        deterministic_result.domain,
+        extra={"stage": "extract", "correlation_id": correlation_id},
+    )
+    try:
+        llm_result = llm_extract_and_respond(
+            query=query,
+            chunks=chunks,
+            llm_client=llm_client,
+            budget=budget,
+            correlation_id=correlation_id,
+            intent=intent_hint,
+            num_documents=_count_unique_documents(chunks),
+            tool_context=tool_context,
+            domain=deterministic_result.domain or chunk_domain or "generic",
+            redis_client=redis_client,
+            context_intelligence=_context_intelligence,
+            use_thinking=use_thinking,
+            multi_resolution_context=_multi_res_ctx,
+        )
+        if llm_result is not None:
+            inferred = deterministic_result.domain or chunk_domain or "generic"
+            return ExtractionResult(
+                domain=inferred,
+                intent=intent_hint or "answer",
+                schema=llm_result,
+            )
+    except Exception as exc:
+        logger.warning(
+            "LLM fallback for structured domain also failed: %s",
+            exc,
+            extra={"stage": "extract", "correlation_id": correlation_id},
+        )
+    return deterministic_result
 
 
 def _convert_document_data_to_candidate(data: Dict[str, Any]) -> Candidate:

@@ -32,6 +32,23 @@ INFO_KEYWORDS = (
     "features",
 )
 
+_INFO_QUERY_PATTERNS = (
+    re.compile(r"\bwho\s+are\s+you\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+are\s+you\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+is\s+docwain\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+do\s+(?:you|docwain)\s+work\b", re.IGNORECASE),
+    re.compile(r"\bwhat\s+(?:else\s+|all\s+)?can\s+(?:you|docwain)\s+(?:do|help\s+with)\b", re.IGNORECASE),
+    re.compile(r"\bshow\s+(?:me\s+)?what\s+(?:you|docwain)\s+can\s+do\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+can\s+(?:you|docwain)\s+help(?:\s+me)?\b", re.IGNORECASE),
+    re.compile(r"\bhow\s+(?:do\s+i|can\s+i|to)\s+(?:start|begin|use)\s+docwain\b", re.IGNORECASE),
+    re.compile(
+        r"\bhow\s+(?:do\s+i|can\s+i|to)\s+"
+        r"(?:compare|rank|summarize|summarise|extract|list|find|screen|generate|upload|add|import)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b(?:your\s+)?(?:features|capabilities)\b", re.IGNORECASE),
+)
+
 TASK_VERB_CUES = (
     "summarize",
     "summarise",
@@ -140,6 +157,8 @@ class ResponseModeClassifier:
 
     @staticmethod
     def _keyword_classify(text: str) -> Optional[str]:
+        if ResponseModeClassifier._matches_info_patterns(text):
+            return INFO_MODE
         if "docwain" in text or "doc wain" in text:
             if ResponseModeClassifier._explicit_info_request(text) or len(text.split()) <= 3:
                 return INFO_MODE
@@ -153,11 +172,12 @@ class ResponseModeClassifier:
 
     @staticmethod
     def _needs_fallback(text: str) -> bool:
-        meta_cues = ("who are you", "what are you", "how do you work", "what can you do", "privacy", "docs")
-        return any(cue in text for cue in meta_cues)
+        return ResponseModeClassifier._matches_info_patterns(text)
 
     @staticmethod
     def _explicit_info_request(text: str) -> bool:
+        if ResponseModeClassifier._matches_info_patterns(text):
+            return True
         info_cues = (
             "what is",
             "who are you",
@@ -173,6 +193,10 @@ class ResponseModeClassifier:
             "features",
         )
         return any(cue in text for cue in info_cues)
+
+    @staticmethod
+    def _matches_info_patterns(text: str) -> bool:
+        return any(pattern.search(text) for pattern in _INFO_QUERY_PATTERNS)
 
     @staticmethod
     def _llm_fallback(text: str, llm_client: Any) -> str:

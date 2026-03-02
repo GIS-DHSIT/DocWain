@@ -8,6 +8,14 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    """Access attribute or dict key — supports both objects and dicts."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 DOCUMENT_TAXONOMY = [
     "resume",
     "invoice",
@@ -33,10 +41,11 @@ class DocumentIdentification:
     created_date: Optional[str]
 
 
-_INVOICE_RE = re.compile(r"\b(invoice|bill to|total|vat|gst|due date|amount due)\b", re.IGNORECASE)
-_RESUME_RE = re.compile(r"\b(resume|curriculum vitae|experience|education|skills|linkedin)\b", re.IGNORECASE)
+# Multi-word phrases preferred to avoid single-word false positives (e.g. "total" in resumes)
+_INVOICE_RE = re.compile(r"\b(invoice\s+number|invoice\s+date|bill\s+to|amount\s+due|total\s+due|payment\s+terms|vat|gst|remittance|subtotal|invoice)\b", re.IGNORECASE)
+_RESUME_RE = re.compile(r"\b(resume|curriculum vitae|work\s+experience|professional\s+experience|education|skills|linkedin|career\s+objective|professional\s+summary)\b", re.IGNORECASE)
 _PO_RE = re.compile(r"\b(purchase order|po number|ship to|vendor)\b", re.IGNORECASE)
-_CONTRACT_RE = re.compile(r"\b(agreement|terms|liability|confidentiality|governing law)\b", re.IGNORECASE)
+_CONTRACT_RE = re.compile(r"\b(agreement|terms and conditions|liability|confidentiality|governing law)\b", re.IGNORECASE)
 _POLICY_RE = re.compile(r"\b(policy|procedure|compliance|guideline)\b", re.IGNORECASE)
 _BROCHURE_RE = re.compile(r"\b(brochure|catalog|features|overview)\b", re.IGNORECASE)
 _REPORT_RE = re.compile(r"\b(report|analysis|findings|executive summary)\b", re.IGNORECASE)
@@ -50,9 +59,9 @@ def _guess_from_filename(filename: str) -> Optional[str]:
         return None
     if "invoice" in lower:
         return "invoice"
-    if "resume" in lower or "cv" in lower:
+    if "resume" in lower or re.search(r"\bcv\b", lower):
         return "resume"
-    if "purchase" in lower or "po" in lower:
+    if "purchase" in lower or re.search(r"\bpo\b", lower):
         return "purchase_order"
     if "contract" in lower or "agreement" in lower:
         return "contract"
@@ -75,60 +84,76 @@ def _heuristic_classify(text: str, tables: str, filename: str) -> Optional[tuple
         return candidate, 0.72
 
     sample = "\n".join([text or "", tables or ""]).lower()
-    if _INVOICE_RE.search(sample):
-        return "invoice", 0.78
-    if _RESUME_RE.search(sample):
-        return "resume", 0.78
-    if _PO_RE.search(sample):
-        return "purchase_order", 0.76
-    if _CONTRACT_RE.search(sample):
-        return "contract", 0.72
-    if _POLICY_RE.search(sample):
-        return "policy", 0.68
-    if _BROCHURE_RE.search(sample):
-        return "brochure", 0.66
-    if _REPORT_RE.search(sample):
-        return "report", 0.64
-    if _STATEMENT_RE.search(sample):
-        return "statement", 0.64
-    if _PRESENTATION_RE.search(sample):
-        return "presentation", 0.62
+
+    # Score-based: count matches per type, pick the highest
+    _PATTERNS = [
+        ("invoice", _INVOICE_RE, 0.78),
+        ("resume", _RESUME_RE, 0.78),
+        ("purchase_order", _PO_RE, 0.76),
+        ("contract", _CONTRACT_RE, 0.72),
+        ("policy", _POLICY_RE, 0.68),
+        ("brochure", _BROCHURE_RE, 0.66),
+        ("report", _REPORT_RE, 0.64),
+        ("statement", _STATEMENT_RE, 0.64),
+        ("presentation", _PRESENTATION_RE, 0.62),
+    ]
+    best_type: Optional[str] = None
+    best_count = 0
+    best_conf = 0.0
+    for doc_type, pattern, base_conf in _PATTERNS:
+        matches = pattern.findall(sample)
+        count = len(set(m.lower() if isinstance(m, str) else m for m in matches))
+        if count > best_count:
+            best_count = count
+            best_type = doc_type
+            best_conf = base_conf
+    if best_type and best_count >= 1:
+        return best_type, best_conf
     return None
 
 
-def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional[str], llm_client=None) -> Optional[tuple[str, float]]:
-    if not model_name and llm_client is None:
-        return None
+def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional[str] = None, llm_client=None) -> Optional[tuple[str, float]]:
     prompt = (
-        "Classify the document into one of the following types: "
-        f"{', '.join(DOCUMENT_TAXONOMY)}. "
-        "Use the provided text/tables/filename sample. "
-        "Return strict JSON: {\"document_type\": "
-        "\"invoice|resume|purchase_order|contract|policy|brochure|report|statement|presentation|other\", "
-        "\"confidence\": 0.0-1.0}.\n\n"
-        f"Filename: {filename}\n\nText sample:\n{text[:2000]}\n\nTables sample:\n{tables[:2000]}\n"
+        "You are a document classification expert. Classify this document into exactly one type.\n"
+        f"Allowed types: {', '.join(DOCUMENT_TAXONOMY)}.\n\n"
+        "Key rules:\n"
+        "- 'resume' = CV, candidate profile, job application, career summary\n"
+        "- 'invoice' = bill, payment request with line items, amounts due\n"
+        "- Do NOT classify a resume as invoice just because it mentions 'total experience'\n"
+        "- Use filename as a strong signal when available\n\n"
+        "Return strict JSON only: {\"document_type\": \"<type>\", \"confidence\": 0.0-1.0}\n\n"
+        f"Filename: {filename}\n\nText sample:\n{text[:3000]}\n\nTables sample:\n{tables[:1000]}\n"
     )
     try:
         if llm_client is not None:
             content = llm_client.generate(prompt)
         else:
             from src.llm.gateway import get_llm_gateway
-            content = get_llm_gateway().generate(prompt)
+            gw = get_llm_gateway()
+            if gw is None:
+                return None
+            content = gw.generate(prompt)
         content = (content or "").strip()
+        # Extract JSON from possible markdown code block
+        if "```" in content:
+            import re as _re
+            json_match = _re.search(r"\{[^}]+\}", content)
+            if json_match:
+                content = json_match.group()
         payload = json.loads(content)
-        doc_type = str(payload.get("document_type", "other")).strip()
+        doc_type = str(payload.get("document_type", "other")).strip().lower()
         confidence = float(payload.get("confidence", 0.0))
         if doc_type not in DOCUMENT_TAXONOMY:
             doc_type = "other"
         return doc_type, max(0.0, min(confidence, 1.0))
     except Exception as exc:  # noqa: BLE001
-        logger.debug("Ollama document classification failed: %s", exc)
+        logger.debug("LLM document classification failed: %s", exc)
         return None
 
 
 def _extract_page_count(extracted: Any) -> Optional[int]:
     try:
-        pages = [getattr(sec, "end_page", None) for sec in getattr(extracted, "sections", [])]
+        pages = [_get(sec, "end_page") for sec in (_get(extracted, "sections") or [])]
         pages = [p for p in pages if isinstance(p, int)]
         if pages:
             return max(pages)
@@ -143,13 +168,18 @@ def classify_document_type(
     filename: str,
     model_name: Optional[str] = None,
 ) -> tuple[str, float]:
-    heuristic = _heuristic_classify(text_sample, tables_sample, filename)
-    if heuristic:
-        return heuristic
-
+    # LLM-first: gpt-oss provides accurate classification with full context understanding
     llm = _ollama_classify(text_sample, tables_sample, filename, model_name)
     if llm:
+        doc_type, conf = llm
+        logger.info("LLM classified document '%s' as %s (confidence=%.2f)", filename, doc_type, conf)
         return llm
+
+    # Heuristic fallback when LLM is unavailable
+    heuristic = _heuristic_classify(text_sample, tables_sample, filename)
+    if heuristic:
+        logger.info("Heuristic classified document '%s' as %s", filename, heuristic[0])
+        return heuristic
 
     return "other", 0.5
 
@@ -164,12 +194,15 @@ def identify_document(
     text_sample = ""
     tables_sample = ""
     try:
-        if extracted and getattr(extracted, "full_text", None):
-            text_sample = extracted.full_text
-        elif extracted and getattr(extracted, "sections", None):
-            text_sample = "\n".join([sec.text for sec in extracted.sections[:5] if sec.text])
-        if extracted and getattr(extracted, "tables", None):
-            tables_sample = "\n".join([tbl.text for tbl in extracted.tables[:3] if tbl.text])
+        ft = _get(extracted, "full_text") if extracted else None
+        if ft:
+            text_sample = ft
+        else:
+            secs = (_get(extracted, "sections") or []) if extracted else []
+            text_sample = "\n".join([_get(s, "text", "") for s in secs[:5] if _get(s, "text")])
+        tbls = (_get(extracted, "tables") or []) if extracted else []
+        if tbls:
+            tables_sample = "\n".join([_get(t, "text", "") for t in tbls[:3] if _get(t, "text")])
     except Exception:  # noqa: BLE001
         text_sample = text_sample or ""
 

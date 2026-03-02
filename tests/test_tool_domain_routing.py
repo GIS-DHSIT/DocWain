@@ -176,8 +176,10 @@ class TestToolDomainMap:
     def test_medical_maps_to_medical(self):
         assert _TOOL_DOMAIN_MAP["medical"] == "medical"
 
-    def test_lawhere_maps_to_legal(self):
-        assert _TOOL_DOMAIN_MAP["lawhere"] == "legal"
+    def test_lawhere_not_in_map(self):
+        # lawhere handles both legal and insurance/policy docs;
+        # ML domain detector decides based on chunk content.
+        assert "lawhere" not in _TOOL_DOMAIN_MAP
 
     def test_legal_maps_to_legal(self):
         assert _TOOL_DOMAIN_MAP["legal"] == "legal"

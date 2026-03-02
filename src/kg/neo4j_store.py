@@ -54,6 +54,7 @@ class Neo4jStore:
             "CREATE CONSTRAINT kg_chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
             "CREATE CONSTRAINT kg_entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.entity_id IS UNIQUE",
             "CREATE CONSTRAINT kg_state_name IF NOT EXISTS FOR (k:KGState) REQUIRE k.name IS UNIQUE",
+            "CREATE CONSTRAINT kg_timeline_id IF NOT EXISTS FOR (t:Timeline) REQUIRE t.timeline_id IS UNIQUE",
         ]
         with self._session() as session:
             for query in queries:
@@ -280,3 +281,85 @@ class Neo4jStore:
             except TypeError:
                 result = session.run(query, **params)
             return [dict(record) for record in result]
+
+    def create_entity_relationship(
+        self,
+        entity1_id: str,
+        entity2_id: str,
+        relation_type: str = "RELATED_TO",
+        frequency: int = 1,
+    ) -> None:
+        """Create or update a relationship between two entities."""
+        query = (
+            "MATCH (e1:Entity {entity_id: $e1_id}) "
+            "MATCH (e2:Entity {entity_id: $e2_id}) "
+            "MERGE (e1)-[r:RELATED_TO]->(e2) "
+            "ON CREATE SET r.frequency = $freq, r.relation_type = $rel_type, r.created_at = timestamp() "
+            "ON MATCH SET r.frequency = r.frequency + $freq"
+        )
+        with self._session() as session:
+            session.run(
+                query,
+                e1_id=entity1_id,
+                e2_id=entity2_id,
+                freq=frequency,
+                rel_type=relation_type,
+            )
+
+    def create_timeline_node(
+        self,
+        document_id: str,
+        start_date: str,
+        end_date: str,
+        description: str,
+        entity_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Create a Timeline node linked to a document and related entities."""
+        import uuid
+
+        timeline_id = f"tl_{document_id}_{uuid.uuid4().hex[:8]}"
+        query = (
+            "MERGE (t:Timeline {timeline_id: $tid}) "
+            "SET t.document_id = $doc_id, t.start_date = $start, t.end_date = $end, "
+            "    t.description = $desc, t.updated_at = timestamp() "
+            "WITH t "
+            "MATCH (d:Document {document_id: $doc_id}) "
+            "MERGE (d)-[:HAS_TIMELINE]->(t)"
+        )
+        with self._session() as session:
+            session.run(
+                query,
+                tid=timeline_id,
+                doc_id=document_id,
+                start=start_date,
+                end=end_date,
+                desc=description,
+            )
+
+        if entity_ids:
+            for eid in entity_ids[:10]:  # Cap at 10 entity links
+                link_query = (
+                    "MATCH (t:Timeline {timeline_id: $tid}) "
+                    "MATCH (e:Entity {entity_id: $eid}) "
+                    "MERGE (t)-[:INVOLVES]->(e)"
+                )
+                with self._session() as session:
+                    session.run(link_query, tid=timeline_id, eid=eid)
+
+    def create_document_similarity(
+        self,
+        doc1_id: str,
+        doc2_id: str,
+        similarity: float,
+    ) -> None:
+        """Create a similarity relationship between two documents."""
+        if similarity < 0.85:
+            return
+        query = (
+            "MATCH (d1:Document {document_id: $d1_id}) "
+            "MATCH (d2:Document {document_id: $d2_id}) "
+            "MERGE (d1)-[r:SIMILAR_TO]->(d2) "
+            "SET r.similarity = $sim, r.updated_at = timestamp()"
+        )
+        with self._session() as session:
+            session.run(query, d1_id=doc1_id, d2_id=doc2_id, sim=similarity)

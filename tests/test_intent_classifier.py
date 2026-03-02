@@ -413,17 +413,17 @@ class TestIntegration:
                 result = _neural_parse("What are the skills?")
                 assert result is None
 
-    def test_heuristic_falls_back_to_regex(self):
-        from src.intent.llm_intent import _heuristic_parse
+    def test_fallback_parse_falls_back_to_regex(self):
+        from src.intent.llm_intent import _fallback_parse
 
         set_intent_classifier(None)
         with patch("src.intent.llm_intent._get_embedder", return_value=None):
             with patch("src.intent.intent_classifier.ensure_intent_classifier", side_effect=Exception("no embedder")):
-                result = _heuristic_parse("summarize the document")
+                result = _fallback_parse("summarize the document")
                 assert result["intent"] == "summarize"
 
-    def test_heuristic_parse_includes_entity_hints(self):
-        from src.intent.llm_intent import _heuristic_parse
+    def test_fallback_parse_includes_entity_hints(self):
+        from src.intent.llm_intent import _fallback_parse
 
         emb = FakeEmbedder(dim=64)
         clf = IntentDomainClassifier(input_dim=64, hidden_dim=32)
@@ -431,7 +431,7 @@ class TestIntegration:
         set_intent_classifier(clf)
 
         with patch("src.intent.llm_intent._get_embedder", return_value=emb):
-            result = _heuristic_parse("What are John's skills?")
+            result = _fallback_parse("What are John's skills?")
             assert "entity_hints" in result
 
     def test_parse_intent_full_flow(self):
@@ -462,12 +462,12 @@ class TestGracefulDegradation:
         set_intent_classifier(self._original)
 
     def test_no_embedder_falls_back_to_regex(self):
-        from src.intent.llm_intent import _heuristic_parse
+        from src.intent.llm_intent import _fallback_parse
 
         set_intent_classifier(None)
         with patch("src.intent.llm_intent._get_embedder", return_value=None):
             with patch("src.intent.intent_classifier.ensure_intent_classifier", side_effect=Exception("no embedder")):
-                result = _heuristic_parse("compare the candidates")
+                result = _fallback_parse("compare the candidates")
                 assert result["intent"] == "compare"
                 assert result["domain"] == "generic"
 

@@ -159,6 +159,9 @@ def _nlp_enrich(text: str, add_fn) -> bool:
         "GPE": "LOCATION",
         "LOC": "LOCATION",
         "FAC": "LOCATION",
+        "PRODUCT": "PRODUCT",
+        "LAW": "LAW",
+        "EVENT": "EVENT",
     }
     for ent in doc.ents:
         mapped = _SPACY_TYPE_MAP.get(ent.label_)
@@ -167,22 +170,6 @@ def _nlp_enrich(text: str, add_fn) -> bool:
             if len(name) > 1:
                 add_fn(mapped, name, 0.75)
                 found = True
-
-    # DPIE entity recognizer (if available and trained)
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-        registry = DPIERegistry.get()
-        if registry.is_loaded:
-            dpie_entities = registry.extract_entities(text[:5000])
-            for ent_dict in dpie_entities:
-                ent_type = str(ent_dict.get("type", "")).upper()
-                ent_name = str(ent_dict.get("entity", "")).strip()
-                ent_conf = float(ent_dict.get("confidence", 0.5))
-                if ent_name and ent_type in {"PERSON", "ORGANIZATION", "SKILL", "LOCATION"}:
-                    add_fn(ent_type, ent_name, max(ent_conf, 0.7))
-                    found = True
-    except Exception:  # noqa: BLE001
-        pass  # DPIE not available
 
     return found
 

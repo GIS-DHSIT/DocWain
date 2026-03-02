@@ -343,81 +343,6 @@ async def reindex_profile(body: ReindexRequest) -> Dict[str, Any]:
         }
 
 
-class DPIETrainRequest(BaseModel):
-    subscription_id: str
-    profile_id: str
-
-
-@health_router.post("/api/admin/dpie/train")
-async def train_dpie(body: DPIETrainRequest) -> Dict[str, Any]:
-    """
-    Manually trigger DPIE model training from Qdrant data.
-
-    Bootstraps training data from the specified profile's Qdrant vectors
-    and trains all DPIE ML models (document classifier, section detector,
-    section kind classifier, entity recognizer).
-    """
-    from src.api import dw_newron
-    from src.api.rag_state import get_app_state
-
-    subscription_id = body.subscription_id
-    profile_id = body.profile_id
-
-    state = get_app_state()
-    qdrant_client = (state.qdrant_client if state else None) or dw_newron.get_qdrant_client()
-    embedding_model = (state.embedding_model if state else None) or dw_newron.get_model()
-
-    if not qdrant_client or not embedding_model:
-        return {"status": "error", "error": "qdrant_client or embedding_model not available"}
-
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-
-        registry = DPIERegistry.get()
-        stats = registry.train_and_save(
-            qdrant_client=qdrant_client,
-            sentence_model=embedding_model,
-            collection_name=subscription_id,
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-        )
-
-        return {
-            "status": "success",
-            "subscription_id": subscription_id,
-            "profile_id": profile_id,
-            "is_loaded": registry.is_loaded,
-            "training_stats": {
-                k: v if not isinstance(v, dict) else {
-                    sk: sv[:5] if isinstance(sv, list) and len(sv) > 5 else sv
-                    for sk, sv in v.items()
-                }
-                for k, v in stats.items()
-            },
-        }
-    except Exception as exc:
-        logger.error("DPIE training failed: %s", exc, exc_info=True)
-        return {
-            "status": "error",
-            "error": str(exc)[:300],
-        }
-
-
-@health_router.get("/api/admin/dpie/status")
-async def dpie_status() -> Dict[str, Any]:
-    """Return the current DPIE model status."""
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-
-        registry = DPIERegistry.get()
-        return {
-            "is_loaded": registry.is_loaded,
-            "model_dir": getattr(registry, "_model_dir", ""),
-        }
-    except ImportError:
-        return {"is_loaded": False, "error": "dpie_integration not available"}
-
-
 @health_router.get("/api/admin/metrics/quality")
 async def quality_metrics(hours: int = 24) -> Dict[str, Any]:
     """Return pipeline quality metrics aggregated over the last N hours."""
@@ -614,6 +539,353 @@ async def kg_status() -> Dict[str, Any]:
         result["status"] = "unhealthy"
         result["neo4j_connected"] = False
         result["error"] = str(exc)[:200]
+
+    return result
+
+
+@health_router.get("/api/admin/task-routing/status")
+async def task_routing_status() -> Dict[str, Any]:
+    """Return task-aware model routing status, discovered models, and per-task statistics."""
+    from src.api.config import Config
+
+    enabled = getattr(Config, "TaskRouting", None) and getattr(Config.TaskRouting, "ENABLED", False)
+    if not enabled:
+        return {"enabled": False, "status": "disabled"}
+
+    try:
+        from src.llm.model_registry import get_model_registry
+        from src.llm.task_router import TaskType
+
+        registry = get_model_registry()
+        if registry is None:
+            return {"enabled": True, "status": "registry_not_initialized"}
+
+        # Check if the active gateway is task-aware
+        from src.llm.gateway import get_llm_gateway
+        gateway = get_llm_gateway()
+        is_task_aware = hasattr(gateway, "_router")
+
+        models = [
+            {
+                "name": m.name,
+                "size_bytes": m.size_bytes,
+                "speed_tier": m.speed_tier,
+                "strengths": m.strengths,
+                "available": m.available,
+            }
+            for m in registry.get_available()
+        ]
+
+        routing_table = {}
+        if is_task_aware:
+            for task in TaskType:
+                routing_table[task.value] = gateway._router.explain(task)
+
+        task_stats = {}
+        if is_task_aware and hasattr(gateway, "get_task_stats"):
+            task_stats = gateway.get_task_stats()
+
+        return {
+            "enabled": is_task_aware,
+            "status": "active" if is_task_aware else "registry_only",
+            "models_discovered": len(models),
+            "models": models,
+            "routing_table": routing_table,
+            "task_stats": task_stats,
+        }
+    except Exception as exc:
+        return {"enabled": True, "status": "error", "error": str(exc)[:200]}
+
+
+@health_router.get("/api/admin/tools/status")
+async def tools_status() -> Dict[str, Any]:
+    """Return registered tool count and intelligence profile summary."""
+    try:
+        from src.tools.intelligence import TOOL_PROFILES
+        profiles_info = [
+            {"name": p.name, "domain": p.domain, "intelligence": bool(p.system_prompt)}
+            for p in TOOL_PROFILES.values()
+        ]
+    except ImportError:
+        profiles_info = []
+
+    registered_count = 0
+    try:
+        from src.tools.base import registry
+        registered_count = len(registry._registry)
+    except Exception:
+        pass
+
+    return {
+        "registered_tools": registered_count,
+        "intelligence_profiles": len(profiles_info),
+        "tools": profiles_info,
+    }
+
+
+@health_router.get("/api/admin/enterprise-intelligence/status")
+async def enterprise_intelligence_status() -> Dict[str, Any]:
+    """Return status of enterprise intelligence features."""
+    from src.api.config import Config
+
+    features = {}
+
+    # Feature 1: Follow-Up Suggestions
+    fu_cls = getattr(Config, "FollowUp", None)
+    features["followup_suggestions"] = {
+        "enabled": getattr(fu_cls, "ENABLED", False) if fu_cls else False,
+        "max_suggestions": getattr(fu_cls, "MAX_SUGGESTIONS", 3) if fu_cls else 3,
+    }
+
+    # Feature 2: Insights Tool
+    try:
+        from src.tools.base import registry
+        features["insights_tool"] = {
+            "registered": "insights" in registry._registry,
+        }
+    except Exception:
+        features["insights_tool"] = {"registered": False}
+
+    # Feature 3: Action Items Tool
+    try:
+        from src.tools.base import registry
+        features["action_items_tool"] = {
+            "registered": "action_items" in registry._registry,
+        }
+    except Exception:
+        features["action_items_tool"] = {"registered": False}
+
+    # Feature 4: Query Planner
+    qp_cls = getattr(Config, "QueryPlanner", None)
+    features["query_planner"] = {
+        "enabled": getattr(qp_cls, "ENABLED", False) if qp_cls else False,
+        "max_steps": getattr(qp_cls, "MAX_STEPS", 3) if qp_cls else 3,
+    }
+
+    # Feature 5: Hallucination Corrector
+    hc_cls = getattr(Config, "HallucinationCorrector", None)
+    features["hallucination_corrector"] = {
+        "enabled": getattr(hc_cls, "ENABLED", False) if hc_cls else False,
+        "score_threshold": getattr(hc_cls, "SCORE_THRESHOLD", 0.5) if hc_cls else 0.5,
+        "max_corrections": getattr(hc_cls, "MAX_CORRECTIONS", 3) if hc_cls else 3,
+    }
+
+    # Feature 6: Confidence Scoring
+    conf_cls = getattr(Config, "Confidence", None)
+    features["confidence_scoring"] = {
+        "enabled": getattr(conf_cls, "ENABLED", False) if conf_cls else False,
+    }
+
+    enabled_count = sum(
+        1 for f in features.values()
+        if f.get("enabled") or f.get("registered")
+    )
+
+    return {
+        "status": "active" if enabled_count > 0 else "disabled",
+        "features_enabled": enabled_count,
+        "features_total": len(features),
+        "features": features,
+    }
+
+
+@health_router.get("/api/admin/web-search/status")
+async def web_search_status() -> Dict[str, Any]:
+    """Return web search configuration status."""
+    from src.api.config import Config
+
+    ws = getattr(Config, "WebSearch", None)
+    if ws is None:
+        return {"enabled": False, "status": "not_configured"}
+
+    tavily_configured = bool(getattr(ws, "TAVILY_API_KEY", ""))
+
+    return {
+        "enabled": getattr(ws, "ENABLED", False),
+        "engine": getattr(ws, "ENGINE", "duckduckgo"),
+        "tavily_configured": tavily_configured,
+        "max_results": getattr(ws, "MAX_RESULTS", 5),
+        "timeout": getattr(ws, "TIMEOUT", 10.0),
+        "max_url_fetch_chars": getattr(ws, "MAX_URL_FETCH_CHARS", 6000),
+        "fallback_on_no_results": getattr(ws, "FALLBACK_ON_NO_RESULTS", True),
+    }
+
+
+@health_router.get("/api/admin/vision-ocr/status")
+async def vision_ocr_status() -> Dict[str, Any]:
+    """Return vision OCR engine status."""
+    from src.api.config import Config
+
+    cfg = getattr(Config, "VisionOCR", None)
+    if cfg is None:
+        return {"enabled": False, "status": "not_configured"}
+
+    result: Dict[str, Any] = {
+        "enabled": getattr(cfg, "ENABLED", False),
+        "model": getattr(cfg, "MODEL", "glm-ocr:latest"),
+        "ocr_content_images": getattr(cfg, "OCR_CONTENT_IMAGES", True),
+        "fallback_to_traditional": getattr(cfg, "FALLBACK_TO_TRADITIONAL", True),
+    }
+
+    try:
+        from src.llm.vision_ocr import get_vision_ocr_client
+        client = get_vision_ocr_client()
+        result["available"] = client.is_available() if client else False
+        result["status"] = "active" if result["available"] else "model_not_available"
+    except Exception:
+        result["available"] = False
+        result["status"] = "not_initialized"
+
+    return result
+
+
+@health_router.get("/api/admin/domain-knowledge/status")
+async def domain_knowledge_status() -> Dict[str, Any]:
+    """Return domain knowledge engine status."""
+    from src.api.config import Config
+
+    dk = getattr(Config, "DomainKnowledge", None)
+    if dk is None:
+        return {"enabled": False, "status": "not_configured"}
+
+    result: Dict[str, Any] = {
+        "enabled": getattr(dk, "ENABLED", False),
+        "web_enrichment": getattr(dk, "WEB_ENRICHMENT", False),
+        "inject_into_prompts": getattr(dk, "INJECT_INTO_PROMPTS", True),
+        "cache_ttl": getattr(dk, "CACHE_TTL", 3600),
+    }
+
+    try:
+        from src.intelligence.domain_knowledge import get_domain_knowledge_provider
+        provider = get_domain_knowledge_provider()
+        result["supported_domains"] = provider.supported_domains
+        result["status"] = "active"
+    except Exception:
+        result["status"] = "not_initialized"
+
+    return result
+
+
+@health_router.get("/api/admin/context-understanding/status")
+async def context_understanding_status() -> Dict[str, Any]:
+    """Return ML-based context understanding module status."""
+    result: Dict[str, Any] = {"enabled": True, "status": "active"}
+    try:
+        from src.intelligence.context_understanding import understand_context
+        result["capabilities"] = [
+            "semantic_clustering",
+            "query_evidence_alignment",
+            "entity_salience",
+            "cross_document_relationships",
+            "structured_fact_extraction",
+            "context_distillation",
+        ]
+    except ImportError:
+        result["enabled"] = False
+        result["status"] = "not_available"
+    return result
+
+
+@health_router.get("/admin/domain-agents/status")
+async def domain_agents_status() -> Dict[str, Any]:
+    """Return domain agent availability and capabilities."""
+    result: Dict[str, Any] = {"enabled": True, "status": "active"}
+    try:
+        from src.agentic.domain_agents import list_available_agents
+        agents = list_available_agents()
+        result["agents"] = {domain: caps for domain, caps in agents.items()}
+        result["agent_count"] = len(agents)
+        result["total_capabilities"] = sum(len(caps) for caps in agents.values())
+    except ImportError:
+        result["enabled"] = False
+        result["status"] = "not_available"
+    except Exception:
+        result["status"] = "error"
+    return result
+
+
+@health_router.get("/admin/profile-domain/status")
+async def profile_domain_status() -> Dict[str, Any]:
+    """Return profile domain tagging system status."""
+    result: Dict[str, Any] = {"enabled": True, "status": "active"}
+    try:
+        from src.api.config import Config
+        cfg = getattr(Config, "ProfileDomain", None)
+        if cfg is None or not getattr(cfg, "ENABLED", True):
+            result["enabled"] = False
+            result["status"] = "disabled"
+            return result
+        result["majority_threshold"] = getattr(cfg, "MAJORITY_THRESHOLD", 0.80)
+        result["min_signal_score"] = getattr(cfg, "MIN_SIGNAL_SCORE", 0.25)
+        from src.profiles.profile_domain_tagger import compute_profile_domain
+        result["module_available"] = True
+    except ImportError:
+        result["enabled"] = False
+        result["status"] = "not_available"
+        result["module_available"] = False
+    except Exception:
+        result["status"] = "error"
+    return result
+
+
+@health_router.get("/api/admin/thinking-model/status")
+async def thinking_model_status() -> Dict[str, Any]:
+    """Return lfm2.5-thinking MoE sub-agent status."""
+    from src.api.config import Config
+
+    cfg = getattr(Config, "ThinkingModel", None)
+    if cfg is None:
+        return {"enabled": False, "status": "not_configured"}
+
+    result: Dict[str, Any] = {
+        "enabled": getattr(cfg, "ENABLED", False),
+        "model": getattr(cfg, "MODEL", "lfm2.5-thinking:latest"),
+        "use_for_judging": getattr(cfg, "USE_FOR_JUDGING", True),
+        "use_for_agent_steps": getattr(cfg, "USE_FOR_AGENT_STEPS", True),
+        "use_for_verification": getattr(cfg, "USE_FOR_VERIFICATION", True),
+        "keep_alive": getattr(cfg, "KEEP_ALIVE", "24h"),
+        "temperature": getattr(cfg, "DEFAULT_TEMPERATURE", 0.05),
+    }
+
+    try:
+        import ollama
+        ollama.show(result["model"])
+        result["available"] = True
+        result["status"] = "active"
+    except Exception:
+        result["available"] = False
+        result["status"] = "model_not_available"
+
+    return result
+
+
+@health_router.get("/api/admin/vision-analysis/status")
+async def vision_analysis_status() -> Dict[str, Any]:
+    """Return glm-ocr enhanced vision analysis status."""
+    from src.api.config import Config
+
+    cfg = getattr(Config, "VisionAnalysis", None)
+    if cfg is None:
+        return {"enabled": False, "status": "not_configured"}
+
+    result: Dict[str, Any] = {
+        "enabled": getattr(cfg, "ENABLED", False),
+        "model": getattr(cfg, "MODEL", "glm-ocr:latest"),
+        "chart_analysis": getattr(cfg, "CHART_ANALYSIS", True),
+        "table_analysis": getattr(cfg, "TABLE_ANALYSIS", True),
+        "diagram_analysis": getattr(cfg, "DIAGRAM_ANALYSIS", True),
+        "photo_analysis": getattr(cfg, "PHOTO_ANALYSIS", True),
+        "max_image_tokens": getattr(cfg, "MAX_IMAGE_TOKENS", 4096),
+    }
+
+    try:
+        from src.llm.vision_ocr import get_vision_ocr_client
+        client = get_vision_ocr_client()
+        result["available"] = client.is_available() if client else False
+        result["status"] = "active" if result["available"] else "model_not_available"
+    except Exception:
+        result["available"] = False
+        result["status"] = "not_initialized"
 
     return result
 

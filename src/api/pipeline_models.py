@@ -24,6 +24,11 @@ class Table:
 class Figure:
     page: int
     caption: str
+    ocr_method: Optional[str] = None
+    ocr_confidence: Optional[float] = None
+    is_diagram: bool = False
+    diagram_type: Optional[str] = None
+    diagram_structure: Optional[Dict[str, Any]] = None
 
 
 @dataclass

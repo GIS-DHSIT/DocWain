@@ -131,6 +131,79 @@ def initialize_app_state(app: FastAPI) -> AppState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Mongo error normalization skipped: %s", exc)
 
+    # Recover zombie documents stuck in TRAINING_STARTED (e.g. server restart killed threads)
+    try:
+        from src.api.document_status import recover_zombie_documents
+        recovered = recover_zombie_documents()
+        if recovered:
+            logger.info("Recovered %d zombie training documents at startup", recovered)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Zombie document recovery skipped: %s", exc)
+
+    # Task-aware multi-model routing (auto-discovers available Ollama models)
+    if getattr(Config, "TaskRouting", None) and getattr(Config.TaskRouting, "ENABLED", False):
+        try:
+            from src.llm.model_registry import ModelRegistry, set_model_registry
+            from src.llm.task_router import TaskRouter
+            from src.llm.multi_agent import TaskAwareGateway
+
+            registry = ModelRegistry()
+            registry.discover()
+            set_model_registry(registry)
+            logger.info(
+                "ModelRegistry discovered %d models: %s",
+                len(registry.get_available()),
+                [m.name for m in registry.get_available()],
+            )
+
+            router = TaskRouter(registry)
+            task_aware_gateway = TaskAwareGateway(
+                router=router,
+                fallback_gateway=llm_gateway,
+            )
+
+            # Replace the llm_gateway singleton so all existing code uses task routing
+            set_llm_gateway(task_aware_gateway)
+            llm_gateway = task_aware_gateway
+            ollama_client = task_aware_gateway
+            logger.info("TaskAwareGateway active — task routing enabled")
+
+            # Pin gpt-oss in GPU memory to eliminate model swap latency.
+            # First evict non-essential models to free GPU memory for gpt-oss (13GB).
+            try:
+                import ollama as _ollama
+
+                # Evict ALL other models to make room for gpt-oss (14GB on T4 16GB)
+                # T4 can only hold one large model; gpt-oss is the critical generation model
+                try:
+                    _running = _ollama.ps()
+                    for _m in getattr(_running, "models", []) or []:
+                        _name = getattr(_m, "name", "") or ""
+                        if _name and "gpt-oss" not in _name:
+                            try:
+                                _ollama.generate(model=_name, prompt="", options={"num_predict": 0}, keep_alive="0s")
+                                logger.info("Evicted %s from GPU to make room for gpt-oss", _name)
+                            except Exception:  # noqa: BLE001
+                                pass
+                except Exception:  # noqa: BLE001
+                    pass
+
+                _ollama.generate(
+                    model="gpt-oss:latest",
+                    prompt="ping",
+                    options={"num_predict": 1},
+                    keep_alive="24h",
+                )
+                logger.info("gpt-oss pinned in GPU memory (keep_alive=24h)")
+            except Exception as _pin_exc:  # noqa: BLE001
+                logger.warning("gpt-oss pinning FAILED — expect model swap latency: %s", _pin_exc)
+
+            # NOTE: lfm2.5-thinking (1GB) loads on-demand in ~3s — no need to pin.
+            # T4 16GB cannot hold both gpt-oss (14GB) and lfm2.5-thinking simultaneously.
+            # lfm2.5-thinking is used for reasoning tasks and will load when needed.
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Task routing init failed (continuing with single-model): %s", exc)
+
     # Multi-agent gateway (role-specific Ollama models)
     multi_agent_gateway = None
     if getattr(Config, "MultiAgent", None) and getattr(Config.MultiAgent, "ENABLED", False):
@@ -178,97 +251,12 @@ def initialize_app_state(app: FastAPI) -> AppState:
     return state
 
 
-def _bootstrap_dpie_background(
-    qdrant_client: Any,
-    embedding_model: Any,
-) -> None:
-    """Discover all Qdrant collections and train DPIE models in the background.
-
-    Runs in a daemon thread so it does not block server startup.
-    Skips silently if DPIE dependencies are not available or if
-    models are already trained.
-    """
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-        from src.api.vector_store import build_collection_name
-
-        registry = DPIERegistry.get()
-        if registry.is_loaded:
-            logger.info("DPIE models already loaded; skipping background training")
-            return
-
-        # Discover all collections (each is a subscription_id)
-        collections = qdrant_client.get_collections().collections
-        if not collections:
-            logger.info("DPIE: no Qdrant collections found; skipping")
-            return
-
-        for col in collections:
-            subscription_id = getattr(col, "name", None) or str(col)
-            # Discover all profile_ids (only fetches identity field, not full payloads)
-            profile_ids = _discover_profile_ids(qdrant_client, subscription_id)
-            if not profile_ids:
-                logger.debug("DPIE: no profiles found in collection %s; skipping", subscription_id)
-                continue
-
-            for profile_id in profile_ids:
-                logger.info("DPIE: auto-training for subscription=%s profile=%s", subscription_id, profile_id)
-                try:
-                    registry.ensure_ready(
-                        qdrant_client=qdrant_client,
-                        sentence_model=embedding_model,
-                        collection_name=subscription_id,
-                        subscription_id=subscription_id,
-                        profile_id=profile_id,
-                    )
-                    logger.info("DPIE: models ready for subscription=%s profile=%s", subscription_id, profile_id)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("DPIE: training failed for %s/%s: %s", subscription_id, profile_id, exc)
-
-    except ImportError:
-        logger.debug("DPIE: intelligence.dpie_integration not available; skipping")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("DPIE: background bootstrap failed: %s", exc)
-
-
-def _discover_profile_ids(qdrant_client: Any, collection_name: str) -> List[str]:
-    """Scroll points to discover all unique profile_ids in the collection.
-
-    Only fetches the ``profile_id`` payload field (never full payloads) to
-    avoid leaking document content into memory during bootstrap.
-    """
-    try:
-        seen: set[str] = set()
-        offset = None
-        while len(seen) < 50:  # cap to avoid unbounded scroll
-            result = qdrant_client.scroll(
-                collection_name=collection_name,
-                limit=20,
-                with_payload=["profile_id"],
-                with_vectors=False,
-                offset=offset,
-            )
-            points, next_offset = result if result else ([], None)
-            for point in points:
-                payload = getattr(point, "payload", None) or {}
-                pid = payload.get("profile_id")
-                if pid:
-                    seen.add(str(pid))
-            if not next_offset or not points:
-                break
-            offset = next_offset
-        return list(seen)
-    except Exception:
-        pass
-    return []
-
-
 def _precreate_subscription_collections(qdrant_client) -> None:
     """Pre-create Qdrant collections for active subscriptions to avoid 404s on first document."""
     try:
         from src.api.vector_store import build_collection_name, VectorStoreClient
         from src.api.config import Config
-        db = Config.MongoDB.get_db()
+        from src.api.dataHandler import db
         if db is None:
             return
         subs_coll = db.get_collection("subscriptions")
@@ -334,20 +322,93 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Line role classifier startup training skipped: %s", exc)
 
-    # Kick off DPIE background training (non-blocking)
-    if state.qdrant_client and state.embedding_model:
-        dpie_thread = threading.Thread(
-            target=_bootstrap_dpie_background,
-            args=(state.qdrant_client, state.embedding_model),
-            daemon=True,
-            name="dpie-bootstrap",
-        )
-        dpie_thread.start()
-        logger.info("DPIE background training thread started")
+    # Pre-train field importance classifier (fast, <2s on CPU)
+    if state.embedding_model:
+        try:
+            from src.rag_v3.field_classifier import ensure_field_classifier
+            ensure_field_classifier(state.embedding_model)
+            logger.info("Field importance classifier ready at startup")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Field importance classifier startup training skipped: %s", exc)
+
+    # Initialize Vision OCR client (lazy availability check)
+    if getattr(Config, "VisionOCR", None) and getattr(Config.VisionOCR, "ENABLED", True):
+        try:
+            from src.llm.vision_ocr import get_vision_ocr_client
+            client = get_vision_ocr_client()
+            if client and client.is_available():
+                logger.info("Vision OCR ready: %s", Config.VisionOCR.MODEL)
+            else:
+                logger.warning("Vision OCR model not available; traditional OCR will be used")
+        except Exception as exc:
+            logger.warning("Vision OCR init failed: %s", exc)
+
+    # Initialize domain knowledge provider (fast, no I/O)
+    try:
+        from src.intelligence.domain_knowledge import ensure_domain_knowledge_provider
+        _dk_web = getattr(getattr(Config, "DomainKnowledge", None), "WEB_ENRICHMENT", False)
+        ensure_domain_knowledge_provider(web_enrichment=_dk_web)
+        logger.info("Domain knowledge provider initialized (web_enrichment=%s)", _dk_web)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Domain knowledge provider init skipped: %s", exc)
+
+    # Initialize intelligence router (cloud LLM tiered chain)
+    try:
+        from src.llm.intelligence_router import IntelligenceRouter, set_intelligence_router
+        from src.llm.clients import OllamaClient, GeminiClient, OpenAIClient, ClaudeClient
+        _local = OllamaClient()
+        _gemini = None
+        _openai = None
+        _claude = None
+        _cloud_cfg = getattr(Config, "CloudLLM", None)
+        _cloud_enabled = getattr(_cloud_cfg, "ENABLED", False) if _cloud_cfg else False
+        if _cloud_enabled:
+            try:
+                _gemini = GeminiClient()
+            except Exception:
+                pass
+            _az_ep = getattr(_cloud_cfg, "AZURE_OPENAI_ENDPOINT", "")
+            _az_key = getattr(_cloud_cfg, "AZURE_OPENAI_API_KEY", "")
+            if _az_ep and _az_key:
+                try:
+                    _openai = OpenAIClient(endpoint=_az_ep, api_key=_az_key, deployment=getattr(_cloud_cfg, "AZURE_DEPLOYMENT", "gpt-4o"))
+                except Exception:
+                    pass
+            _cl_key = getattr(_cloud_cfg, "CLAUDE_API_KEY", "")
+            if _cl_key:
+                try:
+                    _claude = ClaudeClient(api_key=_cl_key, model=getattr(_cloud_cfg, "CLAUDE_MODEL", "claude-sonnet-4-20250514"))
+                except Exception:
+                    pass
+        router = IntelligenceRouter(_local, _gemini, _openai, _claude)
+        if _cloud_enabled and _cloud_cfg:
+            router.configure(
+                enabled=True,
+                t2_threshold=getattr(_cloud_cfg, "COMPLEXITY_THRESHOLD_T2", 0.4),
+                t3_threshold=getattr(_cloud_cfg, "COMPLEXITY_THRESHOLD_T3", 0.7),
+            )
+        set_intelligence_router(router)
+        logger.info("Intelligence router initialized (cloud=%s)", _cloud_enabled)
+    except Exception as exc:
+        logger.warning("Intelligence router init skipped: %s", exc)
+
+    # Initialize background document analyzer
+    try:
+        from src.doc_understanding.background_analyzer import BackgroundAnalyzer, set_background_analyzer
+        _deep_cfg = getattr(Config, "DeepAnalysis", None)
+        if _deep_cfg and getattr(_deep_cfg, "BACKGROUND_ENABLED", True):
+            bg = BackgroundAnalyzer()
+            if state.redis_client:
+                bg.set_redis(state.redis_client)
+                bg.start_worker()
+            set_background_analyzer(bg)
+            logger.info("Background analyzer initialized and worker started")
+    except Exception as exc:
+        logger.warning("Background analyzer init skipped: %s", exc)
 
     # Run startup checks (migrated from @app.on_event("startup") in main.py)
     try:
-        from src.api.logging_config import configure_logging
+        from src.utils.logging_utils import configure_logging
         configure_logging(
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             json_format=os.getenv("JSON_LOGGING", "false").lower() in {"1", "true", "yes"},
@@ -356,28 +417,36 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.debug("Logging configuration skipped: %s", exc)
     try:
-        from src.storage.blob_persistence import validate_storage_configured_once, validate_containers_once
+        from src.storage.blob_persistence import validate_storage_configured_once
         validate_storage_configured_once()
+    except (ImportError, AttributeError):
+        pass  # function not yet implemented
     except Exception as exc:
         logger.warning("Azure blob storage configuration check skipped: %s", exc)
     try:
+        from src.storage.blob_persistence import validate_containers_once
         validate_containers_once()
+    except (ImportError, AttributeError):
+        pass  # function not yet implemented
     except Exception as exc:
         logger.warning("Azure blob container validation skipped: %s", exc)
     try:
-        from src.api.dataHandler import clear_legacy_vetting_metadata, log_legacy_vetting_notice_if_missing
+        from src.api.dataHandler import clear_legacy_vetting_metadata
         clear_legacy_vetting_metadata()
     except Exception as exc:
         logger.warning("Legacy metadata cleanup skipped: %s", exc)
-    try:
-        log_legacy_vetting_notice_if_missing()
-    except Exception as exc:
-        logger.warning("Legacy config notice skipped: %s", exc)
     logger.info("Startup checks completed")
 
     yield
 
-    # Shutdown (currently no-op)
+    # Shutdown
+    try:
+        from src.doc_understanding.background_analyzer import get_background_analyzer
+        bg = get_background_analyzer()
+        if bg:
+            bg.stop_worker()
+    except Exception:
+        pass
     logger.info("DocWain API shutting down")
 
 

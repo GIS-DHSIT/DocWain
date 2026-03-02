@@ -7,7 +7,7 @@ against the *same* document set produce *different* responses.
 ML enhancements:
 - **Semantic similarity**: cosine similarity via BAAI/bge-large-en-v1.5 embedder
 - **Field importance classifier**: learned MLP for query→field_tag prediction
-- **Neural section routing**: DPIE SectionKindClassifier for robust section matching
+- **Section routing**: string-matching based section affinity scoring
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ _SECTION_MAP = [
 ]
 
 # ---------------------------------------------------------------------------
-# Field-focus map (mirrors enterprise._FIELD_FOCUS_MAP)
+# Field-focus map — keyword fallback when ML classifier produces nothing
 # ---------------------------------------------------------------------------
 _FIELD_FOCUS_MAP = {
     "skill": {"skills"},
@@ -122,17 +122,9 @@ _EXHAUSTIVE_RE = re.compile(
 # Thread-local caches for ML scoring
 # ---------------------------------------------------------------------------
 _chunk_embed_cache = threading.local()
-_dpie_cache = threading.local()
-
-
 def clear_chunk_embed_cache() -> None:
     """Free per-request chunk embedding cache."""
     _chunk_embed_cache.cache = {}
-
-
-def clear_dpie_cache() -> None:
-    """Free per-request DPIE classification cache."""
-    _dpie_cache.cache = {}
 
 
 # ---------------------------------------------------------------------------
@@ -162,11 +154,32 @@ def build_query_focus(
         if tokens[i] not in _STOP and tokens[i + 1] not in _STOP:
             bigrams.append(f"{tokens[i]} {tokens[i + 1]}")
 
-    # --- field tags ---
+    # --- ML: encode query embedding ---
+    query_embedding = None
+    if embedder is not None and query:
+        try:
+            query_embedding = embedder.encode([query], normalize_embeddings=True)[0]
+        except Exception:
+            log.debug("Failed to encode query for semantic similarity", exc_info=True)
+
+    # --- ML-FIRST: field classifier predictions ---
     field_tags: set[str] = set()
-    for keyword, tags in _FIELD_FOCUS_MAP.items():
-        if keyword in lowered:
-            field_tags.update(tags)
+    field_probabilities = None
+    if query_embedding is not None:
+        try:
+            from .field_classifier import get_field_classifier
+            clf = get_field_classifier()
+            if clf is not None:
+                field_probabilities = clf.predict(query_embedding)
+                field_tags.update(field_probabilities.keys())
+        except Exception:
+            log.debug("Field classifier prediction failed", exc_info=True)
+
+    # --- Keyword fallback: only when ML classifier produced nothing ---
+    if not field_tags:
+        for keyword, tags in _FIELD_FOCUS_MAP.items():
+            if keyword in lowered:
+                field_tags.update(tags)
 
     # --- section kinds (return ALL matching, not just first) ---
     section_kinds: list[str] = []
@@ -182,27 +195,6 @@ def build_query_focus(
 
     # --- intent ---
     intent = intent_hint or "factual"
-
-    # --- ML: encode query embedding ---
-    query_embedding = None
-    if embedder is not None and query:
-        try:
-            query_embedding = embedder.encode([query], normalize_embeddings=True)[0]
-        except Exception:
-            log.debug("Failed to encode query for semantic similarity", exc_info=True)
-
-    # --- ML: field classifier predictions ---
-    field_probabilities = None
-    if query_embedding is not None:
-        try:
-            from .field_classifier import get_field_classifier
-            clf = get_field_classifier()
-            if clf is not None:
-                field_probabilities = clf.predict(query_embedding)
-                # Merge classifier predictions into keyword field_tags
-                field_tags.update(field_probabilities.keys())
-        except Exception:
-            log.debug("Field classifier prediction failed", exc_info=True)
 
     return QueryFocus(
         keywords=singles,
@@ -316,24 +308,21 @@ def _keyword_overlap_score(chunk: Any, focus: QueryFocus) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Section affinity scoring + DPIE neural routing (ML Enhancement 3)
+# Section affinity scoring (ML Enhancement 3)
 # ---------------------------------------------------------------------------
 
 def _section_affinity_score(chunk: Any, focus: QueryFocus) -> float:
     """1.0 if chunk section_kind matches any focus kinds, 0.5 for partial, 0.0 otherwise.
 
     When the chunk has a missing or generic section_kind (misc/other/unknown),
-    the DPIE SectionKindClassifier is used for neural reclassification
-    (confidence gate >= 0.5).
+    a neutral penalty score is applied.
     """
     if not focus.section_kinds:
         return 0.5  # neutral when no section focus
 
     chunk_kind = _get_chunk_section_kind(chunk)
 
-    # Skip expensive DPIE neural reclassification at query time — the 2
-    # encode() calls per chunk saturate the GPU and starve Ollama.
-    # Use a neutral score for generic/missing section_kinds instead.
+    # Use a neutral score for generic/missing section_kinds.
     _is_generic = not chunk_kind or chunk_kind in ("misc", "other", "unknown")
     if _is_generic:
         return 0.3  # unknown/generic section — mild penalty
@@ -363,44 +352,6 @@ def _get_chunk_section_kind(chunk: Any) -> str:
     return (chunk_kind or "").lower().strip()
 
 
-def _dpie_classify_chunk(chunk: Any) -> tuple:
-    """Classify chunk section via DPIE neural classifier.
-
-    Returns ``(kind, confidence)`` or ``("", 0.0)`` if DPIE is unavailable.
-    Results are cached per-request via thread-local storage.
-    """
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-        registry = DPIERegistry.get()
-        if registry is None or getattr(registry, "section_kind_classifier", None) is None:
-            return ("", 0.0)
-
-        text = (getattr(chunk, "text", "") or "")[:300]
-        if not text:
-            return ("", 0.0)
-
-        # Cache by text hash
-        cache = getattr(_dpie_cache, "cache", None)
-        if cache is None:
-            _dpie_cache.cache = {}
-            cache = _dpie_cache.cache
-
-        key = hash(text)
-        if key in cache:
-            return cache[key]
-
-        meta = getattr(chunk, "meta", None) or {}
-        if isinstance(meta, dict):
-            title = meta.get("section_title", "") or ""
-        else:
-            title = getattr(meta, "section_title", "") or ""
-
-        result = registry.section_kind_classifier.classify(title, text)
-        cache[key] = result
-        return result
-    except Exception:
-        log.debug("DPIE section classification failed", exc_info=True)
-        return ("", 0.0)
 
 
 def _normalized_reranker_score(chunk: Any) -> float:

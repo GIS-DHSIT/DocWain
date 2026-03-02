@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
@@ -270,6 +271,9 @@ def _normalize(text: str) -> str:
     return re.sub(r"\W+", " ", text.lower()).strip()
 
 
+_LLM_JUDGE_TIMEOUT_S = 5.0
+
+
 def _llm_judge(
     answer: str,
     schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema,
@@ -278,8 +282,21 @@ def _llm_judge(
     correlation_id: Optional[str],
 ) -> Optional[JudgeResult]:
     prompt = _build_prompt(answer, schema, intent)
+
+    def _call() -> Optional[str]:
+        return llm_client.generate(prompt, max_retries=1, backoff=0.4)
+
     try:
-        raw = llm_client.generate(prompt, max_retries=1, backoff=0.4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_call)
+            raw = future.result(timeout=_LLM_JUDGE_TIMEOUT_S)
+    except concurrent.futures.TimeoutError:
+        logger.warning(
+            "RAG v3 LLM judge timed out after %.1fs",
+            _LLM_JUDGE_TIMEOUT_S,
+            extra={"stage": "judge", "correlation_id": correlation_id},
+        )
+        return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "RAG v3 LLM judge failed: %s",

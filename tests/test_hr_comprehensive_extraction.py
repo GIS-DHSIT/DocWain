@@ -421,7 +421,7 @@ class TestFormatCandidateDetail:
             source_type="Resume",
         )
         result = _format_candidate_detail(cand)
-        assert "**Alice Smith**" in result
+        assert "**Candidate: Alice Smith**" in result
         assert "Senior Engineer" in result
         assert "Total experience: 8 years" in result
         assert "Technical skills:" in result
@@ -432,20 +432,20 @@ class TestFormatCandidateDetail:
         assert "Source: Resume" in result
 
     def test_header_format_name_dash_role(self):
-        """Header should be '**Name** -- Role' not '**Candidate:** Name'."""
+        """Header should be '**Candidate: Name** -- Role'."""
         cand = _make_candidate(name="Bob Jones", role="Data Scientist")
         result = _format_candidate_detail(cand)
         first_line = result.split("\n")[0]
-        assert "**Bob Jones**" in first_line
+        assert "**Candidate: Bob Jones**" in first_line
         # The em dash separator
         assert "\u2014" in first_line or "—" in first_line or " — " in first_line
 
     def test_missing_role_no_dash(self):
-        """When role is None, header should just be '**Name**' without dash."""
+        """When role is None, header should just be '**Candidate: Name**' without dash."""
         cand = _make_candidate(name="Carol White", role=None)
         result = _format_candidate_detail(cand)
         first_line = result.split("\n")[0]
-        assert first_line == "**Carol White**"
+        assert first_line == "**Candidate: Carol White**"
 
     def test_source_label_says_source_not_source_type(self):
         """Should use 'Source:' not 'Source type:'."""
@@ -489,10 +489,10 @@ class TestFormatCandidateDetail:
         assert "LinkedIn: linkedin.com/in/test" in result
 
     def test_default_candidate_name_when_none(self):
-        """When name is None, header should show 'Candidate'."""
+        """When name is None, header should show 'Candidate: Candidate'."""
         cand = _make_candidate(name=None)
         result = _format_candidate_detail(cand)
-        assert "**Candidate**" in result
+        assert "**Candidate: Candidate**" in result
 
 
 # ===========================================================================

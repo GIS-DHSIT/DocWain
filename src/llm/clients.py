@@ -12,9 +12,10 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib import request
 from urllib.error import HTTPError, URLError
 
@@ -53,16 +54,61 @@ def _get_config():
     return Config
 
 
+# ── Thinking mode helpers ──────────────────────────────────────────
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _split_thinking(text: str) -> Tuple[str, str]:
+    """Extract <think>...</think> block from response, returning (reasoning, cleaned_text)."""
+    match = _THINK_RE.search(text)
+    if not match:
+        return "", text
+    reasoning = match.group(1).strip()
+    cleaned = _THINK_RE.sub("", text).strip()
+    return reasoning, cleaned
+
+
+# ── Default client singleton ───────────────────────────────────────
+
+_default_client = None
+_default_client_lock = threading.Lock()
+
+
+def get_default_client():
+    """Return (or create) a singleton OllamaClient with the default model."""
+    global _default_client
+    if _default_client is None:
+        with _default_client_lock:
+            if _default_client is None:
+                _default_client = OllamaClient()
+    return _default_client
+
+
 # ── OllamaClient ───────────────────────────────────────────────────
 
 class OllamaClient:
     """Handles local Ollama model calls with controlled generation."""
+
+    # HTTP-level timeout for Ollama requests.  When a pipeline-level timeout
+    # fires (e.g. 30s in _generate()), future.cancel() does NOT kill the HTTP
+    # connection — the zombie request keeps running until Ollama finishes.
+    # This limits how long a zombie can block the Ollama queue.
+    # Must be >= LLM_EXTRACT_TIMEOUT_S (30s) to avoid premature cancellation.
+    _OLLAMA_HTTP_TIMEOUT_S = 45.0
 
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "gpt-oss:latest")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         self.backend = "ollama"
+        # Create a client with bounded HTTP timeout to prevent zombie requests
+        try:
+            import ollama as _ollama
+            import httpx as _httpx
+            self._client = _ollama.Client(timeout=_httpx.Timeout(self._OLLAMA_HTTP_TIMEOUT_S))
+        except Exception:
+            self._client = None
         logger.info("Initialized OllamaClient with model: %s", self.model_name)
 
     def generate_with_metadata(
@@ -72,6 +118,7 @@ class OllamaClient:
         options: Optional[Dict[str, Any]] = None,
         max_retries: int = 1,
         backoff: float = 0.5,
+        thinking: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         import ollama
         Config = _get_config()
@@ -89,22 +136,32 @@ class OllamaClient:
             "top_k": 40,
             "repeat_penalty": 1.1,
             "num_ctx": 4096,
-            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 2048),
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 1024),
         }
         if options:
             generation_options.update({k: v for k, v in options.items() if v is not None})
 
+        # Build extra kwargs for thinking mode
+        extra_kwargs: Dict[str, Any] = {}
+        if thinking:
+            extra_kwargs["think"] = True
+
         last_response: Dict[str, Any] = {}
         for attempt in range(1, max_retries + 1):
             try:
-                response = ollama.generate(
+                _gen_fn = self._client.generate if self._client else ollama.generate
+                response = _gen_fn(
                     model=self.model_name,
                     prompt=prompt,
                     options=generation_options,
-                    keep_alive="60m",
+                    keep_alive="24h",
+                    **extra_kwargs,
                 )
                 last_response = response or {}
                 text = (last_response.get("response") or "").strip()
+                reasoning = ""
+                if thinking and "<think>" in text:
+                    reasoning, text = _split_thinking(text)
                 if metrics_store.available:
                     latency_ms = (time.time() - request_started) * 1000
                     metrics_store.record(
@@ -117,7 +174,10 @@ class OllamaClient:
                             counters={"llm_retry_count": attempt - 1},
                             model_id=self.model_name,
                         )
-                return text, last_response
+                meta = dict(last_response)
+                if reasoning:
+                    meta["reasoning"] = reasoning
+                return text, meta
             except Exception as exc:
                 logger.warning("Ollama attempt %d/%d failed: %s", attempt, max_retries, exc)
                 if attempt < max_retries:
@@ -136,12 +196,88 @@ class OllamaClient:
 
         return "", last_response
 
-    def generate(self, prompt: str, max_retries: int = 3, backoff: float = 1.0) -> str:
-        text, response = self.generate_with_metadata(prompt, max_retries=max_retries, backoff=backoff)
+    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5, **kwargs) -> str:
+        # Accept and forward options kwarg (TaskAwareGateway passes it)
+        extra = {}
+        if "options" in kwargs:
+            extra["options"] = kwargs.pop("options")
+        text, response = self.generate_with_metadata(prompt, max_retries=max_retries, backoff=backoff, **extra)
         if not text:
             logger.warning("Ollama returned empty response: %s", response)
             return "I don't have enough information in the documents to answer that."
         return text
+
+    def generate_with_tools(
+        self,
+        prompt: str,
+        tools: List[Dict[str, Any]],
+        *,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, List[Dict[str, Any]], Dict[str, Any]]:
+        """Generate with native tool calling support.
+
+        Returns (text, tool_calls, raw_response).
+        """
+        import ollama
+        Config = _get_config()
+        generation_options = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.2),
+            "num_ctx": 4096,
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 1024),
+        }
+        if options:
+            generation_options.update({k: v for k, v in options.items() if v is not None})
+        try:
+            _gen_fn = self._client.generate if self._client else ollama.generate
+            raw = _gen_fn(
+                model=self.model_name,
+                prompt=prompt,
+                tools=tools,
+                options=generation_options,
+                keep_alive="24h",
+            )
+        except Exception as exc:
+            logger.warning("Ollama tool-calling generate failed: %s", exc)
+            raise
+        raw = raw or {}
+        tool_calls = raw.get("tool_calls", [])
+        text = (raw.get("response") or "").strip()
+        return text, tool_calls, raw
+
+    def generate_stream(
+        self,
+        prompt: str,
+        *,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Generator[str, None, None]:
+        """Generate with true token streaming via ollama.generate(stream=True)."""
+        import ollama
+        Config = _get_config()
+        generation_options = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.2),
+            "top_p": getattr(Config.LLM, "TOP_P", 0.85),
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "num_ctx": 4096,
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 1024),
+        }
+        if options:
+            generation_options.update({k: v for k, v in options.items() if v is not None})
+        try:
+            _gen_fn = self._client.generate if self._client else ollama.generate
+            for chunk in _gen_fn(
+                model=self.model_name,
+                prompt=prompt,
+                options=generation_options,
+                stream=True,
+                keep_alive="24h",
+            ):
+                token = chunk.get("response", "") if isinstance(chunk, dict) else getattr(chunk, "response", "")
+                if token:
+                    yield token
+        except Exception as exc:
+            logger.warning("Ollama streaming failed: %s", exc)
+            raise
 
     def warm_up(self):
         try:
@@ -306,7 +442,7 @@ class GeminiClient:
             pass
         return None
 
-    def generate(self, prompt: str, max_retries: int = 3, backoff: float = 1.0) -> str:
+    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5) -> str:
         metrics_store = _get_metrics_store()
         request_started = time.time()
         cache_key = hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()
@@ -451,7 +587,7 @@ class OpenAICompatibleClient:
         except Exception as exc:
             logger.warning("Local LLM warm-up failed (continuing): %s", exc)
 
-    def generate(self, prompt: str, max_retries: int = 3, backoff: float = 1.0) -> str:
+    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5) -> str:
         metrics_store = _get_metrics_store()
         request_started = time.time()
         if metrics_store.available:
@@ -637,3 +773,165 @@ class ResilientLLMClient:
                     warm_fb()
                 except Exception:
                     pass
+
+
+# ── OpenAIClient (Azure OpenAI / GPT-4o) ──────────────────────────
+
+class OpenAIClient:
+    """Azure OpenAI client with circuit breaker."""
+
+    def __init__(
+        self,
+        endpoint: str = "",
+        api_key: str = "",
+        deployment: str = "gpt-4o",
+        api_version: str = "2024-05-01-preview",
+    ):
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.deployment = deployment
+        self.api_version = api_version
+        self.model_name = f"azure/{deployment}"
+        self.backend = "azure_openai"
+        self._circuit_failures = 0
+        self._circuit_open_until = 0.0
+        self._circuit_threshold = 3
+        self._circuit_cooldown = 60
+
+    def in_cooldown(self) -> bool:
+        return time.time() < self._circuit_open_until
+
+    def generate(self, prompt: str, max_retries: int = 2, backoff: float = 1.0) -> str:
+        text, _ = self.generate_with_metadata(prompt, max_retries=max_retries, backoff=backoff)
+        return text or "I couldn't generate a response."
+
+    def generate_with_metadata(
+        self,
+        prompt: str,
+        *,
+        options: Optional[Dict[str, Any]] = None,
+        max_retries: int = 2,
+        backoff: float = 1.0,
+        **kwargs,
+    ) -> Tuple[str, Dict[str, Any]]:
+        if self.in_cooldown():
+            raise RateLimitCooldownError("Azure OpenAI circuit breaker open")
+        if not self.endpoint or not self.api_key:
+            raise ValueError("Azure OpenAI endpoint/key not configured")
+
+        url = f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions?api-version={self.api_version}"
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": (options or {}).get("temperature", 0.3),
+            "max_tokens": (options or {}).get("num_predict", 2048),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.api_key,
+        }
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                req = request.Request(url, data=data, headers=headers, method="POST")
+                with request.urlopen(req, timeout=60) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                choice = (body.get("choices") or [{}])[0]
+                text = (choice.get("message", {}).get("content") or "").strip()
+                self._circuit_failures = 0
+                return text, {"response": text, "model": self.deployment, "backend": self.backend, "raw": body}
+            except Exception as exc:
+                logger.warning("Azure OpenAI attempt %d/%d failed: %s", attempt, max_retries, exc)
+                self._circuit_failures += 1
+                if self._circuit_failures >= self._circuit_threshold:
+                    self._circuit_open_until = time.time() + self._circuit_cooldown
+                    logger.warning("Azure OpenAI circuit breaker opened for %ds", self._circuit_cooldown)
+                if attempt < max_retries:
+                    time.sleep(backoff * attempt)
+                else:
+                    raise
+        return "", {}
+
+    def warm_up(self):
+        pass  # No warm-up needed for cloud client
+
+
+# ── ClaudeClient (Anthropic Claude) ───────────────────────────────
+
+class ClaudeClient:
+    """Anthropic Claude API client with circuit breaker."""
+
+    def __init__(
+        self,
+        api_key: str = "",
+        model: str = "claude-sonnet-4-20250514",
+    ):
+        self.api_key = api_key
+        self.model_name = model
+        self.backend = "claude"
+        self._circuit_failures = 0
+        self._circuit_open_until = 0.0
+        self._circuit_threshold = 3
+        self._circuit_cooldown = 60
+
+    def in_cooldown(self) -> bool:
+        return time.time() < self._circuit_open_until
+
+    def generate(self, prompt: str, max_retries: int = 2, backoff: float = 1.0) -> str:
+        text, _ = self.generate_with_metadata(prompt, max_retries=max_retries, backoff=backoff)
+        return text or "I couldn't generate a response."
+
+    def generate_with_metadata(
+        self,
+        prompt: str,
+        *,
+        options: Optional[Dict[str, Any]] = None,
+        max_retries: int = 2,
+        backoff: float = 1.0,
+        **kwargs,
+    ) -> Tuple[str, Dict[str, Any]]:
+        if self.in_cooldown():
+            raise RateLimitCooldownError("Claude circuit breaker open")
+        if not self.api_key:
+            raise ValueError("Claude API key not configured")
+
+        url = "https://api.anthropic.com/v1/messages"
+        payload = {
+            "model": self.model_name,
+            "max_tokens": (options or {}).get("num_predict", 2048),
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+        }
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                req = request.Request(url, data=data, headers=headers, method="POST")
+                with request.urlopen(req, timeout=60) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                content_blocks = body.get("content", [])
+                text = ""
+                for block in content_blocks:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text += block.get("text", "")
+                text = text.strip()
+                self._circuit_failures = 0
+                return text, {"response": text, "model": self.model_name, "backend": self.backend, "raw": body}
+            except Exception as exc:
+                logger.warning("Claude attempt %d/%d failed: %s", attempt, max_retries, exc)
+                self._circuit_failures += 1
+                if self._circuit_failures >= self._circuit_threshold:
+                    self._circuit_open_until = time.time() + self._circuit_cooldown
+                    logger.warning("Claude circuit breaker opened for %ds", self._circuit_cooldown)
+                if attempt < max_retries:
+                    time.sleep(backoff * attempt)
+                else:
+                    raise
+        return "", {}
+
+    def warm_up(self):
+        pass  # No warm-up needed for cloud client

@@ -12,7 +12,7 @@ from .types import LLMBudget
 
 logger = logging.getLogger(__name__)
 
-REWRITE_TIMEOUT_MS = 2500
+REWRITE_TIMEOUT_MS = 5000
 REWRITE_MAX_TOKENS = 96
 REWRITE_CACHE_TTL_SEC = 24 * 60 * 60
 

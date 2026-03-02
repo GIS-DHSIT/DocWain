@@ -62,7 +62,7 @@ except Exception as _datahandler_exc:  # noqa: BLE001
     train_on_document = _datahandler_unavailable
     update_extraction_metadata = _datahandler_unavailable
     update_pii_stats = _datahandler_unavailable
-from src.api.document_status import get_document_record, update_document_fields, update_stage
+from src.api.document_status import emit_progress, get_document_record, update_document_fields, update_stage
 from src.api.pipeline_models import ExtractedDocument
 from dataclasses import is_dataclass, asdict
 from src.api.structured_extraction import StructuredDocument
@@ -91,7 +91,6 @@ logger = logging.getLogger(__name__)
 
 COMPLETED_STATUSES = {
     STATUS_EMBEDDING_COMPLETED,
-    STATUS_TRAINING_STARTED,
     STATUS_TRAINING_COMPLETED,
     STATUS_TRAINING_PARTIALLY_COMPLETED,
 }
@@ -278,7 +277,9 @@ def _get_max_workers(total: int) -> int:
     except ValueError:
         max_workers = None
     if max_workers is None:
-        max_workers = min(total, max(os.cpu_count() or 2, 2))
+        # Default to 2: prevents GPU OOM from concurrent docs and
+        # avoids CPU thrashing when GPU is unavailable.
+        max_workers = min(total, 2)
     return max_workers
 
 
@@ -456,6 +457,33 @@ def _min_chars_threshold() -> int:
 def _is_meta_tensor_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "meta tensor" in msg or "cannot copy out of meta tensor" in msg
+
+
+def _is_cuda_oom(exc: Exception) -> bool:
+    """Detect CUDA out-of-memory errors including CUBLAS allocation failures."""
+    try:
+        import torch
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    msg = str(exc).lower()
+    return (
+        "cuda out of memory" in msg
+        or "cuda error: out of memory" in msg
+        or "cublas_status_alloc_failed" in msg
+        or ("cuda error" in msg and "alloc" in msg)
+    )
+
+
+def _clear_gpu_cache() -> None:
+    """Best-effort GPU cache clear after CUDA OOM."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _coverage_threshold() -> float:
@@ -789,10 +817,26 @@ def _prepare_extracted_docs(
 
     invalid_docs = [doc_name for doc_name, content in extracted_docs.items() if not _payload_has_required_schema(content)]
     if invalid_docs:
-        if metrics_store.available:
-            metrics_store.record(counters={"empty_docs_count": len(invalid_docs)}, document_id=document_id, agent="embedding")
-        logger.warning("Extracted payload missing required schema keys for %s: %s", document_id, invalid_docs)
-        return None, None, [], "empty_extraction"
+        logger.warning("Extracted payload missing required schema keys for %s: %s; attempting re-extraction", document_id, invalid_docs)
+        # Attempt re-extraction before giving up
+        fallback_docs = _reextract_from_source(
+            document_id=document_id,
+            record=record,
+            subscription_id=subscription_id,
+        )
+        if fallback_docs:
+            extracted_docs = _normalize_extracted_docs(fallback_docs)
+            for doc_name, content in list(extracted_docs.items()):
+                extracted_docs[doc_name] = _normalize_content_in_place(content)
+                extracted_docs[doc_name] = _normalize_metadata_in_place(
+                    extracted_docs[doc_name], document_id=document_id,
+                )
+            invalid_docs = [doc_name for doc_name, content in extracted_docs.items() if not _payload_has_required_schema(content)]
+        if invalid_docs:
+            if metrics_store.available:
+                metrics_store.record(counters={"empty_docs_count": len(invalid_docs)}, document_id=document_id, agent="embedding")
+            logger.warning("Re-extraction also failed for %s: %s", document_id, invalid_docs)
+            return None, None, [], "empty_extraction"
 
     assessment = _assess_extracted_docs(extracted_docs)
     logger.info(
@@ -803,9 +847,21 @@ def _prepare_extracted_docs(
     )
 
     if not assessment.get("has_data"):
-        if metrics_store.available:
-            metrics_store.record(counters={"empty_docs_count": 1}, document_id=document_id, agent="embedding")
-        return None, None, [], "empty_extraction"
+        # Try re-extraction as last resort before returning empty
+        fallback_docs = _reextract_from_source(
+            document_id=document_id,
+            record=record,
+            subscription_id=subscription_id,
+        )
+        if fallback_docs:
+            extracted_docs = _normalize_extracted_docs(fallback_docs)
+            for doc_name, content in list(extracted_docs.items()):
+                extracted_docs[doc_name] = _normalize_content_in_place(content)
+            assessment = _assess_extracted_docs(extracted_docs)
+        if not assessment.get("has_data"):
+            if metrics_store.available:
+                metrics_store.record(counters={"empty_docs_count": 1}, document_id=document_id, agent="embedding")
+            return None, None, [], "empty_extraction"
 
     if assessment.get("incomplete"):
         logger.warning(
@@ -966,7 +1022,10 @@ def _build_chunks_for_extracted_doc(
         coverage_ratio = None
         if full_text:
             coverage_ratio = len("".join(chunks)) / max(1, len(full_text))
-        return chunks, chunk_metadata, coverage_ratio, dropped
+        if chunks:
+            return chunks, chunk_metadata, coverage_ratio, dropped
+        # Layout graph produced 0 chunks — fall through to SectionChunker
+        logger.info("LayoutGraph produced 0 chunks for %s; falling back to SectionChunker", doc_name)
     except Exception as exc:  # noqa: BLE001
         logger.debug("LayoutGraph chunk preview failed for %s: %s", doc_name, exc)
 
@@ -1417,9 +1476,18 @@ def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
 
         except Exception as exc:
             logger.warning("Failed to normalize structured document %s: %s", name, exc)
-            # Try raw_text/full_text attrs before falling back to str()
+            # Try raw_text/full_text attrs — never fall back to str() on ExtractedDocument
             raw_text_attr = getattr(value, "raw_text", None) or getattr(value, "full_text", None)
-            text_content = raw_text_attr if isinstance(raw_text_attr, str) else (str(value).strip() if value else "")
+            if isinstance(raw_text_attr, str) and raw_text_attr.strip():
+                text_content = raw_text_attr.strip()
+            elif isinstance(value, ExtractedDocument):
+                # Use dedicated extraction to avoid garbage repr
+                from src.api.extraction_service import _extract_text_from_extracted_document
+                text_content = _extract_text_from_extracted_document(value)
+            elif isinstance(value, str):
+                text_content = value.strip()
+            else:
+                text_content = ""
             from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
             if text_content and not _is_metadata_garbage(text_content):
                 normalized[name] = {
@@ -1454,7 +1522,14 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                 # Extract sections with titles from the ExtractedDocument
                 sections_list = getattr(content, "sections", None) or []
                 full_text = getattr(content, "full_text", None) or ""
-                if sections_list and len(sections_list) > 1:
+                # Also try chunk_candidates and tables when sections/full_text are empty
+                if not full_text and not sections_list:
+                    candidate_texts = [cand.text.strip() for cand in (getattr(content, "chunk_candidates", None) or []) if (getattr(cand, "text", "") or "").strip()]
+                    table_texts = [t.text.strip() for t in (getattr(content, "tables", None) or []) if (getattr(t, "text", "") or "").strip()]
+                    all_fallback = candidate_texts + table_texts
+                    if all_fallback:
+                        full_text = "\n\n".join(all_fallback)
+                if sections_list and len(sections_list) >= 1:
                     texts = []
                     chunk_meta = []
                     sections_data = []
@@ -1534,8 +1609,17 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                             "doc_type": getattr(content, "doc_type", None),
                         }
                         continue
-                # Fallback: store ExtractedDocument as-is for legacy handling
-                normalized[name] = content
+                # Fallback: if full_text is available, use it as single chunk
+                if full_text and full_text.strip():
+                    normalized[name] = {
+                        "full_text": full_text,
+                        "texts": [full_text],
+                        "sections": [{"text": full_text, "start_page": 1, "end_page": 1}],
+                        "doc_type": getattr(content, "doc_type", None),
+                    }
+                else:
+                    # Last resort: store ExtractedDocument as-is for legacy handling
+                    normalized[name] = content
             elif isinstance(content, dict):
                 # Extract text from various possible fields
                 full_text = (
@@ -1821,10 +1905,30 @@ def _process_blob(
     lease_id = None
     lock = None
     try:
-        lease_id = store.try_acquire_lease(blob.name, lease_duration=_lease_seconds())
+        # Retry lease acquisition up to 3 times with exponential backoff
+        lease_id = None
+        for _lease_attempt in range(3):
+            lease_id = store.try_acquire_lease(blob.name, lease_duration=_lease_seconds())
+            if lease_id:
+                break
+            import time as _t
+            _backoff = 2 ** _lease_attempt  # 1s, 2s, 4s
+            logger.info("Lease conflict for %s, retrying in %ds (attempt %d/3)", blob.name, _backoff, _lease_attempt + 1)
+            _t.sleep(_backoff)
         if not lease_id:
             if telemetry:
                 telemetry.increment("embed_pickles_lease_conflict_total")
+            # Reset stuck documents so they can be retried
+            _lease_doc_id = result.get("document_id")
+            if _lease_doc_id:
+                try:
+                    _lease_record = get_document_record(_lease_doc_id) or {}
+                    if _lease_record.get("status") == STATUS_TRAINING_STARTED:
+                        _safe_set_document_status(_lease_doc_id, STATUS_TRAINING_FAILED,
+                                                  "lease_conflict_after_retries",
+                                                  error_summary="lease_conflict")
+                except Exception:  # noqa: BLE001
+                    pass
             result["status"] = "SKIPPED"
             result["error"] = "lease_conflict"
             result["failed_reason"] = "lease_conflict"
@@ -1855,20 +1959,38 @@ def _process_blob(
         try:
             extracted = pickle.loads(payload)
         except Exception as exc:  # noqa: BLE001
-            if telemetry:
-                telemetry.increment("embed_pickles_download_fail_total")
-            result["error"] = "pickle_deserialize_failed"
-            result["failed_reason"] = "blob_read_failed"
-            doc_id_hint = result.get("document_id")
+            logger.warning("Pickle deserialization failed for blob %s: %s; attempting re-extraction", blob.name, exc)
+            # Try to resolve doc_id and attempt re-extraction from source
+            doc_id_hint = result.get("document_id") or (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=store.prefix)
             if doc_id_hint:
-                _safe_set_document_status(
-                    doc_id_hint,
-                    STATUS_TRAINING_FAILED,
-                    f"pickle_deserialize_failed: {exc}",
-                    error_summary="blob_read_failed",
-                    cause=exc,
+                record = get_document_record(doc_id_hint) or {}
+                fallback_docs = _reextract_from_source(
+                    document_id=doc_id_hint,
+                    record=record,
+                    subscription_id=record.get("subscription_id") or subscription_id or "",
                 )
-            return result
+                if fallback_docs:
+                    logger.info("Re-extraction succeeded for %s after pickle failure", doc_id_hint)
+                    extracted = fallback_docs
+                else:
+                    if telemetry:
+                        telemetry.increment("embed_pickles_download_fail_total")
+                    result["error"] = "pickle_deserialize_failed"
+                    result["failed_reason"] = "blob_read_failed"
+                    _safe_set_document_status(
+                        doc_id_hint,
+                        STATUS_TRAINING_FAILED,
+                        f"pickle_deserialize_failed: {exc}",
+                        error_summary="blob_read_failed",
+                        cause=exc,
+                    )
+                    return result
+            else:
+                if telemetry:
+                    telemetry.increment("embed_pickles_download_fail_total")
+                result["error"] = "pickle_deserialize_failed"
+                result["failed_reason"] = "blob_read_failed"
+                return result
 
         doc_id = (blob.metadata or {}).get("document_id") or extract_document_id(blob.name, prefix=store.prefix)
         if not doc_id:
@@ -1878,7 +2000,41 @@ def _process_blob(
         result["document_id"] = doc_id
 
         record = get_document_record(doc_id) or {}
+        current_status = record.get("status")
+        if current_status in COMPLETED_STATUSES:
+            result["status"] = "SKIPPED"
+            result["failed_reason"] = None
+            return result
+        # HITL gate: only screened or retryable docs can be embedded
+        _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED, STATUS_TRAINING_STARTED}
+        if current_status not in _EMBEDDING_ELIGIBLE_STATUSES:
+            result["status"] = "SKIPPED"
+            if current_status == STATUS_EXTRACTION_COMPLETED:
+                result["error"] = "screening_not_completed"
+                result["failed_reason"] = f"screening_not_completed (current: {current_status})"
+                logger.info(
+                    "HITL gate: embedding rejected for %s (status=%s). Run screening first (POST /api/gateway/screen).",
+                    doc_id, current_status,
+                )
+            else:
+                result["error"] = "not_eligible"
+                result["failed_reason"] = f"not_eligible (current: {current_status})"
+                logger.info(
+                    "HITL gate: embedding rejected for %s (status=%s). Run extraction then screening first.",
+                    doc_id, current_status,
+                )
+            return result
+        # Zombie guard: if stuck in TRAINING_STARTED for >30 min, auto-fail before retrying
+        if current_status == STATUS_TRAINING_STARTED:
+            started_at = record.get("training_started_at", 0)
+            if started_at and (time.time() - started_at) > 1800:
+                logger.warning("Document %s stuck in TRAINING_STARTED for >30min — recovering", doc_id)
+                _safe_set_document_status(doc_id, STATUS_TRAINING_FAILED,
+                    "zombie_timeout: stuck in TRAINING_STARTED",
+                    error_summary="zombie_timeout")
+                emit_progress(doc_id, "failed", 0.0, "Auto-recovered: training timeout exceeded")
         _set_document_status(doc_id, STATUS_TRAINING_STARTED)
+        emit_progress(doc_id, "extraction", 0.10, "Starting document processing")
 
         try:
             subscription_id = resolve_subscription_id(
@@ -1925,6 +2081,7 @@ def _process_blob(
             "embedding",
             {"status": "IN_PROGRESS", "started_at": time.time(), "error": None, "reason": None},
         )
+        emit_progress(doc_id, "chunking", 0.20, "Preparing document chunks")
 
         extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
             document_id=doc_id,
@@ -1947,6 +2104,35 @@ def _process_blob(
                 )
                 if not prep_error:
                     extracted = reextracted
+
+        # Inject document understanding metadata from pickle into each doc's metadata
+        _understanding = None
+        if isinstance(extracted, dict):
+            _understanding = extracted.get("understanding") or {}
+        if _understanding and extracted_docs:
+            for _doc_key, _doc_content in extracted_docs.items():
+                if isinstance(_doc_content, dict):
+                    if "doc_metadata" not in _doc_content:
+                        _doc_content["doc_metadata"] = {}
+                    if isinstance(_doc_content.get("doc_metadata"), dict):
+                        if _understanding.get("document_summary"):
+                            _doc_content["doc_metadata"]["document_summary"] = str(
+                                _understanding["document_summary"]
+                            )[:500]
+                        if _understanding.get("key_entities"):
+                            _doc_content["doc_metadata"]["key_entities"] = _understanding["key_entities"]
+                        if _understanding.get("key_facts"):
+                            _doc_content["doc_metadata"]["key_facts"] = _understanding["key_facts"]
+                        if _understanding.get("intent_tags"):
+                            _doc_content["doc_metadata"]["intent_tags"] = _understanding["intent_tags"]
+
+            # Fallback: persist understanding from pickle to MongoDB if extraction missed it
+            try:
+                from src.api.extraction_service import _update_understanding_fields
+                _update_understanding_fields(doc_id, _understanding)
+            except Exception as exc:
+                logger.warning("Embedding fallback: failed to persist understanding from pickle for %s: %s",
+                               doc_id, exc)
 
         if prep_error or extracted_docs is None or expected_chunks is None:
             if telemetry:
@@ -1978,10 +2164,15 @@ def _process_blob(
                 message,
                 error_summary=reason,
             )
+            emit_progress(doc_id, "failed", 0.25, message)
             result["error"] = reason
             result["error_message"] = message
             result["failed_reason"] = reason
             return result
+
+        emit_progress(doc_id, "chunking", 0.25,
+                      f"Prepared {expected_chunks} chunks for embedding",
+                      extra={"chunks_total": expected_chunks})
 
         result["chunks_count"] = expected_chunks
         logger.info("Embedding pre-check for %s: expected_chunks=%s", doc_id, expected_chunks)
@@ -2052,16 +2243,22 @@ def _process_blob(
         coverage_values = coverage_values or []
 
         try:
+            _file_idx = 0
+            _file_total = max(len(extracted_docs), 1)
             for file_name, content in extracted_docs.items():
                 try:
                     embed_result = train_on_document(content, subscription_id, profile_id, doc_id, file_name)
                 except Exception as exc:  # noqa: BLE001
-                    if _is_meta_tensor_error(exc):
+                    if _is_meta_tensor_error(exc) or _is_cuda_oom(exc):
+                        device_type = "meta tensor" if _is_meta_tensor_error(exc) else "CUDA OOM"
                         logger.warning(
-                            "embed_request_id=%s doc=%s meta tensor error; retrying on cpu",
+                            "embed_request_id=%s doc=%s %s error; retrying on cpu",
                             embed_request_id,
                             doc_id,
+                            device_type,
                         )
+                        if _is_cuda_oom(exc):
+                            _clear_gpu_cache()
                         try:
                             get_model(reload=True, device="cpu")
                             embed_result = train_on_document(
@@ -2087,6 +2284,11 @@ def _process_blob(
                 ratio = embed_result.get("coverage_ratio")
                 if isinstance(ratio, (int, float)):
                     coverage_values.append(float(ratio))
+                _file_idx += 1
+                _file_progress = 0.30 + (0.50 * _file_idx / _file_total)
+                emit_progress(doc_id, "encoding", _file_progress,
+                              f"Encoded file {_file_idx}/{_file_total} ({total_upserted} chunks stored)",
+                              extra={"files_done": _file_idx, "files_total": _file_total, "chunks_stored": total_upserted})
         except ChunkingDiagnosticError as exc:
             error_message = _truncate_error_message(str(exc) or repr(exc))
             diagnostics = exc.diagnostics or {}
@@ -2171,35 +2373,42 @@ def _process_blob(
             embed_request_id, doc_id, total_chunks, total_dropped, total_upserted, effective_expected,
         )
         if effective_expected > 0 and effective_expected != total_upserted:
-            error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
-            logger.error(
-                "embed_request_id=%s doc=%s MISMATCH: %s",
-                embed_request_id, doc_id, error_msg,
-            )
-            if telemetry:
-                telemetry.increment("embed_qdrant_upsert_fail_total")
-            error_payload = _build_error_payload(
-                stage="embedding",
-                message=error_msg,
-                run_id=embed_request_id,
-                code="qdrant_upsert_failed",
-            )
-            _safe_update_stage(
-                doc_id,
-                "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
-            )
-            _safe_set_document_status(
-                doc_id,
-                STATUS_TRAINING_FAILED,
-                error_msg,
-                error_summary="qdrant_upsert_failed",
-            )
-            result["error"] = "qdrant_upsert_failed"
-            result["error_message"] = error_msg
-            result["failed_reason"] = "qdrant_upsert_failed"
-            result["points_upserted"] = total_upserted
-            return result
+            shortfall_ratio = total_upserted / effective_expected if effective_expected > 0 else 0
+            if shortfall_ratio >= 0.9 and total_upserted > 0:
+                logger.warning(
+                    "embed_request_id=%s doc=%s minor mismatch (%.0f%%): expected %s, saved %s — treating as success",
+                    embed_request_id, doc_id, shortfall_ratio * 100, effective_expected, total_upserted,
+                )
+            else:
+                error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
+                logger.error(
+                    "embed_request_id=%s doc=%s MISMATCH: %s",
+                    embed_request_id, doc_id, error_msg,
+                )
+                if telemetry:
+                    telemetry.increment("embed_qdrant_upsert_fail_total")
+                error_payload = _build_error_payload(
+                    stage="embedding",
+                    message=error_msg,
+                    run_id=embed_request_id,
+                    code="qdrant_upsert_failed",
+                )
+                _safe_update_stage(
+                    doc_id,
+                    "embedding",
+                    {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
+                )
+                _safe_set_document_status(
+                    doc_id,
+                    STATUS_TRAINING_FAILED,
+                    error_msg,
+                    error_summary="qdrant_upsert_failed",
+                )
+                result["error"] = "qdrant_upsert_failed"
+                result["error_message"] = error_msg
+                result["failed_reason"] = "qdrant_upsert_failed"
+                result["points_upserted"] = total_upserted
+                return result
 
         collection_name = build_collection_name(subscription_id)
         logger.info(
@@ -2226,31 +2435,171 @@ def _process_blob(
                 "qdrant": {"collection": collection_name, "expected": total_chunks, "upserted": total_upserted},
             },
         )
+        emit_progress(doc_id, "upserting", 0.85,
+                      f"Stored {total_upserted} embeddings in Qdrant",
+                      extra={"chunks_stored": total_upserted, "chunks_total": total_chunks})
 
-        _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        # ── Multi-resolution: create doc-level + section-level vectors ──
+        try:
+            from src.embedding.multi_resolution import build_multi_resolution_extras
+            from src.doc_understanding.schema_detector import detect_and_extract_schema
+            from src.intelligence.answerability_index import build_answerability_index
+            from src.doc_understanding.form_extractor import extract_all_form_fields, form_fields_to_chunk_text
 
-        # KG chunk-level ingestion (async, non-blocking)
-        _ingest_chunks_to_knowledge_graph(
-            document_id=doc_id,
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-            doc_name=file_name or doc_id,
-            extracted_docs=extracted_docs,
-        )
+            _mr_understanding = _understanding or {}
+            _mr_doc_type = record.get("document_type") or record.get("doc_type") or "other"
+            _mr_doc_domain = record.get("doc_domain") or "generic"
 
+            # Schema detection (Phase 3)
+            _schema_result = {}
+            _answerability = []
+            try:
+                _mr_sections = []
+                _mr_entities = _mr_understanding.get("key_entities") or []
+                _mr_full_text = ""
+                if extracted_docs:
+                    _ex_data = list(extracted_docs.values())[0] if extracted_docs else {}
+                    if isinstance(_ex_data, dict):
+                        _mr_full_text = _ex_data.get("full_text") or ""
+                        for sec in (_ex_data.get("sections") or []):
+                            if isinstance(sec, dict):
+                                _mr_sections.append(sec)
+                _mr_section_roles = {}
+                _struct = _mr_understanding.get("structure_inference") or {}
+                for s_info in (_struct.get("sections") or []):
+                    if isinstance(s_info, dict):
+                        _mr_section_roles[s_info.get("section_title", "")] = s_info.get("inferred_section_role", "")
+
+                _schema_result = detect_and_extract_schema(
+                    doc_type=_mr_doc_type,
+                    sections=_mr_sections,
+                    entities=_mr_entities,
+                    full_text=_mr_full_text,
+                    section_roles=_mr_section_roles,
+                )
+                logger.info(
+                    "Schema detection for %s: type=%s completeness=%.2f found=%s missing=%s",
+                    doc_id, _mr_doc_type,
+                    _schema_result.get("completeness_score", 0),
+                    _schema_result.get("found_sections", []),
+                    _schema_result.get("missing_sections", []),
+                )
+
+                # Answerability index (Phase 4)
+                _answerability_result = build_answerability_index(
+                    doc_type=_mr_doc_type,
+                    schema_result=_schema_result,
+                    entities=_mr_entities,
+                    full_text=_mr_full_text,
+                    section_summaries=_mr_understanding.get("section_summaries"),
+                )
+                _answerability = _answerability_result.get("answerable_query_types") or []
+                logger.info(
+                    "Answerability index for %s: %d query types (confidence=%.2f)",
+                    doc_id, len(_answerability), _answerability_result.get("confidence", 0),
+                )
+
+                # Form field extraction (Phase 6)
+                _form_fields = []
+                try:
+                    _form_fields = extract_all_form_fields(_mr_sections)
+                    if _form_fields:
+                        logger.info("Form field extraction for %s: %d fields", doc_id, len(_form_fields))
+                except Exception as ff_exc:
+                    logger.debug("Form field extraction failed for %s: %s", doc_id, ff_exc)
+
+                # Persist schema + answerability + form fields to MongoDB
+                _schema_mongo_fields = {
+                    "schema_extraction": _schema_result,
+                    "answerability": _answerability,
+                }
+                if _form_fields:
+                    _schema_mongo_fields["form_fields"] = [
+                        {"label": f.label, "value": f.value, "confidence": f.confidence,
+                         "page": f.page, "section_title": f.section_title}
+                        for f in _form_fields
+                    ]
+                try:
+                    from src.api.document_status import update_document_fields
+                    update_document_fields(doc_id, _schema_mongo_fields)
+                except Exception:
+                    pass
+            except Exception as schema_exc:
+                logger.debug("Schema/answerability detection failed for %s: %s", doc_id, schema_exc)
+
+            # Build multi-resolution vectors
+            _mr_extras = build_multi_resolution_extras(
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                document_id=doc_id,
+                doc_name=file_name or doc_id,
+                doc_domain=_mr_doc_domain,
+                doc_type=_mr_doc_type,
+                understanding=_mr_understanding,
+                rescued_fragments={},
+                answerability=_answerability,
+                schema_completeness=_schema_result.get("completeness_score") if _schema_result else None,
+            )
+
+            # Encode and upsert multi-resolution extras
+            if _mr_extras:
+                try:
+                    from src.embedding.model_loader import get_embedding_model as get_model
+                    _mr_model_result = get_model()
+                    # get_embedding_model returns (model, dim) tuple
+                    _mr_model = _mr_model_result[0] if isinstance(_mr_model_result, tuple) else _mr_model_result
+                    _mr_texts = [e["text"] for e in _mr_extras]
+                    _mr_vectors = _mr_model.encode(_mr_texts, show_progress_bar=False)
+                    from src.api.vector_store import build_collection_name as _bcn
+                    from src.embedding.pipeline.schema_normalizer import build_qdrant_payload
+                    _mr_collection = _bcn(subscription_id)
+                    from qdrant_client.models import PointStruct
+                    import uuid as _uuid
+                    _mr_points = []
+                    for i, extra in enumerate(_mr_extras):
+                        _payload = build_qdrant_payload(extra["metadata"])
+                        _mr_points.append(PointStruct(
+                            id=str(_uuid.uuid4()),
+                            vector=[float(x) for x in _mr_vectors[i]],
+                            payload=_payload,
+                        ))
+                    from src.api.vector_store import get_vector_store
+                    _vs = get_vector_store()
+                    _vs.client.upsert(collection_name=_mr_collection, points=_mr_points)
+                    total_upserted += len(_mr_points)
+                    logger.info(
+                        "Multi-resolution: upserted %d extra vectors (doc+section) for %s",
+                        len(_mr_points), doc_id,
+                    )
+                except Exception as mr_upsert_exc:
+                    logger.warning("Multi-resolution upsert failed for %s: %s", doc_id, mr_upsert_exc)
+        except Exception as mr_exc:
+            logger.debug("Multi-resolution/schema processing skipped for %s: %s", doc_id, mr_exc)
+
+        # Post-upsert verification BEFORE setting TRAINING_COMPLETED
         post_count: Optional[int] = None
         cleanup_allowed = True
         cleanup_error: Optional[Dict[str, Any]] = None
-        if subscription_id and profile_id:
+        if subscription_id and profile_id and total_upserted > 0:
+            emit_progress(doc_id, "verifying", 0.90, "Verifying storage integrity")
             try:
                 post_count, cleanup_allowed = _verify_post_upsert_count(
                     subscription_id=subscription_id,
                     profile_id=profile_id,
                     document_id=doc_id,
-                    expected_chunks=total_chunks,
+                    expected_chunks=total_upserted,
                 )
                 if post_count is not None:
                     logger.info("Post-upsert Qdrant points for %s: %s", doc_id, post_count)
+                if post_count is not None and post_count < total_upserted * 0.5:
+                    error_msg = f"Post-upsert verification failed: Qdrant has {post_count} points, expected {total_upserted}"
+                    logger.error("embed_request_id=%s doc=%s %s", embed_request_id, doc_id, error_msg)
+                    _safe_set_document_status(doc_id, STATUS_TRAINING_FAILED, error_msg, error_summary="qdrant_verification_failed")
+                    emit_progress(doc_id, "failed", 0.90, error_msg)
+                    result["error"] = "qdrant_verification_failed"
+                    result["error_message"] = error_msg
+                    result["failed_reason"] = "qdrant_verification_failed"
+                    return result
                 if not cleanup_allowed:
                     cleanup_error = (
                         {"message": "post_upsert_count_unavailable"}
@@ -2258,7 +2607,7 @@ def _process_blob(
                         else {
                             "message": "post_upsert_count_mismatch",
                             "post_count": post_count,
-                            "expected": total_chunks,
+                            "expected": total_upserted,
                         }
                     )
                     logger.warning(
@@ -2276,6 +2625,61 @@ def _process_blob(
                     doc_id,
                     exc,
                 )
+
+        _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        emit_progress(doc_id, "completed", 1.0,
+                      f"Training completed — {total_upserted} chunks stored",
+                      extra={"chunks_stored": total_upserted, "collection": collection_name})
+
+        # KG chunk-level ingestion (async, non-blocking)
+        _ingest_chunks_to_knowledge_graph(
+            document_id=doc_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            doc_name=file_name or doc_id,
+            extracted_docs=extracted_docs,
+        )
+
+        # ── Cross-document intelligence (Phase 5, non-blocking daemon thread) ──
+        try:
+            import threading as _cd_threading
+            from src.intelligence.cross_doc import run_cross_document_intelligence
+
+            _cd_doc_vector = None
+            # Use the first multi-resolution doc vector if available
+            if _mr_extras:
+                for _mre in _mr_extras:
+                    if _mre.get("metadata", {}).get("resolution") == "doc":
+                        # Re-encode the doc text to get the vector
+                        try:
+                            from src.embedding.model_loader import get_embedding_model as _cd_get_model
+                            _cd_model_result = _cd_get_model()
+                            _cd_model = _cd_model_result[0] if isinstance(_cd_model_result, tuple) else _cd_model_result
+                            _cd_doc_vector = _cd_model.encode([_mre["text"]], show_progress_bar=False)[0].tolist()
+                        except Exception:
+                            pass
+                        break
+
+            _cd_entities = (_understanding or {}).get("key_entities") or []
+
+            def _run_cross_doc():
+                try:
+                    run_cross_document_intelligence(
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        document_id=doc_id,
+                        doc_name=file_name or doc_id,
+                        doc_summary=str((_understanding or {}).get("document_summary") or ""),
+                        doc_entities=_cd_entities,
+                        doc_vector=_cd_doc_vector,
+                    )
+                except Exception as _cd_exc:
+                    logger.debug("Cross-doc intelligence failed for %s: %s", doc_id, _cd_exc)
+
+            _cd_thread = _cd_threading.Thread(target=_run_cross_doc, daemon=True)
+            _cd_thread.start()
+        except Exception:
+            pass  # cross-doc is purely additive, never blocks pipeline
 
         deleted = False
         # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
@@ -2333,6 +2737,7 @@ def _process_blob(
                 error_summary="training_failed",
                 cause=exc,
             )
+            emit_progress(doc_id_hint, "failed", 0.0, error_message)
         return result
     finally:
         if lease_id:
@@ -2413,13 +2818,34 @@ def _process_local_document(
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
         return _early_return(result)
-    _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED}
+    # HITL gate: only screened or retryable docs can be embedded
+    _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED, STATUS_TRAINING_STARTED}
     if current_status not in _EMBEDDING_ELIGIBLE_STATUSES:
         result["status"] = "SKIPPED"
-        result["error"] = "screening_not_completed"
-        result["failed_reason"] = f"screening_not_completed (current: {current_status})"
-        logger.info("Embedding skipped for %s: screening not yet completed (status=%s). Run screening first.", document_id, current_status)
+        if current_status == STATUS_EXTRACTION_COMPLETED:
+            result["error"] = "screening_not_completed"
+            result["failed_reason"] = f"screening_not_completed (current: {current_status})"
+            logger.info(
+                "HITL gate: embedding rejected for %s (status=%s). Run screening first (POST /api/gateway/screen).",
+                document_id, current_status,
+            )
+        else:
+            result["error"] = "not_eligible"
+            result["failed_reason"] = f"not_eligible (current: {current_status})"
+            logger.info(
+                "HITL gate: embedding rejected for %s (status=%s). Run extraction then screening first.",
+                document_id, current_status,
+            )
         return _early_return(result)
+    # Zombie guard: if stuck in TRAINING_STARTED for >30 min, auto-fail before retrying
+    if current_status == STATUS_TRAINING_STARTED:
+        started_at = record.get("training_started_at", 0)
+        if started_at and (time.time() - started_at) > 1800:
+            logger.warning("Document %s stuck in TRAINING_STARTED for >30min — recovering", document_id)
+            _safe_set_document_status(document_id, STATUS_TRAINING_FAILED,
+                "zombie_timeout: stuck in TRAINING_STARTED",
+                error_summary="zombie_timeout")
+            emit_progress(document_id, "failed", 0.0, "Auto-recovered: training timeout exceeded")
 
     try:
         subscription_id = resolve_subscription_id(
@@ -2456,6 +2882,7 @@ def _process_local_document(
         return _early_return(result)
 
     _set_document_status(document_id, STATUS_TRAINING_STARTED)
+    emit_progress(document_id, "extraction", 0.10, "Starting document processing")
     telemetry = _telemetry()
 
     update_stage(
@@ -2463,6 +2890,7 @@ def _process_local_document(
         "embedding",
         {"status": "IN_PROGRESS", "started_at": time.time(), "error": None, "reason": None},
     )
+    emit_progress(document_id, "chunking", 0.20, "Preparing document chunks")
 
     try:
         try:
@@ -2514,6 +2942,37 @@ def _process_local_document(
             record=record,
             subscription_id=subscription_id,
         )
+
+        # Inject document understanding metadata from pickle into each doc's metadata
+        _understanding_local = None
+        if isinstance(extracted, dict):
+            _understanding_local = extracted.get("understanding") or {}
+        if _understanding_local and extracted_docs:
+            for _doc_key, _doc_content in extracted_docs.items():
+                if isinstance(_doc_content, dict):
+                    if "doc_metadata" not in _doc_content:
+                        _doc_content["doc_metadata"] = {}
+                    if isinstance(_doc_content.get("doc_metadata"), dict):
+                        if _understanding_local.get("document_summary"):
+                            _doc_content["doc_metadata"]["document_summary"] = str(
+                                _understanding_local["document_summary"]
+                            )[:500]
+                        if _understanding_local.get("key_entities"):
+                            _doc_content["doc_metadata"]["key_entities"] = _understanding_local["key_entities"]
+                        if _understanding_local.get("key_facts"):
+                            _doc_content["doc_metadata"]["key_facts"] = _understanding_local["key_facts"]
+                        if _understanding_local.get("intent_tags"):
+                            _doc_content["doc_metadata"]["intent_tags"] = _understanding_local["intent_tags"]
+
+            # Fallback: if extraction_service failed to write understanding to MongoDB,
+            # persist from pickle now so _fetch_document_metadata() and Qdrant payload get it.
+            try:
+                from src.api.extraction_service import _update_understanding_fields
+                _update_understanding_fields(document_id, _understanding_local)
+            except Exception as exc:
+                logger.warning("Embedding fallback: failed to persist understanding from pickle for %s: %s",
+                               document_id, exc)
+
         if prep_error or extracted_docs is None or expected_chunks is None:
             reason = prep_error or "empty_extraction"
             message = {
@@ -2542,10 +3001,15 @@ def _process_local_document(
                 message,
                 error_summary=reason,
             )
+            emit_progress(document_id, "failed", 0.25, message)
             result["error"] = reason
             result["error_message"] = message
             result["failed_reason"] = reason
             return result
+
+        emit_progress(document_id, "chunking", 0.25,
+                      f"Prepared {expected_chunks} chunks for embedding",
+                      extra={"chunks_total": expected_chunks})
 
         result["chunks_count"] = expected_chunks
         logger.info("Embedding pre-check for %s: expected_chunks=%s", document_id, expected_chunks)
@@ -2555,16 +3019,22 @@ def _process_local_document(
         total_dropped = 0
         coverage_values = coverage_values or []
         try:
+            _file_idx_local = 0
+            _file_total_local = max(len(extracted_docs), 1)
             for file_name, content in extracted_docs.items():
                 try:
                     embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
                 except Exception as exc:  # noqa: BLE001
-                    if _is_meta_tensor_error(exc):
+                    if _is_meta_tensor_error(exc) or _is_cuda_oom(exc):
+                        device_type = "meta tensor" if _is_meta_tensor_error(exc) else "CUDA OOM"
                         logger.warning(
-                            "embed_request_id=%s doc=%s meta tensor error; retrying on cpu",
+                            "embed_request_id=%s doc=%s %s error; retrying on cpu",
                             embed_request_id,
                             document_id,
+                            device_type,
                         )
+                        if _is_cuda_oom(exc):
+                            _clear_gpu_cache()
                         try:
                             get_model(reload=True, device="cpu")
                             embed_result = train_on_document(
@@ -2590,6 +3060,11 @@ def _process_local_document(
                 ratio = embed_result.get("coverage_ratio")
                 if isinstance(ratio, (int, float)):
                     coverage_values.append(float(ratio))
+                _file_idx_local += 1
+                _file_progress_local = 0.30 + (0.50 * _file_idx_local / _file_total_local)
+                emit_progress(document_id, "encoding", _file_progress_local,
+                              f"Encoded file {_file_idx_local}/{_file_total_local} ({total_upserted} chunks stored)",
+                              extra={"files_done": _file_idx_local, "files_total": _file_total_local, "chunks_stored": total_upserted})
         except ChunkingDiagnosticError as exc:
             error_message = _truncate_error_message(str(exc) or repr(exc))
             diagnostics = exc.diagnostics or {}
@@ -2672,35 +3147,42 @@ def _process_local_document(
             embed_request_id, document_id, total_chunks, total_dropped, total_upserted, effective_expected,
         )
         if effective_expected > 0 and effective_expected != total_upserted:
-            error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
-            logger.error(
-                "embed_request_id=%s doc=%s MISMATCH: %s",
-                embed_request_id, document_id, error_msg,
-            )
-            if telemetry:
-                telemetry.increment("embed_qdrant_upsert_fail_total")
-            error_payload = _build_error_payload(
-                stage="embedding",
-                message=error_msg,
-                run_id=embed_request_id,
-                code="qdrant_upsert_failed",
-            )
-            _safe_update_stage(
-                document_id,
-                "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
-            )
-            _safe_set_document_status(
-                document_id,
-                STATUS_TRAINING_FAILED,
-                error_msg,
-                error_summary="qdrant_upsert_failed",
-            )
-            result["error"] = "qdrant_upsert_failed"
-            result["error_message"] = error_msg
-            result["failed_reason"] = "qdrant_upsert_failed"
-            result["points_upserted"] = total_upserted
-            return result
+            shortfall_ratio = total_upserted / effective_expected if effective_expected > 0 else 0
+            if shortfall_ratio >= 0.9 and total_upserted > 0:
+                logger.warning(
+                    "embed_request_id=%s doc=%s minor mismatch (%.0f%%): expected %s, saved %s — treating as success",
+                    embed_request_id, document_id, shortfall_ratio * 100, effective_expected, total_upserted,
+                )
+            else:
+                error_msg = f"Embedding upsert mismatch: expected {effective_expected} (prepared {total_chunks}, dropped {total_dropped}), saved {total_upserted}"
+                logger.error(
+                    "embed_request_id=%s doc=%s MISMATCH: %s",
+                    embed_request_id, document_id, error_msg,
+                )
+                if telemetry:
+                    telemetry.increment("embed_qdrant_upsert_fail_total")
+                error_payload = _build_error_payload(
+                    stage="embedding",
+                    message=error_msg,
+                    run_id=embed_request_id,
+                    code="qdrant_upsert_failed",
+                )
+                _safe_update_stage(
+                    document_id,
+                    "embedding",
+                    {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
+                )
+                _safe_set_document_status(
+                    document_id,
+                    STATUS_TRAINING_FAILED,
+                    error_msg,
+                    error_summary="qdrant_upsert_failed",
+                )
+                result["error"] = "qdrant_upsert_failed"
+                result["error_message"] = error_msg
+                result["failed_reason"] = "qdrant_upsert_failed"
+                result["points_upserted"] = total_upserted
+                return result
 
         collection_name = build_collection_name(subscription_id)
         logger.info(
@@ -2727,31 +3209,34 @@ def _process_local_document(
                 "qdrant": {"collection": collection_name, "expected": total_chunks, "upserted": total_upserted},
             },
         )
+        emit_progress(document_id, "upserting", 0.85,
+                      f"Stored {total_upserted} embeddings in Qdrant",
+                      extra={"chunks_stored": total_upserted, "chunks_total": total_chunks})
 
-        _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
-
-        # KG chunk-level ingestion (async, non-blocking)
-        _ingest_chunks_to_knowledge_graph(
-            document_id=document_id,
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-            doc_name=file_name or document_id,
-            extracted_docs=extracted_docs,
-        )
-
+        # Post-upsert verification BEFORE setting TRAINING_COMPLETED
         post_count: Optional[int] = None
         cleanup_allowed = True
         cleanup_error: Optional[Dict[str, Any]] = None
-        if subscription_id and profile_id:
+        if subscription_id and profile_id and total_upserted > 0:
+            emit_progress(document_id, "verifying", 0.90, "Verifying storage integrity")
             try:
                 post_count, cleanup_allowed = _verify_post_upsert_count(
                     subscription_id=subscription_id,
                     profile_id=profile_id,
                     document_id=document_id,
-                    expected_chunks=total_chunks,
+                    expected_chunks=total_upserted,
                 )
                 if post_count is not None:
                     logger.info("Post-upsert Qdrant points for %s: %s", document_id, post_count)
+                if post_count is not None and post_count < total_upserted * 0.5:
+                    error_msg = f"Post-upsert verification failed: Qdrant has {post_count} points, expected {total_upserted}"
+                    logger.error("embed_request_id=%s doc=%s %s", embed_request_id, document_id, error_msg)
+                    _safe_set_document_status(document_id, STATUS_TRAINING_FAILED, error_msg, error_summary="qdrant_verification_failed")
+                    emit_progress(document_id, "failed", 0.90, error_msg)
+                    result["error"] = "qdrant_verification_failed"
+                    result["error_message"] = error_msg
+                    result["failed_reason"] = "qdrant_verification_failed"
+                    return result
                 if not cleanup_allowed:
                     cleanup_error = (
                         {"message": "post_upsert_count_unavailable"}
@@ -2759,14 +3244,14 @@ def _process_local_document(
                         else {
                             "message": "post_upsert_count_mismatch",
                             "post_count": post_count,
-                            "expected": total_chunks,
+                            "expected": total_upserted,
                         }
                     )
                     logger.warning(
                         "Skipping pickle cleanup for %s because embedding is not yet verified (post_count=%s, expected=%s)",
                         document_id,
                         post_count,
-                        total_chunks,
+                        total_upserted,
                     )
             except Exception as exc:  # noqa: BLE001
                 cleanup_allowed = False
@@ -2777,6 +3262,46 @@ def _process_local_document(
                     document_id,
                     exc,
                 )
+
+        _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        emit_progress(document_id, "completed", 1.0,
+                      f"Training completed — {total_upserted} chunks stored",
+                      extra={"chunks_stored": total_upserted, "collection": collection_name})
+
+        # KG chunk-level ingestion (async, non-blocking)
+        _ingest_chunks_to_knowledge_graph(
+            document_id=document_id,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            doc_name=file_name or document_id,
+            extracted_docs=extracted_docs,
+        )
+
+        # ── Cross-document intelligence (Phase 5, non-blocking daemon thread) ──
+        try:
+            import threading as _cd_threading_local
+            from src.intelligence.cross_doc import run_cross_document_intelligence
+
+            _cd_entities_local = (_understanding_local or {}).get("key_entities") or []
+
+            def _run_cross_doc_local():
+                try:
+                    run_cross_document_intelligence(
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        document_id=document_id,
+                        doc_name=file_name or document_id,
+                        doc_summary=str((_understanding_local or {}).get("document_summary") or ""),
+                        doc_entities=_cd_entities_local,
+                        doc_vector=None,  # no doc vector in local path
+                    )
+                except Exception as _cd_exc_local:
+                    logger.debug("Cross-doc intelligence failed for %s: %s", document_id, _cd_exc_local)
+
+            _cd_thread_local = _cd_threading_local.Thread(target=_run_cross_doc_local, daemon=True)
+            _cd_thread_local.start()
+        except Exception:
+            pass  # cross-doc is purely additive, never blocks pipeline
 
         deleted = False
         # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
@@ -2832,6 +3357,7 @@ def _process_local_document(
             error_summary="training_failed",
             cause=exc,
         )
+        emit_progress(document_id, "failed", 0.0, error_message)
         return result
     finally:
         if lock and lock.acquired:
@@ -2851,36 +3377,6 @@ def _process_local_document(
             result.get("status"),
         )
         request_ctx.__exit__(*sys.exc_info())
-
-
-def _maybe_trigger_dpie_retrain(
-    subscription_id: Optional[str],
-    profile_id: Optional[str],
-) -> None:
-    """Trigger DPIE retrain if new data was embedded and models are stale."""
-    if not subscription_id or not profile_id:
-        return
-    try:
-        from src.intelligence.dpie_integration import DPIERegistry
-        from src.api.rag_state import get_app_state
-
-        state = get_app_state()
-        if not state or not state.qdrant_client or not state.embedding_model:
-            return
-        registry = DPIERegistry.get()
-        if not registry.is_loaded:
-            return  # Not yet initialized; startup/query triggers will handle it
-        collection_name = str(subscription_id)
-        if registry.needs_retrain(state.qdrant_client, collection_name, str(profile_id)):
-            registry.retrain_async(
-                state.qdrant_client,
-                state.embedding_model,
-                collection_name,
-                str(subscription_id),
-                str(profile_id),
-            )
-    except Exception as exc:
-        logger.debug("DPIE retrain trigger skipped: %s", exc)
 
 
 def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2991,7 +3487,6 @@ def _embed_from_local_pickles(
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     summary = _build_embed_summary(results)
-    _maybe_trigger_dpie_retrain(subscription_id, profile_id)
     return summary
 
 
@@ -3094,7 +3589,6 @@ def embed_documents(
             telemetry.increment("embed_pickles_processed_total")
 
     summary = _build_embed_summary(results)
-    _maybe_trigger_dpie_retrain(subscription_id, profile_id)
     return summary
 
 

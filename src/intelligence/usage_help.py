@@ -36,6 +36,7 @@ TASK_HELP = "TASK_HELP"
 SCREENING_HELP = "SCREENING_HELP"
 CONTENT_GENERATION_HELP = "CONTENT_GENERATION_HELP"
 ADVANCED_FEATURES = "ADVANCED_FEATURES"
+CAPABILITY_OVERVIEW = "CAPABILITY_OVERVIEW"
 
 _DOMAIN_KEYWORDS = {
     "resume": re.compile(r"\b(?:resume|cv|candidate|profile|hiring)\b", re.I),
@@ -76,6 +77,12 @@ _SUB_INTENT_PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\b(?:content\s+generation|generate\s+content)\s+(?:help|guide|how)\b", re.I), CONTENT_GENERATION_HELP),
     (re.compile(r"\bhow\s+(?:do\s+i|can\s+i|to)\s+generate\b", re.I), CONTENT_GENERATION_HELP),
     (re.compile(r"\bwhat\s+(?:can\s+i|content)\s+(?:generate|create)\b", re.I), CONTENT_GENERATION_HELP),
+    # Capability overview
+    (re.compile(r"\bwhat\s+(?:else\s+|all\s+)?can\s+(?:you|docwain)\s+(?:do|help\s+with)\b", re.I), CAPABILITY_OVERVIEW),
+    (re.compile(r"\bwhat\s+can\s+(?:docwain|i)\s+do\s+with\s+docwain\b", re.I), CAPABILITY_OVERVIEW),
+    (re.compile(r"\bshow\s+(?:me\s+)?what\s+(?:you|docwain)\s+can\s+do\b", re.I), CAPABILITY_OVERVIEW),
+    (re.compile(r"\bhow\s+can\s+(?:you|docwain)\s+help(?:\s+me)?\b", re.I), CAPABILITY_OVERVIEW),
+    (re.compile(r"\b(?:list|show)\s+(?:your\s+)?(?:features|capabilities)\b", re.I), CAPABILITY_OVERVIEW),
     # Advanced features
     (re.compile(r"\badvanced\s+(?:features?|capabilities?|options?)\b", re.I), ADVANCED_FEATURES),
     (re.compile(r"\bfine.?tun(?:e|ing)\s+(?:help|guide|how)\b", re.I), ADVANCED_FEATURES),
@@ -413,6 +420,21 @@ _CONTENT_GEN_HELP_TEXT = (
     "Try: \"Generate a cover letter\" or \"Create a skills matrix.\""
 )
 
+_CAPABILITY_OVERVIEW_TEXT = (
+    "**What DocWain Can Do**\n\n"
+    "DocWain is built for document intelligence in your profile:\n\n"
+    "1. **Answer questions** from uploaded documents with grounded evidence.\n"
+    "2. **Summarize** single or multiple documents.\n"
+    "3. **Extract data** like skills, totals, clauses, dates, contacts, and line items.\n"
+    "4. **Compare and rank** documents (for example, candidates or invoices).\n"
+    "5. **Generate content** such as summaries, briefs, cover letters, and interview questions.\n"
+    "6. **Run screening checks** for PII, AI-authorship signals, readability, and policy checks.\n\n"
+    "**How to ask effectively**\n"
+    "- Be specific: \"Rank candidates by Python and backend experience.\"\n"
+    "- Name the target: \"Compare Alice and Bob resumes.\"\n"
+    "- Ask for format: \"Give me a bullet summary with key risks.\"\n"
+)
+
 _TASK_HELP_TEMPLATES: Dict[str, str] = {
     "compare": (
         "**How to Compare Documents**\n\n"
@@ -567,6 +589,14 @@ def compose_usage_help_response(
     if sub_intent.name == CONTENT_GENERATION_HELP:
         return _CONTENT_GEN_HELP_TEXT
 
+    if sub_intent.name == CAPABILITY_OVERVIEW:
+        examples = select_examples(ctx, HelpSubIntent(name=QUERY_EXAMPLES), seed, max_examples=6)
+        parts = [_CAPABILITY_OVERVIEW_TEXT]
+        if examples:
+            parts.append("\n**Try these queries:**\n" + _format_grouped_examples(examples))
+        parts.append("\n\n" + _closing_line(ctx))
+        return "".join(parts)
+
     if sub_intent.name == ADVANCED_FEATURES:
         return _ADVANCED_FEATURES_TEXT
 
@@ -638,5 +668,5 @@ __all__ = [
     "compose_usage_help_response",
     "QUICK_START", "UPLOAD_HELP", "FILE_TYPES", "QUERY_EXAMPLES",
     "DOMAIN_EXAMPLES", "TASK_HELP", "SCREENING_HELP",
-    "CONTENT_GENERATION_HELP", "ADVANCED_FEATURES",
+    "CONTENT_GENERATION_HELP", "ADVANCED_FEATURES", "CAPABILITY_OVERVIEW",
 ]

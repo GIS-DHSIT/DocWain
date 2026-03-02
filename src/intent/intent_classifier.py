@@ -167,6 +167,19 @@ TRAINING_TEMPLATES: List[Tuple[str, str, str]] = [
     ("Premium payment schedule.", "extract", "policy"),
     ("Summary of audit findings.", "summarize", "report"),
     ("Data analysis methodology used.", "qa", "report"),
+    # ── scope-reinforcing: all_profile routing ────────────
+    ("Summarize all the resumes.", "summarize", "resume"),
+    ("Overview of every candidate.", "summarize", "resume"),
+    ("Give me details about all the documents.", "summarize", "generic"),
+    ("Who among the candidates has the best skills?", "rank", "resume"),
+    ("Show the differences between the contracts.", "compare", "legal"),
+    ("How many invoices are pending?", "list", "invoice"),
+    ("List every uploaded report.", "list", "report"),
+    ("What are the top skills across all resumes?", "rank", "resume"),
+    ("Analyze all uploaded files.", "summarize", "generic"),
+    ("Overview of all reports.", "summarize", "report"),
+    ("Can you compare all candidates' experience?", "compare", "resume"),
+    ("Rank all policies by coverage.", "rank", "policy"),
 ]
 
 # Stop words that should not be dropped during augmentation

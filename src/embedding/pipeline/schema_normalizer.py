@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from src.embedding.pipeline.content_classifier import classify_doc_domain, classify_section_kind, classify_section_kind_with_source
 from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
@@ -12,6 +12,42 @@ from src.utils.payload_utils import token_count
 
 
 EMBED_PIPELINE_VERSION = "dwx-2026-02-05"
+
+
+def validate_chunk_for_embedding(text: str, max_tokens: int = 2048) -> Tuple[bool, str]:
+    """Validate a chunk before embedding.
+
+    Returns (is_valid, reason).
+    """
+    if not text or not text.strip():
+        return False, "empty_or_whitespace"
+    stripped = text.strip()
+    # Reject very short chunks
+    if len(stripped) < 20:
+        return False, "too_short"
+    # Reject chunks exceeding token limit (rough estimate: 4 chars per token)
+    if len(stripped) > max_tokens * 4:
+        return False, "exceeds_token_limit"
+    # Reject metadata garbage
+    if _is_chunk_metadata_garbage(stripped):
+        return False, "metadata_garbage"
+    return True, "ok"
+
+
+def _is_chunk_metadata_garbage(text: str) -> bool:
+    """Detect chunks that are pure metadata noise."""
+    # More than 60% non-alphanumeric characters
+    alpha_ratio = sum(1 for c in text if c.isalnum() or c.isspace()) / max(1, len(text))
+    if alpha_ratio < 0.4:
+        return True
+    # Very repetitive content (same line repeated)
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) > 3:
+        unique_lines = set(lines)
+        if len(unique_lines) / len(lines) < 0.3:
+            return True
+    return False
+
 
 # Matches C0/C1 control characters EXCEPT \t (0x09), \n (0x0a), \r (0x0d).
 # Strips NULL, backspace, vertical tab, form feed, escape sequences, etc.
@@ -424,6 +460,8 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
         # integrity
         "hash": chunk_hash,
         "embed_pipeline_version": _stringify(raw.get("embed_pipeline_version")) or EMBED_PIPELINE_VERSION,
+        # multi-resolution: "doc", "section", or "chunk" (default)
+        "resolution": _stringify(raw.get("resolution")) or "chunk",
     }
 
     # Table structure metadata (only for table chunks)
@@ -438,7 +476,37 @@ def build_qdrant_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(table_row_count, int):
             payload["table_row_count"] = table_row_count
 
+    # Document understanding context (enriches retrieval without separate lookups)
+    _doc_summary = raw.get("doc_summary")
+    _doc_entities = raw.get("doc_key_entities")
+    _doc_tags = raw.get("doc_intent_tags")
+    if _doc_summary or _doc_entities or _doc_tags:
+        ctx: Dict[str, Any] = {}
+        if _doc_summary:
+            ctx["document_summary"] = str(_doc_summary)[:500]
+        if isinstance(_doc_entities, list) and _doc_entities:
+            ctx["key_entities"] = _doc_entities
+        if isinstance(_doc_tags, list) and _doc_tags:
+            ctx["intent_tags"] = _doc_tags
+        if ctx:
+            payload["context"] = ctx
+
+    # Query answerability index (enables pre-filtering at retrieval)
+    _answerability = raw.get("answerability")
+    if isinstance(_answerability, list) and _answerability:
+        payload["answerability"] = _answerability
+
+    # Schema completeness score
+    _schema_completeness = raw.get("schema_completeness")
+    if _schema_completeness is not None:
+        payload["schema_completeness"] = _floatify(_schema_completeness, default=0.0)
+
+    # Parent section ID for multi-resolution back-linking
+    _parent_section_id = _stringify(raw.get("parent_section_id"))
+    if _parent_section_id:
+        payload["parent_section_id"] = _parent_section_id
+
     return {k: v for k, v in payload.items() if v is not None}
 
 
-__all__ = ["EMBED_PIPELINE_VERSION", "build_qdrant_payload", "normalize_content"]
+__all__ = ["EMBED_PIPELINE_VERSION", "build_qdrant_payload", "normalize_content", "validate_chunk_for_embedding"]

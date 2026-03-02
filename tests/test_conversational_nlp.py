@@ -118,6 +118,16 @@ class TestIntentClassifier:
         assert result is not None
         assert result[0] == CAPABILITY
 
+    def test_capability_what_else_can_you_do(self):
+        result = classify_conversational_intent("what else can you do?")
+        assert result is not None
+        assert result[0] == CAPABILITY
+
+    def test_capability_how_can_you_help(self):
+        result = classify_conversational_intent("how can you help me?")
+        assert result is not None
+        assert result[0] == CAPABILITY
+
     def test_how_it_works(self):
         result = classify_conversational_intent("how do you work?")
         assert result is not None
@@ -358,6 +368,13 @@ class TestPublicAPI:
         assert resp is not None
         assert resp.intent == IDENTITY
         assert "docwain" in resp.text.lower()
+
+    def test_capability_variant_returns_response(self):
+        resp = generate_conversational_response("what else can you do?")
+        assert resp is not None
+        assert resp.intent == CAPABILITY
+        low = resp.text.lower()
+        assert "docwain" in low or "capabilities" in low or "documents" in low
 
     def test_no_internal_ids_in_response(self):
         """Responses should not contain UUIDs or profile_ids."""

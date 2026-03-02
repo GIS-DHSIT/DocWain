@@ -7,6 +7,7 @@ Phase 1 of the multi-agent plan:
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass, field as dc_field
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,95 +17,120 @@ import pytest
 # Domain detection tests (extract.py)
 # ---------------------------------------------------------------------------
 
-from src.rag_v3.extract import _query_domain_override
+from src.rag_v3.extract import _ml_query_domain
+
+
+@dataclass(frozen=True)
+class _FakeIntentParse:
+    """Lightweight mock for IntentParse — simulates ML classifier output."""
+    intent: str = "qa"
+    output_format: str = "text"
+    requested_fields: list = dc_field(default_factory=list)
+    domain: str = "generic"
+    constraints: dict = dc_field(default_factory=dict)
+    entity_hints: list = dc_field(default_factory=list)
+    source: str = "test"
+
+
+def _hr_intent(**kwargs):
+    """Create an intent_parse with domain='resume' (maps to 'hr')."""
+    return _FakeIntentParse(domain="resume", **kwargs)
+
+
+def _invoice_intent(**kwargs):
+    return _FakeIntentParse(domain="invoice", **kwargs)
+
+
+def _legal_intent(**kwargs):
+    return _FakeIntentParse(domain="legal", **kwargs)
 
 
 class TestDomainDetectionExpansion:
-    """Test _QUERY_HR_WEAK expansion and person-name pattern matching."""
+    """Test _ml_query_domain with intent_parse providing domain signal."""
 
-    # Existing strong signals still work
+    # HR domain via intent_parse
     def test_resume_strong(self):
-        assert _query_domain_override("show me the resume") == "hr"
+        assert _ml_query_domain("show me the resume", _hr_intent()) == "hr"
 
     def test_candidate_strong(self):
-        assert _query_domain_override("list all candidates") == "hr"
+        assert _ml_query_domain("list all candidates", _hr_intent()) == "hr"
 
-    # Expanded weak signals
+    # Expanded weak signals — ML classifier provides domain
     def test_profile_weak(self):
-        assert _query_domain_override("what is their profile") == "hr"
+        assert _ml_query_domain("what is their profile", _hr_intent()) == "hr"
 
     def test_qualified_weak(self):
-        assert _query_domain_override("is the person qualified") == "hr"
+        assert _ml_query_domain("is the person qualified", _hr_intent()) == "hr"
 
     def test_suitable_weak(self):
-        assert _query_domain_override("are they suitable for the role") == "hr"
+        assert _ml_query_domain("are they suitable for the role", _hr_intent()) == "hr"
 
     def test_background_weak(self):
-        assert _query_domain_override("check their background") == "hr"
+        assert _ml_query_domain("check their background", _hr_intent()) == "hr"
 
     def test_career_weak(self):
-        assert _query_domain_override("describe their career history") == "hr"
+        assert _ml_query_domain("describe their career history", _hr_intent()) == "hr"
 
     def test_designation_weak(self):
-        assert _query_domain_override("what is the designation") == "hr"
+        assert _ml_query_domain("what is the designation", _hr_intent()) == "hr"
 
     def test_work_history_weak(self):
-        assert _query_domain_override("work history details") == "hr"
+        assert _ml_query_domain("work history details", _hr_intent()) == "hr"
 
-    # Person-name possessive patterns
+    # Person-name possessive patterns — ML classifier detects resume domain
     def test_possessive_profile(self):
-        assert _query_domain_override("Gaurav's profile") == "hr"
+        assert _ml_query_domain("Gaurav's profile", _hr_intent()) == "hr"
 
     def test_possessive_summary(self):
-        assert _query_domain_override("Dhayal's summary") == "hr"
+        assert _ml_query_domain("Dhayal's summary", _hr_intent()) == "hr"
 
     def test_possessive_background(self):
-        assert _query_domain_override("Dev's background") == "hr"
+        assert _ml_query_domain("Dev's background", _hr_intent()) == "hr"
 
     def test_possessive_career(self):
-        assert _query_domain_override("Gokul's career") == "hr"
+        assert _ml_query_domain("Gokul's career", _hr_intent()) == "hr"
 
     def test_possessive_strengths(self):
-        assert _query_domain_override("Bharath's strengths") == "hr"
+        assert _ml_query_domain("Bharath's strengths", _hr_intent()) == "hr"
 
     # Reasoning about a person
     def test_is_qualified(self):
-        assert _query_domain_override("Is Gokul qualified for a senior developer role?") == "hr"
+        assert _ml_query_domain("Is Gokul qualified for a senior developer role?", _hr_intent()) == "hr"
 
     def test_is_suitable(self):
-        assert _query_domain_override("Is Dev suitable for the position?") == "hr"
+        assert _ml_query_domain("Is Dev suitable for the position?", _hr_intent()) == "hr"
 
     def test_can_fit(self):
-        assert _query_domain_override("Can Bharath fit the lead role?") == "hr"
+        assert _ml_query_domain("Can Bharath fit the lead role?", _hr_intent()) == "hr"
 
     def test_would_eligible(self):
-        assert _query_domain_override("Would Dhayal be eligible for this position?") == "hr"
+        assert _ml_query_domain("Would Dhayal be eligible for this position?", _hr_intent()) == "hr"
 
     # Summarize/describe a person
     def test_summarize_person(self):
-        assert _query_domain_override("Summarize Gaurav") == "hr"
+        assert _ml_query_domain("Summarize Gaurav", _hr_intent()) == "hr"
 
     def test_describe_person(self):
-        assert _query_domain_override("Describe Gokul's experience") == "hr"
+        assert _ml_query_domain("Describe Gokul's experience", _hr_intent()) == "hr"
 
     def test_tell_me_about(self):
-        assert _query_domain_override("Tell me about Dev") == "hr"
+        assert _ml_query_domain("Tell me about Dev", _hr_intent()) == "hr"
 
     # Non-HR queries should still return None or correct domain
     def test_generic_query_returns_none(self):
-        assert _query_domain_override("what is the weather today") is None
+        assert _ml_query_domain("what is the weather today") is None
 
     def test_invoice_query_returns_invoice(self):
-        assert _query_domain_override("show me the invoice totals") == "invoice"
+        assert _ml_query_domain("show me the invoice totals", _invoice_intent()) == "invoice"
 
     def test_legal_query_returns_legal(self):
-        assert _query_domain_override("review the contract terms") == "legal"
+        assert _ml_query_domain("review the contract terms", _legal_intent()) == "legal"
 
     def test_empty_query_returns_none(self):
-        assert _query_domain_override("") is None
+        assert _ml_query_domain("") is None
 
     def test_none_query_returns_none(self):
-        assert _query_domain_override(None) is None
+        assert _ml_query_domain(None) is None
 
 
 # ---------------------------------------------------------------------------

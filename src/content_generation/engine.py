@@ -250,12 +250,19 @@ def _call_llm(
     }
 
     def _call() -> str:
-        if hasattr(llm_client, "generate_with_metadata"):
-            text, _meta = llm_client.generate_with_metadata(
-                full_prompt, options=options, max_retries=1, backoff=0.4,
-            )
-            return text or ""
-        return llm_client.generate(full_prompt, max_retries=1, backoff=0.4) or ""
+        try:
+            from src.llm.task_router import task_scope, TaskType
+            _ctx = task_scope(TaskType.CONTENT_GENERATION)
+        except ImportError:
+            from contextlib import nullcontext
+            _ctx = nullcontext()
+        with _ctx:
+            if hasattr(llm_client, "generate_with_metadata"):
+                text, _meta = llm_client.generate_with_metadata(
+                    full_prompt, options=options, max_retries=1, backoff=0.4,
+                )
+                return text or ""
+            return llm_client.generate(full_prompt, max_retries=1, backoff=0.4) or ""
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_call)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import os
 from typing import Any, List, Sequence
 
 from .types import Chunk
@@ -10,6 +12,15 @@ logger = logging.getLogger(__name__)
 # Minimum rerank score threshold - chunks below this are considered irrelevant
 MIN_RERANK_SCORE = 0.15  # Cross-encoder scores are typically -10 to 10, normalized
 MIN_HIGH_QUALITY = 3  # Minimum chunks to keep even if below threshold
+
+# Configurable timeout — cross-encoder on CPU needs 3-5s for 8-14 pairs,
+# but under concurrent load (multiple queries + document processing) it can
+# take up to 10s.  12s gives enough headroom without excessive pipeline delay.
+try:
+    from src.api.config import Config as _Cfg
+    _RERANK_TIMEOUT_S = getattr(getattr(_Cfg, "Reranker", None), "TIMEOUT_S", 12.0)
+except Exception:
+    _RERANK_TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "12.0"))
 
 
 def rerank_chunks(
@@ -29,12 +40,6 @@ def rerank_chunks(
         result = _try_cross_encoder(cross_encoder, query, ordered, min_score, top_k, correlation_id)
         if result is not None:
             return result
-        # GPU attempt failed — try CPU fallback
-        cpu_encoder = _move_to_cpu(cross_encoder)
-        if cpu_encoder is not None:
-            result = _try_cross_encoder(cpu_encoder, query, ordered, min_score, top_k, correlation_id)
-            if result is not None:
-                return result
 
     ordered.sort(key=lambda c: (-c.score, c.id))
     return ordered[:top_k]
@@ -67,14 +72,29 @@ def _try_cross_encoder(
     top_k: int,
     correlation_id: str | None,
 ) -> List[Chunk] | None:
-    """Run cross-encoder scoring. Returns reranked list or None on failure."""
-    try:
+    """Run cross-encoder scoring with hard timeout. Returns reranked list or None on failure."""
+    def _score():
         pairs = [[query, chunk.text] for chunk in ordered]
-        scores = None
         if hasattr(encoder, "predict"):
-            scores = encoder.predict(pairs)
+            return encoder.predict(pairs, show_progress_bar=False)
         elif callable(encoder):
-            scores = encoder(pairs)
+            return encoder(pairs)
+        return None
+
+    try:
+        # Hard timeout — cross-encoder on CPU can stall under GPU contention
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_score)
+            try:
+                scores = future.result(timeout=_RERANK_TIMEOUT_S)
+            except (TimeoutError, concurrent.futures.TimeoutError):
+                future.cancel()
+                logger.warning(
+                    "RAG v3 rerank cross-encoder timed out (%.1fs) — skipping | cid=%s",
+                    _RERANK_TIMEOUT_S, correlation_id,
+                )
+                return None
+
         flat = _normalize_scores(scores, len(ordered))
         if not flat:
             return None
@@ -113,24 +133,6 @@ def _try_cross_encoder(
         )
         return None
 
-
-def _move_to_cpu(encoder: Any) -> Any:
-    """Attempt to move a cross-encoder model to CPU for CUDA OOM fallback."""
-    try:
-        import torch
-        if hasattr(encoder, "model") and hasattr(encoder.model, "to"):
-            encoder.model.to("cpu")
-            # Update internal device tracking — CrossEncoder.device is read-only
-            # so we set the private attribute directly.
-            try:
-                encoder._target_device = torch.device("cpu")
-            except Exception:  # noqa: BLE001
-                pass
-            logger.info("RAG v3 rerank moved cross-encoder to CPU for fallback")
-            return encoder
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("RAG v3 rerank CPU fallback failed: %s", exc)
-    return None
 
 
 def _normalize_scores(scores: Any, expected: int) -> List[float]:
