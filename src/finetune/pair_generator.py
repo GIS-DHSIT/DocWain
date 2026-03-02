@@ -1,10 +1,11 @@
 import json
 import logging
-import math
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from src.utils.payload_utils import get_document_type, get_source_name
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +112,7 @@ def merge_adjacent(
         return []
     groups: Dict[str, List[ChunkRecord]] = {}
     for ch in chunks:
-        doc_id = str(ch.metadata.get("document_id") or ch.metadata.get("doc_id") or ch.metadata.get("source_file") or "doc")
+        doc_id = str(ch.metadata.get("document_id") or ch.metadata.get("doc_id") or get_source_name(ch.metadata) or "doc")
         groups.setdefault(doc_id, []).append(ch)
     merged_blocks: List[ChunkRecord] = []
     for _, items in groups.items():
@@ -242,7 +243,7 @@ class MultiStrategyPairGenerator:
     def _strategy_metadata(self, block: ChunkRecord) -> List[Dict[str, Any]]:
         meta = block.metadata or {}
         pairs = []
-        for key in ("doc_type", "section_title", "page", "source_file"):
+        for key in ("section_title", "page"):
             if key in meta and meta.get(key):
                 pairs.append(
                     {
@@ -251,6 +252,24 @@ class MultiStrategyPairGenerator:
                         "output": str(meta.get(key)),
                     }
                 )
+        doc_type = get_document_type(meta)
+        if doc_type:
+            pairs.append(
+                {
+                    "instruction": "Extract document type from the document metadata.",
+                    "input": block.text,
+                    "output": str(doc_type),
+                }
+            )
+        source_name = get_source_name(meta)
+        if source_name:
+            pairs.append(
+                {
+                    "instruction": "Extract source name from the document metadata.",
+                    "input": block.text,
+                    "output": str(source_name),
+                }
+            )
         return self._attach_source(block, pairs, strategy="metadata_task")
 
     def _strategy_bootstrap(self, pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -279,7 +298,7 @@ class MultiStrategyPairGenerator:
             pair["output"] = pair.get("output", "").strip()
             pair["source"] = {
                 "document_id": block.metadata.get("document_id") or block.metadata.get("doc_id"),
-                "source_file": block.metadata.get("source_file"),
+                "source_name": get_source_name(block.metadata or {}),
                 "chunk_ids": block.metadata.get("merged_chunk_ids") or [block.chunk_id],
                 "strategy": strategy,
             }

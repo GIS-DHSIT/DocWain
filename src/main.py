@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import ollama
 import uvicorn
@@ -15,18 +15,33 @@ from bson.objectid import ObjectId
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, constr
+from pydantic import BaseModel, Field, constr, field_validator
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
-from src.api.dataHandler import (
-    db,
-    clear_legacy_vetting_metadata,
-    delete_embeddings,
-    get_subscription_pii_setting,
-    trainData,
-    train_single_document,
-)
+from src.middleware.correlation import CorrelationIdMiddleware
+from src.utils.logging_utils import configure_logging
+from src.api.app_lifespan import lifespan
+try:
+    from src.api.dataHandler import (
+        db,
+        clear_legacy_vetting_metadata,
+        delete_embeddings,
+        get_subscription_pii_setting,
+        trainData,
+        train_single_document,
+    )
+except Exception as _datahandler_exc:  # noqa: BLE001
+    db = None
+
+    def _datahandler_unavailable(*_args, **_kwargs):
+        raise RuntimeError("dataHandler unavailable") from _datahandler_exc
+
+    clear_legacy_vetting_metadata = _datahandler_unavailable
+    delete_embeddings = _datahandler_unavailable
+    get_subscription_pii_setting = _datahandler_unavailable
+    trainData = _datahandler_unavailable
+    train_single_document = _datahandler_unavailable
 from src.api.dw_chat import (
     add_message_to_history,
     delete_chat_history,
@@ -37,6 +52,17 @@ from src.api.dw_chat import (
 )
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
+from src.api.debug import debug_router
+from src.api.health_endpoints import health_router
+from src.api.profile_documents_api import profile_docs_router
+from src.api.profiles_api import profiles_router
+from src.api.knowledge_graph import knowledge_graph_router
+try:
+    from src.api.extraction_pipeline_api import extraction_router
+    _EXTRACTION_ROUTER_AVAILABLE = True
+except ImportError:
+    _EXTRACTION_ROUTER_AVAILABLE = False
+    extraction_router = None
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
@@ -52,28 +78,60 @@ from src.metrics.aggregation import (
 )
 from src.metrics.ai_metrics import get_metrics_store
 from src.metrics.repository import MetricsRepository
-from src.mode.execution_mode import ExecutionMode, resolve_execution_mode
+from src.mode.execution_mode import resolve_execution_mode
 from src.mode.session_state import SessionStateStore
 from src.execution.router import execute_request
-from src.execution.common import normalize_answer, chunk_text_stream
-from src.screening.api import screening_router
+from src.execution.common import normalize_answer
+from src.intelligence.redis_intel_cache import RedisIntelCache
+from src.api.learning_signals import LearningSignalStore
+from src import rag_v3
+from src.api import rag_state
 from src.screening.config import log_legacy_vetting_notice_if_missing
-from src.storage.azure_blob_client import validate_containers_once
-from botbuilder.schema import Activity
+from src.storage.azure_blob_client import validate_containers_once, validate_storage_configured_once
+try:
+    from botbuilder.schema import Activity
+except ImportError:
+    Activity = None
 
-from src.teams import adapter as teams_adapter
-from src.teams.bot_app import (
-    BOT_CREDENTIALS_CONFIGURED,
-    bot_adapter,
-    docwain_teams_bot,
-    MICROSOFT_APP_ID,
-    MICROSOFT_APP_PASSWORD,
-)
+from src.nlp.dialogue_intel import route_message
+from src.prompting.persona import sanitize_response
+
+try:
+    from src.teams import adapter as teams_adapter
+    from src.teams.bot_app import (
+        BOT_CREDENTIALS_CONFIGURED,
+        bot_adapter,
+        docwain_teams_bot,
+        MICROSOFT_APP_ID,
+        MICROSOFT_APP_PASSWORD,
+    )
+except ImportError:
+    teams_adapter = None
+    BOT_CREDENTIALS_CONFIGURED = False
+    bot_adapter = None
+    docwain_teams_bot = None
+    MICROSOFT_APP_ID = None
+    MICROSOFT_APP_PASSWORD = None
+# Import agent modules to trigger @register_agent registration, then mount gateway only.
+# Screening is handled by /api/gateway/screen. Agents are invoked via /api/ask with the tools field.
+import src.tools.stt, src.tools.tts, src.tools.translator  # noqa: F401, E401
+import src.tools.tutor, src.tools.creator, src.tools.email_drafting  # noqa: F401, E401
+import src.tools.db_connector, src.tools.code_docs, src.tools.medical  # noqa: F401, E401
+import src.tools.lawhere, src.tools.resumes  # noqa: F401, E401
+import src.tools.jira_confluence, src.tools.web_extract, src.tools.image_analysis  # noqa: F401, E401
+import src.tools.insights, src.tools.action_items  # noqa: F401, E401
+import src.tools.web_search  # noqa: F401, E401
+import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
+import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
+from src.gateway.api import gateway_router
 from src.tools.router import tools_router
+from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
 
 logger = logging.getLogger(__name__)
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -90,7 +148,7 @@ def _get_dw_newron():
     return dw_newron
 
 
-app = FastAPI(title="DocWain API")
+app = FastAPI(title="DocWain API", lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
 
 app.add_middleware(
@@ -101,32 +159,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-api_router.include_router(screening_router)
+# Add correlation ID middleware for request tracing
+app.add_middleware(CorrelationIdMiddleware)
+
 api_router.include_router(documents_router, tags=["Documents"])
-api_router.include_router(tools_router, tags=["Tools"])
+api_router.include_router(profiles_router)
+api_router.include_router(profile_docs_router)
+api_router.include_router(gateway_router, tags=["Gateway"])
+api_router.include_router(debug_router, tags=["Debug"])
+api_router.include_router(health_router)
+api_router.include_router(tools_router, tags=["Agents"])
+
+
+@api_router.get("/agents/capabilities", tags=["Agents"])
+def list_available_agents_with_capabilities():
+    """List all available agents with their intelligence profiles and capabilities."""
+    from src.tools.intelligence import list_agents_with_capabilities
+    return list_agents_with_capabilities()
+
+
+@api_router.get("/tools", tags=["Agents"], deprecated=True)
+def list_available_tools():
+    """List all available tools with their intelligence profiles and capabilities.
+
+    .. deprecated::
+        Use ``GET /api/agents/capabilities`` instead.
+    """
+    return list_available_agents_with_capabilities()
+
+
+api_router.include_router(agents_router, tags=["Agents"])
+if _EXTRACTION_ROUTER_AVAILABLE and extraction_router:
+    api_router.include_router(extraction_router, tags=["Extraction Pipeline"])
+
+
+class FeedbackRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    answer: str = Field(..., min_length=1)
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
+    reason: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 session_state_store = SessionStateStore()
 
 
-@app.on_event("startup")
-async def _startup_checks() -> None:
-    try:
-        validate_containers_once()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Azure blob container validation skipped: %s", exc)
-    try:
-        clear_legacy_vetting_metadata()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Legacy metadata cleanup skipped: %s", exc)
-    try:
-        log_legacy_vetting_notice_if_missing()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Legacy config notice skipped: %s", exc)
-    try:
-        from docwain_ollama_orchestrator.fastapi_integration_example import ensure_ollama_registry_actor
-        await ensure_ollama_registry_actor()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ollama registry bootstrap skipped: %s", exc)
+## Startup checks migrated to lifespan handler in src/api/app_lifespan.py
 
 
 @app.exception_handler(HTTPException)
@@ -150,18 +227,35 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 class QuestionRequest(BaseModel):
     query: constr(min_length=1)
     user_id: str = "someone@email.com"
-    profile_id: constr(min_length=1) = "67ac62ddfaa3aee44d38f4a5"
-    subscription_id: str = "default"
-    model_name: str = "llama3.2"
-    persona: str = "Document Assistant"
+    profile_id: str
+    subscription_id: str
+    document_id: Optional[str] = None
+    tool_hint: Optional[str] = None
+    model_name: str = "DocWain-Agent"
+    persona: str = "DocWain"
     session_id: Optional[str] = None
     new_session: bool = False  # Frontend sends flag here
     agent_mode: Optional[bool] = None
     stream: bool = False  # When true, /ask returns a streaming response instead of JSON.
     debug: bool = False
-    tools: Optional[List[str]] = None
+    tools: Optional[Union[str, List[str]]] = None
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def _normalize_tools(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return [t.strip() for t in v if isinstance(t, str) and t.strip()]
+        if isinstance(v, str):
+            parts = [t.strip() for t in v.split(",") if t.strip()]
+            return parts if parts else None
+        return None
     tool_inputs: Optional[Dict[str, Any]] = None
     use_tools: bool = False
+    enable_internet: bool = False
+    agent_name: Optional[str] = Field(default=None, description="Domain agent to invoke (e.g. 'hr', 'medical', 'legal', 'content')")
+    agent_task: Optional[str] = Field(default=None, description="Specific agent task (e.g. 'generate_interview_questions')")
 
 
 class AnswerPayload(BaseModel):
@@ -170,12 +264,18 @@ class AnswerPayload(BaseModel):
     grounded: bool = False
     context_found: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    ok: bool = True
 
 
 class AskResponse(BaseModel):
     answer: AnswerPayload
     current_session_id: Optional[str]
     debug: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AskLiteResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
@@ -192,6 +292,180 @@ def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
     return None
 
 
+def _latest_profile_from_catalog(cache: RedisIntelCache, subscription_id: str) -> Optional[str]:
+    prefix = f"{cache.prefix}:catalog:{subscription_id}:"
+    keys = cache.scan_prefix(prefix)
+    best_profile = None
+    best_ts = -1.0
+    for key in keys:
+        payload = cache.get_json(key) or {}
+        ts = float(payload.get("updated_at") or payload.get("last_updated") or 0.0)
+        profile_id = payload.get("profile_id")
+        if not profile_id:
+            parts = key.split(":")
+            if len(parts) >= 4:
+                profile_id = parts[-1]
+        if not profile_id:
+            continue
+        if ts >= best_ts:
+            best_ts = ts
+            best_profile = str(profile_id)
+    return best_profile
+
+
+def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Optional[str]) -> Tuple[Optional[str], str]:
+    explicit = (request.profile_id or "").strip()
+    if explicit:
+        return explicit, "explicit"
+
+    subscription_id = request.subscription_id or "default"
+    session_key = session_id or "default"
+    redis_client = None
+    try:
+        from src.api.dw_newron import get_redis_client
+
+        redis_client = get_redis_client()
+    except Exception:
+        redis_client = None
+
+    cache = RedisIntelCache(redis_client)
+    try:
+        state = cache.get_session_state(subscription_id, session_key)
+        if state.active_profile_id:
+            return str(state.active_profile_id), "session"
+    except Exception:
+        pass
+
+    try:
+        latest = _latest_profile_from_catalog(cache, subscription_id)
+        if latest:
+            return latest, "catalog"
+    except Exception:
+        pass
+
+    return None, "missing"
+
+
+def _history_response_text(value: Any) -> str:
+    """Extract plain-text assistant response from stored history payloads."""
+    if isinstance(value, dict):
+        payload = value.get("response")
+        if isinstance(payload, str):
+            return payload.strip()
+        if payload is not None:
+            return str(payload).strip()
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value or "").strip()
+
+
+def _hydrate_runtime_session_context(
+    *,
+    user_id: str,
+    session_id: Optional[str],
+    subscription_id: str,
+    profile_id: str,
+) -> None:
+    """
+    Rehydrate Redis/in-memory conversation memory from persisted chat history
+    when runtime memory is empty, so follow-up chats can continue after restarts.
+    """
+    if not user_id or not session_id:
+        return
+
+    state = rag_state.get_app_state()
+    rag_system = state.rag_system if state else None
+    if rag_system is None:
+        return
+
+    conversation_history = getattr(rag_system, "conversation_history", None)
+    conversation_state = getattr(rag_system, "conversation_state", None)
+    if conversation_history is None and conversation_state is None:
+        return
+
+    try:
+        from src.api.dw_newron import _build_namespace
+    except Exception:
+        return
+
+    namespace = _build_namespace(
+        str(subscription_id),
+        str(profile_id),
+        getattr(rag_system, "model_name", "") or "default",
+        session_id,
+    )
+
+    try:
+        if conversation_history is not None and hasattr(conversation_history, "get_context"):
+            existing = conversation_history.get_context(namespace, user_id, max_turns=1)
+            if existing:
+                return
+    except Exception:
+        pass
+
+    archived_session = get_session_by_id(user_id, session_id)
+    if not archived_session:
+        return
+
+    archived_messages = archived_session.get("messages") or []
+    if not archived_messages:
+        return
+
+    to_rehydrate = archived_messages[-8:]
+    restored = 0
+    for message in to_rehydrate:
+        if not isinstance(message, dict):
+            continue
+        query = str(message.get("query") or "").strip()
+        answer_text = _history_response_text(message.get("response"))
+        if not query or not answer_text:
+            continue
+        try:
+            if conversation_state is not None and hasattr(conversation_state, "record_turn"):
+                conversation_state.record_turn(namespace, user_id, query, answer_text, resolved_query=None)
+            elif conversation_history is not None and hasattr(conversation_history, "add_turn"):
+                conversation_history.add_turn(namespace, user_id, query, answer_text)
+            else:
+                break
+            restored += 1
+        except Exception:
+            continue
+
+    if restored:
+        logger.info(
+            "Hydrated runtime conversation memory | user=%s session=%s turns=%d",
+            user_id,
+            session_id,
+            restored,
+        )
+
+
+def _persist_chat_turn(
+    *,
+    user_id: str,
+    query: str,
+    answer_payload: Dict[str, Any],
+    session_id: Optional[str],
+    new_session: bool,
+) -> Optional[str]:
+    """Persist turn to durable chat history and return effective session_id."""
+    if not user_id:
+        return session_id
+    try:
+        _, active_session_id = add_message_to_history(
+            user_id=user_id,
+            query=query,
+            response=answer_payload,
+            session_id=session_id,
+            new_session=new_session,
+        )
+        return active_session_id or session_id
+    except Exception as exc:
+        logger.debug("Chat history persistence skipped: %s", exc)
+        return session_id
+
+
 def _normalize_answer(answer):
     """Backward-compatible wrapper around the shared normalizer."""
     return normalize_answer(answer)
@@ -203,6 +477,23 @@ def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "…"
+
+
+def _minimize_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    minimal: List[Dict[str, Any]] = []
+    for src in sources or []:
+        if not isinstance(src, dict):
+            continue
+        name = src.get("file_name") or src.get("source_name") or src.get("document_name") or src.get("source")
+        page = src.get("page")
+        entry: Dict[str, Any] = {}
+        if name:
+            entry["file_name"] = str(name)
+        if page is not None:
+            entry["page"] = page
+        if entry:
+            minimal.append(entry)
+    return minimal
 
 
 def _resolve_output_root(path_str: str) -> Path:
@@ -473,6 +764,11 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
 @api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
     """Endpoint for Microsoft Teams activities (messages, attachments)."""
+    if teams_adapter is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Teams integration is not available. Install botbuilder-core to enable it.",
+        )
     activity_payload, raw_body = await _parse_teams_activity(request)
     if activity_payload is None:
         return {
@@ -607,6 +903,7 @@ def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool
         tools=request.tools,
         use_tools=bool(getattr(request, "use_tools", False)),
         tool_inputs=request.tool_inputs,
+        enable_internet=bool(getattr(request, "enable_internet", False)),
     )
     return session_id, session_state, mode, ctx
 
@@ -616,62 +913,147 @@ def ask_question_api(
     request: QuestionRequest,
     agent_mode: Optional[bool] = Query(None),
     stream: Optional[bool] = Query(None),
+    http_request: Request = None,
 ):
     """
     Unified /ask handler. Toggle `stream=true` to receive a streamed response instead of JSON.
     """
-    streaming = bool(stream if stream is not None else request.stream)
-    session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
-    logger.info(
-        "[ASK%s] user=%s session_id=%s new_session=%s agent_mode(body)=%s agent_mode(query)=%s stream(body)=%s stream(query)=%s query_snippet=%s",
-        "_STREAM" if streaming else "",
-        request.user_id,
-        session_id,
-        request.new_session,
-        request.agent_mode,
-        agent_mode,
-        request.stream,
-        stream,
-        _safe_snippet(request.query),
-    )
+    _ = (agent_mode, stream)
+    session_id = _resolve_session_id(request)
+    correlation_id = str(uuid.uuid4())
+    request.session_id = session_id
 
-    result = execute_request(request, session_state=session_state, ctx=ctx, stream=streaming, debug=bool(request.debug))
-
-    explicit_toggle = request.agent_mode if request.agent_mode is not None else agent_mode
-    if explicit_toggle is not None:
-        session_state_store.set_preferred_mode(
-            session_id,
-            ExecutionMode.AGENT if explicit_toggle else ExecutionMode.NORMAL,
+    resolved_profile_id, profile_source = _resolve_profile_id_for_request(request, session_id)
+    if not resolved_profile_id:
+        raise HTTPException(
+            status_code=400,
+            detail=_error(
+                "MISSING_PROFILE_SCOPE",
+                "profile_id is required to answer this request.",
+                {"resolution": profile_source, "correlation_id": correlation_id},
+            ),
         )
-
-    if streaming:
-        def _stream():
-            try:
-                normalized_answer = _normalize_answer(result.answer)
-                stream_iterable = result.stream or chunk_text_stream(normalized_answer.get("response") or "")
-                logger.info("[ASK_STREAM] streaming session_id=%s mode=%s", session_id, result.mode.value)
-                for chunk in stream_iterable:
-                    yield chunk
-            except Exception as exc:
-                logger.error("[ASK_STREAM] Streaming failed for session=%s: %s", session_id, exc, exc_info=True)
-                yield "[error] Unable to stream response right now."
-
-        return StreamingResponse(_stream(), media_type="text/plain")
-
-    answer = AnswerPayload.model_validate(result.answer)
-
-    _, active_session_id = add_message_to_history(
-        request.user_id,
-        request.query,
-        answer.model_dump(),
+    object.__setattr__(request, "profile_id", resolved_profile_id)
+    _hydrate_runtime_session_context(
+        user_id=request.user_id,
         session_id=session_id,
-        new_session=request.new_session,
+        subscription_id=request.subscription_id,
+        profile_id=request.profile_id,
     )
 
-    logger.info("[ASK] completed session_id=%s mode=%s stream=%s", active_session_id, result.mode.value, streaming)
+    if request.tool_hint == "dialogue_intel":
+        route_state = {
+            "profile_id": request.profile_id,
+            "subscription_id": request.subscription_id,
+        }
+        decision = route_message(request.query, route_state)
+        if getattr(decision, "direct_response", False):
+            response_text = decision.response_text or ""
+            response_text = sanitize_response(response_text)
+            answer_payload = AnswerPayload(response=response_text, sources=[], grounded=True, context_found=False)
+            persisted_session_id = _persist_chat_turn(
+                user_id=request.user_id,
+                query=request.query,
+                answer_payload=answer_payload.model_dump(),
+                session_id=session_id,
+                new_session=bool(request.new_session),
+            )
+            return AskResponse(answer=answer_payload, current_session_id=persisted_session_id, debug={})
 
-    enriched_debug = {**(result.debug or {}), "request_id": ctx.request_id}
-    return AskResponse(answer=answer, current_session_id=active_session_id, debug=enriched_debug)
+    # ── Agent dispatch: explicit agent_name routes directly to domain agent ──
+    _agent_name = getattr(request, "agent_name", None)
+    if _agent_name:
+        try:
+            from src.agentic.domain_agents import get_domain_agent, detect_agent_task
+            _agent = get_domain_agent(_agent_name)
+            if _agent:
+                # Determine task type: explicit, auto-detected, or default
+                _task = getattr(request, "agent_task", None)
+                if not _task:
+                    _det = detect_agent_task(request.query, domain=_agent.domain)
+                    _task = _det["task_type"] if _det else _agent.get_capabilities()[0]
+
+                # Retrieve RAG context for the agent
+                _agent_ctx: Dict[str, Any] = {"query": request.query}
+                try:
+                    from src.agentic.api_router import _retrieve_rag_context
+                    _rag_text = _retrieve_rag_context(
+                        query=request.query,
+                        subscription_id=request.subscription_id,
+                        profile_id=request.profile_id,
+                    )
+                    if _rag_text:
+                        _agent_ctx["text"] = _rag_text
+                except Exception:
+                    pass
+
+                # Add tool_inputs if provided
+                if request.tool_inputs:
+                    _agent_ctx.update(request.tool_inputs)
+
+                _agent_result = _agent.execute(_task, _agent_ctx)
+                if _agent_result.success and _agent_result.output:
+                    _agent_answer = {
+                        "response": _agent_result.output,
+                        "sources": _agent_result.sources,
+                        "grounded": True,
+                        "context_found": bool(_agent_ctx.get("text")),
+                        "metadata": {
+                            "agent": _agent_name,
+                            "agent_task": _task,
+                            "agent_handled": True,
+                        },
+                    }
+                    normalized = normalize_answer(_agent_answer)
+                    persisted_session_id = _persist_chat_turn(
+                        user_id=request.user_id,
+                        query=request.query,
+                        answer_payload=normalized,
+                        session_id=session_id,
+                        new_session=bool(request.new_session),
+                    )
+                    answer_payload = AnswerPayload(**normalized)
+                    return AskResponse(
+                        answer=answer_payload,
+                        current_session_id=persisted_session_id,
+                        debug={"agent": _agent_name, "task": _task},
+                    )
+        except Exception as _agent_exc:
+            logger.debug("Agent dispatch via /ask failed, falling through: %s", _agent_exc)
+
+    session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
+    want_stream = bool(getattr(request, "stream", False) or stream)
+    result = execute_request(request, session_state, ctx, stream=want_stream, debug=bool(request.debug))
+
+    if want_stream:
+        normalized_stream_answer = normalize_answer(result.answer)
+        persisted_session_id = _persist_chat_turn(
+            user_id=request.user_id,
+            query=request.query,
+            answer_payload=normalized_stream_answer,
+            session_id=session_id,
+            new_session=bool(request.new_session),
+        )
+        stream_iter = result.stream or []
+        response = StreamingResponse(stream_iter, media_type="text/plain")
+        if persisted_session_id:
+            response.headers["X-Session-ID"] = persisted_session_id
+        return response
+
+    normalized = normalize_answer(result.answer)
+    persisted_session_id = _persist_chat_turn(
+        user_id=request.user_id,
+        query=request.query,
+        answer_payload=normalized,
+        session_id=session_id,
+        new_session=bool(request.new_session),
+    )
+    answer_payload = AnswerPayload(**normalized)
+    return AskResponse(
+        answer=answer_payload,
+        current_session_id=persisted_session_id,
+        debug=result.debug or {},
+    )
 
 
 @api_router.post("/askStream", tags=["Default"], deprecated=True)
@@ -689,7 +1071,11 @@ def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
     try:
         logging.info(f"Received single document extraction request for: {doc_id} (subscription: {subscription_id})")
         result = train_single_document(doc_id)
+        if isinstance(result, dict) and result.get("status") == "CONFLICT":
+            raise HTTPException(status_code=409, detail=result.get("reason", "duplicate_extraction"))
         return {"status": "success", "message": result}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Single extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Single document extraction failed")
@@ -942,16 +1328,23 @@ def _collect_available_models() -> List[ModelInfo]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to list managed models: %s", exc)
 
+    def _display_name(name: str) -> str:
+        normalized = name.lower()
+        if normalized == "gpt-oss" or normalized.startswith("gpt-oss:"):
+            return "DocWain-Agent"
+        return name
+
     try:
         raw = ollama.list().model_dump()
         for entry in raw.get("models", []):
             name = entry.get("model") or entry.get("name")
             if not name:
                 continue
+            display_name = _display_name(name)
             models.setdefault(
-                name,
+                display_name,
                 ModelInfo(
-                    model=name,
+                    model=display_name,
                     source="ollama",
                     backend="ollama",
                     size=entry.get("size"),
@@ -962,6 +1355,10 @@ def _collect_available_models() -> List[ModelInfo]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to list Ollama models: %s", exc)
 
+    models.setdefault(
+        "DocWain-Agent",
+        ModelInfo(model="DocWain-Agent", source="docwain", backend="ollama"),
+    )
     models.setdefault("gemini-2.5-flash", ModelInfo(model="gemini-2.5-flash", source="gemini", backend="gemini"))
     return list(models.values())
 
@@ -1145,6 +1542,67 @@ def get_metrics(
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
+
+
+@api_router.post("/feedback/positive", tags=["Default"])
+def record_positive_feedback(request: FeedbackRequest):
+    """Capture positive user feedback for evaluation and fine-tuning."""
+    store = LearningSignalStore()
+    metadata = dict(request.metadata)
+    store.record_high_quality(
+        query=request.query,
+        context=metadata.get("context", ""),
+        answer=request.answer,
+        sources=request.sources,
+        metadata=metadata,
+    )
+    # Persist to MongoDB for queryable feedback analysis
+    try:
+        from src.api.dataHandler import db as _feedback_db
+        if _feedback_db is not None:
+            from datetime import datetime
+            _feedback_db.feedback.insert_one({
+                "type": "positive",
+                "query": request.query,
+                "answer": request.answer,
+                "sources": request.sources,
+                "metadata": metadata,
+                "timestamp": datetime.utcnow(),
+            })
+    except Exception as _fb_exc:
+        logging.warning("Feedback MongoDB write failed: %s", _fb_exc)
+    return {"status": "ok", "feedback": "positive"}
+
+
+@api_router.post("/feedback/negative", tags=["Default"])
+def record_negative_feedback(request: FeedbackRequest):
+    """Capture negative user feedback for evaluation and retrieval fixes."""
+    store = LearningSignalStore()
+    metadata = dict(request.metadata)
+    store.record_low_confidence(
+        query=request.query,
+        context=metadata.get("context", ""),
+        answer=request.answer,
+        reason=request.reason or "user_reported",
+        metadata=metadata,
+    )
+    # Persist to MongoDB for queryable feedback analysis
+    try:
+        from src.api.dataHandler import db as _feedback_db
+        if _feedback_db is not None:
+            from datetime import datetime
+            _feedback_db.feedback.insert_one({
+                "type": "negative",
+                "query": request.query,
+                "answer": request.answer,
+                "reason": request.reason or "user_reported",
+                "sources": request.sources,
+                "metadata": metadata,
+                "timestamp": datetime.utcnow(),
+            })
+    except Exception as _fb_exc:
+        logging.warning("Feedback MongoDB write failed: %s", _fb_exc)
+    return {"status": "ok", "feedback": "negative"}
 
 '''
 @api_router.get("/chat-history/{user_id}")
@@ -1379,6 +1837,7 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 
 
 app.include_router(api_router)
+app.include_router(knowledge_graph_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)

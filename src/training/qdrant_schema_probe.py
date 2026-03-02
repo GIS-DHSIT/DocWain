@@ -1,16 +1,16 @@
 import json
 import logging
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import Filter
 
 logger = logging.getLogger(__name__)
 
 TEXT_FIELD_CANDIDATES = [
+    "canonical_text",
     "text",
     "content",
     "page_content",

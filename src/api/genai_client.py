@@ -15,14 +15,20 @@ _client_api_key: str | None = None
 
 
 def _coerce_generation_config(config: Optional[dict]) -> Optional[Any]:
-    """Convert plain dicts into the SDK's GenerationConfig when available."""
+    """Convert plain dicts into the SDK's config type when available."""
     if not config:
         return None
 
     try:
-        generation_config_cls = getattr(getattr(_genai, "types", None), "GenerationConfig", None)
-        if generation_config_cls and isinstance(config, dict):
-            return generation_config_cls(**config)
+        types_module = getattr(_genai, "types", None)
+        if types_module and isinstance(config, dict):
+            for cls_name in ("GenerateContentConfig", "GenerationConfig"):
+                generation_config_cls = getattr(types_module, cls_name, None)
+                if generation_config_cls:
+                    try:
+                        return generation_config_cls(**config)
+                    except Exception:
+                        continue
     except Exception:
         # Gracefully fall back to the raw config
         return config
@@ -84,11 +90,27 @@ def generate_text(
     gen_config = _coerce_generation_config(generation_config)
 
     if hasattr(client, "models"):  # google.genai
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            generation_config=gen_config,
-        )
+        if gen_config is None:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+        else:
+            try:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=gen_config,
+                )
+            except TypeError as exc:
+                if "unexpected keyword argument" in str(exc) and "config" in str(exc):
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=prompt,
+                        generation_config=gen_config,
+                    )
+                else:
+                    raise
     else:  # google.generativeai
         model_client = client.GenerativeModel(model)
         response = model_client.generate_content(prompt, generation_config=gen_config)

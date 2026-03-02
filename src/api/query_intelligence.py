@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
+from src.kg.entity_extractor import EntityExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,10 @@ class QueryAnalysis:
     expansion_terms: List[str] = field(default_factory=list)
     metadata_filters: Dict[str, Any] = field(default_factory=dict)
     used_llm: bool = False
+    sentiment: str = "neutral"
+    sentiment_signals: List[str] = field(default_factory=list)
+    instructions: Dict[str, Any] = field(default_factory=dict)
+    entities: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def query_variants(self) -> List[str]:
@@ -33,11 +38,15 @@ class QueryIntelligence:
 
     def __init__(self, llm_client: Optional[Any] = None):
         self.llm_client = llm_client
+        self._entity_extractor = EntityExtractor()
 
     def analyze(self, query: str, profile_context: Optional[Dict[str, Any]] = None) -> QueryAnalysis:
         normalized = re.sub(r"\s+", " ", query or "").strip()
         intent = self._detect_intent(normalized)
         metadata_filters = self._extract_metadata_filters(normalized, profile_context or {})
+        sentiment, sentiment_signals = self._detect_sentiment(normalized)
+        instructions = self._parse_instructions(normalized)
+        entities = self.extract_entities(normalized)
 
         sub_queries = self._decompose_query(normalized)
         used_llm = False
@@ -60,7 +69,18 @@ class QueryIntelligence:
             expansion_terms=expansion_terms,
             metadata_filters=metadata_filters,
             used_llm=used_llm,
+            sentiment=sentiment,
+            sentiment_signals=sentiment_signals,
+            instructions=instructions,
+            entities=[entity.__dict__ for entity in entities],
         )
+
+    def extract_entities(self, query: str) -> List[Any]:
+        """Expose deterministic entity extraction for downstream KG probe."""
+        try:
+            return self._entity_extractor.extract(query or "")
+        except Exception:
+            return []
 
     @staticmethod
     def _use_llm() -> bool:
@@ -132,6 +152,60 @@ Return format:
         if any(word in q for word in ["error", "issue", "fail", "troubleshoot", "bug"]):
             return "troubleshooting"
         return "factual"
+
+    @staticmethod
+    def _detect_sentiment(query: str) -> tuple[str, List[str]]:
+        q = query.lower()
+        signals: List[str] = []
+        if any(word in q for word in ["frustrated", "annoyed", "upset", "angry", "doesn't work", "not working"]):
+            signals.append("frustration")
+        if any(word in q for word in ["confused", "unclear", "not sure", "don't understand"]):
+            signals.append("confusion")
+        if any(word in q for word in ["thanks", "thank you", "appreciate"]):
+            signals.append("gratitude")
+        if any(word in q for word in ["urgent", "asap", "immediately", "right away"]):
+            signals.append("urgency")
+        if not signals:
+            return "neutral", []
+        # prioritize negative/urgent before gratitude
+        for ordered in ["frustration", "confusion", "urgency", "gratitude"]:
+            if ordered in signals:
+                return ordered, signals
+        return signals[0], signals
+
+    @staticmethod
+    def _parse_instructions(query: str) -> Dict[str, Any]:
+        q = query.lower()
+        instructions: Dict[str, Any] = {}
+
+        if any(word in q for word in ["table", "tabular", "matrix"]):
+            instructions["use_table"] = True
+            instructions["format"] = "table"
+        if any(word in q for word in ["step by step", "step-by-step", "steps"]):
+            instructions["step_by_step"] = True
+            instructions["format"] = "steps"
+        if any(word in q for word in ["bullet", "bullets", "list"]):
+            instructions["use_bullets"] = True
+            instructions.setdefault("format", "bullets")
+        if any(word in q for word in ["with sections", "in sections", "use sections", "sectioned"]):
+            instructions["format"] = "sections"
+        if any(word in q for word in ["brief", "short", "concise"]):
+            instructions["brevity"] = "brief"
+        if any(word in q for word in ["detailed", "in depth", "deep dive"]):
+            instructions["brevity"] = "detailed"
+            instructions["analysis"] = True
+        if any(word in q for word in ["analyze", "analysis", "deep analysis", "in-depth analysis"]):
+            instructions["analysis"] = True
+        if any(word in q for word in ["formal", "executive tone"]):
+            instructions["tone"] = "formal"
+        if any(word in q for word in ["casual", "informal"]):
+            instructions["tone"] = "informal"
+        if any(word in q for word in ["empathetic", "with empathy", "be kind", "supportive"]):
+            instructions["empathy"] = True
+        if any(word in q for word in ["narrative", "story"]):
+            instructions["style"] = "narrative"
+
+        return instructions
 
     @staticmethod
     def _decompose_query(query: str) -> List[str]:

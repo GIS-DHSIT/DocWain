@@ -4,7 +4,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src import main as docwain_api
-from src.execution.common import ExecutionResult
+try:
+    from src.execution.common import ExecutionResult
+except ImportError:
+    from src.execution import ExecutionResult
 from src.mode.execution_mode import ExecutionMode
 
 

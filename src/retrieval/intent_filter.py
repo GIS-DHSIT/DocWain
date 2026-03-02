@@ -1,46 +1,122 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Pattern, Tuple
+
+from src.utils.payload_utils import get_source_name
+
+
+_ATTRIBUTE_TERMS = {
+    "education": [
+        "education",
+        "degree",
+        "university",
+        "college",
+        "school",
+        "bachelor",
+        "master",
+        "phd",
+        "gpa",
+    ],
+    "experience": [
+        "experience",
+        "work history",
+        "employment",
+        "career",
+        "roles",
+        "positions",
+        "job",
+        "responsibilities",
+        "tenure",
+    ],
+    "skills": [
+        "skill",
+        "skills",
+        "stack",
+        "technology",
+        "technologies",
+        "tools",
+        "languages",
+        "framework",
+        "expertise",
+    ],
+    "certification": [
+        "certification",
+        "certified",
+        "certificate",
+        "license",
+        "licence",
+        "credential",
+    ],
+    "contact": [
+        "contact",
+        "email",
+        "phone",
+        "mobile",
+        "address",
+        "linkedin",
+        "website",
+    ],
+    "summary": [
+        "summary",
+        "overview",
+        "profile",
+        "bio",
+    ],
+    "projects": [
+        "project",
+        "portfolio",
+        "case study",
+    ],
+}
+
+_NUMERIC_HINTS = {
+    "how many",
+    "number of",
+    "total",
+    "sum",
+    "amount",
+    "count",
+    "average",
+    "median",
+    "mean",
+    "percent",
+    "percentage",
+    "ratio",
+    "years",
+    "months",
+    "days",
+    "experience",
+    "salary",
+    "cost",
+    "price",
+}
+
+_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_PHONE_RE = re.compile(r"\b\+?\d[\d\s().-]{7,}\d\b")
+_NUMBER_RE = re.compile(r"\b\d+[\d,\.]*\b")
+_DATE_RE = re.compile(
+    r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b",
+    re.IGNORECASE,
+)
+_EDU_RE = re.compile(r"\b(bachelor|master|phd|degree|university|college|school)\b", re.IGNORECASE)
+_EXP_RE = re.compile(r"\b(experience|years|worked|role|responsibilities|employment)\b", re.IGNORECASE)
+_SKILL_RE = re.compile(r"\b(skills?|expertise|proficient|technolog(?:y|ies)|tools|languages?)\b", re.IGNORECASE)
+_CERT_RE = re.compile(r"\b(certification|certified|certificate|license|licence|credential)\b", re.IGNORECASE)
+_ADDRESS_RE = re.compile(r"\b(street|st\.|avenue|ave\.|road|rd\.|lane|ln\.|drive|dr\.|city|state|zip|postal)\b", re.IGNORECASE)
 
 
 def extract_required_attributes(query: str, intent_type: str) -> List[str]:
     lowered = (query or "").lower()
-    attributes: List[str] = []
-    education_terms = [
-        "education", "educational", "qualification", "degree", "college", "university",
-        "school", "academic", "academics", "b.tech", "btech", "b.e", "be",
-        "m.tech", "mtech", "mba", "phd", "doctorate", "diploma",
-    ]
-    experience_terms = [
-        "experience", "work history", "employment", "career", "role", "position",
-        "company", "employer", "years",
-    ]
-    skills_terms = ["skill", "skills", "competency", "expertise", "proficiency"]
-    certification_terms = ["certification", "certificate", "license", "credential"]
-    contact_terms = ["email", "phone", "contact", "address", "location", "linkedin"]
-
-    if any(term in lowered for term in education_terms):
-        attributes.extend(education_terms)
-    if any(term in lowered for term in experience_terms):
-        attributes.extend(experience_terms)
-    if any(term in lowered for term in skills_terms):
-        attributes.extend(skills_terms)
-    if any(term in lowered for term in certification_terms):
-        attributes.extend(certification_terms)
-    if any(term in lowered for term in contact_terms):
-        attributes.extend(contact_terms)
-
-    if intent_type in {"numeric_lookup", "field_extraction"} and not attributes:
-        attributes.extend(["total", "amount", "number", "count", "date", "year"])
-
-    if not attributes:
-        return []
-    deduped = []
-    for term in attributes:
-        if term not in deduped:
-            deduped.append(term)
-    return deduped[:10]
+    required: List[str] = []
+    for attr, terms in _ATTRIBUTE_TERMS.items():
+        if any(term in lowered for term in terms):
+            required.append(attr)
+    if intent_type == "field_extraction" and not required:
+        for attr in ("contact", "education", "experience", "skills", "certification"):
+            if attr in lowered:
+                required.append(attr)
+    return sorted(set(required))
 
 
 def filter_chunks_by_intent(
@@ -49,61 +125,81 @@ def filter_chunks_by_intent(
     entities: List[str],
     intent_type: str,
 ) -> List[object]:
-    chunks_list = list(chunks or [])
-    if not chunks_list or not required_attributes:
-        return chunks_list
-    filtered: List[object] = []
-    attr_terms = [term.lower() for term in required_attributes if term]
-    entity_terms = [ent.lower() for ent in entities if ent]
-    number_re = re.compile(r"\b\d+[\d,\.]*\b")
+    chunk_list = list(chunks or [])
+    if not chunk_list:
+        return []
+    if intent_type in {"summarization", "deep_analysis"}:
+        return chunk_list
 
-    for chunk in chunks_list:
-        text = (getattr(chunk, "text", None) or (chunk.get("text") if isinstance(chunk, dict) else "") or "").lower()
-        meta = getattr(chunk, "metadata", None) or (chunk.get("metadata") if isinstance(chunk, dict) else {}) or {}
-        section = str(meta.get("section_title") or meta.get("section_path") or meta.get("section") or "").lower()
-        attr_hits = sum(1 for term in attr_terms if term in text or term in section)
-        entity_hits = sum(1 for ent in entity_terms if ent and ent in text)
-        numeric_hit = bool(number_re.search(text))
+    required_attributes = [attr for attr in (required_attributes or []) if attr]
+    entities = [entity for entity in (entities or []) if entity]
+    if not required_attributes and not entities:
+        return chunk_list
 
-        valid = attr_hits > 0 or (intent_type == "numeric_lookup" and numeric_hit)
-        score = attr_hits + (0.5 * entity_hits) + (0.4 if numeric_hit else 0.0)
+    entity_keys = _entity_keys(entities)
 
-        if isinstance(chunk, dict):
-            meta.setdefault("intent_match_score", round(score, 3))
-            chunk["metadata"] = meta
-        else:
-            meta["intent_match_score"] = round(score, 3)
-            setattr(chunk, "metadata", meta)
-        if valid:
-            filtered.append(chunk)
+    def matches(chunk: object) -> bool:
+        text = _chunk_text(chunk).lower()
+        attr_match = False
+        if required_attributes:
+            for attr in required_attributes:
+                terms = _ATTRIBUTE_TERMS.get(attr) or [attr]
+                if any(term in text for term in terms):
+                    attr_match = True
+                    break
+        entity_match = False
+        if entity_keys:
+            if any(key in text for key in entity_keys if key):
+                entity_match = True
+        if required_attributes and entities:
+            return attr_match or entity_match
+        if required_attributes:
+            return attr_match
+        if entities:
+            return entity_match
+        return True
 
-    return filtered
+    filtered = [chunk for chunk in chunk_list if matches(chunk)]
+    return filtered or chunk_list
 
 
-def extract_answer_requirements(query: str, intent_type: str) -> List[Tuple[str, re.Pattern]]:
+def extract_answer_requirements(query: str, intent_type: str) -> List[Tuple[str, Pattern[str]]]:
     lowered = (query or "").lower()
-    requirements: List[Tuple[str, re.Pattern]] = []
-    if any(term in lowered for term in ("education", "educational", "qualification", "degree", "college", "university", "school")):
-        requirements.append(("degree", re.compile(r"\b(b\.?tech|b\.?e|bachelor|master|m\.?tech|m\.?sc|mba|phd|doctorate|diploma)\b", re.IGNORECASE)))
-        requirements.append(("institution", re.compile(r"\b(university|college|institute|school|academy|polytechnic)\b", re.IGNORECASE)))
-        if any(term in lowered for term in ("year", "when", "date", "graduat")):
-            requirements.append(("year", re.compile(r"\b(19|20)\d{2}\b")))
-    if intent_type == "field_extraction":
-        if "email" in lowered:
-            requirements.append(("email", re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.IGNORECASE)))
-        if "phone" in lowered or "contact" in lowered:
-            requirements.append(("phone", re.compile(r"\+?\d[\d\s().-]{6,}\d")))
+    requirements: List[Tuple[str, Pattern[str]]] = []
+
+    if "email" in lowered or "e-mail" in lowered:
+        requirements.append(("email", _EMAIL_RE))
+    if "phone" in lowered or "mobile" in lowered or "contact" in lowered:
+        requirements.append(("phone", _PHONE_RE))
+    if "address" in lowered or "location" in lowered:
+        requirements.append(("address", _ADDRESS_RE))
+    if "education" in lowered or "degree" in lowered:
+        requirements.append(("education", _EDU_RE))
+    if "experience" in lowered or "work history" in lowered:
+        requirements.append(("experience", _EXP_RE))
+    if "skills" in lowered or "skill" in lowered:
+        requirements.append(("skills", _SKILL_RE))
+    if "certification" in lowered or "certificate" in lowered or "license" in lowered or "licence" in lowered:
+        requirements.append(("certification", _CERT_RE))
+
+    if intent_type == "numeric_lookup" or _NUMBER_RE.search(lowered) or any(hint in lowered for hint in _NUMERIC_HINTS):
+        requirements.append(("number", _NUMBER_RE))
+    if "date" in lowered or "when" in lowered or "during" in lowered:
+        requirements.append(("date", _DATE_RE))
+
     return requirements
 
 
-def validate_answer_requirements(chunks: Iterable[object], requirements: List[Tuple[str, re.Pattern]]) -> List[str]:
+def validate_answer_requirements(
+    chunks: Iterable[object],
+    requirements: List[Tuple[str, Pattern[str]]],
+) -> List[str]:
     if not requirements:
         return []
-    combined = " ".join(
-        (getattr(chunk, "text", None) or (chunk.get("text") if isinstance(chunk, dict) else "") or "")
-        for chunk in chunks
-        if chunk
-    )
+    chunk_list = list(chunks or [])
+    if not chunk_list:
+        return [name for name, _ in requirements]
+    combined = " ".join(_chunk_text(chunk) for chunk in chunk_list)
     missing: List[str] = []
     for name, pattern in requirements:
         if not pattern.search(combined):
@@ -113,8 +209,38 @@ def validate_answer_requirements(chunks: Iterable[object], requirements: List[Tu
 
 def build_intent_miss_response(entity: str, intent_label: str) -> str:
     entity = (entity or "").strip()
+    intent_label = (intent_label or "").strip()
     if entity and intent_label:
-        return f"I couldn't find {intent_label} details for {entity} in the available documents."
+        return f"I could not find {intent_label} details for {entity} in the available documents."
+    if entity:
+        return f"I could not find relevant details about {entity} in the available documents."
     if intent_label:
-        return f"I couldn't find {intent_label} details in the available documents."
-    return "I couldn't find that information in the available documents."
+        return f"I could not find {intent_label} details in the available documents."
+    return "I could not find relevant details in the available documents."
+
+
+def _chunk_text(chunk: object) -> str:
+    text = getattr(chunk, "text", None)
+    meta = getattr(chunk, "metadata", None)
+    if isinstance(chunk, dict):
+        text = chunk.get("text") if text is None else text
+        meta = chunk.get("metadata") if meta is None else meta
+    meta = meta or {}
+    section = str(meta.get("section_title") or meta.get("section_path") or meta.get("section") or "")
+    source = str(get_source_name(meta) or "")
+    return " ".join(part for part in (text or "", section, source) if part)
+
+
+def _entity_keys(entities: List[str]) -> List[str]:
+    keys: List[str] = []
+    for entity in entities:
+        cleaned = " ".join(entity.split()).strip()
+        if not cleaned:
+            continue
+        lower = cleaned.lower()
+        keys.append(lower)
+        if " " in lower:
+            last = lower.split()[-1]
+            if last not in keys:
+                keys.append(last)
+    return keys

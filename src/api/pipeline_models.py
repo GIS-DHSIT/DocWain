@@ -17,12 +17,18 @@ class Table:
     page: int
     text: str
     csv: Optional[str] = None
+    structured: Optional[Any] = None  # StructuredTable when available
 
 
 @dataclass
 class Figure:
     page: int
     caption: str
+    ocr_method: Optional[str] = None
+    ocr_confidence: Optional[float] = None
+    is_diagram: bool = False
+    diagram_type: Optional[str] = None
+    diagram_structure: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -32,6 +38,7 @@ class ChunkCandidate:
     section_title: str
     section_id: Optional[str]
     chunk_type: str = "text"
+    table_meta: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -44,6 +51,8 @@ class ExtractedDocument:
     doc_type: Optional[str] = None
     errors: List[str] = field(default_factory=list)
     metrics: Dict[str, Any] = field(default_factory=dict)
+    canonical_json: Dict[str, Any] = field(default_factory=dict)
+    doc_quality: Optional[str] = None
 
 
 @dataclass

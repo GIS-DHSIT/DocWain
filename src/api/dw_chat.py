@@ -1,189 +1,337 @@
+from __future__ import annotations
+
 import json
 import logging
-from datetime import datetime
+import os
+import uuid
+from datetime import datetime, timezone
 from io import BytesIO
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from src.storage.azure_blob_client import get_chat_container_client, upload_chat_history
+from src.api.config import Config
 from src.api.genai_client import generate_text
+from src.storage.azure_blob_client import get_chat_container_client, upload_chat_history
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-def get_chat_history(user_id: str) -> Dict:
-    """Retrieve chat history with sessions from Azure Blob Storage."""
+MAX_SESSIONS = int(os.getenv("CHAT_HISTORY_MAX_SESSIONS", "50"))
+MAX_MESSAGES_PER_SESSION = int(os.getenv("CHAT_HISTORY_MAX_MESSAGES_PER_SESSION", "200"))
+MAX_QUERY_CHARS = int(os.getenv("CHAT_HISTORY_MAX_QUERY_CHARS", "2000"))
+MAX_RESPONSE_CHARS = int(os.getenv("CHAT_HISTORY_MAX_RESPONSE_CHARS", "6000"))
+MAX_SOURCES_PER_MESSAGE = int(os.getenv("CHAT_HISTORY_MAX_SOURCES_PER_MESSAGE", "8"))
+DEFAULT_CONTEXT_MESSAGES = int(os.getenv("CHAT_HISTORY_CONTEXT_MESSAGES", "10"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_to_epoch(value: Optional[str]) -> float:
+    raw = (value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        return datetime.fromisoformat(raw).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _trim_text(value: Any, *, max_chars: int) -> str:
+    text = str(value or "").strip()
+    if len(text) > max_chars:
+        return text[:max_chars]
+    return text
+
+
+def _response_text(response: Any) -> str:
+    if isinstance(response, dict):
+        payload = response.get("response")
+        if isinstance(payload, str):
+            return payload.strip()
+        if payload is not None:
+            return str(payload).strip()
+        return ""
+    if isinstance(response, str):
+        return response.strip()
+    return str(response or "").strip()
+
+
+def _sanitize_sources(sources: Any) -> List[Dict[str, Any]]:
+    if not isinstance(sources, list):
+        return []
+    cleaned: List[Dict[str, Any]] = []
+    for source in sources[:MAX_SOURCES_PER_MESSAGE]:
+        if not isinstance(source, dict):
+            continue
+        item: Dict[str, Any] = {}
+        for key in ("source_name", "file_name", "document_id", "page"):
+            if key in source and source.get(key) is not None:
+                item[key] = source.get(key)
+        if not item and source:
+            item = dict(source)
+        cleaned.append(item)
+    return cleaned
+
+
+def serialize_response(response: Any) -> Any:
+    """Serialize responses for storage with bounded size."""
+    if isinstance(response, dict):
+        text = _trim_text(response.get("response", ""), max_chars=MAX_RESPONSE_CHARS)
+        return {
+            "response": text,
+            "sources": _sanitize_sources(response.get("sources", [])),
+        }
+    if isinstance(response, str):
+        return _trim_text(response, max_chars=MAX_RESPONSE_CHARS)
+    return _trim_text(str(response or ""), max_chars=MAX_RESPONSE_CHARS)
+
+
+def _normalize_message(message: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(message, dict):
+        return None
+
+    query = _trim_text(message.get("query", ""), max_chars=MAX_QUERY_CHARS)
+    if not query:
+        return None
+
+    timestamp = str(message.get("timestamp") or _now_iso())
+    response = serialize_response(message.get("response"))
+    return {
+        "query": query,
+        "response": response,
+        "timestamp": timestamp,
+    }
+
+
+def _normalize_session(session: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(session, dict):
+        return None
+
+    raw_messages = session.get("messages") or []
+    normalized_messages: List[Dict[str, Any]] = []
+    for raw in raw_messages:
+        msg = _normalize_message(raw)
+        if msg:
+            normalized_messages.append(msg)
+
+    if not normalized_messages:
+        return None
+
+    if len(normalized_messages) > MAX_MESSAGES_PER_SESSION:
+        normalized_messages = normalized_messages[-MAX_MESSAGES_PER_SESSION:]
+
+    created_at = str(session.get("created_at") or normalized_messages[0].get("timestamp") or _now_iso())
+    updated_at = str(session.get("updated_at") or normalized_messages[-1].get("timestamp") or created_at)
+
+    session_id = str(session.get("session_id") or f"session_{uuid.uuid4().hex[:12]}")
+    title = _trim_text(
+        session.get("title") or normalized_messages[0].get("query") or "Chat Session",
+        max_chars=80,
+    )
+
+    return {
+        "session_id": session_id,
+        "title": title,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "messages": normalized_messages,
+    }
+
+
+def _normalize_history(history: Any) -> Dict[str, Any]:
+    sessions: List[Dict[str, Any]] = []
+
+    # Legacy: list[message]
+    if isinstance(history, list) and (not history or isinstance(history[0], dict) and "query" in history[0]):
+        if history:
+            migrated = _normalize_session(
+                {
+                    "session_id": f"migrated_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}",
+                    "title": history[0].get("query", "Migrated Session"),
+                    "created_at": history[0].get("timestamp") or _now_iso(),
+                    "updated_at": history[-1].get("timestamp") or _now_iso(),
+                    "messages": history,
+                }
+            )
+            if migrated:
+                sessions.append(migrated)
+    elif isinstance(history, dict):
+        raw_sessions = history.get("sessions")
+        if isinstance(raw_sessions, list):
+            for raw in raw_sessions:
+                normalized = _normalize_session(raw)
+                if normalized:
+                    sessions.append(normalized)
+
+    sessions.sort(key=lambda s: _parse_iso_to_epoch(s.get("updated_at")))
+    if len(sessions) > MAX_SESSIONS:
+        sessions = sessions[-MAX_SESSIONS:]
+    return {"sessions": sessions}
+
+
+def _latest_session(sessions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not sessions:
+        return None
+    return max(sessions, key=lambda s: _parse_iso_to_epoch(s.get("updated_at")))
+
+
+def get_chat_history(user_id: str) -> Dict[str, Any]:
+    """Retrieve normalized chat history with sessions from Azure Blob Storage."""
     try:
         blob_name = f"chat_history/{user_id}.json"
         container_client = get_chat_container_client()
         blob_client = container_client.get_blob_client(blob_name)
         blob_data = blob_client.download_blob().readall()
-        chat_history = json.loads(blob_data.decode("utf-8"))
-
-        if isinstance(chat_history, list):
-            if chat_history:
-                logging.info(f"Migrating old format for {user_id}: {len(chat_history)} messages")
-                migrated_session = {
-                    "session_id": "migrated_" + datetime.utcnow().strftime("%Y%m%d_%H%M%S"),
-                    "title": chat_history[0].get("query", "Migrated Session")[:50],
-                    "created_at": chat_history[0].get("timestamp", datetime.utcnow().isoformat()),
-                    "updated_at": chat_history[-1].get("timestamp", datetime.utcnow().isoformat()),
-                    "messages": chat_history,
-                }
-                chat_history = {"sessions": [migrated_session]}
-            else:
-                chat_history = {"sessions": []}
-        elif "sessions" not in chat_history:
-            chat_history = {"sessions": []}
-
-        logging.info(f"[GET_HISTORY] User {user_id}: {len(chat_history.get('sessions', []))} sessions")
-        return chat_history
-    except Exception as e:
-        logging.info(f"[GET_HISTORY] No existing chat history for {user_id}: {e}")
+        payload = json.loads(blob_data.decode("utf-8"))
+        history = _normalize_history(payload)
+        logger.info("[GET_HISTORY] User=%s sessions=%d", user_id, len(history.get("sessions", [])))
+        return history
+    except Exception as exc:
+        logger.info("[GET_HISTORY] No existing chat history for %s: %s", user_id, exc)
         return {"sessions": []}
 
 
-def save_chat_history(user_id: str, chat_history: Dict) -> None:
-    """Save chat history to Azure Blob Storage."""
+def save_chat_history(user_id: str, chat_history: Dict[str, Any]) -> None:
+    """Save normalized chat history to Azure Blob Storage."""
     try:
+        normalized = _normalize_history(chat_history)
         blob_name = f"chat_history/{user_id}.json"
-        chat_data_stream = BytesIO(json.dumps(chat_history, ensure_ascii=False, indent=2).encode("utf-8"))
+        payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        chat_data_stream = BytesIO(payload)
         upload_chat_history(blob_name, chat_data_stream.getvalue())
-        logging.info(f"Chat history saved for user {user_id}")
-    except Exception as e:
-        logging.error(f"Error saving chat history: {e}")
+        logger.info("[SAVE_HISTORY] User=%s sessions=%d", user_id, len(normalized.get("sessions", [])))
+    except Exception as exc:
+        logger.error("Error saving chat history for %s: %s", user_id, exc)
 
 
-def serialize_response(response):
-    """Serialize responses for storage."""
-    if isinstance(response, dict):
-        return {
-            "response": response.get("response", ""),
-            "sources": response.get("sources", []),
-        }
-    if isinstance(response, str):
-        return response
-    return str(response)
-
-
-def create_new_session(query, response, session_id=None, initial_message=None):
+def create_new_session(
+    query: Any,
+    response: Any,
+    session_id: Optional[str] = None,
+    initial_message: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Create a new session with the first message.
     Allows supplying a specific session_id and initial message so callers can
     control when a brand-new session is created.
     """
-    now = datetime.utcnow()
+    now = _now_iso()
     message = initial_message or {
-        "query": str(query),
+        "query": _trim_text(query, max_chars=MAX_QUERY_CHARS),
         "response": serialize_response(response),
-        "timestamp": now.isoformat(),
+        "timestamp": now,
+    }
+    normalized_message = _normalize_message(message) or {
+        "query": _trim_text(query, max_chars=MAX_QUERY_CHARS),
+        "response": serialize_response(response),
+        "timestamp": now,
     }
     return {
-        "session_id": session_id or now.strftime("%Y%m%d_%H%M%S"),
-        "title": generate_session_title(query),
-        "created_at": message["timestamp"],
-        "updated_at": message["timestamp"],
-        "messages": [message],
+        "session_id": session_id or f"session_{uuid.uuid4().hex[:12]}",
+        "title": generate_session_title(normalized_message.get("query", "")),
+        "created_at": normalized_message["timestamp"],
+        "updated_at": normalized_message["timestamp"],
+        "messages": [normalized_message],
     }
 
 
-def generate_session_title(first_query: str) -> str:
+def generate_session_title(first_query: Any) -> str:
     """Generate a session title from the first query."""
-    title = first_query.strip()
-    if len(title) > 50:
-        title = title[:50] + "..."
-    return title
+    title = _trim_text(first_query, max_chars=50)
+    return title or "Chat Session"
 
 
-def _append_message(target_session: Dict, new_message: Dict, now: datetime) -> Tuple[int, int]:
+def _append_message(target_session: Dict[str, Any], new_message: Dict[str, Any]) -> Tuple[int, int]:
     """Append message to a session and return old/new counts."""
-    old_count = len(target_session.get("messages", []))
+    target_session.setdefault("messages", [])
+    old_count = len(target_session["messages"])
     target_session["messages"].append(new_message)
-    target_session["updated_at"] = now.isoformat()
+    if len(target_session["messages"]) > MAX_MESSAGES_PER_SESSION:
+        target_session["messages"] = target_session["messages"][-MAX_MESSAGES_PER_SESSION:]
+    target_session["updated_at"] = new_message.get("timestamp") or _now_iso()
     return old_count, len(target_session["messages"])
 
 
-def add_message_to_history(user_id, query, response, session_id=None, new_session=False):
+def add_message_to_history(
+    user_id: str,
+    query: Any,
+    response: Any = None,
+    session_id: Optional[str] = None,
+    new_session: bool = False,
+    **kwargs: Any,
+) -> Tuple[Dict[str, Any], Optional[str]]:
     """
     Session management where frontend controls session IDs.
 
-    LOGIC:
-    1. Frontend sends session_id (UUID) + new_session flag
-    2. If session_id exists in history: continue in that session
-    3. If session_id is new: create new session with that ID
-    4. If session_id is None: use most recent session (fallback)
-
+    Supports legacy callers that pass ``answer=...`` instead of ``response=...``.
     Returns: (history, active_session_id)
     """
-    logging.info("[ADD_MSG] ===== START =====")
-    logging.info(f"[ADD_MSG] User: {user_id}")
-    logging.info(f"[ADD_MSG] Query: {query[:50]}...")
-    logging.info(f"[ADD_MSG] Received session_id: {session_id}")
-    logging.info(f"[ADD_MSG] New session flag: {new_session}")
+    if response is None and "answer" in kwargs:
+        response = kwargs.get("answer")
 
     history = get_chat_history(user_id)
-    now = datetime.utcnow()
     sessions = history.get("sessions", [])
+    now = _now_iso()
 
-    logging.info(f"[ADD_MSG] Existing sessions: {len(sessions)}")
-    if sessions:
-        recent = sessions[-1]
-        logging.info(f"[ADD_MSG] Most recent: {recent['session_id']} ({len(recent.get('messages', []))} msgs)")
+    new_message = _normalize_message(
+        {
+            "query": query,
+            "response": response,
+            "timestamp": now,
+        }
+    )
+    if not new_message:
+        return history, session_id
 
-    new_message = {
-        "query": str(query),
-        "response": serialize_response(response),
-        "timestamp": now.isoformat(),
-    }
-
-    target_session = None
+    target_session: Optional[Dict[str, Any]] = None
+    appended_to_existing = False
 
     if session_id:
         target_session = next((s for s in sessions if s.get("session_id") == session_id), None)
-        if target_session:
-            logging.info(f"[ADD_MSG] Found existing session: {session_id}")
-            before, after = _append_message(target_session, new_message, now)
-            logging.info(f"[ADD_MSG] Messages: {before} -> {after}")
-        else:
-            logging.info(f"[ADD_MSG] Session ID not found, creating NEW session: {session_id}")
-            new_session_obj = create_new_session(
+        if target_session is None:
+            session_obj = create_new_session(
                 query,
                 response,
                 session_id=session_id,
                 initial_message=new_message,
             )
-            sessions.append(new_session_obj)
-            target_session = new_session_obj
-            logging.info(f"[ADD_MSG] Created new session with ID: {session_id}")
-    else:
-        logging.info("[ADD_MSG] No session_id provided")
-        if sessions:
-            target_session = sessions[-1]
-            logging.info(f"[ADD_MSG] Using most recent: {target_session['session_id']}")
-            before, after = _append_message(target_session, new_message, now)
-            logging.info(f"[ADD_MSG] Messages: {before} -> {after}")
+            sessions.append(session_obj)
+            target_session = session_obj
         else:
-            logging.info("[ADD_MSG] No sessions exist, creating first")
-            new_session_obj = create_new_session(query, response, initial_message=new_message)
-            sessions.append(new_session_obj)
-            target_session = new_session_obj
-            logging.info(f"[ADD_MSG] Created first session: {new_session_obj['session_id']}")
+            _append_message(target_session, new_message)
+            appended_to_existing = True
+    elif new_session or not sessions:
+        session_obj = create_new_session(query, response, initial_message=new_message)
+        sessions.append(session_obj)
+        target_session = session_obj
+    else:
+        target_session = _latest_session(sessions)
+        if target_session is None:
+            session_obj = create_new_session(query, response, initial_message=new_message)
+            sessions.append(session_obj)
+            target_session = session_obj
+        else:
+            _append_message(target_session, new_message)
+            appended_to_existing = True
 
-    if len(sessions) > 50:
-        logging.info(f"[ADD_MSG] Trimming sessions: {len(sessions)} -> 50")
-        sessions = sessions[-50:]
+    if target_session and not appended_to_existing and target_session.get("updated_at") != new_message.get("timestamp"):
+        target_session["updated_at"] = new_message.get("timestamp") or _now_iso()
 
-    history["sessions"] = sessions
-    save_chat_history(user_id, history)
+    normalized_history = _normalize_history({"sessions": sessions})
+    save_chat_history(user_id, normalized_history)
 
-    final_id = target_session.get("session_id") if target_session else None
-    logging.info(f"[ADD_MSG] < Final session_id: {final_id}")
-    logging.info(f"[ADD_MSG] Total sessions: {len(sessions)}")
-    logging.info("[ADD_MSG] ===== END =====\n")
-
-    return history, final_id
+    active_session_id = target_session.get("session_id") if target_session else None
+    return normalized_history, active_session_id
 
 
-def get_current_session_context(user_id, session_id=None, max_messages=10):
-    """Get messages for a specific session (or the latest one)."""
+def get_current_session_context(
+    user_id: str,
+    session_id: Optional[str] = None,
+    max_messages: int = DEFAULT_CONTEXT_MESSAGES,
+) -> List[Dict[str, Any]]:
+    """Get the latest messages for a session as compact query/response context."""
     history = get_chat_history(user_id)
     sessions = history.get("sessions", [])
     if not sessions:
@@ -193,26 +341,38 @@ def get_current_session_context(user_id, session_id=None, max_messages=10):
     if session_id:
         current_session = next((s for s in sessions if s.get("session_id") == session_id), None)
     if current_session is None:
-        current_session = sessions[-1]
+        current_session = _latest_session(sessions)
+    if current_session is None:
+        return []
 
     messages = current_session.get("messages", [])
-    return messages[-max_messages:] if len(messages) > max_messages else messages
+    selected = messages[-max_messages:] if len(messages) > max_messages else messages
+    return [
+        {
+            "query": msg.get("query", ""),
+            "response": _response_text(msg.get("response")),
+            "timestamp": msg.get("timestamp"),
+        }
+        for msg in selected
+        if isinstance(msg, dict)
+    ]
 
 
-def delete_chat_history(user_id):
+def delete_chat_history(user_id: str) -> Dict[str, str]:
     """Delete chat history from Azure Blob Storage."""
     try:
         blob_name = f"chat_history/{user_id}.json"
+        container_client = get_chat_container_client()
         blob_client = container_client.get_blob_client(blob_name)
         blob_client.delete_blob()
-        logging.info(f"Chat history deleted for {user_id}")
+        logger.info("Chat history deleted for %s", user_id)
         return {"status": "success", "message": f"Chat history deleted for {user_id}"}
-    except Exception as e:
-        logging.error(f"Error deleting chat history: {e}")
+    except Exception as exc:
+        logger.error("Error deleting chat history for %s: %s", user_id, exc)
         return {"status": "error", "message": "Error deleting chat history"}
 
 
-def delete_session(user_id, session_id):
+def delete_session(user_id: str, session_id: str) -> Dict[str, str]:
     """Delete a specific session from chat history."""
     try:
         history = get_chat_history(user_id)
@@ -222,33 +382,34 @@ def delete_session(user_id, session_id):
         if len(updated_sessions) == len(sessions):
             return {"status": "error", "message": "Session not found"}
 
-        history["sessions"] = updated_sessions
-        save_chat_history(user_id, history)
+        updated_history = {"sessions": updated_sessions}
+        save_chat_history(user_id, updated_history)
 
-        logging.info(f"Session {session_id} deleted for {user_id}")
+        logger.info("Session %s deleted for %s", session_id, user_id)
         return {"status": "success", "message": f"Session {session_id} deleted"}
-    except Exception as e:
-        logging.error(f"Error deleting session: {e}")
+    except Exception as exc:
+        logger.error("Error deleting session %s for %s: %s", session_id, user_id, exc)
         return {"status": "error", "message": "Error deleting session"}
 
 
-def get_session_list(user_id) -> List[Dict]:
+def get_session_list(user_id: str) -> List[Dict[str, Any]]:
     """Get list of all sessions with metadata (for sidebar display)."""
     history = get_chat_history(user_id)
     sessions = history.get("sessions", [])
-    session_list = []
-    for session in sessions:
-        session_list.append({
+    ordered = sorted(sessions, key=lambda s: _parse_iso_to_epoch(s.get("updated_at")), reverse=True)
+    return [
+        {
             "session_id": session.get("session_id"),
             "title": session.get("title"),
             "created_at": session.get("created_at"),
             "updated_at": session.get("updated_at"),
             "message_count": len(session.get("messages", [])),
-        })
-    return session_list
+        }
+        for session in ordered
+    ]
 
 
-def get_session_by_id(user_id, session_id):
+def get_session_by_id(user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
     """Get a specific session's full chat history."""
     history = get_chat_history(user_id)
     sessions = history.get("sessions", [])
@@ -258,7 +419,7 @@ def get_session_by_id(user_id, session_id):
     return None
 
 
-def generate_follow_up_questions(retrieved_text, num_questions=3):
+def generate_follow_up_questions(retrieved_text: str, num_questions: int = 3):
     """Generates follow-up questions using Gemini 2.5 Flash based on retrieved content."""
     try:
         prompt = f"""
@@ -275,6 +436,6 @@ Context:
             prompt=prompt,
         )
         return text if text else []
-    except Exception as e:
-        logging.error(f"Error generating follow-up questions: {e}")
+    except Exception as exc:
+        logger.error("Error generating follow-up questions: %s", exc)
         return []

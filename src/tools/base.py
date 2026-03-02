@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +26,11 @@ def standard_response(
     error: Optional[Dict[str, Any]] = None,
     correlation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build the canonical tool response shape."""
+    """Build the canonical tool/agent response shape."""
     return {
         "status": status,
         "tool_name": tool_name,
+        "agent_name": tool_name,
         "correlation_id": generate_correlation_id(correlation_id),
         "grounded": bool(grounded),
         "context_found": bool(context_found),
@@ -41,7 +42,7 @@ def standard_response(
 
 
 class ToolError(Exception):
-    """Structured error used by tool implementations for predictable responses."""
+    """Structured error used by tool/agent implementations for predictable responses."""
 
     def __init__(self, message: str, code: str = "tool_error", status_code: int = 400):
         super().__init__(message)
@@ -50,6 +51,10 @@ class ToolError(Exception):
 
     def as_dict(self) -> Dict[str, Any]:
         return {"message": str(self), "code": self.code}
+
+
+# Agent-primary alias
+AgentError = ToolError
 
 
 async def _maybe_await(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -61,8 +66,8 @@ async def _maybe_await(func: Callable[..., Any], *args: Any, **kwargs: Any) -> A
 
 class ToolRegistry:
     """
-    Registry for callable tool backends. Keeps wiring isolated from FastAPI routes
-    so tools can also be invoked programmatically (e.g., inside RAG flow).
+    Registry for callable agent/tool backends. Keeps wiring isolated from FastAPI
+    routes so agents can also be invoked programmatically (e.g., inside RAG flow).
     """
 
     def __init__(self) -> None:
@@ -71,15 +76,15 @@ class ToolRegistry:
 
     def register(self, name: str, handler: Callable[..., Any]) -> None:
         if not name:
-            raise ValueError("Tool name is required")
+            raise ValueError("Agent name is required")
         if not callable(handler):
-            raise ValueError("Tool handler must be callable")
+            raise ValueError("Agent handler must be callable")
         self._registry[name] = handler
-        logger.info("Registered tool handler: %s", name)
+        logger.info("Registered agent handler: %s", name)
 
     def get(self, name: str) -> Callable[..., Any]:
         if name not in self._registry:
-            raise ToolError(f"Tool '{name}' is not registered", code="tool_not_found", status_code=404)
+            raise ToolError(f"Agent '{name}' is not registered", code="agent_not_found", status_code=404)
         return self._registry[name]
 
     async def invoke(
@@ -109,16 +114,16 @@ class ToolRegistry:
                 correlation_id=cid,
             )
         except asyncio.TimeoutError:
-            logger.error("Tool timed out | tool=%s correlation_id=%s", name, cid)
-            raise ToolError("Tool execution timed out", code="timeout", status_code=504)
+            logger.error("Agent timed out | agent=%s correlation_id=%s", name, cid)
+            raise ToolError("Agent execution timed out", code="timeout", status_code=504)
         except ToolError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Tool invocation failed | tool=%s correlation_id=%s", name, cid, exc_info=True)
+            logger.exception("Agent invocation failed | agent=%s correlation_id=%s", name, cid, exc_info=True)
             raise ToolError(str(exc), code="internal_error", status_code=500) from exc
 
         logger.info(
-            "Tool completed | tool=%s correlation_id=%s latency_ms=%d",
+            "Agent completed | agent=%s correlation_id=%s latency_ms=%d",
             name,
             cid,
             int((time.time() - start) * 1000),
@@ -126,11 +131,14 @@ class ToolRegistry:
         return response
 
 
+# Agent-primary alias
+AgentRegistry = ToolRegistry
+
 registry = ToolRegistry()
 
 
 def register_tool(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Decorator to simplify registration of tool handlers."""
+    """Decorator to simplify registration of agent handlers."""
 
     def _decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         registry.register(name, func)
@@ -138,3 +146,6 @@ def register_tool(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any
 
     return _decorator
 
+
+# Agent-primary alias
+register_agent = register_tool

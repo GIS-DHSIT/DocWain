@@ -7,15 +7,22 @@ Key Fixes:
 """
 
 import logging
+import hashlib
+import time
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 from qdrant_client import QdrantClient
-from qdrant_client.models import SparseVector, Filter, FieldCondition, MatchValue, MatchAny
+from qdrant_client.models import Filter, FieldCondition, MatchValue, MatchAny
+from src.api.vector_store import build_qdrant_filter
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 import re
-from src.api.vector_store import compute_chunk_id
+from src.embedding.pipeline.embed_pipeline import compute_stable_chunk_id
+from src.kg.entity_extractor import EntityExtractor
+from src.kg.neo4j_store import Neo4jStore
+from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
+from src.utils.payload_utils import get_canonical_text, get_source_name
 
 logger = logging.getLogger(__name__)
 
@@ -267,10 +274,14 @@ def normalize_chunk_links(
     if len(chunk_metadata) != len(chunks):
         raise ValueError("chunk_metadata and chunks length mismatch")
 
-    computed_ids = [
-        compute_chunk_id(subscription_id, profile_id, document_id, doc_name, idx, chunks[idx])
-        for idx in range(len(chunks))
-    ]
+    computed_ids = []
+    for idx in range(len(chunks)):
+        meta = chunk_metadata[idx] or {}
+        chunk_hash = meta.get("chunk_hash") or hashlib.sha256(chunks[idx].encode("utf-8")).hexdigest()
+        section_id = meta.get("section_id") or meta.get("section_path") or meta.get("section_title") or "section"
+        computed_ids.append(
+            compute_stable_chunk_id(subscription_id, profile_id, document_id, str(section_id), idx, chunk_hash)
+        )
 
     normalized = []
     for idx, meta in enumerate(chunk_metadata):
@@ -312,6 +323,7 @@ class AdaptiveRetriever:
 
     def _build_filter(
             self,
+            subscription_id: str,
             profile_id: str,
             document_ids: Optional[List[str]] = None,
             source_files: Optional[List[str]] = None
@@ -319,16 +331,9 @@ class AdaptiveRetriever:
         """
         FIXED: Use MatchAny for OR logic with multiple documents
         """
-        conditions = []
-
-        # Profile filter (always required)
-        if profile_id:
-            conditions.append(
-                FieldCondition(
-                    key="profile_id",
-                    match=MatchValue(value=str(profile_id))
-                )
-            )
+        base = build_qdrant_filter(subscription_id=str(subscription_id), profile_id=str(profile_id))
+        conditions = list(getattr(base, "must", []) or [])
+        should = list(getattr(base, "should", []) or [])
 
         # FIXED: Use MatchAny for document filtering (OR logic)
         if document_ids and len(document_ids) > 0:
@@ -341,22 +346,29 @@ class AdaptiveRetriever:
 
         # FIXED: Use MatchAny for source file filtering (OR logic)
         if source_files and len(source_files) > 0:
-            conditions.append(
+            should.append(
+                FieldCondition(
+                    key="source.name",
+                    match=MatchAny(any=source_files)
+                )
+            )
+            should.append(
                 FieldCondition(
                     key="source_file",
-                    match=MatchAny(any=source_files)  # FIXED: OR logic
+                    match=MatchAny(any=source_files)
                 )
             )
 
         if not conditions:
             return None
 
-        return Filter(must=conditions)
+        return Filter(must=conditions, should=should or None)
 
     def _dense_search(
             self,
             collection_name: str,
             query: str,
+            subscription_id: str,
             profile_id: str,
             top_k: int,
             document_ids: Optional[List[str]] = None,
@@ -373,7 +385,7 @@ class AdaptiveRetriever:
             ).astype(np.float32).tolist()
 
             # Build filter with OR logic
-            query_filter = self._build_filter(profile_id, document_ids, source_files)
+            query_filter = self._build_filter(subscription_id, profile_id, document_ids, source_files)
 
             # Log filter for debugging
             if query_filter:
@@ -402,7 +414,7 @@ class AdaptiveRetriever:
                 payload = pt.payload or {}
                 chunks.append({
                     'id': str(pt.id),
-                    'text': payload.get('text', ''),
+                    'text': get_canonical_text(payload),
                     'score': float(pt.score),
                     'metadata': payload,
                     'method': 'dense'
@@ -411,7 +423,7 @@ class AdaptiveRetriever:
             logger.info(f"Dense search returned {len(chunks)} results")
             if chunks:
                 # ADDED: Log which documents were returned
-                returned_docs = list(set([c['metadata'].get('source_file', 'unknown') for c in chunks[:10]]))
+                returned_docs = list(set([get_source_name(c.get("metadata") or {}) or "unknown" for c in chunks[:10]]))
                 logger.info(f"Returned documents: {returned_docs}")
                 logger.info(f"Top 3 scores: {[round(c['score'], 4) for c in chunks[:3]]}")
 
@@ -437,10 +449,174 @@ class AdaptiveRetriever:
         chunks.sort(key=lambda x: x['score'], reverse=True)
         return chunks
 
+
+@dataclass
+class KGProbeResult:
+    document_ids: List[str]
+    section_paths: List[str]
+    hits: Dict[str, int]
+    source: str = "neo4j"
+
+
+class GraphGuidedRetriever:
+    """Lightweight KG probe + score boost layer for retrieval."""
+
+    def __init__(
+        self,
+        *,
+        neo4j_store: Optional[Neo4jStore],
+        cache: Optional[RedisJsonCache],
+        entity_extractor: Optional[EntityExtractor] = None,
+        probe_limit: int = 20,
+        probe_timeout_ms: int = 80,
+        cache_ttl_seconds: int = 1200,
+    ) -> None:
+        self.neo4j_store = neo4j_store
+        self.cache = cache
+        self.entity_extractor = entity_extractor or EntityExtractor()
+        self.probe_limit = int(probe_limit)
+        self.probe_timeout_ms = int(probe_timeout_ms)
+        self.cache_ttl_seconds = int(cache_ttl_seconds)
+
+    @staticmethod
+    def _normalize_query(query: str) -> str:
+        return " ".join((query or "").strip().lower().split())
+
+    def _cache_key(self, tenant: str, collection: str, normalized_query: str) -> str:
+        return f"kgprobe:{tenant}:{collection}:{hash_query(normalized_query)}"
+
+    def _entity_cache_key(self, tenant: str, normalized_query: str) -> str:
+        return f"kgentities:{tenant}:{hash_query(normalized_query)}"
+
+    def get_cached_probe(self, *, tenant: str, collection: str, query: str) -> Optional[KGProbeResult]:
+        if not self.cache:
+            return None
+        normalized = self._normalize_query(query)
+        cached = self.cache.get_json(self._cache_key(tenant, collection, normalized), feature="kgprobe")
+        if not cached:
+            return None
+        return KGProbeResult(
+            document_ids=cached.get("document_ids") or [],
+            section_paths=cached.get("section_paths") or [],
+            hits=cached.get("hits") or {},
+            source="cache",
+        )
+
+    def _extract_entities(self, *, tenant: str, query: str) -> List[str]:
+        normalized = self._normalize_query(query)
+        if self.cache:
+            cached = self.cache.get_json(self._entity_cache_key(tenant, normalized), feature="kgprobe")
+            if cached:
+                return cached.get("entity_ids") or []
+        entities = self.entity_extractor.extract(query)
+        entity_ids = [ent.entity_id for ent in entities]
+        if self.cache:
+            self.cache.set_json(
+                self._entity_cache_key(tenant, normalized),
+                stamp_cache_payload({"entity_ids": entity_ids}),
+                feature="kgprobe",
+                ttl=max(300, self.cache_ttl_seconds // 2),
+            )
+        return entity_ids
+
+    def probe(self, *, tenant: str, collection: str, query: str) -> KGProbeResult:
+        normalized = self._normalize_query(query)
+        if self.cache:
+            cached = self.cache.get_json(self._cache_key(tenant, collection, normalized), feature="kgprobe")
+            if cached:
+                return KGProbeResult(
+                    document_ids=cached.get("document_ids") or [],
+                    section_paths=cached.get("section_paths") or [],
+                    hits=cached.get("hits") or {},
+                    source="cache",
+                )
+
+        entity_ids = self._extract_entities(tenant=tenant, query=normalized)
+        if not entity_ids or not self.neo4j_store:
+            result = KGProbeResult(document_ids=[], section_paths=[], hits={}, source="empty")
+            if self.cache:
+                self.cache.set_json(
+                    self._cache_key(tenant, collection, normalized),
+                    stamp_cache_payload(result.__dict__),
+                    feature="kgprobe",
+                    ttl=self.cache_ttl_seconds,
+                )
+            return result
+
+        start = time.time()
+        try:
+            hits = self.neo4j_store.probe_entities(
+                entity_ids=entity_ids,
+                limit=self.probe_limit,
+                timeout_ms=self.probe_timeout_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("KG probe failed: %s", exc)
+            hits = []
+
+        doc_hits: Dict[str, int] = {}
+        section_paths: List[str] = []
+        for row in hits:
+            doc_id = str(row.get("document_id") or "")
+            section_path = row.get("section_path")
+            hit_count = int(row.get("hits") or 0)
+            if doc_id:
+                doc_hits[doc_id] = doc_hits.get(doc_id, 0) + hit_count
+            if section_path:
+                section_paths.append(str(section_path))
+
+        ranked_docs = [doc for doc, _ in sorted(doc_hits.items(), key=lambda item: item[1], reverse=True)]
+        unique_sections = list(dict.fromkeys(section_paths))
+        result = KGProbeResult(
+            document_ids=ranked_docs,
+            section_paths=unique_sections,
+            hits=doc_hits,
+            source="neo4j",
+        )
+        if self.cache:
+            self.cache.set_json(
+                self._cache_key(tenant, collection, normalized),
+                stamp_cache_payload(result.__dict__),
+                feature="kgprobe",
+                ttl=self.cache_ttl_seconds,
+            )
+        elapsed_ms = (time.time() - start) * 1000
+        if elapsed_ms > self.probe_timeout_ms:
+            logger.debug("KG probe exceeded budget: %.1fms", elapsed_ms)
+        return result
+
+    @staticmethod
+    def apply_boosts(
+        chunks: List[Dict[str, Any]],
+        probe: KGProbeResult,
+        *,
+        doc_boost: float = 0.12,
+        section_boost: float = 0.08,
+    ) -> List[Dict[str, Any]]:
+        if not chunks or not probe.document_ids:
+            return chunks
+        doc_set = set(probe.document_ids)
+        section_set = set([s.lower() for s in (probe.section_paths or [])])
+        for chunk in chunks:
+            meta = chunk.get("metadata") or {}
+            doc_id = str(meta.get("document_id") or "")
+            if doc_id and doc_id in doc_set:
+                chunk["score"] = float(chunk.get("score", 0.0)) + doc_boost
+                meta["kg_boost"] = True
+            section_path = (meta.get("section_path") or meta.get("section_title") or "").strip().lower()
+            if section_path and section_path in section_set:
+                chunk["score"] = float(chunk.get("score", 0.0)) + section_boost
+                meta["kg_section_boost"] = True
+            chunk["metadata"] = meta
+        chunks.sort(key=lambda c: float(c.get("score", 0.0)), reverse=True)
+        return chunks
+
     def _expand_with_adjacent_chunks(
             self,
             collection_name: str,
             chunks: List[Dict],
+            subscription_id: str,
+            profile_id: str,
             max_adjacent: int = 1
     ) -> List[Dict]:
         """
@@ -475,18 +651,14 @@ class AdaptiveRetriever:
                 for adj_id in adjacent_ids[:max_adjacent]:
                     try:
                         # FIXED: Filter by both chunk_id AND document_id
-                        scroll_filter = Filter(
-                            must=[
-                                FieldCondition(
-                                    key="chunk_id",
-                                    match=MatchValue(value=adj_id)
-                                ),
-                                FieldCondition(
-                                    key="document_id",
-                                    match=MatchValue(value=current_doc_id)  # ADDED
-                                )
-                            ]
+                        base = build_qdrant_filter(
+                            subscription_id=str(subscription_id),
+                            profile_id=str(profile_id),
+                            document_id=str(current_doc_id),
                         )
+                        must = list(getattr(base, "must", []) or [])
+                        must.append(FieldCondition(key="chunk_id", match=MatchValue(value=adj_id)))
+                        scroll_filter = Filter(must=must)
 
                         results = self.client.scroll(
                             collection_name=collection_name,
@@ -511,7 +683,7 @@ class AdaptiveRetriever:
                                 if adj_doc_id == current_doc_id:  # ADDED CHECK
                                     expanded.append({
                                         'id': str(pt.id),
-                                        'text': payload.get('text', ''),
+                                        'text': get_canonical_text(payload),
                                         'score': chunk['score'] * 0.95,
                                         'metadata': payload,
                                         'method': f"{chunk['method']}_adjacent"
@@ -535,6 +707,7 @@ class AdaptiveRetriever:
             self,
             collection_name: str,
             query: str,
+            subscription_id: str,
             profile_id: str,
             top_k: int = 30,
             document_ids: Optional[List[str]] = None,
@@ -553,7 +726,7 @@ class AdaptiveRetriever:
 
         # Strategy 1: Dense search with moderate threshold
         chunks = self._dense_search(
-            collection_name, query, profile_id, top_k,
+            collection_name, query, subscription_id, profile_id, top_k,
             document_ids=document_ids,
             source_files=source_files,
             score_threshold=0.15
@@ -563,7 +736,7 @@ class AdaptiveRetriever:
         if not chunks:
             logger.warning("No results with threshold, retrying without")
             chunks = self._dense_search(
-                collection_name, query, profile_id, top_k,
+                collection_name, query, subscription_id, profile_id, top_k,
                 document_ids=document_ids,
                 source_files=source_files,
                 score_threshold=None
@@ -573,7 +746,7 @@ class AdaptiveRetriever:
         if not chunks and (document_ids or source_files):
             logger.warning("No results with document filter, retrying without filter")
             chunks = self._dense_search(
-                collection_name, query, profile_id, top_k * 2,
+                collection_name, query, subscription_id, profile_id, top_k * 2,
                 score_threshold=None
             )
 
@@ -587,7 +760,13 @@ class AdaptiveRetriever:
 
         # Adjacent chunk expansion (FIXED: same-document only)
         if use_expansion and len(chunks) > 0:
-            chunks = self._expand_with_adjacent_chunks(collection_name, chunks, max_adjacent=1)
+            chunks = self._expand_with_adjacent_chunks(
+                collection_name,
+                chunks,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                max_adjacent=1,
+            )
 
         # Add methods metadata
         for chunk in chunks:
@@ -596,7 +775,7 @@ class AdaptiveRetriever:
 
         logger.info(f"Final retrieval: {len(chunks)} chunks")
         if chunks:
-            unique_docs = list(set([c['metadata'].get('source_file', 'unknown') for c in chunks]))
+            unique_docs = list(set([get_source_name(c.get("metadata") or {}) or "unknown" for c in chunks]))
             logger.info(f"Unique documents in results: {unique_docs}")
             logger.info(f"Top 5 scores: {[round(c['score'], 4) for c in chunks[:5]]}")
 

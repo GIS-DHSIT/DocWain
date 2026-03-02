@@ -41,13 +41,21 @@ class RequestChain:
     def run(self, *, stream: bool = False, debug: bool = False, force_refresh: bool = False) -> Tuple[Dict[str, Any], List[str]]:
         resolved_model = resolve_model_for_profile(self.ctx.profile_id, self.ctx.model_name or "")
         model_name = resolved_model.model_name or self.ctx.model_name
+        rag_system = None
+        try:
+            from src.api.rag_state import get_app_state
+
+            app_state = get_app_state()
+            rag_system = app_state.rag_system if app_state else None
+        except Exception:
+            rag_system = None
 
         raw_answer = dw_newron.answer_question(
             query=self.ctx.query,
             user_id=self.ctx.user_id or "",
             profile_id=self.ctx.profile_id or "",
             subscription_id=self.ctx.subscription_id or "default",
-            model_name=model_name or "llama3.2",
+            model_name=model_name or "DocWain-Agent",
             persona=self.ctx.persona or "Document Assistant",
             session_id=self.ctx.session_id,
             new_session=force_refresh,
@@ -58,6 +66,8 @@ class RequestChain:
             tools=self.ctx.tools,
             use_tools=getattr(self.ctx, "use_tools", False),
             tool_inputs=getattr(self.ctx, "tool_inputs", None),
+            enable_internet=getattr(self.ctx, "enable_internet", False),
+            rag_system=rag_system,
         )
 
         normalized = normalize_answer(raw_answer)
@@ -65,6 +75,7 @@ class RequestChain:
         metadata.update(
             {
                 "request_id": self.ctx.request_id,
+                "correlation_id": self.ctx.request_id,
                 "session_id": self.ctx.session_id,
                 "execution_mode": self.mode.value,
             }
