@@ -47,11 +47,13 @@ class TestQueryScopeInference:
         assert scope.mode == "all_profile"
 
     def test_all_documents_summarize(self):
-        scope = _infer_query_scope("summarize all documents", None, None)
+        intent = _make_intent(intent="list", entity_hints=[])
+        scope = _infer_query_scope("summarize all documents", None, intent)
         assert scope.mode == "all_profile"
 
     def test_all_documents_how_many(self):
-        scope = _infer_query_scope("how many resumes are there", None, None)
+        intent = _make_intent(intent="list", entity_hints=[])
+        scope = _infer_query_scope("how many resumes are there", None, intent)
         assert scope.mode == "all_profile"
 
     def test_all_documents_rank(self):
@@ -59,11 +61,13 @@ class TestQueryScopeInference:
         assert scope.mode == "all_profile"
 
     def test_all_documents_list(self):
-        scope = _infer_query_scope("list all candidates", None, None)
+        intent = _make_intent(intent="list", entity_hints=[])
+        scope = _infer_query_scope("list all candidates", None, intent)
         assert scope.mode == "all_profile"
 
     def test_all_documents_show_every(self):
-        scope = _infer_query_scope("show every document", None, None)
+        intent = _make_intent(intent="list", entity_hints=[])
+        scope = _infer_query_scope("show every document", None, intent)
         assert scope.mode == "all_profile"
 
     def test_intent_compare_no_entities(self):
@@ -248,16 +252,18 @@ class TestAllProfileRetrieval:
     def test_all_profile_list_documents_query(self):
         """'list all documents' triggers all_profile mode."""
         points = self._build_multi_doc_points()
-        result = run(
-            query="list all documents",
-            subscription_id="sub-1",
-            profile_id="prof-1",
-            qdrant_client=FakeQdrant(points),
-            embedder=FakeEmbedder(),
-            redis_client=FakeRedis(),
-            llm_client=None,
-            cross_encoder=None,
-        )
+        list_intent = _make_intent(intent="list", entity_hints=[])
+        with patch("src.rag_v3.pipeline._resolve_intent_future", return_value=list_intent):
+            result = run(
+                query="list all documents",
+                subscription_id="sub-1",
+                profile_id="prof-1",
+                qdrant_client=FakeQdrant(points),
+                embedder=FakeEmbedder(),
+                redis_client=FakeRedis(),
+                llm_client=None,
+                cross_encoder=None,
+            )
         metadata = result.get("metadata", {})
         assert metadata.get("scope") == "all_profile"
 
@@ -286,16 +292,18 @@ class TestAllProfileRetrieval:
             make_point(pid="p3", profile_id="prof-1", document_id="doc3",
                        file_name="c.pdf", text="content C about Go and Kubernetes", page=1, score=0.80),
         ]
-        result = run(
-            query="summarize all documents",
-            subscription_id="sub-1",
-            profile_id="prof-1",
-            qdrant_client=FakeQdrant(points),
-            embedder=FakeEmbedder(),
-            redis_client=FakeRedis(),
-            llm_client=None,
-            cross_encoder=None,
-        )
+        list_intent = _make_intent(intent="list", entity_hints=[])
+        with patch("src.rag_v3.pipeline._resolve_intent_future", return_value=list_intent):
+            result = run(
+                query="summarize all documents",
+                subscription_id="sub-1",
+                profile_id="prof-1",
+                qdrant_client=FakeQdrant(points),
+                embedder=FakeEmbedder(),
+                redis_client=FakeRedis(),
+                llm_client=None,
+                cross_encoder=None,
+            )
         metadata = result.get("metadata", {})
         assert metadata.get("scope") == "all_profile"
         assert metadata["document_count"] == 3

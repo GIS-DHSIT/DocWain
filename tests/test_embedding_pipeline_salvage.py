@@ -147,7 +147,7 @@ class TestPrepareEmbeddingChunksSalvage:
 
         chunks = [text]
         meta = [{"section_title": "Config", "section_path": "Config"}]
-        result_chunks, result_meta, stats = prepare_embedding_chunks(
+        result_chunks, result_meta, stats, _rescued = prepare_embedding_chunks(
             chunks, meta,
             subscription_id="sub1", profile_id="prof1",
             document_id="doc1", doc_name="test.pdf",
@@ -166,7 +166,7 @@ class TestPrepareEmbeddingChunksSalvage:
 
         chunks = [repr_text]
         meta = [{"section_title": "Resume", "section_path": "Resume"}]
-        result_chunks, result_meta, stats = prepare_embedding_chunks(
+        result_chunks, result_meta, stats, _rescued = prepare_embedding_chunks(
             chunks, meta,
             subscription_id="sub1", profile_id="prof1",
             document_id="doc1", doc_name="Gaurav_Resume.pdf",
@@ -180,7 +180,7 @@ class TestPrepareEmbeddingChunksSalvage:
         """A genuinely short chunk (<20 chars) should still be dropped."""
         chunks = ["Hi"]
         meta = [{"section_title": "Short", "section_path": "Short"}]
-        result_chunks, result_meta, stats = prepare_embedding_chunks(
+        result_chunks, result_meta, stats, _rescued = prepare_embedding_chunks(
             chunks, meta,
             subscription_id="sub1", profile_id="prof1",
             document_id="doc1", doc_name="test.pdf",
@@ -198,7 +198,7 @@ class TestPrepareEmbeddingChunksSalvage:
 
         chunks = [text]
         meta = [{"section_title": "Summary", "section_path": "Summary"}]
-        result_chunks, result_meta, stats = prepare_embedding_chunks(
+        result_chunks, result_meta, stats, _rescued = prepare_embedding_chunks(
             chunks, meta,
             subscription_id="sub1", profile_id="prof1",
             document_id="doc1", doc_name="resume.pdf",
@@ -219,7 +219,7 @@ class TestPrepareEmbeddingChunksSalvage:
             {"section_title": "Repr", "section_path": "Repr"},
             {"section_title": "Education", "section_path": "Education"},
         ]
-        result_chunks, result_meta, stats = prepare_embedding_chunks(
+        result_chunks, result_meta, stats, _rescued = prepare_embedding_chunks(
             chunks, meta,
             subscription_id="sub1", profile_id="prof1",
             document_id="doc1", doc_name="resume.pdf",

@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    """Access attribute or dict key — supports both objects and dicts."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
 
 _ENTITY_PATTERNS = {
     "EMAIL": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.IGNORECASE),
@@ -45,18 +53,52 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
+_ROLE_KEYWORDS: Dict[str, List[str]] = {
+    "header_meta": ["header", "title page", "cover", "metadata", "document info"],
+    "contact_info": ["contact", "address", "phone", "email", "location", "reach us"],
+    "summary_like": ["summary", "overview", "abstract", "executive summary", "introduction", "highlights"],
+    "experience_history": ["experience", "employment", "work history", "career", "positions held", "professional background"],
+    "education_training": ["education", "training", "certification", "qualification", "academic", "degree", "courses"],
+    "financial_data": ["financial", "revenue", "profit", "loss", "balance sheet", "income", "expense", "budget"],
+    "legal_terms": ["terms", "conditions", "liability", "warranty", "indemnity", "agreement", "clause", "governing law"],
+    "clinical_data": ["diagnosis", "treatment", "medication", "patient", "clinical", "lab results", "vitals", "prognosis"],
+    "technical_specs": ["specifications", "technical", "architecture", "system requirements", "configuration", "api"],
+    "appendix": ["appendix", "annex", "attachment", "exhibit", "addendum", "supplementary"],
+    "requirements_like": ["requirements", "spec", "details", "scope", "objectives", "deliverables"],
+    "transactional": ["total due", "amount due", "balance due", "invoice number", "invoice date", "payment terms", "subtotal", "unit price", "net amount"],
+}
+
+
 def _infer_section_role(text: str, title: str, numeric_ratio: float, list_density: float) -> str:
     lowered_title = (title or "").lower()
     lowered_text = (text or "").lower()
-    if any(token in lowered_title for token in ("summary", "overview", "abstract")):
-        return "summary_like"
-    if any(token in lowered_text for token in ("total", "amount", "balance", "due")) or numeric_ratio > 0.07:
-        return "transactional"
-    if list_density > 0.25:
-        return "list_heavy"
-    if any(token in lowered_title for token in ("requirements", "spec", "details")):
-        return "requirements_like"
-    return "descriptive"
+    word_count = len(re.findall(r"\w+", text or ""))
+
+    # Score each role by keyword hits in title (weight 3) + text (weight 1)
+    best_role = "descriptive"
+    best_score = 0.0
+    for role, keywords in _ROLE_KEYWORDS.items():
+        score = 0.0
+        for kw in keywords:
+            if kw in lowered_title:
+                score += 3.0
+            if kw in lowered_text:
+                score += 1.0
+        if score > best_score:
+            best_score = score
+            best_role = role
+
+    # Structural heuristics as tiebreakers when keyword score is low
+    if best_score < 2.0:
+        if numeric_ratio > 0.15:
+            return "transactional"
+        if list_density > 0.25:
+            return "list_heavy"
+        if word_count < 30:
+            return "header_meta"
+        return "descriptive"
+
+    return best_role
 
 
 def _section_importance_score(
@@ -95,18 +137,18 @@ def _element_importance_score(text: str, base: float = 0.5) -> float:
 
 
 def _extract_sections(extracted: Any) -> List[Dict[str, Any]]:
-    sections = list(getattr(extracted, "sections", []) or [])
+    sections = list(_get(extracted, "sections", []) or [])
     if sections:
         return [
             {
-                "title": getattr(sec, "title", "Untitled Section") or "Untitled Section",
-                "text": getattr(sec, "text", "") or "",
-                "start_page": getattr(sec, "start_page", None),
-                "end_page": getattr(sec, "end_page", None),
+                "title": _get(sec, "title", "Untitled Section") or "Untitled Section",
+                "text": _get(sec, "text", "") or "",
+                "start_page": _get(sec, "start_page"),
+                "end_page": _get(sec, "end_page"),
             }
             for sec in sections
         ]
-    full_text = getattr(extracted, "full_text", "") or ""
+    full_text = _get(extracted, "full_text", "") or ""
     if full_text:
         return [{"title": "Document", "text": full_text, "start_page": None, "end_page": None}]
     return []
@@ -147,13 +189,13 @@ def infer_structure(extracted: Any) -> Dict[str, Any]:
         )
 
     tables_payload: List[Dict[str, Any]] = []
-    for table in list(getattr(extracted, "tables", []) or []):
-        text = getattr(table, "text", "") or getattr(table, "csv", "") or ""
-        csv_text = getattr(table, "csv", "") or ""
+    for table in list(_get(extracted, "tables", []) or []):
+        text = _get(table, "text", "") or _get(table, "csv", "") or ""
+        csv_text = _get(table, "csv", "") or ""
         rows = [ln for ln in csv_text.splitlines() if ln.strip()] if csv_text else []
         tables_payload.append(
             {
-                "page": getattr(table, "page", None),
+                "page": _get(table, "page"),
                 "row_count": len(rows),
                 "element_importance_score": _element_importance_score(text, base=0.65),
                 "numeric_ratio": round(_numeric_ratio(text), 4),
@@ -161,17 +203,17 @@ def infer_structure(extracted: Any) -> Dict[str, Any]:
         )
 
     images_payload: List[Dict[str, Any]] = []
-    for figure in list(getattr(extracted, "figures", []) or []):
-        caption = getattr(figure, "caption", "") or ""
+    for figure in list(_get(extracted, "figures", []) or []):
+        caption = _get(figure, "caption", "") or ""
         images_payload.append(
             {
-                "page": getattr(figure, "page", None),
+                "page": _get(figure, "page"),
                 "caption_present": bool(caption.strip()),
                 "element_importance_score": _element_importance_score(caption, base=0.55),
             }
         )
 
-    full_text = getattr(extracted, "full_text", "") or ""
+    full_text = _get(extracted, "full_text", "") or ""
     doc_density = {
         "numeric_ratio": round(_numeric_ratio(full_text), 4),
         "entity_density": round(_entity_density(full_text), 4),

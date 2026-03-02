@@ -250,7 +250,7 @@ async def handle_teams_activity(
             add_message_to_history(
                 user_id=user_id,
                 query=question,
-                answer=answer,
+                response=answer,
                 session_id=context.session_id,
                 new_session=False,
             )

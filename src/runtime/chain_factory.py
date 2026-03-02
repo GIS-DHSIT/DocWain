@@ -66,6 +66,7 @@ class RequestChain:
             tools=self.ctx.tools,
             use_tools=getattr(self.ctx, "use_tools", False),
             tool_inputs=getattr(self.ctx, "tool_inputs", None),
+            enable_internet=getattr(self.ctx, "enable_internet", False),
             rag_system=rag_system,
         )
 

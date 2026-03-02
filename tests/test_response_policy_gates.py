@@ -53,6 +53,18 @@ def test_info_mode_returns_short_intro():
     assert len(intro) <= 500  # Structured response format
 
 
+def test_info_mode_detects_capability_variants():
+    queries = [
+        "What else can you do?",
+        "What all can DocWain do?",
+        "How can you help me?",
+        "What else can you help with?",
+        "How do I compare resumes?",
+    ]
+    for query in queries:
+        assert ResponseModeClassifier.classify(query) == INFO_MODE
+
+
 def test_hallucinated_doc_name_removed():
     ledger, _ = _ledger("The SLA is 99.9%.", source_name="RealDoc.pdf")
     answer = (

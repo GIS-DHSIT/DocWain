@@ -296,6 +296,10 @@ def configure_logging(
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("neo4j.notifications").setLevel(logging.ERROR)
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+    logging.getLogger("pymongo.client").setLevel(logging.WARNING)
+    logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
 
 def get_logger(

@@ -284,15 +284,20 @@ def build_layout_graph(
     ocr_chars = 0
     if isinstance(extracted, ExtractedDocument):
         full_text = extracted.full_text or ""
-        tables = list(extracted.tables or [])
-        ocr_used = any(cand.chunk_type == "ocr_text" for cand in (extracted.chunk_candidates or []))
-        if extracted.chunk_candidates:
-            ocr_chars = sum(len(cand.text or "") for cand in extracted.chunk_candidates if cand.chunk_type == "ocr_text")
+        _raw_tables = extracted.tables
+        tables = list(_raw_tables) if isinstance(_raw_tables, (list, tuple)) else []
+        _raw_candidates = extracted.chunk_candidates
+        if isinstance(_raw_candidates, (list, tuple)):
+            ocr_used = any(cand.chunk_type == "ocr_text" for cand in _raw_candidates)
+            ocr_chars = sum(len(cand.text or "") for cand in _raw_candidates if cand.chunk_type == "ocr_text")
         canon = extracted.canonical_json or {}
-        layout_blocks = list(canon.get("layout_blocks") or [])
-        page_dims = {int(k): v for k, v in (canon.get("page_dims") or {}).items()}
-        if not layout_blocks and canon.get("pages"):
-            layout_blocks = _synthetic_blocks_from_text(canon.get("pages") or [])
+        _raw_blocks = canon.get("layout_blocks")
+        layout_blocks = list(_raw_blocks) if isinstance(_raw_blocks, (list, tuple)) else []
+        _raw_dims = canon.get("page_dims")
+        page_dims = {int(k): v for k, v in _raw_dims.items()} if isinstance(_raw_dims, dict) else {}
+        _raw_pages = canon.get("pages")
+        if not layout_blocks and isinstance(_raw_pages, (list, tuple)) and _raw_pages:
+            layout_blocks = _synthetic_blocks_from_text(_raw_pages)
     elif isinstance(extracted, dict):
         full_text = str(extracted.get("full_text") or extracted.get("text") or "")
         if isinstance(extracted.get("tables"), list):
@@ -301,8 +306,9 @@ def build_layout_graph(
                     tables.append(table)
                 elif isinstance(table, dict):
                     tables.append(Table(page=_safe_int(table.get("page"), 1), text=str(table.get("text") or ""), csv=table.get("csv")))
-        if extracted.get("pages"):
-            layout_blocks = _synthetic_blocks_from_text(extracted.get("pages") or [])
+        _raw_pages = extracted.get("pages")
+        if isinstance(_raw_pages, (list, tuple)) and _raw_pages:
+            layout_blocks = _synthetic_blocks_from_text(_raw_pages)
     elif isinstance(extracted, str):
         full_text = extracted
         layout_blocks = _synthetic_blocks_from_text([{"page_number": 1, "text": extracted}])

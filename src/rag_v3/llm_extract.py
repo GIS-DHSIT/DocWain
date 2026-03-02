@@ -8,6 +8,7 @@ render step.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import logging
 import re
@@ -20,13 +21,148 @@ from .types import LLMBudget, LLMResponseSchema
 logger = logging.getLogger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────
-LLM_EXTRACT_TIMEOUT_S = 60.0
-LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S = 30.0
-LLM_MAX_OUTPUT_TOKENS = 2048
+LLM_EXTRACT_TIMEOUT_S = 30.0
+LLM_MAX_OUTPUT_TOKENS = 1024
 LLM_MAX_CONTEXT_CHARS = 6144
+LLM_MAX_CONTEXT_CHARS_MULTI = 12288  # Expanded limit for multi-document queries
 LLM_MAX_CHUNKS = 8  # Send only top-scored chunks to LLM
+LLM_MAX_CHUNKS_MULTI = 16  # Expanded chunk limit for multi-document queries
 LLM_CHUNKED_TOKEN_THRESHOLD = 2000  # Estimated token count to trigger chunked extraction
 _CHARS_PER_TOKEN = 4  # Rough char-to-token ratio for estimation
+
+
+_INTENT_CHUNK_LIMITS = {
+    "factual": 6,
+    "summary": 10,
+    "comparison": 12,
+    "ranking": 14,
+    "cross_document": 16,
+    "analytics": 16,
+    "reasoning": 12,
+    "timeline": 10,
+    "multi_field": 10,
+}
+
+_INTENT_CONTEXT_CHARS = {
+    "factual": 4096,
+    "summary": 8192,
+    "comparison": 10240,
+    "ranking": 12288,
+    "cross_document": 12288,
+    "analytics": 12288,
+    "reasoning": 10240,
+    "timeline": 8192,
+    "multi_field": 8192,
+}
+
+
+def _effective_max_chunks(num_documents: int, intent: str = "") -> int:
+    """Return chunk limit scaled by document count and intent."""
+    if intent and intent in _INTENT_CHUNK_LIMITS:
+        base = _INTENT_CHUNK_LIMITS[intent]
+    else:
+        base = LLM_MAX_CHUNKS_MULTI if num_documents > 1 else LLM_MAX_CHUNKS
+    # Multi-doc queries always get at least the multi limit
+    if num_documents > 1:
+        base = max(base, LLM_MAX_CHUNKS_MULTI)
+    return base
+
+
+def _effective_context_chars(num_documents: int, intent: str = "") -> int:
+    """Return context char limit scaled by document count and intent."""
+    if intent and intent in _INTENT_CONTEXT_CHARS:
+        base = _INTENT_CONTEXT_CHARS[intent]
+    else:
+        base = LLM_MAX_CONTEXT_CHARS_MULTI if num_documents > 1 else LLM_MAX_CONTEXT_CHARS
+    # Multi-doc queries always get at least the multi limit
+    if num_documents > 1:
+        base = max(base, LLM_MAX_CONTEXT_CHARS_MULTI)
+    return base
+
+
+# ── LLM extraction cache ──────────────────────────────────────────
+
+def _build_cache_key(query: str, chunks: List[Any], intent: Optional[str]) -> str:
+    """Build a deterministic cache key from query + chunk IDs + intent."""
+    chunk_ids = sorted(getattr(c, "id", "") or "" for c in chunks)
+    raw = f"{query}|{'|'.join(chunk_ids)}|{intent or ''}"
+    return f"llm_extract:{hashlib.sha256(raw.encode()).hexdigest()}"
+
+
+def _cache_get(redis_client: Any, key: str) -> Optional[LLMResponseSchema]:
+    """Try to retrieve a cached LLM extraction result."""
+    if redis_client is None:
+        return None
+    try:
+        data = redis_client.get(key)
+        if data:
+            payload = json.loads(data)
+            return LLMResponseSchema(
+                text=payload.get("text", ""),
+                evidence_chunks=payload.get("evidence_chunks", []),
+            )
+    except Exception:
+        pass
+    return None
+
+
+def _cache_set(redis_client: Any, key: str, result: LLMResponseSchema, ttl: int = 3600) -> None:
+    """Store an LLM extraction result in Redis cache."""
+    if redis_client is None:
+        return
+    try:
+        payload = json.dumps({
+            "text": result.text,
+            "evidence_chunks": result.evidence_chunks,
+        })
+        redis_client.setex(key, ttl, payload)
+    except Exception:
+        pass
+
+
+def _verify_self_consistency(
+    answer: str,
+    evidence_text: str,
+    llm_client: Any,
+    correlation_id: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Run a self-consistency check on a cloud-generated answer.
+
+    Asks the LLM whether the answer contradicts the evidence.
+    Returns (is_consistent, corrected_answer).
+    Only called for T3 (cloud LLM) responses to avoid latency on simple queries.
+    """
+    if not answer or not evidence_text:
+        return True, answer
+    prompt = (
+        "You are a fact-checking assistant. Compare the ANSWER against the EVIDENCE below.\n"
+        "Does the answer contain any claims that contradict the evidence?\n\n"
+        f"EVIDENCE:\n{evidence_text[:3000]}\n\n"
+        f"ANSWER:\n{answer}\n\n"
+        "Respond in this format:\n"
+        "CONSISTENT: yes/no\n"
+        "If no, provide a CORRECTED answer that only uses information from the evidence."
+    )
+    try:
+        if hasattr(llm_client, "generate_with_metadata"):
+            text, _ = llm_client.generate_with_metadata(
+                prompt, options={"temperature": 0.0, "num_predict": 512, "num_ctx": 4096}
+            )
+        else:
+            text = llm_client.generate(prompt)
+        text = (text or "").strip()
+        if "CONSISTENT: no" in text.lower() or "consistent: no" in text.lower():
+            # Extract corrected answer
+            corrected_idx = text.lower().find("corrected")
+            if corrected_idx >= 0:
+                corrected = text[corrected_idx:].split("\n", 1)
+                if len(corrected) > 1:
+                    return False, corrected[1].strip()
+            return False, answer  # Couldn't parse correction, keep original
+        return True, answer
+    except Exception as exc:
+        logger.debug("Self-consistency check failed (keeping original): %s", exc)
+        return True, answer
 
 
 def llm_extract_and_respond(
@@ -38,21 +174,52 @@ def llm_extract_and_respond(
     correlation_id: Optional[str] = None,
     intent: Optional[str] = None,
     num_documents: int = 1,
+    tool_context: Optional[str] = None,
+    domain: Optional[str] = None,
+    redis_client: Any = None,
+    context_intelligence: Optional[str] = None,
+    use_thinking: bool = False,
+    multi_resolution_context: Optional[Dict[str, Any]] = None,
 ) -> Optional[LLMResponseSchema]:
     """Answer *query* from *chunks* via a single LLM call with intent-adaptive prompts."""
     if not budget.consume():
         return None
 
+    # ── Cache check ───────────────────────────────────────────────
+    _cache_enabled = False
+    _cache_ttl = 3600
+    try:
+        from src.api.config import Config
+        _cache_enabled = getattr(getattr(Config, "LLMCache", None), "ENABLED", False)
+        _cache_ttl = getattr(getattr(Config, "LLMCache", None), "TTL_SECONDS", 3600)
+    except Exception:
+        pass
+
+    _cache_key = None
+    if _cache_enabled and redis_client and chunks:
+        _cache_key = _build_cache_key(query, chunks, intent)
+        cached = _cache_get(redis_client, _cache_key)
+        if cached:
+            logger.info(
+                "LLM extract cache hit: key=%s",
+                _cache_key[:32],
+                extra={"stage": "llm_extract_cache", "correlation_id": correlation_id},
+            )
+            return cached
+
     # Use expanded 8-type intent classification
     intent_type = classify_query_intent(query, intent_hint=intent)
 
-    # Limit to top chunks by score to keep context manageable for LLM
+    # Limit to top chunks by score — scale for intent and multi-doc queries
+    max_chunks = _effective_max_chunks(num_documents, intent=intent_type)
     scored = [(getattr(c, "score", 0.0) or 0.0, c) for c in chunks]
     scored.sort(key=lambda x: x[0], reverse=True)
-    top_chunks = [c for _, c in scored[:LLM_MAX_CHUNKS]]
+
+    # Deduplicate near-identical chunks before sending to LLM
+    top_chunks = _deduplicate_evidence_chunks([c for _, c in scored[:max_chunks]])
 
     # Build grouped evidence from top chunks only
-    evidence = _build_grouped_evidence(top_chunks)
+    evidence = _build_grouped_evidence(top_chunks, max_context_chars=_effective_context_chars(num_documents, intent=intent_type))
 
     # For reasoning/cross_document intents, build structured evidence chain
     evidence_context = ""
@@ -75,6 +242,10 @@ def llm_extract_and_respond(
         evidence_text=full_evidence,
         intent=intent_type,
         num_documents=num_documents,
+        tool_context=tool_context,
+        domain=domain,
+        context_intelligence=context_intelligence,
+        multi_resolution_context=multi_resolution_context,
     )
 
     # Use GENERATOR role for multi-agent, else default
@@ -97,7 +268,7 @@ def llm_extract_and_respond(
             extra={"stage": "llm_extract", "correlation_id": correlation_id},
         )
 
-    raw_text = _generate(llm_client, prompt, correlation_id, role=_gen_role, fallback_prompt=fallback_prompt)
+    raw_text = _generate(llm_client, prompt, correlation_id, role=_gen_role, fallback_prompt=fallback_prompt, use_thinking=use_thinking)
     if not raw_text:
         logger.warning(
             "LLM extract returned no result: domain=%s chunks=%d est_tokens=%d",
@@ -106,7 +277,37 @@ def llm_extract_and_respond(
         )
         return None
 
-    return _parse_response(raw_text, top_chunks)
+    result = _parse_response(raw_text, top_chunks)
+
+    # ── Store thinking mode metadata on result ────────────────────
+    if result and use_thinking:
+        result.thinking_used = True
+
+    # ── Self-consistency verification for cloud LLM responses ────
+    if result and result.text:
+        _is_cloud = getattr(llm_client, "backend", "") in ("azure_openai", "claude")
+        _verify_enabled = False
+        try:
+            from src.api.config import Config as _VCfg
+            _verify_enabled = getattr(getattr(_VCfg, "Verification", None), "ENABLED", False)
+        except Exception:
+            pass
+        if _is_cloud and _verify_enabled:
+            consistent, corrected = _verify_self_consistency(
+                result.text, full_evidence, llm_client, correlation_id
+            )
+            if not consistent and corrected:
+                result = LLMResponseSchema(text=corrected, evidence_chunks=result.evidence_chunks)
+                logger.info(
+                    "Self-consistency correction applied",
+                    extra={"stage": "llm_verify", "correlation_id": correlation_id},
+                )
+
+    # ── Cache write ───────────────────────────────────────────────
+    if result and _cache_key and _cache_enabled and redis_client:
+        _cache_set(redis_client, _cache_key, result, ttl=_cache_ttl)
+
+    return result
 
 
 # ── intent detection ─────────────────────────────────────────────────
@@ -163,7 +364,7 @@ _CROSS_DOC_RE = re.compile(
     r"\b(?:all\s+(?:candidates?|documents?|resumes?|invoices?)|across|shared?|common|each\s+(?:candidate|document))\b", re.I,
 )
 _ANALYTICS_RE = re.compile(
-    r"\b(?:how many|total (?:amount|number)|average|sum of|count of|across all|in total|distribution)\b", re.I,
+    r"\b(?:how many|total (?:amount|number)|average|sum of|count of|in total|distribution)\b", re.I,
 )
 
 _INTENT_HINT_MAP = {
@@ -242,75 +443,165 @@ _PROMPT_TEMPLATES = {
 # ── intent-adaptive generation templates (8 types) ───────────────────
 
 _GENERATION_SYSTEM = (
-    "You are an intelligent document analysis assistant. "
-    "Answer ONLY from the provided evidence. "
-    "Never invent information. If evidence is insufficient, say so explicitly. "
-    "Cite specific details from the documents.\n"
+    "You are an expert document intelligence analyst with deep analytical skills. "
+    "Answer ONLY from the provided evidence — every claim must be traceable to the documents. "
+    "Never invent, hallucinate, or assume information not present in the evidence. "
+    "When evidence is insufficient, explicitly state what is missing rather than guessing. "
+    "Always cite the source document for key facts. "
+    "Present information in a clear, structured format with specific details and numbers.\n\n"
+    "ANALYTICAL DEPTH:\n"
+    "- Start with a brief overview of what was analyzed\n"
+    "- Identify patterns common across documents and highlight unique findings\n"
+    "- Include aggregate totals, averages, and ranges where applicable\n"
+    "- When comparing, state what was compared and rank highest to lowest\n"
+    "- Conclude with a distribution summary of key findings analyzed across the evidence\n"
 )
 
 _GENERATION_TEMPLATES = {
     "factual": (
-        "Provide a direct, specific answer to the question. "
-        "Include the exact value or fact requested. "
-        "Cite the document source.\n"
+        "Provide a precise, evidence-based answer:\n"
+        "1. Start with a brief overview of what was analyzed\n"
+        "2. Include exact values, names, dates, and numbers from the documents\n"
+        "3. Cite which document each fact comes from\n"
+        "4. If the answer spans multiple documents, organize by source\n"
+        "5. Distinguish between facts stated in documents vs your inferences\n"
+        "6. Conclude with a total summary of findings analyzed across the evidence\n"
     ),
     "comparison": (
         "Compare the {num_documents} document(s) systematically:\n"
-        "1. Identify each entity/document subject\n"
+        "1. Start with an overview of what was compared and analyzed\n"
         "2. Compare on the criteria mentioned in the question\n"
         "3. Present as a structured comparison (use a table if 2+ entities)\n"
-        "4. End with key differences and similarities\n"
+        "4. Identify common patterns and unique differences across the documents\n"
+        "5. End with a total summary ranking from highest to lowest\n"
     ),
     "summary": (
         "Provide a structured summary:\n"
-        "1. Opening statement (1-2 sentences capturing the essence)\n"
+        "1. Start with an overview of the total content analyzed\n"
         "2. Key highlights (3-6 bullet points with specific details)\n"
-        "3. Brief takeaway or notable observation\n"
+        "3. Identify the most common patterns across the evidence\n"
+        "4. End with a total overview of the range of findings analyzed\n"
     ),
     "ranking": (
         "Rank the {num_documents} document subjects based on the criteria:\n"
-        "1. Identify each subject and extract relevant attributes\n"
-        "2. Score/evaluate against the ranking criteria\n"
-        "3. Present as a numbered ranked list\n"
-        "4. Include justification for each ranking position\n"
+        "1. Start with an overview of what was analyzed across the documents\n"
+        "2. Score/evaluate each subject against the ranking criteria\n"
+        "3. Present as a numbered ranked list from highest to lowest\n"
+        "4. Include justification and note common patterns or unique strengths\n"
+        "5. End with a total distribution summary of the range analyzed\n"
     ),
     "timeline": (
         "Present information in chronological order:\n"
-        "1. Identify dates, periods, and sequences\n"
+        "1. Start with an overview of the total time range analyzed\n"
         "2. Arrange events/experiences from earliest to latest\n"
         "3. Show progression or evolution over time\n"
-        "4. Note any gaps in the timeline\n"
+        "4. Identify common patterns and unique milestones across the timeline\n"
+        "5. Note any gaps in the timeline\n"
     ),
     "multi_field": (
         "Extract and present all requested fields systematically:\n"
-        "1. Identify each field/item to extract\n"
+        "1. Start with an overview of the total fields analyzed\n"
         "2. Present in a structured format (table or labeled list)\n"
         "3. Mark any missing or unclear fields\n"
         "4. Include source document for each extraction\n"
+        "5. End with a total summary of findings analyzed across the evidence\n"
     ),
     "reasoning": (
         "Reason through the question using evidence:\n"
-        "1. Identify what evidence supports the question\n"
-        "2. Identify what evidence contradicts or is missing\n"
-        "3. Present supporting factors with specific citations\n"
+        "1. Start with an overview of the total evidence analyzed\n"
+        "2. Identify what evidence supports the question\n"
+        "3. Identify common patterns and unique findings across documents\n"
         "4. Note gaps — explicitly state what the documents do NOT contain\n"
-        "5. Provide a qualified conclusion based on available evidence\n"
+        "5. Provide a qualified conclusion with a distribution of supporting factors\n"
     ),
     "cross_document": (
         "Analyze across all {num_documents} document(s):\n"
-        "1. Extract relevant information from each document\n"
-        "2. Identify patterns, commonalities, and differences\n"
+        "1. Start with an overview of the total documents analyzed\n"
+        "2. Identify common patterns and unique findings across documents\n"
         "3. Present per-document findings, then a synthesis\n"
-        "4. Cite which document each fact comes from\n"
+        "4. End with a distribution summary of the range of findings analyzed\n"
     ),
     "analytics": (
         "Compute aggregate statistics from the {num_documents} document(s):\n"
-        "1. Count documents by type\n"
-        "2. Sum/average any numeric fields mentioned\n"
-        "3. Present statistics clearly with exact numbers\n"
-        "4. Cite which documents contribute to each statistic\n"
+        "1. Start with an overview of the total data analyzed\n"
+        "2. Sum/average any numeric fields; include the range from highest to lowest\n"
+        "3. Identify common patterns and the distribution across documents\n"
+        "4. End with a total overview of the unique and common findings analyzed\n"
     ),
 }
+
+
+_REASONING_PREAMBLE = (
+    "ANALYTICAL APPROACH — follow these steps before answering:\n"
+    "1. Identify all relevant data points across the evidence\n"
+    "2. Find patterns, commonalities, and trends\n"
+    "3. Identify outliers or unusual values\n"
+    "4. Note any contradictions between documents\n"
+    "5. Compute statistics where applicable (counts, averages, ranges)\n"
+    "6. Synthesize findings into a coherent analytical response\n\n"
+)
+
+_COMPLEX_INTENTS = frozenset({
+    "comparison", "ranking", "reasoning", "cross_document", "analytics", "summary",
+})
+
+
+def _build_multi_resolution_context(chunks: List[Any]) -> Optional[Dict[str, Any]]:
+    """Build a multi-resolution context dict from chunks with resolution metadata.
+
+    Separates chunks by their resolution field (doc/section/chunk) from the
+    chunk payload's meta dict.  Returns a dict with:
+        - doc_context: list of (doc_name, summary_text) from resolution="doc" chunks
+        - section_context: list of (section_title, text) from resolution="section" chunks
+        - chunk_evidence: remaining chunks at chunk resolution
+
+    Returns None when no multi-resolution data is present in any chunk.
+    """
+    doc_chunks: List[Tuple[str, str]] = []
+    section_chunks: List[Tuple[str, str]] = []
+    regular_chunks: List[Any] = []
+
+    found_multi_res = False
+
+    for chunk in chunks:
+        meta = getattr(chunk, "meta", None) or {}
+        resolution = str(meta.get("resolution") or meta.get("chunk_resolution") or "").lower().strip()
+        chunk_kind = str(meta.get("chunk_kind") or meta.get("chunk_type") or "").lower().strip()
+        text = (getattr(chunk, "text", "") or "").strip()
+
+        if not text:
+            continue
+
+        source = getattr(chunk, "source", None)
+        doc_name = (
+            meta.get("source_name")
+            or meta.get("document_name")
+            or (getattr(source, "document_name", "") if source else "")
+            or "Document"
+        )
+
+        if resolution == "doc" or chunk_kind in ("doc_summary", "document_summary"):
+            found_multi_res = True
+            doc_chunks.append((doc_name, text))
+        elif resolution == "section":
+            found_multi_res = True
+            section_title = (
+                meta.get("section_title")
+                or meta.get("section.title")
+                or "Section"
+            )
+            section_chunks.append((str(section_title), text))
+        else:
+            regular_chunks.append(chunk)
+
+    if not found_multi_res:
+        return None
+
+    return {
+        "doc_context": doc_chunks,
+        "section_context": section_chunks,
+        "chunk_evidence": regular_chunks,
+    }
 
 
 def build_generation_prompt(
@@ -319,23 +610,102 @@ def build_generation_prompt(
     evidence_text: str,
     intent: str,
     num_documents: int = 1,
+    tool_context: Optional[str] = None,
+    domain: Optional[str] = None,
+    context_intelligence: Optional[str] = None,
+    multi_resolution_context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build a structured prompt for the LLM generation call."""
     template = _GENERATION_TEMPLATES.get(intent, _GENERATION_TEMPLATES["factual"])
     if "{num_documents}" in template:
         template = template.format(num_documents=num_documents)
 
-    max_evidence = LLM_MAX_CONTEXT_CHARS - 1500
+    # Use scaled limits for intent and multi-doc queries
+    effective_max = _effective_context_chars(num_documents, intent=intent)
+    max_evidence = effective_max - 1500
     if len(evidence_text) > max_evidence:
         evidence_text = evidence_text[:max_evidence]
 
+    tool_section = f"\nDOMAIN EXPERTISE:\n{tool_context}\n" if tool_context else ""
+
+    # Inject domain knowledge context when available and no tool_context already present
+    domain_section = ""
+    if domain and not tool_context:
+        domain_section = _get_domain_knowledge_section(domain, intent)
+
+    # Inject ML-based context understanding when available
+    context_section = ""
+    if context_intelligence:
+        context_section = f"\n{context_intelligence}\n"
+
+    # Prepend analytical reasoning preamble for complex intents or multi-doc queries
+    reasoning_section = ""
+    if intent in _COMPLEX_INTENTS or num_documents > 1:
+        reasoning_section = _REASONING_PREAMBLE
+
+    # Build multi-resolution context section when doc/section level data is available
+    multi_res_section = ""
+    if multi_resolution_context:
+        parts: List[str] = []
+        doc_ctx = multi_resolution_context.get("doc_context") or []
+        sec_ctx = multi_resolution_context.get("section_context") or []
+
+        if doc_ctx:
+            doc_lines = []
+            for doc_name, summary in doc_ctx:
+                doc_lines.append(f"  [{doc_name}]: {summary[:400]}")
+            parts.append("[DOCUMENT CONTEXT]\n" + "\n".join(doc_lines))
+
+        if sec_ctx:
+            sec_lines = []
+            for sec_title, sec_text in sec_ctx[:6]:  # cap at 6 sections
+                sec_lines.append(f"  [{sec_title}]: {sec_text[:300]}")
+            parts.append("[SECTION CONTEXT]\n" + "\n".join(sec_lines))
+
+        if parts:
+            parts.append("[EVIDENCE FROM DOCUMENTS]")
+            multi_res_section = "\n\n".join(parts) + "\n"
+
+    # When multi-resolution context provides doc/section headers, use it as preamble
+    evidence_block = (
+        f"{multi_res_section}{evidence_text}"
+        if multi_res_section
+        else evidence_text
+    )
+
     return (
         f"{_GENERATION_SYSTEM}\n"
+        f"{reasoning_section}"
         f"TASK:\n{template}\n"
+        f"{tool_section}"
+        f"{domain_section}"
+        f"{context_section}"
         f"QUESTION: {query}\n\n"
-        f"DOCUMENT EVIDENCE:\n{evidence_text}\n\n"
-        "Answer thoroughly. Be specific and cite document details."
+        f"DOCUMENT EVIDENCE:\n{evidence_block}\n\n"
+        "INSTRUCTIONS: Answer thoroughly and accurately. "
+        "Include specific names, numbers, dates, and details from the evidence. "
+        "Reference source documents by name. "
+        "Use the document intelligence and extracted facts above to ensure completeness. "
+        "Structure your response with clear sections when the answer is complex."
     )
+
+
+def _get_domain_knowledge_section(domain: str, intent: str) -> str:
+    """Build a domain knowledge section for LLM prompt injection."""
+    try:
+        from src.intelligence.domain_knowledge import get_domain_knowledge_provider
+        from src.api.config import Config
+        if not getattr(Config, "DomainKnowledge", None):
+            return ""
+        if not Config.DomainKnowledge.ENABLED or not Config.DomainKnowledge.INJECT_INTO_PROMPTS:
+            return ""
+        provider = get_domain_knowledge_provider()
+        brief = provider.get_brief_context(domain, intent=intent)
+        if brief:
+            return f"\nDOMAIN KNOWLEDGE:\n{brief}\n"
+    except Exception:
+        pass
+    return ""
 
 
 def _build_prompt(
@@ -361,8 +731,50 @@ def _build_prompt(
     )
 
 
-def _build_grouped_evidence(chunks: List[Any]) -> str:
+def _deduplicate_evidence_chunks(chunks: List[Any], threshold: float = 0.70) -> List[Any]:
+    """Remove near-duplicate chunks using Jaccard word overlap.
+
+    Keeps the first (highest-scored) chunk when two chunks have word overlap
+    >= *threshold*.  This maximizes unique evidence sent to the LLM.
+    """
+    if len(chunks) <= 1:
+        return chunks
+
+    kept: List[Any] = []
+    kept_word_sets: List[set] = []
+
+    for chunk in chunks:
+        text = (getattr(chunk, "text", "") or "").strip().lower()
+        if not text:
+            continue
+        words = set(text.split())
+        if not words:
+            kept.append(chunk)
+            kept_word_sets.append(words)
+            continue
+
+        is_dup = False
+        for existing_words in kept_word_sets:
+            if not existing_words:
+                continue
+            intersection = len(words & existing_words)
+            union = len(words | existing_words)
+            if union > 0 and intersection / union >= threshold:
+                is_dup = True
+                break
+
+        if not is_dup:
+            kept.append(chunk)
+            kept_word_sets.append(words)
+
+    return kept
+
+
+def _build_grouped_evidence(chunks: List[Any], max_context_chars: int = 0) -> str:
     """Group chunks by document and format with headers."""
+    if max_context_chars <= 0:
+        max_context_chars = LLM_MAX_CONTEXT_CHARS
+
     doc_groups: OrderedDict[str, List[dict]] = OrderedDict()
 
     for chunk in chunks:
@@ -400,12 +812,12 @@ def _build_grouped_evidence(chunks: List[Any]) -> str:
         for entry in entries:
             section_label = f"[{entry['section']}] " if entry["section"] else ""
             block = f"{section_label}{entry['text']}"
-            if total_chars + len(block) > LLM_MAX_CONTEXT_CHARS:
+            if total_chars + len(block) > max_context_chars:
                 break
             parts.append(block)
             total_chars += len(block)
 
-        if total_chars > LLM_MAX_CONTEXT_CHARS:
+        if total_chars > max_context_chars:
             break
 
     return "\n\n".join(parts)
@@ -434,6 +846,7 @@ def _generate(
     role: Optional[str] = None,
     *,
     fallback_prompt: Optional[str] = None,
+    use_thinking: bool = False,
 ) -> Optional[str]:
     options = {
         "num_predict": LLM_MAX_OUTPUT_TOKENS,
@@ -441,6 +854,17 @@ def _generate(
         "num_ctx": 4096,
         "stop": [],
     }
+
+    # Thinking mode: expand context/prediction limits and enable reasoning
+    if use_thinking:
+        options["think"] = True
+        options["num_ctx"] = max(options.get("num_ctx", 4096), 12288)
+        options["num_predict"] = max(options.get("num_predict", 512), 2048)
+        logger.info(
+            "Thinking mode enabled: num_ctx=%d num_predict=%d",
+            options["num_ctx"], options["num_predict"],
+            extra={"stage": "llm_extract_thinking", "correlation_id": correlation_id},
+        )
 
     def _call(p: str) -> str:
         # Multi-agent role-aware dispatch (isinstance avoids MagicMock false positives)
@@ -461,46 +885,23 @@ def _generate(
             return text or ""
         return llm_client.generate(p, max_retries=1, backoff=0.4) or ""
 
+    # Use fallback (simplified) prompt when context is very large — avoids
+    # sending huge prompts that take too long to generate.
+    effective_prompt = fallback_prompt if fallback_prompt else prompt
+
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(_call, prompt)
+    future = executor.submit(_call, effective_prompt)
     try:
-        # Try intermediate timeout first if we have a fallback prompt
-        timeout = LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S if fallback_prompt else LLM_EXTRACT_TIMEOUT_S
-        result = future.result(timeout=timeout)
+        result = future.result(timeout=LLM_EXTRACT_TIMEOUT_S)
         return result if result and result.strip() else None
     except concurrent.futures.TimeoutError:
         future.cancel()
-        if fallback_prompt:
-            logger.warning(
-                "LLM extract hit intermediate timeout (%.1fs), retrying with simplified prompt",
-                LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S,
-                extra={"stage": "llm_extract", "correlation_id": correlation_id},
-            )
-            # Retry with simplified prompt and remaining time budget
-            executor2 = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future2 = executor2.submit(_call, fallback_prompt)
-            try:
-                remaining = LLM_EXTRACT_TIMEOUT_S - LLM_EXTRACT_INTERMEDIATE_TIMEOUT_S
-                result = future2.result(timeout=max(remaining, 5.0))
-                return result if result and result.strip() else None
-            except (concurrent.futures.TimeoutError, Exception) as exc:
-                future2.cancel()
-                logger.warning(
-                    "LLM extract fallback also failed after %.1fs: %s",
-                    LLM_EXTRACT_TIMEOUT_S,
-                    exc,
-                    extra={"stage": "llm_extract", "correlation_id": correlation_id},
-                )
-                return None
-            finally:
-                executor2.shutdown(wait=False)
-        else:
-            logger.warning(
-                "LLM extract timed out after %.1fs",
-                LLM_EXTRACT_TIMEOUT_S,
-                extra={"stage": "llm_extract", "correlation_id": correlation_id},
-            )
-            return None
+        logger.warning(
+            "LLM extract timed out after %.1fs",
+            LLM_EXTRACT_TIMEOUT_S,
+            extra={"stage": "llm_extract", "correlation_id": correlation_id},
+        )
+        return None
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "LLM extract failed: %s",

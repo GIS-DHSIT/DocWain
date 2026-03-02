@@ -74,6 +74,7 @@ class InvoiceSchema(BaseModel):
     totals: FieldValuesField = Field(default_factory=FieldValuesField)
     parties: FieldValuesField = Field(default_factory=FieldValuesField)
     terms: FieldValuesField = Field(default_factory=FieldValuesField)
+    invoice_metadata: FieldValuesField = Field(default_factory=FieldValuesField)
 
 
 class Candidate(BaseModel):
@@ -183,6 +184,7 @@ class LLMResponseSchema(BaseModel):
 
     text: str
     evidence_chunks: List[str] = Field(default_factory=list)
+    thinking_used: bool = False
 
 
 @dataclass

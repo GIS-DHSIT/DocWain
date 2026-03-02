@@ -1,4 +1,5 @@
 import base64
+import copy
 from pathlib import Path
 
 import pytest
@@ -115,6 +116,98 @@ def test_chat_history_uses_chat_container(monkeypatch):
 
     assert history == {"sessions": []}
     assert fake_container.blob_names == ["chat_history/user-1.json", "chat_history/user-1.json"]
+
+
+def test_add_message_to_history_accepts_legacy_answer_kwarg(monkeypatch):
+    history_store = {
+        "sessions": [
+            {
+                "session_id": "sess-1",
+                "title": "Initial",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "messages": [{"query": "hello", "response": "hi", "timestamp": "2026-01-01T00:00:00+00:00"}],
+            }
+        ]
+    }
+
+    def _get_history(_user_id):
+        return copy.deepcopy(history_store)
+
+    def _save_history(_user_id, payload):
+        history_store.clear()
+        history_store.update(copy.deepcopy(payload))
+
+    monkeypatch.setattr(dw_chat, "get_chat_history", _get_history)
+    monkeypatch.setattr(dw_chat, "save_chat_history", _save_history)
+
+    _, session_id = dw_chat.add_message_to_history(
+        user_id="user-1",
+        query="what is next?",
+        answer={"response": "next answer", "sources": [{"source_name": "doc.pdf"}]},
+        session_id="sess-1",
+    )
+
+    assert session_id == "sess-1"
+    assert len(history_store["sessions"][0]["messages"]) == 2
+    latest = history_store["sessions"][0]["messages"][-1]
+    assert latest["query"] == "what is next?"
+    assert latest["response"]["response"] == "next answer"
+
+
+def test_add_message_to_history_trims_session_message_count(monkeypatch):
+    history_store = {"sessions": []}
+
+    def _get_history(_user_id):
+        return copy.deepcopy(history_store)
+
+    def _save_history(_user_id, payload):
+        history_store.clear()
+        history_store.update(copy.deepcopy(payload))
+
+    monkeypatch.setattr(dw_chat, "get_chat_history", _get_history)
+    monkeypatch.setattr(dw_chat, "save_chat_history", _save_history)
+    monkeypatch.setattr(dw_chat, "MAX_MESSAGES_PER_SESSION", 3)
+
+    for idx in range(5):
+        dw_chat.add_message_to_history(
+            user_id="user-1",
+            query=f"q-{idx}",
+            response=f"a-{idx}",
+            session_id="sess-trim",
+        )
+
+    session = history_store["sessions"][0]
+    messages = session["messages"]
+    assert len(messages) == 3
+    assert [m["query"] for m in messages] == ["q-2", "q-3", "q-4"]
+
+
+def test_get_current_session_context_prefers_latest_updated_session(monkeypatch):
+    payload = {
+        "sessions": [
+            {
+                "session_id": "older",
+                "title": "Old",
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00",
+                "messages": [{"query": "old q", "response": "old a", "timestamp": "2026-01-01T00:00:00+00:00"}],
+            },
+            {
+                "session_id": "latest",
+                "title": "New",
+                "created_at": "2026-02-01T00:00:00+00:00",
+                "updated_at": "2026-02-02T00:00:00+00:00",
+                "messages": [{"query": "new q", "response": {"response": "new a"}, "timestamp": "2026-02-02T00:00:00+00:00"}],
+            },
+        ]
+    }
+    monkeypatch.setattr(dw_chat, "get_chat_history", lambda _user_id: copy.deepcopy(payload))
+
+    context = dw_chat.get_current_session_context("user-1", session_id=None, max_messages=5)
+    assert len(context) == 1
+    assert context[0]["query"] == "new q"
+    assert context[0]["response"] == "new a"
 
 
 def test_blob_store_uses_document_container(monkeypatch):

@@ -42,7 +42,14 @@ except Exception as _datahandler_exc:  # noqa: BLE001
     get_subscription_pii_setting = _datahandler_unavailable
     trainData = _datahandler_unavailable
     train_single_document = _datahandler_unavailable
-from src.api.dw_chat import delete_chat_history, delete_session, get_chat_history, get_session_by_id, get_session_list
+from src.api.dw_chat import (
+    add_message_to_history,
+    delete_chat_history,
+    delete_session,
+    get_chat_history,
+    get_session_by_id,
+    get_session_list,
+)
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
 from src.api.debug import debug_router
@@ -50,6 +57,12 @@ from src.api.health_endpoints import health_router
 from src.api.profile_documents_api import profile_docs_router
 from src.api.profiles_api import profiles_router
 from src.api.knowledge_graph import knowledge_graph_router
+try:
+    from src.api.extraction_pipeline_api import extraction_router
+    _EXTRACTION_ROUTER_AVAILABLE = True
+except ImportError:
+    _EXTRACTION_ROUTER_AVAILABLE = False
+    extraction_router = None
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
@@ -99,16 +112,20 @@ except ImportError:
     docwain_teams_bot = None
     MICROSOFT_APP_ID = None
     MICROSOFT_APP_PASSWORD = None
-# Import tool modules to trigger @register_tool registration, then mount gateway only.
-# Screening is handled by /api/gateway/screen. Tools are invoked via /api/ask with the tools field.
+# Import agent modules to trigger @register_agent registration, then mount gateway only.
+# Screening is handled by /api/gateway/screen. Agents are invoked via /api/ask with the tools field.
 import src.tools.stt, src.tools.tts, src.tools.translator  # noqa: F401, E401
 import src.tools.tutor, src.tools.creator, src.tools.email_drafting  # noqa: F401, E401
 import src.tools.db_connector, src.tools.code_docs, src.tools.medical  # noqa: F401, E401
 import src.tools.lawhere, src.tools.resumes  # noqa: F401, E401
 import src.tools.jira_confluence, src.tools.web_extract, src.tools.image_analysis  # noqa: F401, E401
+import src.tools.insights, src.tools.action_items  # noqa: F401, E401
+import src.tools.web_search  # noqa: F401, E401
 import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
 import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
 from src.gateway.api import gateway_router
+from src.tools.router import tools_router
+from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
 
@@ -151,6 +168,29 @@ api_router.include_router(profile_docs_router)
 api_router.include_router(gateway_router, tags=["Gateway"])
 api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
+api_router.include_router(tools_router, tags=["Agents"])
+
+
+@api_router.get("/agents/capabilities", tags=["Agents"])
+def list_available_agents_with_capabilities():
+    """List all available agents with their intelligence profiles and capabilities."""
+    from src.tools.intelligence import list_agents_with_capabilities
+    return list_agents_with_capabilities()
+
+
+@api_router.get("/tools", tags=["Agents"], deprecated=True)
+def list_available_tools():
+    """List all available tools with their intelligence profiles and capabilities.
+
+    .. deprecated::
+        Use ``GET /api/agents/capabilities`` instead.
+    """
+    return list_available_agents_with_capabilities()
+
+
+api_router.include_router(agents_router, tags=["Agents"])
+if _EXTRACTION_ROUTER_AVAILABLE and extraction_router:
+    api_router.include_router(extraction_router, tags=["Extraction Pipeline"])
 
 
 class FeedbackRequest(BaseModel):
@@ -213,6 +253,9 @@ class QuestionRequest(BaseModel):
         return None
     tool_inputs: Optional[Dict[str, Any]] = None
     use_tools: bool = False
+    enable_internet: bool = False
+    agent_name: Optional[str] = Field(default=None, description="Domain agent to invoke (e.g. 'hr', 'medical', 'legal', 'content')")
+    agent_task: Optional[str] = Field(default=None, description="Specific agent task (e.g. 'generate_interview_questions')")
 
 
 class AnswerPayload(BaseModel):
@@ -301,6 +344,126 @@ def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Option
         pass
 
     return None, "missing"
+
+
+def _history_response_text(value: Any) -> str:
+    """Extract plain-text assistant response from stored history payloads."""
+    if isinstance(value, dict):
+        payload = value.get("response")
+        if isinstance(payload, str):
+            return payload.strip()
+        if payload is not None:
+            return str(payload).strip()
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value or "").strip()
+
+
+def _hydrate_runtime_session_context(
+    *,
+    user_id: str,
+    session_id: Optional[str],
+    subscription_id: str,
+    profile_id: str,
+) -> None:
+    """
+    Rehydrate Redis/in-memory conversation memory from persisted chat history
+    when runtime memory is empty, so follow-up chats can continue after restarts.
+    """
+    if not user_id or not session_id:
+        return
+
+    state = rag_state.get_app_state()
+    rag_system = state.rag_system if state else None
+    if rag_system is None:
+        return
+
+    conversation_history = getattr(rag_system, "conversation_history", None)
+    conversation_state = getattr(rag_system, "conversation_state", None)
+    if conversation_history is None and conversation_state is None:
+        return
+
+    try:
+        from src.api.dw_newron import _build_namespace
+    except Exception:
+        return
+
+    namespace = _build_namespace(
+        str(subscription_id),
+        str(profile_id),
+        getattr(rag_system, "model_name", "") or "default",
+        session_id,
+    )
+
+    try:
+        if conversation_history is not None and hasattr(conversation_history, "get_context"):
+            existing = conversation_history.get_context(namespace, user_id, max_turns=1)
+            if existing:
+                return
+    except Exception:
+        pass
+
+    archived_session = get_session_by_id(user_id, session_id)
+    if not archived_session:
+        return
+
+    archived_messages = archived_session.get("messages") or []
+    if not archived_messages:
+        return
+
+    to_rehydrate = archived_messages[-8:]
+    restored = 0
+    for message in to_rehydrate:
+        if not isinstance(message, dict):
+            continue
+        query = str(message.get("query") or "").strip()
+        answer_text = _history_response_text(message.get("response"))
+        if not query or not answer_text:
+            continue
+        try:
+            if conversation_state is not None and hasattr(conversation_state, "record_turn"):
+                conversation_state.record_turn(namespace, user_id, query, answer_text, resolved_query=None)
+            elif conversation_history is not None and hasattr(conversation_history, "add_turn"):
+                conversation_history.add_turn(namespace, user_id, query, answer_text)
+            else:
+                break
+            restored += 1
+        except Exception:
+            continue
+
+    if restored:
+        logger.info(
+            "Hydrated runtime conversation memory | user=%s session=%s turns=%d",
+            user_id,
+            session_id,
+            restored,
+        )
+
+
+def _persist_chat_turn(
+    *,
+    user_id: str,
+    query: str,
+    answer_payload: Dict[str, Any],
+    session_id: Optional[str],
+    new_session: bool,
+) -> Optional[str]:
+    """Persist turn to durable chat history and return effective session_id."""
+    if not user_id:
+        return session_id
+    try:
+        _, active_session_id = add_message_to_history(
+            user_id=user_id,
+            query=query,
+            response=answer_payload,
+            session_id=session_id,
+            new_session=new_session,
+        )
+        return active_session_id or session_id
+    except Exception as exc:
+        logger.debug("Chat history persistence skipped: %s", exc)
+        return session_id
 
 
 def _normalize_answer(answer):
@@ -740,6 +903,7 @@ def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool
         tools=request.tools,
         use_tools=bool(getattr(request, "use_tools", False)),
         tool_inputs=request.tool_inputs,
+        enable_internet=bool(getattr(request, "enable_internet", False)),
     )
     return session_id, session_state, mode, ctx
 
@@ -770,6 +934,12 @@ def ask_question_api(
             ),
         )
     object.__setattr__(request, "profile_id", resolved_profile_id)
+    _hydrate_runtime_session_context(
+        user_id=request.user_id,
+        session_id=session_id,
+        subscription_id=request.subscription_id,
+        profile_id=request.profile_id,
+    )
 
     if request.tool_hint == "dialogue_intel":
         route_state = {
@@ -781,21 +951,107 @@ def ask_question_api(
             response_text = decision.response_text or ""
             response_text = sanitize_response(response_text)
             answer_payload = AnswerPayload(response=response_text, sources=[], grounded=True, context_found=False)
-            return AskResponse(answer=answer_payload, current_session_id=session_id, debug={})
+            persisted_session_id = _persist_chat_turn(
+                user_id=request.user_id,
+                query=request.query,
+                answer_payload=answer_payload.model_dump(),
+                session_id=session_id,
+                new_session=bool(request.new_session),
+            )
+            return AskResponse(answer=answer_payload, current_session_id=persisted_session_id, debug={})
+
+    # ── Agent dispatch: explicit agent_name routes directly to domain agent ──
+    _agent_name = getattr(request, "agent_name", None)
+    if _agent_name:
+        try:
+            from src.agentic.domain_agents import get_domain_agent, detect_agent_task
+            _agent = get_domain_agent(_agent_name)
+            if _agent:
+                # Determine task type: explicit, auto-detected, or default
+                _task = getattr(request, "agent_task", None)
+                if not _task:
+                    _det = detect_agent_task(request.query, domain=_agent.domain)
+                    _task = _det["task_type"] if _det else _agent.get_capabilities()[0]
+
+                # Retrieve RAG context for the agent
+                _agent_ctx: Dict[str, Any] = {"query": request.query}
+                try:
+                    from src.agentic.api_router import _retrieve_rag_context
+                    _rag_text = _retrieve_rag_context(
+                        query=request.query,
+                        subscription_id=request.subscription_id,
+                        profile_id=request.profile_id,
+                    )
+                    if _rag_text:
+                        _agent_ctx["text"] = _rag_text
+                except Exception:
+                    pass
+
+                # Add tool_inputs if provided
+                if request.tool_inputs:
+                    _agent_ctx.update(request.tool_inputs)
+
+                _agent_result = _agent.execute(_task, _agent_ctx)
+                if _agent_result.success and _agent_result.output:
+                    _agent_answer = {
+                        "response": _agent_result.output,
+                        "sources": _agent_result.sources,
+                        "grounded": True,
+                        "context_found": bool(_agent_ctx.get("text")),
+                        "metadata": {
+                            "agent": _agent_name,
+                            "agent_task": _task,
+                            "agent_handled": True,
+                        },
+                    }
+                    normalized = normalize_answer(_agent_answer)
+                    persisted_session_id = _persist_chat_turn(
+                        user_id=request.user_id,
+                        query=request.query,
+                        answer_payload=normalized,
+                        session_id=session_id,
+                        new_session=bool(request.new_session),
+                    )
+                    answer_payload = AnswerPayload(**normalized)
+                    return AskResponse(
+                        answer=answer_payload,
+                        current_session_id=persisted_session_id,
+                        debug={"agent": _agent_name, "task": _task},
+                    )
+        except Exception as _agent_exc:
+            logger.debug("Agent dispatch via /ask failed, falling through: %s", _agent_exc)
 
     session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
     want_stream = bool(getattr(request, "stream", False) or stream)
     result = execute_request(request, session_state, ctx, stream=want_stream, debug=bool(request.debug))
 
     if want_stream:
+        normalized_stream_answer = normalize_answer(result.answer)
+        persisted_session_id = _persist_chat_turn(
+            user_id=request.user_id,
+            query=request.query,
+            answer_payload=normalized_stream_answer,
+            session_id=session_id,
+            new_session=bool(request.new_session),
+        )
         stream_iter = result.stream or []
-        return StreamingResponse(stream_iter, media_type="text/plain")
+        response = StreamingResponse(stream_iter, media_type="text/plain")
+        if persisted_session_id:
+            response.headers["X-Session-ID"] = persisted_session_id
+        return response
 
     normalized = normalize_answer(result.answer)
+    persisted_session_id = _persist_chat_turn(
+        user_id=request.user_id,
+        query=request.query,
+        answer_payload=normalized,
+        session_id=session_id,
+        new_session=bool(request.new_session),
+    )
     answer_payload = AnswerPayload(**normalized)
     return AskResponse(
         answer=answer_payload,
-        current_session_id=session_id,
+        current_session_id=persisted_session_id,
         debug=result.debug or {},
     )
 
@@ -1300,6 +1556,21 @@ def record_positive_feedback(request: FeedbackRequest):
         sources=request.sources,
         metadata=metadata,
     )
+    # Persist to MongoDB for queryable feedback analysis
+    try:
+        from src.api.dataHandler import db as _feedback_db
+        if _feedback_db is not None:
+            from datetime import datetime
+            _feedback_db.feedback.insert_one({
+                "type": "positive",
+                "query": request.query,
+                "answer": request.answer,
+                "sources": request.sources,
+                "metadata": metadata,
+                "timestamp": datetime.utcnow(),
+            })
+    except Exception as _fb_exc:
+        logging.warning("Feedback MongoDB write failed: %s", _fb_exc)
     return {"status": "ok", "feedback": "positive"}
 
 
@@ -1315,6 +1586,22 @@ def record_negative_feedback(request: FeedbackRequest):
         reason=request.reason or "user_reported",
         metadata=metadata,
     )
+    # Persist to MongoDB for queryable feedback analysis
+    try:
+        from src.api.dataHandler import db as _feedback_db
+        if _feedback_db is not None:
+            from datetime import datetime
+            _feedback_db.feedback.insert_one({
+                "type": "negative",
+                "query": request.query,
+                "answer": request.answer,
+                "reason": request.reason or "user_reported",
+                "sources": request.sources,
+                "metadata": metadata,
+                "timestamp": datetime.utcnow(),
+            })
+    except Exception as _fb_exc:
+        logging.warning("Feedback MongoDB write failed: %s", _fb_exc)
     return {"status": "ok", "feedback": "negative"}
 
 '''

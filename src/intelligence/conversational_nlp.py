@@ -53,6 +53,16 @@ _HELP_META_OVERRIDE = re.compile(
     re.I,
 )
 
+# Capability-meta override — common "what else can you do/help with?" variants.
+_CAPABILITY_META_OVERRIDE = re.compile(
+    r"\b(?:"
+    r"what\s+(?:else\s+|all\s+)?can\s+(?:you|docwain)\s+(?:do|help\s+with)|"
+    r"show\s+me\s+what\s+(?:you|docwain)\s+can\s+do|"
+    r"how\s+can\s+(?:you|docwain)\s+help(?:\s+me)?"
+    r")\b",
+    re.I,
+)
+
 # Document discovery patterns — matched BEFORE doc query overrides.
 _DOCUMENT_DISCOVERY_PATTERNS = [
     re.compile(r"\bwhat\s+can\s+i\s+(?:do|perform|ask)\s+with\s+(?:these|my|the)\s+documents?\b", re.I),
@@ -61,6 +71,10 @@ _DOCUMENT_DISCOVERY_PATTERNS = [
     re.compile(r"\bwhat\s+can\s+i\s+ask\s+(?:about|you)?\b", re.I),
     re.compile(r"\bwhat\s+(?:is|are)\s+(?:available|uploaded|in\s+my\s+profile)\b", re.I),
     re.compile(r"\blist\s+(?:my\s+)?(?:uploaded\s+)?documents?\b", re.I),
+    # "what types/kinds of documents do I have" — inventory, not capability
+    re.compile(r"\bwhat\s+(?:types?|kinds?)\s+of\s+(?:documents?|files?)\s+(?:do\s+i\s+have|are\s+(?:there|in\s+my))\b", re.I),
+    # "how many documents" — document count question
+    re.compile(r"\bhow\s+many\s+(?:documents?|files?|resumes?|invoices?)\b", re.I),
 ]
 
 # Document-query override patterns — if these match, it's NOT conversational.
@@ -128,11 +142,18 @@ _INTENT_PATTERNS: Dict[str, List[re.Pattern]] = {
     ],
     CAPABILITY: [
         re.compile(r"\bwhat\s+can\s+you\s+do\b", re.I),
+        re.compile(r"\bwhat\s+else\s+can\s+you\s+do\b", re.I),
+        re.compile(r"\bwhat\s+all\s+can\s+(?:you|docwain)\s+do\b", re.I),
         re.compile(r"\bwhat\s+(?:are\s+your|do\s+you\s+have)\s+(?:features|capabilities)\b", re.I),
         re.compile(r"\blist\s+(?:your\s+)?features\b", re.I),
+        re.compile(r"\blist\s+(?:your\s+)?capabilities\b", re.I),
         re.compile(r"\bwhat\s+(?:do\s+you|can\s+you)\s+(?:help\s+with|support)\b", re.I),
+        re.compile(r"\bwhat\s+else\s+can\s+you\s+help\s+with\b", re.I),
+        re.compile(r"\bhow\s+can\s+(?:you|docwain)\s+help(?:\s+me)?\b", re.I),
+        re.compile(r"\bwhat\s+can\s+i\s+do\s+with\s+docwain\b", re.I),
+        re.compile(r"\bwhat\s+can\s+docwain\s+do\b", re.I),
         re.compile(r"\bshow\s+me\s+what\s+you\s+can\s+do\b", re.I),
-        re.compile(r"\bwhat\s+(?:types?|kinds?)\s+of\s+(?:documents?|files?)\b", re.I),
+        re.compile(r"\bwhat\s+(?:types?|kinds?)\s+of\s+(?:documents?|files?)\s+(?:can|do)\s+you\b", re.I),
     ],
     HOW_IT_WORKS: [
         re.compile(r"\bhow\s+do\s+you\s+work\b", re.I),
@@ -223,6 +244,10 @@ def classify_conversational_intent(
     if _HELP_META_OVERRIDE.search(text):
         return (USAGE_HELP, 0.90)
 
+    # Capability-meta override — "what else can you do?" is conversational.
+    if _CAPABILITY_META_OVERRIDE.search(text):
+        return (CAPABILITY, 0.92)
+
     # Document query override — these are NOT conversational.
     for pat in _DOC_QUERY_OVERRIDES:
         if pat.search(text):
@@ -279,12 +304,37 @@ def _time_of_day(hour: Optional[int] = None) -> str:
     return "night"
 
 
+def _mongodb_doc_summary(subscription_id: str, profile_id: str):
+    """Fetch document names and domains from MongoDB (authoritative source)."""
+    try:
+        from src.api.config import Config
+        import pymongo
+        client = pymongo.MongoClient(Config.MongoDB.URI, serverSelectionTimeoutMS=3000)
+        db = client[Config.MongoDB.DB]
+        cursor = db.documents.find(
+            {"subscription_id": subscription_id, "profile_id": profile_id,
+             "status": {"$nin": ["DELETED"]}},
+            {"name": 1, "doc_domain": 1},
+        )
+        docs = list(cursor)
+        names = [d.get("name", "") for d in docs if d.get("name")]
+        domains_list = [d.get("doc_domain", "") for d in docs if d.get("doc_domain")]
+        domain_counts: Dict[str, int] = {}
+        for dom in domains_list:
+            domain_counts[dom] = domain_counts.get(dom, 0) + 1
+        return len(docs), names, domain_counts
+    except Exception:
+        return 0, [], {}
+
+
 def collect_context(
     *,
     catalog: Optional[Dict[str, Any]] = None,
     session_state: Optional[Dict[str, Any]] = None,
     collection_point_count: int = 0,
     hour: Optional[int] = None,
+    subscription_id: str = "",
+    profile_id: str = "",
 ) -> ConversationalContext:
     catalog = catalog or {}
     session_state = session_state or {}
@@ -292,6 +342,24 @@ def collect_context(
     doc_names = [str(d.get("source_name") or d.get("name") or "") for d in docs if d]
     doc_names = [n for n in doc_names if n]
     dominant = catalog.get("dominant_domains") or {}
+
+    # Fallback: if catalog is incomplete but profile has data, query MongoDB
+    doc_count = len(docs)
+    if doc_count == 0 and collection_point_count > 0 and subscription_id and profile_id:
+        mongo_count, mongo_names, mongo_domains = _mongodb_doc_summary(subscription_id, profile_id)
+        if mongo_count > 0:
+            doc_count = mongo_count
+            doc_names = mongo_names[:5]
+            dominant = mongo_domains
+    elif doc_count > 0 and collection_point_count > 0 and subscription_id and profile_id:
+        # Catalog exists but may be stale — check if MongoDB has more docs
+        mongo_count, mongo_names, mongo_domains = _mongodb_doc_summary(subscription_id, profile_id)
+        if mongo_count > doc_count:
+            doc_count = mongo_count
+            doc_names = mongo_names[:5]
+            if mongo_domains:
+                dominant = mongo_domains
+
     if isinstance(dominant, dict):
         domains = sorted(dominant.keys(), key=lambda k: dominant[k], reverse=True)
     elif isinstance(dominant, (list, tuple)):
@@ -300,10 +368,10 @@ def collect_context(
         domains = []
     turn_count = int(session_state.get("turn_count", 0) or 0)
     return ConversationalContext(
-        document_count=len(docs),
+        document_count=doc_count,
         document_names=doc_names[:5],
         dominant_domains=domains[:3],
-        profile_is_empty=len(docs) == 0 and collection_point_count == 0,
+        profile_is_empty=doc_count == 0 and collection_point_count == 0,
         is_first_message=turn_count == 0,
         is_returning_user=turn_count > 0,
         conversation_turn_count=turn_count,
@@ -670,22 +738,22 @@ _FRAGMENT_POOLS: Dict[str, Dict[str, List[ResponseFragment]]] = {
     # -- DOCUMENT_DISCOVERY --
     DOCUMENT_DISCOVERY: {
         "opener": [
-            _frag("Here's an overview of your profile:"),
-            _frag("Let me tell you what you have:"),
-            _frag("Great question!"),
+            _frag("Here's a comprehensive overview of your profile:"),
+            _frag("I've analyzed your profile — here's a total overview:"),
+            _frag("Great question! Let me provide an overview of your documents:"),
         ],
         "core": [
-            _frag("You have {doc_count} document(s) covering {domains}. Names: {doc_names}.", requires_docs=True),
-            _frag("Your profile contains {doc_count} document(s) in {domains}. Documents: {doc_names}.", requires_docs=True),
+            _frag("You have a total of {doc_count} document(s) across {domains}. Analyzed documents: {doc_names}. This unique collection covers a range of content types.", requires_docs=True),
+            _frag("Your profile contains a total of {doc_count} document(s) in {domains}, with the most common category being the largest group. Documents: {doc_names}.", requires_docs=True),
             _frag("Your profile is currently empty. Upload documents to get started — I support resumes, invoices, contracts, insurance policies, medical records, and more.", requires_empty=True),
         ],
         "context_bridge": [
             _frag(""),
         ],
         "action_prompt": [
-            _frag("Try asking questions about specific documents, comparing candidates, or extracting key details."),
-            _frag("You can ask me to summarize, compare, rank, or extract information from any of your documents."),
-            _frag("Ask me anything — summaries, comparisons, specific data extraction, or content generation."),
+            _frag("You can analyze patterns across your documents, compare them, or get a total overview of common or unique details."),
+            _frag("Try asking me to analyze the distribution of topics, compare documents, or find common and unique patterns across them."),
+            _frag("I can provide a total overview, analyze patterns, rank items from highest to lowest, or summarize the range of information across your documents."),
         ],
     },
 
@@ -835,8 +903,8 @@ def compose_response(
     *user_key* is used to seed the randomizer (subscription_id + profile_id).
     *user_text* is the original user message (used for USAGE_HELP delegation).
     """
-    # Delegate USAGE_HELP to the dedicated module when user_text is available.
-    if intent == USAGE_HELP and user_text:
+    # Delegate help/capability to the dedicated module when user_text is available.
+    if intent in {USAGE_HELP, CAPABILITY} and user_text:
         try:
             from src.intelligence.usage_help import compose_usage_help_response
             return compose_usage_help_response(user_text, context, user_key)
@@ -982,6 +1050,8 @@ def generate_conversational_response(
         catalog=catalog,
         session_state=session_state,
         collection_point_count=collection_point_count,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
     )
 
     user_key = f"{subscription_id}:{profile_id}"

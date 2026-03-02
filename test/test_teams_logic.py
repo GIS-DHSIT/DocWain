@@ -38,6 +38,7 @@ class TeamsChatServiceTests(unittest.TestCase):
             subscription_id=ctx.subscription_id,
             model_name=ctx.model_name,
             persona=ctx.persona,
+            session_id=ctx.session_id,
         )
 
     def test_answer_question_uses_internet_fallback_when_no_context(self):

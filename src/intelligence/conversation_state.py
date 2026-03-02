@@ -549,7 +549,14 @@ User: {new_turn.user_message}
 Assistant: {new_turn.assistant_response[:200]}
 
 UPDATED SUMMARY:"""
-        result = self.llm_client.generate(prompt, max_retries=1, backoff=0.3)
+        try:
+            from src.llm.task_router import task_scope, TaskType
+            _ctx = task_scope(TaskType.CONVERSATION_SUMMARY)
+        except ImportError:
+            from contextlib import nullcontext
+            _ctx = nullcontext()
+        with _ctx:
+            result = self.llm_client.generate(prompt, max_retries=1, backoff=0.3)
         if result and result.strip():
             self._current_summary = result.strip()
             self._summarized_up_to = new_turn.turn_number

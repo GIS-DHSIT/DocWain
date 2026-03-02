@@ -539,7 +539,7 @@ def format_comparison_response(
 
 def _format_two_way_comparison(a: CandidateDigest, b: CandidateDigest, intent: QueryIntent) -> str:
     """Side-by-side comparison of two candidates."""
-    lines = [f"**{a.name} vs {b.name}**\n"]
+    lines = [f"**Candidate Comparison: {a.name} vs {b.name}**\n"]
 
     # Experience
     a_years = f"{a.years_experience:.0f} years" if a.years_experience else "N/A"
@@ -554,6 +554,11 @@ def _format_two_way_comparison(a: CandidateDigest, b: CandidateDigest, intent: Q
         lines.append(f"| Role | {a.role[:40] or 'N/A'} | {b.role[:40] or 'N/A'} |")
     lines.append("")
 
+    # Shared skills
+    shared = set(s.lower() for s in a.key_skills) & set(s.lower() for s in b.key_skills)
+    if shared:
+        lines.append(f"**Shared skills:** {', '.join(list(shared)[:5])}")
+
     # Unique strengths
     a_unique = set(s.lower() for s in a.key_skills) - set(s.lower() for s in b.key_skills)
     b_unique = set(s.lower() for s in b.key_skills) - set(s.lower() for s in a.key_skills)
@@ -561,6 +566,13 @@ def _format_two_way_comparison(a: CandidateDigest, b: CandidateDigest, intent: Q
         lines.append(f"**{a.name}'s unique skills:** {', '.join(list(a_unique)[:5])}")
     if b_unique:
         lines.append(f"**{b.name}'s unique skills:** {', '.join(list(b_unique)[:5])}")
+
+    # Key skills detail per candidate
+    lines.append("")
+    for cand in (a, b):
+        skills_str = ", ".join(cand.key_skills[:6]) if cand.key_skills else "N/A"
+        cand_years = f"{cand.years_experience:.0f} years" if cand.years_experience else "N/A"
+        lines.append(f"**Candidate {cand.name}:** {cand_years} experience, key skills: {skills_str}")
 
     return "\n".join(lines).strip()
 
@@ -589,6 +601,25 @@ def _format_multi_comparison(digests: List[CandidateDigest], intent: QueryIntent
     # Education
     ed = [d.education_level for d in digests]
     lines.append("| Education | " + " | ".join(ed) + " |")
+
+    lines.append("")
+
+    # Per-candidate detail summary
+    for d in digests:
+        skills_str = ", ".join(d.key_skills[:5]) if d.key_skills else "N/A"
+        d_years = f"{d.years_experience:.0f} years" if d.years_experience else "N/A"
+        role_str = f" ({d.role})" if d.role else ""
+        lines.append(f"**Candidate {d.name}**{role_str}: {d_years} experience, key skills: {skills_str}")
+
+    # Statistical summary
+    years_list = [d.years_experience for d in digests if d.years_experience]
+    if years_list:
+        avg_y = sum(years_list) / len(years_list)
+        lines.append("")
+        lines.append(
+            f"Experience range: {min(years_list):.0f}-{max(years_list):.0f} years "
+            f"(average {avg_y:.1f} years across {len(digests)} candidates)."
+        )
 
     return "\n".join(lines).strip()
 

@@ -77,6 +77,7 @@ class ChunkPrepStats:
     dropped_dedupe: int = 0
     merged_dedupe: int = 0
     merged_small: int = 0
+    rescued_fragments: int = 0
 
 
 def compute_stable_chunk_id(
@@ -151,12 +152,16 @@ def prepare_embedding_chunks(
     ] = None,
     integrity_config: Optional[ChunkIntegrityConfig] = None,
     dedupe_config: Optional[DedupeConfig] = None,
-) -> Tuple[List[str], List[Dict[str, Any]], ChunkPrepStats]:
+) -> Tuple[List[str], List[Dict[str, Any]], ChunkPrepStats, Dict[str, List[str]]]:
     if len(chunks) != len(metadata):
         raise ValueError("chunk and metadata length mismatch")
 
     prepared_chunks: List[str] = []
     prepared_meta: List[Dict[str, Any]] = []
+    # Multi-resolution: collect short fragments that would be dropped, keyed by section_id
+    rescued_fragments: Dict[str, List[str]] = {}
+    rescued_count = 0
+    from src.embedding.pipeline.schema_normalizer import _is_encoding_garbage, _is_metadata_garbage
     for chunk_text, meta in zip(chunks, metadata):
         m = dict(meta)
         m["document_id"] = document_id
@@ -176,7 +181,6 @@ def prepare_embedding_chunks(
         raw_text = chunk_text
         clean_text = clean_text_for_embedding(raw_text)
         # Guard against encoding garbage (UTF-16 null interleaving, etc.)
-        from src.embedding.pipeline.schema_normalizer import _is_encoding_garbage
         if _is_encoding_garbage(raw_text):
             logger.warning(
                 "Dropping encoding-garbage chunk %d for %s (null/control char ratio too high)",
@@ -184,7 +188,6 @@ def prepare_embedding_chunks(
             )
             continue
         # Guard against metadata garbage in raw text — try salvage before fallback
-        from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
         if _is_metadata_garbage(raw_text):
             salvaged = _salvage_chunk_text(raw_text)
             if salvaged and len(salvaged.strip()) >= 20:
@@ -203,18 +206,35 @@ def prepare_embedding_chunks(
                 embedding_text = ensure_embedding_text(salvaged, m.get("doc_domain"), m.get("section_kind"))
                 final_text = embedding_text or salvaged
         if _is_metadata_garbage(final_text) or len(final_text.strip()) < 20:
-            logger.warning(
-                "Dropping garbage/short chunk %d for %s (len=%d)",
-                len(prepared_chunks), doc_name, len(final_text.strip()),
-            )
+            # Multi-resolution rescue: collect short fragments instead of losing them
+            stripped = final_text.strip()
+            if stripped and len(stripped) >= 3 and not _is_metadata_garbage(stripped):
+                sec_id = m["section_id"]
+                rescued_fragments.setdefault(sec_id, []).append(stripped)
+                rescued_count += 1
+                logger.debug(
+                    "Rescued short fragment from chunk %d for %s into section %s (len=%d)",
+                    len(prepared_chunks), doc_name, sec_id, len(stripped),
+                )
+            else:
+                logger.warning(
+                    "Dropping garbage/short chunk %d for %s (len=%d)",
+                    len(prepared_chunks), doc_name, len(final_text.strip()),
+                )
             continue
         m["content"] = raw_text
         m["embedding_text"] = embedding_text
         m["text_clean"] = embedding_text
+        m["resolution"] = "chunk"
         if raw_text != embedding_text:
             m["text_raw"] = raw_text
         prepared_chunks.append(final_text)
         prepared_meta.append(m)
+    if rescued_count:
+        logger.info(
+            "Multi-resolution: rescued %d short fragments across %d sections for %s",
+            rescued_count, len(rescued_fragments), doc_name,
+        )
 
     prepared_chunks, prepared_meta, integrity_stats = enforce_chunk_integrity(
         prepared_chunks, prepared_meta, config=integrity_config
@@ -247,17 +267,19 @@ def prepare_embedding_chunks(
         dropped_dedupe=dedupe_stats.get("dropped", 0),
         merged_dedupe=dedupe_stats.get("merged", 0),
         merged_small=integrity_stats.get("merged_small", 0),
+        rescued_fragments=rescued_count,
     )
     logger.info(
-        "Chunk prep for %s: prepared=%s dropped_quality=%s dropped_dedupe=%s merged_dedupe=%s merged_small=%s",
+        "Chunk prep for %s: prepared=%s dropped_quality=%s dropped_dedupe=%s merged_dedupe=%s merged_small=%s rescued=%s",
         doc_name,
         len(prepared_chunks),
         stats.dropped_quality,
         stats.dropped_dedupe,
         stats.merged_dedupe,
         stats.merged_small,
+        stats.rescued_fragments,
     )
-    return prepared_chunks, prepared_meta, stats
+    return prepared_chunks, prepared_meta, stats, rescued_fragments
 
 
 __all__ = [

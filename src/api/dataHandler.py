@@ -309,8 +309,27 @@ def _is_meta_tensor_error(exc: Exception) -> bool:
 
 
 def _is_cuda_oom(exc: Exception) -> bool:
+    try:
+        if torch and isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     msg = str(exc).lower()
-    return "cuda out of memory" in msg or "cuda error: out of memory" in msg
+    return (
+        "cuda out of memory" in msg
+        or "cuda error: out of memory" in msg
+        or "cublas_status_alloc_failed" in msg
+        or ("cuda error" in msg and "alloc" in msg)
+    )
+
+
+def _clear_gpu_cache() -> None:
+    """Best-effort GPU cache clear after CUDA OOM."""
+    try:
+        if torch and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _resolve_torch_dtype(device: str):
@@ -394,6 +413,7 @@ def encode_with_fallback(
     device: Optional[str] = None,
 ):
     """Encode with recovery from meta-device and CUDA OOM failures."""
+    # Let model_loader handle adaptive batch sizing per device
     effective_batch_size = batch_size or _embedding_batch_size()
     return model_encode_with_fallback(
         texts,
@@ -1418,15 +1438,17 @@ def save_embeddings_to_qdrant(
         ensure_qdrant_collection(collection_name, vector_size)
 
         # Delete old points for this document before upserting to prevent duplicates
+        old_points_deleted = False
         try:
             store = get_vector_store()
             store.delete_document(subscription_id, profile_id, doctag)
+            old_points_deleted = True
             logging.info(
                 "Cleaned old embeddings for document_id=%s before re-embedding",
                 doctag,
             )
         except Exception as exc:  # noqa: BLE001
-            logging.debug("Old embedding cleanup skipped for %s: %s", doctag, exc)
+            logging.warning("Old embedding cleanup failed for %s: %s", doctag, exc)
 
         # Apply embedding enhancement for better retrieval
         dropped_dedup = 0
@@ -1479,107 +1501,134 @@ def save_embeddings_to_qdrant(
                 f"avg quality: {enhancement_result.average_quality_score:.2f}"
             )
         except Exception as enhance_exc:  # noqa: BLE001
-            logging.debug("Embedding enhancement skipped: %s", enhance_exc)
+            logging.warning("Embedding enhancement failed for %s: %s", doctag, enhance_exc)
 
         records: List[ChunkRecord] = []
         invalid_samples: List[Dict[str, Any]] = []
+        chunk_errors: int = 0
         min_chars = int(getattr(Config.Retrieval, "MIN_CHARS", 50))
         min_tokens = int(getattr(Config.Retrieval, "MIN_TOKENS", 10))
         for idx in range(max_len):
-            vector = normalized_vectors[idx]
-            text = texts[idx]
-            if not vector:
-                continue
-            if not is_valid_chunk_text(text, min_chars=min_chars, min_tokens=min_tokens):
+            try:
+                vector = normalized_vectors[idx]
+                text = texts[idx]
+                if not vector:
+                    continue
+                if not is_valid_chunk_text(text, min_chars=min_chars, min_tokens=min_tokens):
+                    chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
+                    invalid_samples.append(
+                        {
+                            "chunk_id": (chunk_meta or {}).get("chunk_id"),
+                            "length": len(text or ""),
+                            "sample": _sanitize_text_sample(text),
+                        }
+                    )
+                    continue
+
                 chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
-                invalid_samples.append(
-                    {
-                        "chunk_id": (chunk_meta or {}).get("chunk_id"),
-                        "length": len(text or ""),
-                        "sample": _sanitize_text_sample(text),
-                    }
+                chunk_document_id = chunk_meta.get("document_id", str(doctag))
+                if chunk_document_id != str(doctag):
+                    raise ValueError(f"Chunk {idx} document_id mismatch: {chunk_document_id} != {doctag}")
+
+                chunk_id = chunk_meta.get(
+                    "chunk_id",
+                    compute_chunk_id(subscription_id, profile_id, doctag, source_filename, idx, text),
                 )
-                continue
 
-            chunk_meta = chunk_metadata[idx] if idx < len(chunk_metadata) else {}
-            chunk_document_id = chunk_meta.get("document_id", str(doctag))
-            if chunk_document_id != str(doctag):
-                raise ValueError(f"Chunk {idx} document_id mismatch: {chunk_document_id} != {doctag}")
+                page_val = pages[idx] if idx < len(pages) else chunk_meta.get("page_number")
+                section_val = chunk_meta.get("section_title", sections[idx] if idx < len(sections) else "")
+                section_path = chunk_meta.get("section_path") or section_val or "Untitled Section"
+                section_id = chunk_meta.get("section_id")
+                section_kind = chunk_meta.get("section_kind") or "misc"
+                page_start = chunk_meta.get("page_start", page_val)
+                page_end = chunk_meta.get("page_end", page_val)
+                chunk_char_len = len(text)
+                chunk_hash = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
-            chunk_id = chunk_meta.get(
-                "chunk_id",
-                compute_chunk_id(subscription_id, profile_id, doctag, source_filename, idx, text),
-            )
+                sparse_vector = None
+                if idx < len(sparse_vectors):
+                    sv = sparse_vectors[idx]
+                    if sv.get("indices") and sv.get("values"):
+                        sparse_vector = sv
 
-            page_val = pages[idx] if idx < len(pages) else chunk_meta.get("page_number")
-            section_val = chunk_meta.get("section_title", sections[idx] if idx < len(sections) else "")
-            section_path = chunk_meta.get("section_path") or section_val or "Untitled Section"
-            section_id = chunk_meta.get("section_id")
-            section_kind = chunk_meta.get("section_kind") or "misc"
-            page_start = chunk_meta.get("page_start", page_val)
-            page_end = chunk_meta.get("page_end", page_val)
-            chunk_char_len = len(text)
-            chunk_hash = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+                chunk_kind = chunk_meta.get("chunk_kind")
+                if not chunk_kind:
+                    chunk_type = chunk_meta.get("chunk_type", "text")
+                    if chunk_type in {"table", "table_row", "table_header"}:
+                        chunk_kind = "table_text"
+                    elif chunk_type == "image_caption":
+                        chunk_kind = "image_caption"
+                    elif chunk_type == "summary":
+                        chunk_kind = "section_summary"
+                    else:
+                        chunk_kind = "section_text"
 
-            sparse_vector = None
-            if idx < len(sparse_vectors):
-                sv = sparse_vectors[idx]
-                if sv.get("indices") and sv.get("values"):
-                    sparse_vector = sv
+                embedding_text = chunk_meta.get("embedding_text") or chunk_meta.get("text_clean") or text
+                content_text = chunk_meta.get("content") or chunk_meta.get("text_raw") or chunk_meta.get("text_clean") or text
+                # Single source of truth: pass flat fields to build_qdrant_payload()
+                raw_payload = {
+                    **chunk_meta,
+                    "subscription_id": str(subscription_id),
+                    "profile_id": str(profile_id),
+                    "document_id": str(doctag),
+                    "content": content_text,
+                    "embedding_text": embedding_text,
+                    "source_name": filename or source_filename,
+                    "doc_domain": doc_domain,
+                    "section_id": section_id,
+                    "section_title": section_val,
+                    "section_path": section_path,
+                    "section_kind": section_kind,
+                    "page": page_val,
+                    "chunk_id": chunk_id,
+                    "chunk_index": idx,
+                    "chunk_count": max_len,
+                    "chunk_kind": chunk_kind,
+                    "hash": chunk_meta.get("chunk_hash") or chunk_hash,
+                    "doc_version_hash": doc_version_hash,
+                    "embed_pipeline_version": EMBED_PIPELINE_VERSION,
+                    "doc_summary": (doc_metadata.get("document_summary") or "")[:500] or None,
+                    "doc_key_entities": doc_metadata.get("key_entities") or None,
+                    "doc_intent_tags": doc_metadata.get("intent_tags") or None,
+                    "quality_grade": doc_metadata.get("quality_grade") or None,
+                    "domain_signals": doc_metadata.get("domain_signals") or None,
+                    "entity_count": doc_metadata.get("entity_count") or 0,
+                    "section_role": doc_metadata.get("section_roles", {}).get(section_val) if section_val else None,
+                    "temporal_span": doc_metadata.get("temporal_span") or None,
+                }
 
-            chunk_kind = chunk_meta.get("chunk_kind")
-            if not chunk_kind:
-                chunk_type = chunk_meta.get("chunk_type", "text")
-                if chunk_type in {"table", "table_row", "table_header"}:
-                    chunk_kind = "table_text"
-                elif chunk_type == "image_caption":
-                    chunk_kind = "image_caption"
-                elif chunk_type == "summary":
-                    chunk_kind = "section_summary"
-                else:
-                    chunk_kind = "section_text"
+                payload = build_qdrant_payload(raw_payload)
 
-            embedding_text = chunk_meta.get("embedding_text") or chunk_meta.get("text_clean") or text
-            content_text = chunk_meta.get("content") or chunk_meta.get("text_raw") or chunk_meta.get("text_clean") or text
-            # Single source of truth: pass flat fields to build_qdrant_payload()
-            raw_payload = {
-                **chunk_meta,
-                "subscription_id": str(subscription_id),
-                "profile_id": str(profile_id),
-                "document_id": str(doctag),
-                "content": content_text,
-                "embedding_text": embedding_text,
-                "source_name": filename or source_filename,
-                "doc_domain": doc_domain,
-                "section_id": section_id,
-                "section_title": section_val,
-                "section_path": section_path,
-                "section_kind": section_kind,
-                "page": page_val,
-                "chunk_id": chunk_id,
-                "chunk_index": idx,
-                "chunk_count": max_len,
-                "chunk_kind": chunk_kind,
-                "hash": chunk_meta.get("chunk_hash") or chunk_hash,
-                "doc_version_hash": doc_version_hash,
-                "embed_pipeline_version": EMBED_PIPELINE_VERSION,
-            }
-
-            payload = build_qdrant_payload(raw_payload)
-
-            records.append(
-                ChunkRecord(
-                    chunk_id=str(chunk_id),
-                    dense_vector=[float(x) for x in vector],
-                    sparse_vector=sparse_vector,
-                    payload=payload,
+                records.append(
+                    ChunkRecord(
+                        chunk_id=str(chunk_id),
+                        dense_vector=[float(x) for x in vector],
+                        sparse_vector=sparse_vector,
+                        payload=payload,
+                    )
                 )
-            )
+            except Exception as chunk_exc:  # noqa: BLE001
+                chunk_errors += 1
+                logging.warning(
+                    "Chunk %d/%d failed for doc %s: %s",
+                    idx + 1, max_len, doctag, chunk_exc,
+                )
+                if _is_cuda_oom(chunk_exc):
+                    _clear_gpu_cache()
+                continue  # Skip bad chunk, don't fail entire document
 
         if not records:
             raise ValueError(f"No valid embedding records generated for document {doctag}")
 
-        saved = get_vector_store().upsert_records(collection_name, records, batch_size=batch_size)
+        try:
+            saved = get_vector_store().upsert_records(collection_name, records, batch_size=batch_size)
+        except Exception as upsert_exc:
+            if old_points_deleted:
+                logging.error(
+                    "CRITICAL: Old embeddings deleted but re-upsert failed for %s — document has ZERO vectors: %s",
+                    doctag, upsert_exc,
+                )
+            raise
         logging.info(
             f"Saved {saved} embeddings for document {doctag} in collection {collection_name} (profile={profile_id})"
         )
@@ -1590,6 +1639,11 @@ def save_embeddings_to_qdrant(
                 doctag,
                 min_chars,
                 min_tokens,
+            )
+        if chunk_errors:
+            logging.warning(
+                "Per-chunk errors during record building for %s: %d/%d chunks failed",
+                doctag, chunk_errors, max_len,
             )
 
         try:
@@ -1700,9 +1754,10 @@ def save_embeddings_to_qdrant(
         return {
             "status": "success",
             "points_saved": saved,
-            "dropped_invalid": len(invalid_samples),
+            "dropped_invalid": len(invalid_samples) + chunk_errors,
             "dropped_dedup": dropped_dedup,
             "invalid_samples": invalid_samples[:5],
+            "chunk_errors": chunk_errors,
         }
 
     except Exception as e:
@@ -1849,6 +1904,19 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
     filename = _safe_basename(record.get("name") or doc_name)
     profile_name = record.get("profile_name") or record.get("profileName")
 
+    # Document understanding fields (populated by extraction_service)
+    document_summary = str(record.get("document_summary") or "")[:500] or None
+    key_entities = record.get("key_entities") or []
+    intent_tags = record.get("doc_intent_tags") or []
+
+    # Deep analysis fields (populated by deep_analyzer)
+    quality_grade = record.get("quality_grade") or None
+    quality_score = record.get("quality_score")
+    domain_signals = record.get("domain_signals") or {}
+    entity_count = len(record.get("entity_mentions") or [])
+    section_roles = record.get("section_roles") or {}
+    temporal_span = (record.get("chronological_span") or [None])[0] if record.get("chronological_span") else None
+
     return {
         "filename": filename or _safe_basename(doc_name),
         "doc_type": str(doc_type) if doc_type else None,
@@ -1857,6 +1925,15 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
         "document_type": str(document_type) if document_type else None,
         "description": str(description) if description else None,
         "profile_name": str(profile_name) if profile_name else None,
+        "document_summary": document_summary,
+        "key_entities": key_entities,
+        "intent_tags": intent_tags,
+        "quality_grade": quality_grade,
+        "quality_score": quality_score,
+        "domain_signals": domain_signals,
+        "entity_count": entity_count,
+        "section_roles": section_roles,
+        "temporal_span": temporal_span,
     }
 
 
@@ -2240,7 +2317,7 @@ def _fallback_chunks_for_full_text(
         doc_type=doc_type,
         doc_ocr_confidence=doc_ocr_confidence,
     )
-    fallback_chunks, fallback_meta, prep_stats = prepare_embedding_chunks(
+    fallback_chunks, fallback_meta, prep_stats, _rescued = prepare_embedding_chunks(
         fallback_chunks,
         fallback_meta,
         subscription_id=subscription_id,
@@ -2400,7 +2477,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 if "sentence_complete" not in meta:
                     meta["sentence_complete"] = str(texts[idx]).strip().endswith((".", "?", "!"))
 
-            texts, chunk_metadata, prep_stats = prepare_embedding_chunks(
+            texts, chunk_metadata, prep_stats, rescued_fragments = prepare_embedding_chunks(
                 texts,
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -2562,11 +2639,18 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                     len(text.get("embeddings") or []),
                     len(texts),
                 )
+                _encode_start = time.time()
                 text["embeddings"] = encode_with_fallback(
                     texts,
                     convert_to_numpy=True,
                     normalize_embeddings=True,
                     device=device,
+                )
+                _encode_elapsed = time.time() - _encode_start
+                _cps = len(texts) / max(_encode_elapsed, 0.001)
+                logging.info(
+                    "Embedding encode completed for %s: %d chunks in %.1fs (%.1f chunks/sec)",
+                    doc_tag, len(texts), _encode_elapsed, _cps,
                 )
                 text["sparse_vectors"] = build_sparse_vectors(texts)
             else:
@@ -2584,6 +2668,12 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             text["texts"] = texts
             text["chunk_metadata"] = chunk_metadata
             text["doc_type"] = doc_type
+            # Merge pickle-injected understanding into MongoDB metadata
+            _pickle_meta = text.get("doc_metadata") or {}
+            if isinstance(_pickle_meta, dict):
+                for _ukey in ("document_summary", "key_entities", "key_facts", "intent_tags"):
+                    if _pickle_meta.get(_ukey) and not doc_metadata.get(_ukey):
+                        doc_metadata[_ukey] = _pickle_meta[_ukey]
             text["doc_metadata"] = doc_metadata
 
             pre_upsert_count = len(texts)
@@ -2752,7 +2842,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             for meta in chunk_metadata:
                 meta.setdefault("chunk_kind", meta.get("chunk_type") or "section_text")
 
-            chunks, chunk_metadata, prep_stats = prepare_embedding_chunks(
+            chunks, chunk_metadata, prep_stats, rescued_fragments = prepare_embedding_chunks(
                 chunks,
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -2856,6 +2946,11 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 device=device,
             )
             embed_latency_ms = (time.time() - embed_start) * 1000
+            logging.info(
+                "Embedding encode completed for %s: %d chunks in %.1fs (%.1f chunks/sec)",
+                doc_tag, len(chunks), embed_latency_ms / 1000.0,
+                len(chunks) / max(embed_latency_ms / 1000.0, 0.001),
+            )
             if telemetry:
                 telemetry.increment("embedding_requests_count")
                 telemetry.increment("total_chunks_embedded", amount=len(chunks))
@@ -3135,7 +3230,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             if not chunks:
                 raise ValueError(f"No valid chunks in {doc_name}")
 
-            chunks, chunk_metadata, prep_stats = prepare_embedding_chunks(
+            chunks, chunk_metadata, prep_stats, rescued_fragments = prepare_embedding_chunks(
                 chunks,
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -3238,6 +3333,11 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 device=device,
             )
             embed_latency_ms = (time.time() - embed_start) * 1000
+            logging.info(
+                "Embedding encode completed for %s: %d chunks in %.1fs (%.1f chunks/sec)",
+                doc_tag, len(chunks), embed_latency_ms / 1000.0,
+                len(chunks) / max(embed_latency_ms / 1000.0, 0.001),
+            )
             if telemetry:
                 telemetry.increment("embedding_requests_count")
                 telemetry.increment("total_chunks_embedded", amount=len(chunks))

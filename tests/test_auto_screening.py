@@ -199,24 +199,26 @@ class TestRunAutoScreeningUnit:
 class TestScreeningIntegration:
     """Tests that apply_security_result correctly sets document status."""
 
+    @patch("src.api.screening_service.update_stage")
     @patch("src.api.screening_service.update_security_screening")
     @patch("src.api.screening_service.get_document_record")
     @patch("src.api.screening_service._update_pickle_with_screening")
     @patch("src.api.screening_service._set_document_status")
     def test_low_risk_sets_screening_completed(
-        self, mock_set_status, mock_pickle, mock_get_record, mock_update
+        self, mock_set_status, mock_pickle, mock_get_record, mock_update, mock_update_stage
     ):
         from src.api.screening_service import apply_security_result
         mock_get_record.return_value = {"status": STATUS_EXTRACTION_COMPLETED}
         apply_security_result("doc-low", {"overall_risk_level": "LOW"})
         mock_set_status.assert_called_with("doc-low", STATUS_SCREENING_COMPLETED)
 
+    @patch("src.api.screening_service.update_stage")
     @patch("src.api.screening_service.update_security_screening")
     @patch("src.api.screening_service.get_document_record")
     @patch("src.api.screening_service._update_pickle_with_screening")
     @patch("src.api.screening_service._set_document_status")
     def test_high_risk_blocks_training(
-        self, mock_set_status, mock_pickle, mock_get_record, mock_update
+        self, mock_set_status, mock_pickle, mock_get_record, mock_update, mock_update_stage
     ):
         from src.api.screening_service import apply_security_result
         mock_get_record.return_value = {"status": STATUS_EXTRACTION_COMPLETED}

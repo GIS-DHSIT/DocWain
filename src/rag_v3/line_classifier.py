@@ -47,7 +47,7 @@ MEDICAL_NAMES: List[str] = [
 POLICY_NAMES: List[str] = [
     "policy_info", "coverage", "premiums", "exclusions", "terms", "other",
 ]
-INVOICE_NAMES: List[str] = ["items", "totals", "parties", "terms", "other"]
+INVOICE_NAMES: List[str] = ["items", "totals", "parties", "terms", "invoice_metadata", "other"]
 LEGAL_NAMES: List[str] = ["clauses", "parties", "obligations", "other"]
 
 HEAD_NAMES: Dict[str, List[str]] = {
@@ -280,8 +280,8 @@ TRAINING_TEMPLATES: List[Tuple[str, str, str, str, str, str]] = [
     ("Payment Terms: Net 30", "kv_pair", "other", "other", "terms", "other"),
     ("Due Date: February 28, 2025", "kv_pair", "other", "other", "terms", "other"),
     ("Terms: Payment due upon receipt", "kv_pair", "other", "other", "terms", "other"),
-    ("Invoice Number: INV-2025-0042", "kv_pair", "other", "other", "terms", "other"),
-    ("Invoice Date: January 15, 2025", "kv_pair", "other", "other", "terms", "other"),
+    ("Invoice Number: INV-2025-0042", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Invoice Date: January 15, 2025", "kv_pair", "other", "other", "invoice_metadata", "other"),
 
     # ── KV pairs: legal / clauses ──
     ("Governing Law: State of Delaware", "kv_pair", "other", "other", "other", "clauses"),
@@ -379,8 +379,18 @@ TRAINING_TEMPLATES: List[Tuple[str, str, str, str, str, str]] = [
     ("Rider: Critical Illness Benefit", "kv_pair", "other", "coverage", "other", "other"),
     ("Discount: 10% for online purchase", "kv_pair", "other", "premiums", "other", "other"),
     ("Sub-limit: Rs. 5,000 per day for room rent", "kv_pair", "other", "exclusions", "other", "other"),
-    ("Invoice Date: 2025-01-15", "kv_pair", "other", "other", "terms", "other"),
-    ("PO Number: PO-2025-0123", "kv_pair", "other", "other", "terms", "other"),
+    ("Invoice Date: 2025-01-15", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("PO Number: PO-2025-0123", "kv_pair", "other", "other", "invoice_metadata", "other"),
+
+    # ── KV pairs: invoice / invoice_metadata ──
+    ("Invoice No: 12345", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Invoice #: INV-2024-0789", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Date: 15 February 2025", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Reference Number: REF-2025-001", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Order Number: ORD-456", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Purchase Order: PO-2025-789", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Bill Number: BILL-2025-042", "kv_pair", "other", "other", "invoice_metadata", "other"),
+    ("Receipt No: REC-78901", "kv_pair", "other", "other", "invoice_metadata", "other"),
     ("Clause 5.1: Limitation of Liability", "kv_pair", "other", "other", "other", "clauses"),
     ("Section 3: Term and Termination", "kv_pair", "other", "other", "other", "clauses"),
     ("Licensee: DataAnalytics Corp", "kv_pair", "other", "other", "other", "parties"),

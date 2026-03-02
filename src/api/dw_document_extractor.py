@@ -5,7 +5,10 @@ import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import docx
-import fitz
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24 exports as pymupdf
+except ImportError:
+    import fitz  # Older PyMuPDF versions export as fitz
 import numpy as np
 import pandas as pd
 import pytesseract
@@ -90,86 +93,6 @@ class DocumentExtractor:
             return True
         heading_pattern = re.compile(r"^(\d+\.)+\s+.+|^[A-Z][A-Z0-9\s,:-]{4,}$")
         return bool(heading_pattern.match(clean))
-
-    def _detect_sections_dpie(self, text: str) -> List[Dict[str, Any]]:
-        """Use DPIE ML model to detect section boundaries.
-
-        Returns a list of section dicts with keys: start_line, end_line,
-        heading, confidence.  Returns an empty list when DPIE is not
-        available or the input is empty.
-        """
-        try:
-            from src.intelligence.dpie_integration import DPIERegistry
-            registry = DPIERegistry.get_instance()
-            if registry.is_loaded and text:
-                return registry.detect_sections(text[:10000])
-        except Exception:
-            pass
-        return []
-
-    def _apply_dpie_sections(
-        self,
-        chunk_candidates: List["ChunkCandidate"],
-        dpie_sections: List[Dict[str, Any]],
-        full_text: str,
-    ) -> None:
-        """Re-assign section_title and section_id on *chunk_candidates* using
-        DPIE-detected section boundaries.
-
-        DPIE sections use *line numbers* (0-indexed, content lines only,
-        excluding blank lines and ``--- Page N ---`` markers).  We build a
-        mapping from content-line index to page number from *full_text* so
-        that each chunk (which carries a ``page`` attribute) can be matched
-        to the correct DPIE section.
-        """
-        if not dpie_sections or not chunk_candidates:
-            return
-
-        # Build line_index -> page mapping from full_text.
-        # Content lines are non-blank lines that are not page markers.
-        line_to_page: Dict[int, int] = {}
-        current_page = 1
-        content_line_idx = 0
-        for raw_line in full_text.splitlines():
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-            # Detect page markers like "--- Page 3 ---"
-            if stripped.startswith("--- Page ") and stripped.endswith("---"):
-                try:
-                    current_page = int(stripped.split("Page")[1].split("---")[0].strip())
-                except (ValueError, IndexError):
-                    pass
-                continue
-            line_to_page[content_line_idx] = current_page
-            content_line_idx += 1
-
-        # Build page -> DPIE section mapping.
-        # For each DPIE section, determine which pages it spans.
-        page_to_section: Dict[int, Dict[str, Any]] = {}
-        for sec in dpie_sections:
-            start = sec.get("start_line", 0)
-            end = sec.get("end_line", start)
-            pages_in_section: set = set()
-            for li in range(start, end + 1):
-                pg = line_to_page.get(li)
-                if pg is not None:
-                    pages_in_section.add(pg)
-            for pg in pages_in_section:
-                # If a page falls into multiple sections, later section wins
-                # (which is fine for overlaps at page boundaries).
-                page_to_section[pg] = sec
-
-        # Update chunk candidates
-        for cand in chunk_candidates:
-            if cand.page is None:
-                continue
-            matched = page_to_section.get(cand.page)
-            if matched:
-                heading = matched.get("heading", "")
-                if heading:
-                    cand.section_title = heading
-                    cand.section_id = self._make_section_id(heading, cand.page)
 
     @staticmethod
     def _looks_like_table(text: str) -> bool:
@@ -321,6 +244,76 @@ class DocumentExtractor:
                 logger.debug("OCR retry with alternate engine failed: %s", exc)
 
         return primary_text, primary_conf
+
+    def _ocr_with_vision(
+        self, image: Image.Image, *, is_full_page: bool = False,
+    ) -> Tuple[str, Optional[float]]:
+        """Run vision OCR (glm-ocr) with traditional OCR fallback.
+
+        When both produce results, picks the best via ``_pick_best_ocr``.
+        Falls through to ``_ocr_image()`` when vision is unavailable.
+        """
+        from src.api.config import Config
+
+        cfg = getattr(Config, "VisionOCR", None)
+        if not cfg or not getattr(cfg, "ENABLED", True):
+            return self._ocr_image(image)
+
+        try:
+            from src.llm.vision_ocr import get_vision_ocr_client
+
+            client = get_vision_ocr_client()
+            if client is None or not client.is_available():
+                return self._ocr_image(image)
+
+            if is_full_page:
+                vision_text, vision_conf = client.ocr_page_image(image)
+            else:
+                vision_text, vision_conf = client.ocr_image(image)
+        except Exception as exc:
+            logger.debug("Vision OCR unavailable, falling back to traditional: %s", exc)
+            return self._ocr_image(image)
+
+        # Also run traditional OCR for comparison / fallback
+        if getattr(cfg, "FALLBACK_TO_TRADITIONAL", True):
+            trad_text, trad_conf = self._ocr_image(image)
+            return self._pick_best_ocr(vision_text, vision_conf, trad_text, trad_conf)
+
+        if vision_text:
+            return vision_text, vision_conf
+        # Vision produced nothing — fall back
+        return self._ocr_image(image)
+
+    @staticmethod
+    def _pick_best_ocr(
+        vision_text: str,
+        vision_conf: Optional[float],
+        trad_text: str,
+        trad_conf: Optional[float],
+    ) -> Tuple[str, Optional[float]]:
+        """Compare vision vs traditional OCR results and return the best."""
+        v_len = len(vision_text.strip()) if vision_text else 0
+        t_len = len(trad_text.strip()) if trad_text else 0
+
+        # One empty, other not → pick non-empty
+        if v_len and not t_len:
+            return vision_text, vision_conf
+        if t_len and not v_len:
+            return trad_text, trad_conf
+        if not v_len and not t_len:
+            return "", None
+
+        # Vision captured >50% more text → prefer vision
+        if v_len > t_len * 1.5:
+            return vision_text, vision_conf
+
+        # Traditional much longer AND high confidence → prefer traditional
+        trad_conf_val = trad_conf if trad_conf is not None else 0.0
+        if t_len > v_len * 1.5 and trad_conf_val >= 80.0:
+            return trad_text, trad_conf
+
+        # Default: prefer vision (better contextual understanding)
+        return vision_text, vision_conf
 
     def _finalize_section(
         self,
@@ -636,23 +629,72 @@ class DocumentExtractor:
 
                         images = page.get_images(full=True)
                         page_text = "\n".join(page_text_parts).strip()
-                        if self._detect_scanned_page(page_text, len(images)):
-                            for img in images:
+                        is_scanned = self._detect_scanned_page(page_text, len(images))
+                        _ocr_content = getattr(getattr(Config, "VisionOCR", None), "OCR_CONTENT_IMAGES", True)
+                        _min_w = getattr(getattr(Config, "VisionOCR", None), "MIN_IMAGE_WIDTH", 100)
+                        _min_h = getattr(getattr(Config, "VisionOCR", None), "MIN_IMAGE_HEIGHT", 100)
+
+                        if images and (is_scanned or _ocr_content):
+                            for img_index, img in enumerate(images):
                                 try:
                                     base_image = doc.extract_image(img[0])
                                     image = Image.open(io.BytesIO(base_image["image"]))
-                                    ocr_text, ocr_conf = self._ocr_image(image)
+                                    w, h = image.size
+                                    if w < _min_w or h < _min_h:
+                                        figures.append(Figure(
+                                            page=page_index,
+                                            caption=f"Image_{page_index}_{img_index}",
+                                        ))
+                                        continue
+
+                                    ocr_text, ocr_conf = self._ocr_with_vision(
+                                        image, is_full_page=is_scanned,
+                                    )
+                                    ocr_method = "vision_ocr" if getattr(
+                                        getattr(Config, "VisionOCR", None), "ENABLED", True,
+                                    ) else "pytesseract"
                                     if ocr_text:
-                                        figures.append(Figure(page=page_index, caption=ocr_text))
+                                        chunk_type = "ocr_text" if is_scanned else "image_content"
+                                        fig = Figure(
+                                            page=page_index,
+                                            caption=ocr_text,
+                                            ocr_method=ocr_method,
+                                            ocr_confidence=ocr_conf,
+                                        )
+                                        figures.append(fig)
                                         chunk_candidates.append(
                                             ChunkCandidate(
                                                 text=ocr_text,
                                                 page=page_index,
                                                 section_title=current_title,
                                                 section_id=current_section_id,
-                                                chunk_type="ocr_text",
+                                                chunk_type=chunk_type,
                                             )
                                         )
+                                        # Diagram detection and structural extraction
+                                        try:
+                                            from src.doc_understanding.diagram_extractor import is_likely_diagram, extract_diagram_structure
+                                            from src.api.config import Config as _DiagCfg
+                                            if getattr(getattr(_DiagCfg, "DiagramExtraction", None), "ENABLED", True):
+                                                if ocr_text and is_likely_diagram(ocr_text, (w, h)):
+                                                    use_think = getattr(getattr(_DiagCfg, "DiagramExtraction", None), "USE_THINKING", True)
+                                                    diagram_struct = extract_diagram_structure(ocr_text, use_thinking=use_think)
+                                                    if diagram_struct:
+                                                        fig.is_diagram = True
+                                                        fig.diagram_type = diagram_struct.diagram_type
+                                                        fig.diagram_structure = diagram_struct.to_dict()
+                                                        # Add diagram as a rich chunk candidate
+                                                        chunk_candidates.append(ChunkCandidate(
+                                                            text=diagram_struct.to_text(),
+                                                            page=page_index,
+                                                            section_title=f"Diagram: {diagram_struct.diagram_type}",
+                                                            section_id=None,
+                                                            chunk_type="diagram",
+                                                        ))
+                                                        logger.info("Extracted %s diagram with %d nodes on page %d",
+                                                            diagram_struct.diagram_type, len(diagram_struct.nodes), page_index)
+                                        except Exception as _diag_exc:
+                                            logger.debug("Diagram extraction skipped: %s", _diag_exc)
                                         page_text_parts.append(ocr_text)
                                         ocr_target = {
                                             "page": page_index,
@@ -668,12 +710,17 @@ class DocumentExtractor:
                                             ocr_confidences.append(float(ocr_conf))
                                             ocr_target["conf_index"] = len(ocr_confidences) - 1
                                         ocr_targets.append(ocr_target)
+                                    else:
+                                        figures.append(Figure(
+                                            page=page_index,
+                                            caption=f"Image_{page_index}_{img_index}",
+                                        ))
                                 except Exception as exc:  # noqa: BLE001
                                     logger.debug("OCR image extraction failed on page %s: %s", page_index, exc)
                                     errors.append(f"image_extraction_failed: page={page_index} err={exc}")
-
-                        for img_index, _ in enumerate(images):
-                            figures.append(Figure(page=page_index, caption=f"Image_{page_index}_{img_index}"))
+                        else:
+                            for img_index, _ in enumerate(images):
+                                figures.append(Figure(page=page_index, caption=f"Image_{page_index}_{img_index}"))
 
                         if page_text_parts:
                             pages_map[page_index] = list(page_text_parts)
@@ -685,8 +732,11 @@ class DocumentExtractor:
                 with pdfplumber.open(io.BytesIO(pdf_content)) as doc:
                     for page_index, page in enumerate(doc.pages, start=1):
                         last_page = max(last_page, page_index)
+                        # Skip pages already handled well by fitz+OCR (>50 chars of content)
+                        existing_page = pages_map.get(page_index, [])
+                        existing_len = sum(len(line) for line in existing_page) if existing_page else 0
                         text = page.extract_text() or ""
-                        if text.strip():
+                        if text.strip() and len(text.strip()) > existing_len:
                             page_lines = text.splitlines()
                             for para in text.split("\n"):
                                 para = para.strip()
@@ -827,10 +877,61 @@ class DocumentExtractor:
 
         full_text = "\n".join(full_text_parts).strip()
 
-        # DPIE ML section detection (fallback: _is_heading regex already applied above)
-        dpie_sections = self._detect_sections_dpie(full_text)
-        if dpie_sections:
-            self._apply_dpie_sections(chunk_candidates, dpie_sections, full_text)
+        # Document-level OCR fallback: if no meaningful text was extracted,
+        # force OCR on ALL pages (the PDF is likely fully image-based)
+        _text_stripped = full_text.strip()
+        _alnum_ratio = sum(c.isalnum() for c in _text_stripped) / max(len(_text_stripped), 1)
+        _text_is_garbage = len(_text_stripped) < 50 or (len(_text_stripped) < 500 and _alnum_ratio < 0.3)
+        if _text_is_garbage and not chunk_candidates:
+            logger.info(
+                "PDF extraction produced low-quality text (%d chars, %.0f%% alnum); triggering full-document OCR",
+                len(_text_stripped), _alnum_ratio * 100,
+            )
+            try:
+                if hasattr(fitz, "open"):
+                    with fitz.open(stream=pdf_content, filetype="pdf") as doc:
+                        for page_index, page in enumerate(doc, start=1):
+                            last_page = max(last_page, page_index)
+                            # Render page as image for OCR
+                            try:
+                                mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for better OCR
+                                pix = page.get_pixmap(matrix=mat)
+                                img_data = pix.tobytes("png")
+                                image = Image.open(io.BytesIO(img_data))
+                                ocr_text, ocr_conf = self._ocr_with_vision(image, is_full_page=True)
+                                if ocr_text and ocr_text.strip():
+                                    full_text_parts.append(f"\n--- Page {page_index} ---\n{ocr_text}")
+                                    for para in ocr_text.split("\n"):
+                                        para = para.strip()
+                                        if not para:
+                                            continue
+                                        section_buffer.append(para)
+                                        chunk_type = "table" if self._looks_like_table(para) else "text"
+                                        chunk_candidates.append(
+                                            ChunkCandidate(
+                                                text=para,
+                                                page=page_index,
+                                                section_title=current_title,
+                                                section_id=current_section_id,
+                                                chunk_type=chunk_type,
+                                            )
+                                        )
+                                    pages_map[page_index] = ocr_text.splitlines()
+                                    if ocr_conf is not None:
+                                        ocr_confidences.append(float(ocr_conf))
+                            except Exception as exc:  # noqa: BLE001
+                                logger.debug("Full-page OCR failed for page %s: %s", page_index, exc)
+                                errors.append(f"full_page_ocr_failed: page={page_index} err={exc}")
+                    # Finalize remaining section buffer from OCR
+                    self._finalize_section(
+                        sections, current_title, current_section_id, current_start_page, last_page, section_buffer
+                    )
+                    section_buffer = []
+                    full_text = "\n".join(full_text_parts).strip()
+                    logger.info("Full-document OCR produced %d chars, %d chunks", len(full_text), len(chunk_candidates))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Full-document OCR fallback failed: %s", exc)
+                errors.append(f"full_doc_ocr_failed: {exc}")
 
         doc_type = self._doc_intel.infer_type(tables, figures, sections, full_text, filename_hint=filename or "document.pdf")
         pages = [
@@ -1270,18 +1371,7 @@ class DocumentIntelligence:
         full_text: str,
         filename_hint: Optional[str] = None,
     ) -> str:
-        # Strategy 1: DPIE ML classification
-        try:
-            from src.intelligence.dpie_integration import DPIERegistry
-            registry = DPIERegistry.get_instance()
-            if registry.is_loaded and full_text and len(full_text) > 50:
-                doc_type, confidence = registry.classify_document(full_text[:5000])
-                if confidence >= 0.4 and doc_type != "other":
-                    return doc_type
-        except Exception:
-            pass
-
-        # Strategy 2: existing heuristic
+        # Strategy 1: filename + structure heuristic
         name = (filename_hint or "").lower()
         if name.endswith((".ppt", ".pptx")):
             return "presentation"

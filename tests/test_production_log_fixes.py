@@ -140,12 +140,12 @@ class TestNLPEntityInPipeline:
         assert scope.mode == "all_profile"
 
 
-class TestHeuristicParseNLP:
-    """Heuristic intent parser uses NLP entity extraction."""
+class TestFallbackParseNLP:
+    """Fallback intent parser uses NLP entity extraction."""
 
     def _parse(self, query):
-        from src.intent.llm_intent import _heuristic_parse
-        return _heuristic_parse(query)
+        from src.intent.llm_intent import _fallback_parse
+        return _fallback_parse(query)
 
     def test_lowercase_name_extracted(self):
         result = self._parse("give me the skills of thamaraikannan")
@@ -193,7 +193,7 @@ class TestNoRegexEntityPatterns:
         import inspect
         from src.intent import llm_intent
         # Entity extraction is in _extract_entity_hints (called by both
-        # _heuristic_parse and _neural_parse)
+        # _fallback_parse and _neural_parse)
         source = inspect.getsource(llm_intent._extract_entity_hints)
         assert "extract_entity_from_query" in source
 

@@ -1028,7 +1028,7 @@ class TestEncodingGarbageDetection:
             {"section_title": "Experience", "section_kind": "experience"},
             {"section_title": "Data", "section_kind": "other"},
         ]
-        result_chunks, result_meta, stats = prepare_embedding_chunks(
+        result_chunks, result_meta, stats, _rescued = prepare_embedding_chunks(
             chunks, meta,
             subscription_id="sub1", profile_id="prof1",
             document_id="doc1", doc_name="test.doc",

@@ -16,7 +16,7 @@ CLASSIFIER_SYSTEM = (
 CLASSIFIER_INTENT_TEMPLATE = """\
 Classify this query. Return JSON with these exact keys:
 - "intent": one of factual|comparison|summary|ranking|timeline|reasoning|multi_field|cross_document|contact|extract
-- "domain": one of hr|invoice|legal|medical|generic
+- "domain": one of hr|invoice|legal|medical|policy|generic
 - "entity": person or document name mentioned, or null
 - "scope": one of all_profile|specific_document|targeted
 - "confidence": float 0.0 to 1.0

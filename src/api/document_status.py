@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 import traceback
@@ -7,8 +8,91 @@ from pymongo import ReturnDocument
 from bson import ObjectId
 
 from src.api.config import Config
+from src.api.statuses import STATUS_UNDER_REVIEW
 
 logger = logging.getLogger(__name__)
+
+_PROGRESS_TTL = 3600  # 1 hour
+_PROGRESS_CHANNEL = "dw:training:events"
+
+
+def emit_progress(
+    document_id: str,
+    stage: str,
+    progress: float,
+    detail: str = "",
+    extra: dict = None,
+):
+    """Emit a training progress event to Redis for real-time SSE streaming."""
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return
+
+        event = {
+            "document_id": str(document_id),
+            "stage": stage,
+            "progress": round(min(max(progress, 0.0), 1.0), 3),
+            "detail": detail,
+            "timestamp": time.time(),
+        }
+        if extra:
+            event["extra"] = extra
+
+        payload = json.dumps(event)
+        client.setex(f"dw:training:progress:{document_id}", _PROGRESS_TTL, payload)
+        client.publish(_PROGRESS_CHANNEL, payload)
+    except Exception:
+        pass  # Best-effort, never block the pipeline
+
+
+def get_training_progress(document_id: str) -> Optional[dict]:
+    """Get the latest training progress from Redis (for polling)."""
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return None
+        raw = client.get(f"dw:training:progress:{document_id}")
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+_ZOMBIE_TIMEOUT_SECONDS = 1800  # 30 minutes
+
+
+def recover_zombie_documents(timeout_seconds: int = _ZOMBIE_TIMEOUT_SECONDS) -> int:
+    """Auto-fail documents stuck in TRAINING_STARTED beyond timeout."""
+    collection = get_documents_collection()
+    cutoff = time.time() - timeout_seconds
+    zombies = list(collection.find(
+        {"status": "TRAINING_STARTED", "training_started_at": {"$lt": cutoff}},
+        {"_id": 1, "document_id": 1, "training_started_at": 1},
+    ))
+    recovered = 0
+    for doc in zombies:
+        doc_id = str(doc.get("document_id") or doc.get("_id"))
+        hours = (time.time() - (doc.get("training_started_at") or 0)) / 3600
+        try:
+            update_document_fields(doc_id, {
+                "status": "TRAINING_FAILED",
+                "training_error": f"Zombie recovery: stuck for {hours:.1f}h",
+                "training_failed_at": time.time(),
+                "error_summary": "zombie_timeout",
+            })
+            update_stage(doc_id, "embedding", {
+                "status": "FAILED", "completed_at": time.time(),
+                "reason": "zombie_timeout",
+                "error": {"message": f"Process died — stuck for {hours:.1f}h, auto-recovered"},
+            })
+            emit_progress(doc_id, "failed", 0.0, f"Auto-recovered: stuck for {hours:.1f}h")
+            recovered += 1
+            logger.info("Recovered zombie document %s (stuck %.1fh)", doc_id, hours)
+        except Exception:
+            logger.warning("Failed to recover zombie %s", doc_id, exc_info=True)
+    return recovered
 
 
 _MISSING = object()
@@ -73,7 +157,7 @@ def init_document_record(
         _doc_filter(document_id),
         {
             "$set": update,
-            "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id)},
+            "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id), "status": STATUS_UNDER_REVIEW},
         },
         upsert=True,
         return_document=ReturnDocument.AFTER,

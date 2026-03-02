@@ -9,6 +9,7 @@ import pytest
 from src.agentic.tool_selector import (
     ToolSelector,
     _DOMAIN_TOOLS,
+    _INTENT_DOMAIN_TOOLS,
     _INTENT_TOOLS,
     _KEYWORD_TOOL_PATTERNS,
     _NEVER_AUTO_SELECT,
@@ -25,7 +26,7 @@ _ALL_TOOLS = frozenset({
     "translator", "email_drafting", "jira_confluence", "code_docs",
     "tutor", "web_extract", "image_analysis", "tts", "stt", "db_connector",
     "screen_ai_authorship", "screen_resume", "screen_readability",
-    "content_types", "creator",
+    "content_types", "creator", "insights", "action_items", "web_search",
 })
 
 
@@ -46,25 +47,44 @@ class TestIntentMapping:
         result = _selector().select_tools("write something", intent_parse=_intent("generate"))
         assert "content_generate" in result
 
-    def test_compare_intent_selects_content_generate(self):
+    def test_compare_intent_no_content_generate(self):
+        """Compare intent is handled by RAG pipeline, not content_generate."""
         result = _selector().select_tools("compare them", intent_parse=_intent("compare"))
-        assert "content_generate" in result
+        assert "content_generate" not in result
 
-    def test_extract_intent_selects_resumes(self):
-        result = _selector().select_tools("extract skills", intent_parse=_intent("extract"))
+    def test_extract_intent_with_hr_domain_selects_resumes(self):
+        """Extract intent requires matching HR domain to select resumes."""
+        result = _selector().select_tools("extract skills", intent_parse=_intent("extract", "hr"))
         assert "resumes" in result
+
+    def test_extract_intent_without_hr_domain_no_resumes(self):
+        """Extract intent on non-HR domain should NOT select resumes."""
+        result = _selector().select_tools("extract totals", intent_parse=_intent("extract", "invoice"))
+        assert "resumes" not in result
+
+    def test_extract_intent_generic_domain_no_resumes(self):
+        """Extract intent on generic domain should NOT select resumes."""
+        result = _selector().select_tools("extract data", intent_parse=_intent("extract", "generic"))
+        assert "resumes" not in result
 
     def test_contact_intent_selects_resumes(self):
         result = _selector().select_tools("get contact info", intent_parse=_intent("contact"))
         assert "resumes" in result
 
-    def test_rank_intent_selects_resumes(self):
-        result = _selector().select_tools("rank candidates", intent_parse=_intent("rank"))
+    def test_rank_intent_with_hr_domain_selects_resumes(self):
+        """Rank intent requires matching HR domain to select resumes."""
+        result = _selector().select_tools("rank candidates", intent_parse=_intent("rank", "resume"))
         assert "resumes" in result
 
-    def test_summarize_intent_selects_content_generate(self):
+    def test_rank_intent_without_hr_domain_no_resumes(self):
+        """Rank intent on non-HR domain should NOT select resumes."""
+        result = _selector().select_tools("rank invoices", intent_parse=_intent("rank", "invoice"))
+        assert "resumes" not in result
+
+    def test_summarize_intent_no_content_generate(self):
+        """Summarize intent is handled by RAG pipeline, not content_generate."""
         result = _selector().select_tools("summarize the doc", intent_parse=_intent("summarize"))
-        assert "content_generate" in result
+        assert "content_generate" not in result
 
     def test_qa_intent_no_tools(self):
         result = _selector().select_tools("what is the date?", intent_parse=_intent("qa"))
@@ -94,9 +114,10 @@ class TestDomainMapping:
         result = _selector().select_tools("patient info", intent_parse=_intent(domain="medical"))
         assert "medical" in result
 
-    def test_invoice_domain_selects_content_generate(self):
+    def test_invoice_domain_no_content_generate(self):
+        """Invoice domain should NOT auto-select content_generate — factual queries use RAG."""
         result = _selector().select_tools("invoice total", intent_parse=_intent("qa", "invoice"))
-        assert "content_generate" in result
+        assert "content_generate" not in result
         assert "resumes" not in result
         assert "lawhere" not in result
 
@@ -124,7 +145,8 @@ class TestKeywordMapping:
 
     def test_interview_prep_keyword(self):
         result = _selector().select_tools("prepare interview prep materials")
-        assert "content_generate" in result
+        # interview prep routes to resumes (for domain agent handling)
+        assert "resumes" in result
 
     def test_translate_keyword(self):
         result = _selector().select_tools("translate this to French")
@@ -134,12 +156,12 @@ class TestKeywordMapping:
         result = _selector().select_tools("provide a translation")
         assert "translator" in result
 
-    def test_email_keyword(self):
+    def test_email_draft_keyword(self):
         result = _selector().select_tools("draft an email to the team")
         assert "email_drafting" in result
 
-    def test_compose_keyword(self):
-        result = _selector().select_tools("compose a message")
+    def test_compose_message_keyword(self):
+        result = _selector().select_tools("compose a message to HR")
         assert "email_drafting" in result
 
     def test_jira_keyword(self):
@@ -154,7 +176,7 @@ class TestKeywordMapping:
         result = _selector().select_tools("look at the code docs for this API")
         assert "code_docs" in result
 
-    def test_tutor_keyword(self):
+    def test_tutor_me_keyword(self):
         result = _selector().select_tools("tutor me on Python")
         assert "tutor" in result
 
@@ -166,45 +188,177 @@ class TestKeywordMapping:
         result = _selector().select_tools("extract text from this image using ocr")
         assert "image_analysis" in result
 
-    def test_screen_keyword(self):
+    def test_screen_for_pii_keyword(self):
         result = _selector().select_tools("screen this for pii")
         assert "screen_pii" in result
 
-    def test_summarize_keyword(self):
+    def test_summarize_keyword_no_content_generate(self):
+        """Summarize keyword should NOT select content_generate — RAG handles summarization."""
         result = _selector().select_tools("Summarize the documents")
-        assert "content_generate" in result
+        assert "content_generate" not in result
 
     def test_compare_candidates_keyword(self):
         result = _selector().select_tools("Compare all candidates by skills")
-        assert "content_generate" in result
+        assert "resumes" in result
 
-    def test_rank_keyword(self):
-        result = _selector().select_tools("Rank candidates by experience")
+    def test_rank_candidates_keyword(self):
+        result = _selector().select_tools("Rank the candidates by experience")
         assert "resumes" in result
 
     def test_contact_info_keyword(self):
         result = _selector().select_tools("Get Dhayal's contact info")
         assert "resumes" in result
 
-    def test_extract_skills_keyword(self):
+    def test_extract_skills_from_resume_keyword(self):
         result = _selector().select_tools("Extract all skills from the resume")
         assert "resumes" in result
 
-    def test_legal_clause_keyword(self):
-        result = _selector().select_tools("Analyze this legal clause for risks")
-        assert "lawhere" in result
-
-    def test_medical_report_keyword(self):
-        result = _selector().select_tools("Summarize the medical report findings")
-        assert "medical" in result
-
-    def test_invoice_keyword(self):
+    def test_invoice_keyword_factual(self):
+        """Factual invoice queries should NOT select content_generate."""
         result = _selector().select_tools("What are the invoice totals?")
+        assert "content_generate" not in result
+
+    def test_invoice_keyword_generate(self):
+        """Only explicit generation queries should select content_generate for invoices."""
+        result = _selector().select_tools("Generate a draft invoice for the client")
         assert "content_generate" in result
 
-    def test_resume_detail_keyword(self):
-        result = _selector().select_tools("Get the candidate profile details from the resume")
+    def test_candidate_profile_keyword(self):
+        result = _selector().select_tools("Show the candidate profile details")
         assert "resumes" in result
+
+    def test_action_items_keyword(self):
+        result = _selector().select_tools("What are the action items from the meeting?")
+        assert "action_items" in result
+
+    def test_find_anomalies_keyword(self):
+        result = _selector().select_tools("Find anomalies in the financial data")
+        assert "insights" in result
+
+    def test_payment_anomaly_selects_insights_not_medical(self):
+        """Payment anomalies are financial, NOT medical."""
+        result = _selector().select_tools("Find payment anomalies in the invoices")
+        assert "insights" in result
+        assert "medical" not in result
+
+    def test_force_majeure_selects_lawhere(self):
+        result = _selector().select_tools("Does this contract have a force majeure clause?")
+        assert "lawhere" in result
+
+    def test_convert_documents_to_english(self):
+        result = _selector().select_tools("Convert all the other language documents to english")
+        assert "translator" in result
+
+    def test_drug_interaction_selects_medical(self):
+        result = _selector().select_tools("Check for drug interactions with aspirin")
+        assert "medical" in result
+
+    def test_compliance_check_selects_lawhere(self):
+        result = _selector().select_tools("Check compliance with GDPR regulations")
+        assert "lawhere" in result
+
+
+# ---------------------------------------------------------------------------
+# False positive prevention tests
+# ---------------------------------------------------------------------------
+
+class TestFalsePositivePrevention:
+    """Verify that common queries do NOT trigger wrong tool selection."""
+
+    def test_bare_email_no_email_drafting(self):
+        """'email' alone should NOT trigger email_drafting — it's contact extraction."""
+        result = _selector().select_tools("What is the candidate's email?")
+        assert "email_drafting" not in result
+
+    def test_bare_draft_no_email_drafting(self):
+        """'draft' alone (as adjective) should NOT trigger email_drafting."""
+        result = _selector().select_tools("What does the draft agreement say?")
+        assert "email_drafting" not in result
+
+    def test_bare_task_no_action_items(self):
+        """'task' alone should NOT trigger action_items."""
+        result = _selector().select_tools("What tasks does the candidate have experience with?")
+        assert "action_items" not in result
+
+    def test_bare_deadline_no_action_items(self):
+        """'deadline' alone should NOT trigger action_items — it's a document fact."""
+        result = _selector().select_tools("What is the project deadline?")
+        assert "action_items" not in result
+
+    def test_explain_how_no_tutor(self):
+        """'explain how' should NOT trigger tutor — it's a normal question."""
+        result = _selector().select_tools("Explain how the payment terms work")
+        assert "tutor" not in result
+
+    def test_learn_no_tutor(self):
+        """'learn' alone should NOT trigger tutor."""
+        result = _selector().select_tools("What can I learn from these documents?")
+        assert "tutor" not in result
+
+    def test_bare_medical_no_medical_tool(self):
+        """'medical' alone in keyword should NOT trigger medical tool — use ML domain."""
+        result = _selector().select_tools("What is the medical expense on this invoice?")
+        assert "medical" not in result
+
+    def test_bare_patient_no_medical_tool(self):
+        """'patient' as adjective should NOT trigger medical tool."""
+        result = _selector().select_tools("Is the candidate patient and detail-oriented?")
+        assert "medical" not in result
+
+    def test_bare_contract_no_lawhere(self):
+        """'contract' alone should NOT trigger lawhere — use ML domain."""
+        result = _selector().select_tools("What is the contract value on this invoice?")
+        assert "lawhere" not in result
+
+    def test_bare_legal_no_lawhere(self):
+        """'legal' alone should NOT trigger lawhere."""
+        result = _selector().select_tools("Is there a legal department mentioned?")
+        assert "lawhere" not in result
+
+    def test_bare_screen_no_screen_pii(self):
+        """'screen' alone should NOT trigger screen_pii."""
+        result = _selector().select_tools("Screen the candidates for this role")
+        assert "screen_pii" not in result
+
+    def test_bare_documentation_no_code_docs(self):
+        """'documentation' alone should NOT trigger code_docs."""
+        result = _selector().select_tools("Where is the documentation for the insurance policy?")
+        assert "code_docs" not in result
+
+    def test_bare_unusual_no_insights(self):
+        """'unusual' alone should NOT trigger insights."""
+        result = _selector().select_tools("The contract has an unusual termination clause")
+        assert "insights" not in result
+
+    def test_rank_invoices_no_resumes(self):
+        """'rank' on non-HR content should NOT select resumes."""
+        result = _selector().select_tools("Rank these invoices by amount")
+        assert "resumes" not in result
+
+    def test_extract_invoice_data_no_resumes(self):
+        """'extract' on non-HR content should NOT select resumes."""
+        result = _selector().select_tools("Extract the total amount from the invoice")
+        assert "resumes" not in result
+
+    def test_top_5_invoices_no_resumes(self):
+        """'top 5' on non-HR content should NOT select resumes."""
+        result = _selector().select_tools("Top 5 invoices by amount")
+        assert "resumes" not in result
+
+    def test_obligations_no_action_items(self):
+        """'obligations' should NOT trigger action_items — it's a legal term."""
+        result = _selector().select_tools("What are the obligations of the employer under this contract?")
+        assert "action_items" not in result
+
+    def test_generic_factual_query_no_tools(self):
+        """Simple factual queries should return no tools."""
+        result = _selector().select_tools("What are the products using laser?")
+        assert result == []
+
+    def test_user_complaint_no_wrong_tools(self):
+        """User feedback/complaint text should not trigger tools incorrectly."""
+        result = _selector().select_tools("these are not invoice documents and my task was different")
+        assert "action_items" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +392,7 @@ class TestCapsAndDedup:
     def test_max_tools_cap(self):
         """Selecting more than MAX_AUTO_TOOLS should be capped."""
         # Query that triggers many tools (via keywords)
-        query = "translate the email draft from the jira confluence code docs and tutor me"
+        query = "translate and check the jira ticket and look at the code docs"
         result = _selector().select_tools(query)
         assert len(result) <= 3
 
@@ -342,7 +496,7 @@ class TestAnalysisFallback:
         ip = _intent("extract", "resume")
         analysis = SimpleNamespace(intent="generate", domain="legal")
         result = _selector().select_tools("get info", intent_parse=ip, analysis=analysis)
-        # Should use intent_parse's intent=extract → resumes, domain=resume → resumes
+        # Should use intent_parse's intent=extract+domain=resume → resumes
         assert "resumes" in result
         # Should NOT pick up generate→content_generate from analysis
         # (intent_parse already provided an intent)

@@ -1,9 +1,9 @@
 """Tests for ML enhancements to query_focus.py.
 
-Tests three ML components:
+Tests ML components:
 1. Semantic similarity via embedder (cosine similarity scoring)
 2. Field importance classifier (NumPy MLP, self-supervised)
-3. Neural section routing via DPIE (confidence-gated reclassification)
+3. Section routing (string-matching based scoring)
 """
 
 import threading
@@ -17,14 +17,12 @@ from src.rag_v3.query_focus import (
     QueryFocus,
     build_query_focus,
     clear_chunk_embed_cache,
-    clear_dpie_cache,
     filter_chunks_by_focus,
     score_chunk_relevance,
     score_field_relevance,
     _semantic_similarity_score,
     _section_affinity_score,
     _get_or_encode_chunk,
-    _dpie_classify_chunk,
     _raw_chunk_score,
 )
 from src.rag_v3.field_classifier import (
@@ -74,31 +72,6 @@ class FakeEmbedder:
         return np.array(results)
 
 
-class FakeDPIERegistry:
-    """Fake DPIE registry with a configurable section classifier."""
-
-    def __init__(self, kind: str = "skills_technical", confidence: float = 0.8):
-        self.section_kind_classifier = FakeSectionClassifier(kind, confidence)
-
-    @classmethod
-    def get(cls):
-        return _fake_dpie_instance
-
-
-class FakeSectionClassifier:
-    def __init__(self, kind: str, confidence: float):
-        self._kind = kind
-        self._confidence = confidence
-        self.call_count = 0
-
-    def classify(self, title: str, content: str, doc_type: str = None) -> tuple:
-        self.call_count += 1
-        return (self._kind, self._confidence)
-
-
-_fake_dpie_instance = None
-
-
 def _make_chunk(text: str, section_kind: str = "", score: float = 0.0) -> SimpleNamespace:
     return SimpleNamespace(
         text=text,
@@ -115,12 +88,10 @@ def _make_chunk(text: str, section_kind: str = "", score: float = 0.0) -> Simple
 def _cleanup():
     """Clear caches and classifier singleton before/after each test."""
     clear_chunk_embed_cache()
-    clear_dpie_cache()
     old_clf = get_field_classifier()
     set_field_classifier(None)
     yield
     clear_chunk_embed_cache()
-    clear_dpie_cache()
     set_field_classifier(old_clf)
 
 
@@ -320,94 +291,21 @@ class TestFieldClassifier:
 
 
 # ===========================================================================
-# Test Class 3: DPIE Neural Section Routing
+# Test Class 3: Section Routing
 # ===========================================================================
 
-class TestDPIERouting:
-    """Tests for DPIE-based section reclassification."""
+class TestSectionRouting:
+    """Tests for section-based scoring."""
 
     def test_misc_chunk_gets_neutral_score(self):
-        """Chunk with section_kind='misc' gets neutral penalty (DPIE disabled at query time for GPU savings)."""
+        """Chunk with section_kind='misc' gets neutral penalty."""
         chunk = _make_chunk("Python Java C++ skills", section_kind="misc")
         focus = QueryFocus(section_kinds=["skills_technical"])
 
         from src.rag_v3.query_focus import _section_affinity_score
         score = _section_affinity_score(chunk, focus)
-        # Generic/misc section_kind → neutral 0.3 penalty (no DPIE call)
+        # Generic/misc section_kind → neutral 0.3 penalty
         assert score == 0.3
-
-    def test_dpie_skipped_for_known_section(self):
-        """Chunk with known section_kind doesn't trigger DPIE."""
-        global _fake_dpie_instance
-        registry = FakeDPIERegistry(kind="education", confidence=0.9)
-        _fake_dpie_instance = registry
-
-        chunk = _make_chunk("Python Java", section_kind="skills_technical")
-        focus = QueryFocus(section_kinds=["skills_technical"])
-
-        with patch("src.intelligence.dpie_integration.DPIERegistry", FakeDPIERegistry):
-            score = _section_affinity_score(chunk, focus)
-            assert score == 1.0
-            # DPIE should NOT have been called (section_kind already set)
-            assert registry.section_kind_classifier.call_count == 0
-
-        _fake_dpie_instance = None
-
-    def test_dpie_low_confidence_falls_back(self):
-        """DPIE confidence < 0.5 → falls back to unknown section score."""
-        global _fake_dpie_instance
-        _fake_dpie_instance = FakeDPIERegistry(kind="skills_technical", confidence=0.3)
-
-        chunk = _make_chunk("some text", section_kind="unknown")
-        focus = QueryFocus(section_kinds=["skills_technical"])
-
-        with patch("src.intelligence.dpie_integration.DPIERegistry", FakeDPIERegistry):
-            score = _section_affinity_score(chunk, focus)
-            # Low confidence → chunk_kind stays empty → 0.3 (unknown penalty)
-            assert score == 0.3
-
-        _fake_dpie_instance = None
-
-    def test_dpie_not_loaded_returns_fallback(self):
-        """DPIE not loaded → returns ("", 0.0)."""
-        chunk = _make_chunk("some text", section_kind="")
-        # No patching → real DPIERegistry.get() returns None or errors
-        result = _dpie_classify_chunk(chunk)
-        assert result == ("", 0.0)
-
-    def test_dpie_cache_works(self):
-        """Same chunk text → cached DPIE result."""
-        global _fake_dpie_instance
-        registry = FakeDPIERegistry(kind="experience", confidence=0.9)
-        _fake_dpie_instance = registry
-
-        chunk = _make_chunk("5 years software engineer", section_kind="misc")
-
-        with patch("src.intelligence.dpie_integration.DPIERegistry", FakeDPIERegistry):
-            r1 = _dpie_classify_chunk(chunk)
-            r2 = _dpie_classify_chunk(chunk)
-            assert r1 == r2
-            # Only called once due to cache
-            assert registry.section_kind_classifier.call_count == 1
-
-        _fake_dpie_instance = None
-
-    def test_clear_dpie_cache(self):
-        """clear_dpie_cache() resets the thread-local cache."""
-        global _fake_dpie_instance
-        registry = FakeDPIERegistry(kind="experience", confidence=0.9)
-        _fake_dpie_instance = registry
-
-        chunk = _make_chunk("5 years engineer", section_kind="other")
-
-        with patch("src.intelligence.dpie_integration.DPIERegistry", FakeDPIERegistry):
-            _dpie_classify_chunk(chunk)
-            clear_dpie_cache()
-            _dpie_classify_chunk(chunk)
-            # Called twice (cache was cleared)
-            assert registry.section_kind_classifier.call_count == 2
-
-        _fake_dpie_instance = None
 
 
 # ===========================================================================
@@ -427,8 +325,8 @@ class TestGracefulDegradation:
         assert "skills" in focus.field_tags
         assert "skills_technical" in focus.section_kinds
 
-    def test_no_dpie_identical_section_scores(self):
-        """Without DPIE, section affinity uses string matching only."""
+    def test_section_affinity_uses_string_matching(self):
+        """Section affinity uses string matching."""
         chunk = _make_chunk("Python Java", section_kind="skills_technical")
         focus = QueryFocus(section_kinds=["skills_technical"])
         score = _section_affinity_score(chunk, focus)

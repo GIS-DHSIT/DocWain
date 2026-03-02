@@ -159,6 +159,7 @@ class TeamsChatService:
                 subscription_id=context.subscription_id,
                 model_name=context.model_name,
                 persona=context.persona,
+                session_id=context.session_id,
             )
         except Exception as exc:  # noqa: BLE001
             raise TeamsChatError(str(exc)) from exc

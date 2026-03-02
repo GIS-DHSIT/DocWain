@@ -11,11 +11,24 @@ Covers all 6 phases:
 """
 
 import time
+from dataclasses import dataclass, field as dc_field
 from unittest.mock import MagicMock, patch, PropertyMock
 from typing import Any, Dict, List
 
 import numpy as np
 import pytest
+
+
+@dataclass(frozen=True)
+class _FakeIntentParse:
+    """Lightweight mock for IntentParse — simulates ML classifier output."""
+    intent: str = "qa"
+    output_format: str = "text"
+    requested_fields: list = dc_field(default_factory=list)
+    domain: str = "generic"
+    constraints: dict = dc_field(default_factory=dict)
+    entity_hints: list = dc_field(default_factory=list)
+    source: str = "test"
 
 
 # ── Phase 1: KG ingestion in extraction service ─────────────────────────
@@ -334,83 +347,37 @@ class TestPipelineKGAugmentation:
 # ── Phase 5: DPIE classification ─────────────────────────────────────────
 
 
-class TestDPIEClassification:
-    """Test DPIE as primary classifier in extraction and embedding."""
+class TestStructuredClassification:
+    """Test structured extraction metadata classification (DPIE removed)."""
 
-    def test_dpie_tried_before_structured_fallback(self):
-        """DPIE classification is attempted before structured extraction metadata."""
+    def test_structured_extraction_returns_document_type(self):
+        """Classification returns document type from structured extraction."""
         from src.api.extraction_service import _extract_classification_from_structured
 
-        with patch("src.intelligence.dpie_integration.dpie_classify_document_type") as mock_dpie:
-            mock_dpie.return_value = ("resume", 0.85)
-            result = _extract_classification_from_structured(
-                {"test.pdf": {"full_text": "John Doe, Python Developer", "document_type": "GENERIC"}}
-            )
-            mock_dpie.assert_called_once()
-            assert result["document_type"] == "RESUME"
-            assert result["domain"] == "resume"
-            assert result["confidence"] == 0.85
-            assert result["classifier"] == "dpie"
+        result = _extract_classification_from_structured(
+            {"test.pdf": {"full_text": "John Doe, Python Developer", "document_type": "RESUME"}}
+        )
+        assert result["document_type"] == "RESUME"
 
-    def test_dpie_low_confidence_falls_through(self):
-        """Low confidence DPIE result falls through to structured extraction."""
+    def test_structured_extraction_generic_fallback(self):
+        """Missing document_type defaults to GENERIC."""
         from src.api.extraction_service import _extract_classification_from_structured
 
-        with patch("src.intelligence.dpie_integration.dpie_classify_document_type") as mock_dpie:
-            mock_dpie.return_value = ("other", 0.3)
-            result = _extract_classification_from_structured(
-                {"test.pdf": {"full_text": "Some text", "document_type": "INVOICE"}}
-            )
-            assert result["document_type"] == "INVOICE"
-            assert "classifier" not in result  # not from DPIE
+        result = _extract_classification_from_structured(
+            {"test.pdf": {"full_text": "Some text"}}
+        )
+        assert result["document_type"] == "GENERIC"
 
-    def test_dpie_unavailable_falls_through(self):
-        """When DPIE is not available, falls through to structured extraction."""
-        from src.api.extraction_service import _extract_classification_from_structured
-
-        with patch(
-            "src.intelligence.dpie_integration.dpie_classify_document_type",
-            side_effect=ImportError("no DPIE"),
-        ):
-            result = _extract_classification_from_structured(
-                {"test.pdf": {"document_type": "REPORT"}}
-            )
-            assert result["document_type"] == "REPORT"
-
-    def test_dpie_section_kind_in_content_classifier(self):
-        """DPIE section kind classifier is tried first in classify_section_kind_with_source."""
+    def test_section_kind_title_based(self):
+        """Section kind classification uses title-based matching."""
         from src.embedding.pipeline.content_classifier import classify_section_kind_with_source
 
-        mock_registry = MagicMock()
-        mock_registry.is_loaded = True
-        mock_registry.classify_section_kind.return_value = ("experience", 0.85)
-
-        with patch("src.intelligence.dpie_integration.DPIERegistry") as mock_dpie_cls:
-            mock_dpie_cls.get.return_value = mock_registry
-            kind, source = classify_section_kind_with_source(
-                "Worked at Google for 5 years as Senior Engineer",
-                "Work Experience",
-            )
-            assert kind == "experience"
-            assert source == "dpie"
-
-    def test_dpie_section_kind_low_confidence_falls_through(self):
-        """Low confidence DPIE section kind falls through to title/keyword."""
-        from src.embedding.pipeline.content_classifier import classify_section_kind_with_source
-
-        mock_registry = MagicMock()
-        mock_registry.is_loaded = True
-        mock_registry.classify_section_kind.return_value = ("misc", 0.3)
-
-        with patch("src.intelligence.dpie_integration.DPIERegistry") as mock_dpie_cls:
-            mock_dpie_cls.get.return_value = mock_registry
-            kind, source = classify_section_kind_with_source(
-                "Bachelor of Science in Computer Science, MIT 2020",
-                "Education",
-            )
-            # Falls through to title-based: "Education" matches
-            assert kind == "education"
-            assert source == "title"
+        kind, source = classify_section_kind_with_source(
+            "Bachelor of Science in Computer Science, MIT 2020",
+            "Education",
+        )
+        assert kind == "education"
+        assert source == "title"
 
 
 # ── Phase 6: KG config + health ──────────────────────────────────────────
@@ -461,20 +428,21 @@ class TestScreeningStatusFix:
         from src.api.screening_service import promote_to_screening_completed
 
         with patch("src.api.screening_service.get_document_record") as mock_get, \
-             patch("src.api.screening_service._set_document_status") as mock_set:
+             patch("src.api.screening_service._set_document_status") as mock_set, \
+             patch("src.api.screening_service.update_stage"):
             mock_get.return_value = {"status": "EXTRACTION_COMPLETED"}
             promote_to_screening_completed("doc1")
             mock_set.assert_called_once_with("doc1", "SCREENING_COMPLETED")
 
-    def test_promote_from_under_review(self):
-        """Documents at UNDER_REVIEW are promoted to SCREENING_COMPLETED."""
+    def test_promote_from_under_review_skipped(self):
+        """Documents at UNDER_REVIEW are NOT promoted — extraction must complete first."""
         from src.api.screening_service import promote_to_screening_completed
 
         with patch("src.api.screening_service.get_document_record") as mock_get, \
              patch("src.api.screening_service._set_document_status") as mock_set:
             mock_get.return_value = {"status": "UNDER_REVIEW"}
             promote_to_screening_completed("doc1")
-            mock_set.assert_called_once_with("doc1", "SCREENING_COMPLETED")
+            mock_set.assert_not_called()
 
     def test_promote_skipped_for_training_completed(self):
         """Documents at TRAINING_COMPLETED are not downgraded."""
@@ -529,15 +497,15 @@ class TestScreeningStatusFix:
 class TestPolicyDomainSupport:
     """Verify insurance/policy domain detection across the stack."""
 
-    def test_heuristic_parse_detects_policy_domain(self):
-        """Insurance keywords map to domain='policy' in heuristic parse."""
-        from src.intent.llm_intent import _heuristic_parse
-        result = _heuristic_parse("what are the conditions for natural calamities in the insurance policy")
+    def test_fallback_parse_detects_policy_domain(self):
+        """Insurance keywords map to domain='policy' in fallback parse."""
+        from src.intent.llm_intent import _fallback_parse
+        result = _fallback_parse("what are the conditions for natural calamities in the insurance policy")
         assert result["domain"] == "policy"
 
-    def test_heuristic_parse_insurance_queries(self):
+    def test_fallback_parse_insurance_queries(self):
         """Realistic policy queries are detected by neural classifier."""
-        from src.intent.llm_intent import _heuristic_parse
+        from src.intent.llm_intent import _fallback_parse
         # Full semantic queries — not isolated keywords
         policy_queries = [
             "what does my insurance policy cover",
@@ -547,7 +515,7 @@ class TestPolicyDomainSupport:
             "what is the deductible for flood insurance",
         ]
         for query in policy_queries:
-            result = _heuristic_parse(query)
+            result = _fallback_parse(query)
             assert result["domain"] == "policy", f"Failed for query: {query!r}"
 
     def test_sanitize_payload_accepts_policy_domain(self):
@@ -579,12 +547,13 @@ class TestPolicyDomainSupport:
         from src.rag_v3.types import PolicySchema
         assert isinstance(schema, PolicySchema)
 
-    def test_query_domain_override_detects_policy(self):
-        """_query_domain_override returns 'policy' for insurance queries."""
-        from src.rag_v3.extract import _query_domain_override
-        assert _query_domain_override("what is the coverage for natural disasters") == "policy"
-        assert _query_domain_override("tell me about the insurance premium") == "policy"
-        assert _query_domain_override("what are the deductible amounts") == "policy"
+    def test_ml_query_domain_detects_policy(self):
+        """_ml_query_domain returns 'policy' for insurance queries with intent_parse."""
+        from src.rag_v3.extract import _ml_query_domain
+        policy_intent = _FakeIntentParse(domain="policy")
+        assert _ml_query_domain("what is the coverage for natural disasters", policy_intent) == "policy"
+        assert _ml_query_domain("tell me about the insurance premium", policy_intent) == "policy"
+        assert _ml_query_domain("what are the deductible amounts", policy_intent) == "policy"
 
     def test_domain_router_knows_policy(self):
         """DomainRouter recognizes 'policy' and 'insurance' alias."""
@@ -607,12 +576,9 @@ class TestPolicyDomainSupport:
         """Content classifier maps policy-related titles to section kinds."""
         from src.embedding.pipeline.content_classifier import classify_section_kind
 
-        with patch("src.intelligence.dpie_integration.DPIERegistry") as mock_dpie_cls:
-            mock_dpie_cls.get.side_effect = Exception("no DPIE")
-
-            assert classify_section_kind("Coverage details for fire", "Coverage") == "legal_clauses"
-            assert classify_section_kind("Items not covered", "Exclusion") == "legal_clauses"
-            assert classify_section_kind("Annual premium $500", "Premium Schedule") == "financial_summary"
+        assert classify_section_kind("Coverage details for fire", "Coverage") == "legal_clauses"
+        assert classify_section_kind("Items not covered", "Exclusion") == "legal_clauses"
+        assert classify_section_kind("Annual premium $500", "Premium Schedule") == "financial_summary"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -748,21 +714,21 @@ class TestNeuralIntentClassifier:
 
     def test_neural_graceful_degradation(self):
         """When classifier and embedder unavailable, falls back to regex."""
-        from src.intent.llm_intent import _heuristic_parse
+        from src.intent.llm_intent import _fallback_parse
         from src.intent.intent_classifier import set_intent_classifier
 
         set_intent_classifier(None)
         with patch("src.intent.llm_intent._get_embedder", return_value=None):
             with patch("src.intent.intent_classifier.ensure_intent_classifier", side_effect=Exception("no embedder")):
-                result = _heuristic_parse("summarize the document")
+                result = _fallback_parse("summarize the document")
                 assert result["intent"] == "summarize"  # Regex fallback works
 
-    def test_heuristic_parse_uses_neural_when_available(self):
-        """_heuristic_parse routes through neural when classifier is loaded."""
+    def test_fallback_parse_uses_neural_when_available(self):
+        """_fallback_parse routes through neural when classifier is loaded."""
         from src.intent.intent_classifier import DOMAIN_NAMES
-        from src.intent.llm_intent import _heuristic_parse
+        from src.intent.llm_intent import _fallback_parse
         with patch("src.intent.llm_intent._get_embedder", return_value=self._emb):
-            result = _heuristic_parse("what are the conditions for natural calamities in insurance")
+            result = _fallback_parse("what are the conditions for natural calamities in insurance")
         assert result is not None
         # Neural classifier is available, so it should be used (not regex fallback)
         assert result["intent"] in ("qa", "extract", "summarize")

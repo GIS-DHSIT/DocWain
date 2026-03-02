@@ -10,6 +10,14 @@ from src.doc_understanding.structure_inference import infer_structure
 
 logger = logging.getLogger(__name__)
 
+
+def _get(obj: Any, key: str, default: Any = None) -> Any:
+    """Access attribute or dict key — supports both objects and dicts."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
 _ENTITY_PATTERNS = {
     "EMAIL": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.IGNORECASE),
     "DATE": re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"),
@@ -25,7 +33,13 @@ def _fallback_entities(text: str) -> List[Dict[str, str]]:
     return entities
 
 
-def _ollama_understand(text: str, doc_type: str, model_name: Optional[str], llm_client=None) -> Optional[Dict[str, Any]]:
+def _ollama_understand(
+    text: str,
+    doc_type: str,
+    model_name: Optional[str],
+    llm_client=None,
+    use_thinking: bool = False,
+) -> Optional[Dict[str, Any]]:
     if not model_name and llm_client is None:
         return None
     prompt = (
@@ -39,12 +53,35 @@ def _ollama_understand(text: str, doc_type: str, model_name: Optional[str], llm_
         "Evidence pointer should be 'Section: <title>, Page: <page>'.\n\n"
         f"TEXT:\n{text[:8000]}"
     )
+
+    # Build generation options — expand for thinking mode
+    _options: Dict[str, Any] = {
+        "temperature": 0.1,
+        "num_predict": 1024,
+        "num_ctx": 4096,
+    }
+    if use_thinking:
+        _options["think"] = True
+        _options["num_ctx"] = max(_options.get("num_ctx", 4096), 16384)
+        _options["num_predict"] = max(_options.get("num_predict", 1024), 4096)
+        logger.info(
+            "Document understanding thinking mode enabled: num_ctx=%d num_predict=%d",
+            _options["num_ctx"], _options["num_predict"],
+        )
+
     try:
         if llm_client is not None:
-            content = llm_client.generate(prompt)
+            if hasattr(llm_client, "generate_with_metadata"):
+                content, _meta = llm_client.generate_with_metadata(prompt, options=_options)
+            else:
+                content = llm_client.generate(prompt)
         else:
             from src.llm.gateway import get_llm_gateway
-            content = get_llm_gateway().generate(prompt)
+            gw = get_llm_gateway()
+            if hasattr(gw, "generate_with_metadata"):
+                content, _meta = gw.generate_with_metadata(prompt, options=_options)
+            else:
+                content = gw.generate(prompt)
         content = (content or "").strip()
         return json.loads(content)
     except Exception as exc:  # noqa: BLE001
@@ -53,10 +90,13 @@ def _ollama_understand(text: str, doc_type: str, model_name: Optional[str], llm_
 
 
 def _extractive_section_summaries(extracted: Any) -> Dict[str, str]:
-    ctx = ContextUnderstanding()
     summaries = {}
-    for section in getattr(extracted, "sections", []) or []:
-        summaries[getattr(section, "title", "Untitled Section")] = ctx.summarize_section(section)
+    for section in _get(extracted, "sections", []) or []:
+        title = _get(section, "title", "Untitled Section")
+        text = _get(section, "text", "")
+        if text:
+            sentences = [s.strip() for s in text.split(".") if s.strip()]
+            summaries[title] = ". ".join(sentences[:3]) + "." if sentences else text[:200]
     return summaries
 
 
@@ -94,12 +134,13 @@ def understand_document(
     extracted: Any,
     doc_type: str,
     model_name: Optional[str] = None,
+    use_thinking: bool = False,
 ) -> Dict[str, Any]:
-    full_text = getattr(extracted, "full_text", "") or ""
-    if not full_text and getattr(extracted, "sections", None):
-        full_text = "\n".join([sec.text for sec in extracted.sections if sec.text])
+    full_text = _get(extracted, "full_text", "") or ""
+    if not full_text and _get(extracted, "sections"):
+        full_text = "\n".join([_get(s, "text", "") for s in _get(extracted, "sections", []) if _get(s, "text")])
 
-    llm_payload = _ollama_understand(full_text, doc_type, model_name=model_name)
+    llm_payload = _ollama_understand(full_text, doc_type, model_name=model_name, use_thinking=use_thinking)
 
     if llm_payload:
         doc_summary = str(llm_payload.get("doc_summary") or "").strip()
@@ -108,10 +149,15 @@ def understand_document(
         key_facts = llm_payload.get("key_facts") or []
         intent_tags = llm_payload.get("intent_tags") or []
     else:
-        ctx = ContextUnderstanding()
-        summary = ctx.summarize_document(extracted)
-        doc_summary = summary.get("abstract", "")
-        section_summaries = summary.get("section_summaries", {})
+        try:
+            ctx = ContextUnderstanding()
+            summary = ctx.summarize_document(extracted)
+            doc_summary = summary.get("abstract", "")
+            section_summaries = summary.get("section_summaries", {})
+        except (AttributeError, TypeError):
+            # extracted is a dict, not ExtractedDocument — use extractive fallback
+            doc_summary = (full_text[:500] + "...") if len(full_text) > 500 else full_text
+            section_summaries = {}
         key_entities = _fallback_entities(full_text)
         key_facts = []
         intent_tags = [doc_type] if doc_type else []

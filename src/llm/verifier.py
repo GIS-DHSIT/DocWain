@@ -165,12 +165,19 @@ def verify_grounding(
     )
 
     def _call() -> str:
-        if hasattr(llm_client, "verify"):
-            return llm_client.verify(prompt)
-        if hasattr(llm_client, "generate_for_role"):
-            from .multi_agent import AgentRole
-            return llm_client.generate_for_role(AgentRole.VERIFIER, prompt, max_retries=1, backoff=0.5)
-        return llm_client.generate(prompt, max_retries=1, backoff=0.5)
+        try:
+            from src.llm.task_router import task_scope, TaskType
+            _ctx = task_scope(TaskType.GROUNDING_VERIFY)
+        except ImportError:
+            from contextlib import nullcontext
+            _ctx = nullcontext()
+        with _ctx:
+            if hasattr(llm_client, "verify"):
+                return llm_client.verify(prompt)
+            if hasattr(llm_client, "generate_for_role"):
+                from .multi_agent import AgentRole
+                return llm_client.generate_for_role(AgentRole.VERIFIER, prompt, max_retries=1, backoff=0.5)
+            return llm_client.generate(prompt, max_retries=1, backoff=0.5)
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     future = executor.submit(_call)

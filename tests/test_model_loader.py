@@ -18,7 +18,7 @@ class FakeSentenceTransformer:
         self.device = device
         return self
 
-    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=False, batch_size=1):
+    def encode(self, texts, convert_to_numpy=True, normalize_embeddings=False, batch_size=1, show_progress_bar=None):
         self.encode_calls += 1
         return [[0.0] * 3 for _ in texts]
 

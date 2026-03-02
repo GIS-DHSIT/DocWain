@@ -16,6 +16,7 @@ numpy
 ollama
 openai
 rank_bm25
+rapidfuzz>=3.0
 pandas
 pdfplumber
 pymupdf

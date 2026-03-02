@@ -67,7 +67,7 @@ def test_sentence_completeness_with_bullets():
     )
     chunks = ["Tourism helps India by:", bullets]
     metadata = _meta_for_section(len(chunks))
-    prepared_chunks, prepared_meta, _stats = prepare_embedding_chunks(
+    prepared_chunks, prepared_meta, _stats, _rescued = prepare_embedding_chunks(
         chunks,
         metadata,
         subscription_id="sub-1",
@@ -139,7 +139,7 @@ def test_chain_integrity():
         "Third section content. " * 12,
     ]
     metadata = _meta_for_section(len(chunks))
-    prepared_chunks, prepared_meta, _stats = prepare_embedding_chunks(
+    prepared_chunks, prepared_meta, _stats, _rescued = prepare_embedding_chunks(
         chunks,
         metadata,
         subscription_id="sub-1",

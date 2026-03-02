@@ -3,7 +3,7 @@ from .rewrite import rewrite_query
 from .retrieve import retrieve
 from .rerank import rerank
 from .extract import extract_schema
-from .renderers.router import render
+from .enterprise import render_enterprise as render
 from .sanitize import sanitize
 from .judge import judge
 

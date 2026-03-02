@@ -13,11 +13,14 @@ logger = logging.getLogger(__name__)
 ALLOWED_CHUNK_KINDS = {
     "section_text",
     "table_text",
+    "table",
     "image_caption",
     "doc_summary",
     "section_summary",
     "structured_field",
     "fact",
+    "entity_fact",
+    "diagram",
 }
 
 

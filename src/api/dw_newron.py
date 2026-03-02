@@ -468,6 +468,14 @@ def sanitize_response_obj(response_obj: Dict[str, Any]) -> Dict[str, Any]:
         response_text = re.sub(r"\[SOURCE[^\]]*\]", "", response_text, flags=re.IGNORECASE)
         response_text = re.sub(r"(?i)citations?:", "", response_text)
         response_text = re.sub(r"/(?:[\w\-.]+/)+[\w\-.]+", "", response_text)
+        # Strip AI disclaimer sentences that leak from LLM responses
+        # Only match "As an AI" when followed by disclaimer patterns, not job titles like "AI Engineer"
+        response_text = re.sub(r"\bAs an AI(?:\s+(?:language\s+model|assistant|model|chatbot|system))\b[^.]*\.", "", response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r"\bAs a language model\b[^.]*\.", "", response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r"\bI(?:'m| am) (?:just )?an? AI(?:\s+(?:language\s+model|assistant|model|chatbot))\b[^.]*\.", "", response_text, flags=re.IGNORECASE)
+        # Strip extraction placeholder phrases that leak through rendering
+        response_text = re.sub(r"Not explicitly mentioned(?:\s+in\s+documents)?\.?", "", response_text, flags=re.IGNORECASE)
+        response_text = re.sub(r"MISSING_REASON", "", response_text)
         lines = response_text.splitlines()
         cleaned_lines: List[str] = []
         for line in lines:
@@ -607,11 +615,10 @@ def _ensure_qdrant_indexes(client: QdrantClient, collection_name: str) -> None:
         store.ensure_payload_indexes(collection_name, REQUIRED_PAYLOAD_INDEX_FIELDS, create_missing=True)
         _QDRANT_INDEX_CACHE.add(collection_name)
     except Exception as exc:  # noqa: BLE001
-        raise RetrievalFilterError(
-            "Index bootstrap failed; cannot search within profile.",
-            code="RETRIEVAL_INDEX_BOOTSTRAP_FAILED",
-            details=str(exc),
-        ) from exc
+        # Best-effort: indexes are created at startup. Log and continue —
+        # the actual query will fail more specifically if indexes are missing.
+        logger.warning("Index bootstrap check failed for %s: %s", collection_name, exc)
+        _QDRANT_INDEX_CACHE.add(collection_name)  # Cache to avoid retry spam
 
 
 def _resolve_collection_name(
@@ -651,10 +658,11 @@ def _torch_cuda_available() -> bool:
 
 
 def _embedding_device() -> str:
-    env_device = (os.getenv("EMBEDDING_DEVICE") or "").strip().lower()
-    if env_device:
-        return env_device
-    return "cuda" if _torch_cuda_available() else "cpu"
+    # Always use CPU for embeddings — the embedding model (bge-large, ~3GB GPU)
+    # competes with gpt-oss (14GB) for T4 16GB VRAM.  CPU embedding adds <1s
+    # latency but frees the GPU entirely for LLM generation.
+    env_device = (os.getenv("EMBEDDING_DEVICE") or "cpu").strip().lower()
+    return env_device
 
 
 def _is_meta_tensor_error(exc: Exception) -> bool:
@@ -866,18 +874,38 @@ def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransf
 
     last_error = None
     _configure_hf_env()
+
+    # Always use CPU for embeddings — GPU is reserved for gpt-oss (14GB on T4 16GB).
+    # bge-large-en-v1.5 (335M params) runs fine on CPU with minimal latency impact.
+    device = "cpu"
+
     for name in candidates:
         try:
-            logger.info(f"Loading sentence transformer model: {name}")
-            model = SentenceTransformer(name, local_files_only=True)
+            logger.info("Loading sentence transformer model: %s (device=%s)", name, device)
+            model = SentenceTransformer(name, device=device, local_files_only=True)
+            model.show_progress_bar = False
             dim = model.get_sentence_embedding_dimension()
-            logger.info(f"Loaded model '{name}' with dim={dim}")
+            logger.info("Loaded model '%s' with dim=%s on %s", name, dim, device)
             if required_dim is None or dim == required_dim:
                 return model
             _MODEL_CACHE[dim] = model  # cache for possible future use
         except Exception as e:
             last_error = e
-            logger.warning(f"Failed to load model '{name}': {e}")
+            logger.warning("Failed to load model '%s' on %s: %s", name, device, e)
+            # If GPU failed, retry on CPU
+            if device != "cpu":
+                try:
+                    logger.info("Retrying '%s' on CPU...", name)
+                    model = SentenceTransformer(name, device="cpu", local_files_only=True)
+                    model.show_progress_bar = False
+                    dim = model.get_sentence_embedding_dimension()
+                    logger.info("Loaded model '%s' with dim=%s on CPU (fallback)", name, dim)
+                    if required_dim is None or dim == required_dim:
+                        return model
+                    _MODEL_CACHE[dim] = model
+                except Exception as cpu_e:
+                    last_error = cpu_e
+                    logger.warning("Failed to load model '%s' on CPU: %s", name, cpu_e)
     raise RuntimeError(f"Could not load any sentence transformer model from {candidates}: {last_error}")
 
 
@@ -996,10 +1024,14 @@ def get_cross_encoder():
             return None
         try:
             _configure_hf_env()
-            _CROSS_ENCODER = CrossEncoder(model_name, local_files_only=True)
-            logger.info("Loaded cross-encoder model: %s", model_name)
+            # Force CPU for cross-encoder to avoid GPU contention with Ollama.
+            # The reranker is small (~420MB) and runs faster on CPU (1-2s)
+            # than on a contended GPU (14-38s when Ollama is generating).
+            ce_device = getattr(getattr(Config, "Reranker", None), "DEVICE", "cpu") or "cpu"
+            _CROSS_ENCODER = CrossEncoder(model_name, device=ce_device, local_files_only=True)
+            logger.info("Loaded cross-encoder model: %s on %s", model_name, ce_device)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"Failed to load cross-encoder '{model_name}', continuing without reranker: {e}")
+            logger.warning("Failed to load cross-encoder '%s', continuing without reranker: %s", model_name, e)
             _CROSS_ENCODER = None
     return _CROSS_ENCODER
 
@@ -3880,6 +3912,7 @@ class EnterpriseRAGSystem:
             tools: Optional[List[str]] = None,
             use_tools: bool = False,
             tool_inputs: Optional[Dict[str, Any]] = None,
+            enable_internet: bool = False,
     ) -> Dict[str, Any]:
         """Main method to answer questions using enhanced RAG pipeline."""
         start_time = time.time()
@@ -3897,24 +3930,21 @@ class EnterpriseRAGSystem:
             if not profile_id:
                 raise ValueError("profile_id is required for retrieval")
             collection_name = build_collection_name(subscription_id)
+            logger.info(
+                "Query from user=%s subscription=%s profile=%s collection=%s | q=%s",
+                user_id, subscription_id, profile_id, collection_name,
+                (query or "")[:120],
+            )
             try:
                 _ensure_qdrant_indexes(self.client, collection_name)
             except RetrievalFilterError as exc:
-                logger.error("Qdrant index bootstrap failed: %s", exc)
-                documents_searched = _collect_profile_documents(
-                    subscription_id=str(subscription_id),
-                    profile_id=str(profile_id),
-                    redis_client=self.redis_client,
-                )
-                return _build_retrieval_filter_error_response(
-                    query=query,
-                    user_id=user_id,
-                    collection_name=collection_name,
-                    request_id=request_id,
-                    index_version=index_version,
-                    details=getattr(exc, "details", str(exc)),
-                    error_code=getattr(exc, "code", "RETRIEVAL_INDEX_BOOTSTRAP_FAILED"),
-                    documents_searched=documents_searched,
+                # Index bootstrap is best-effort — indexes are created at startup
+                # and during document ingestion. Don't block queries if the check
+                # fails (e.g., transient Qdrant network issue). The actual query
+                # will fail more specifically if indexes are truly missing.
+                logger.warning(
+                    "Qdrant index bootstrap check failed (non-blocking): %s | subscription=%s collection=%s",
+                    exc, subscription_id, collection_name,
                 )
             namespace = _build_namespace(subscription_id, profile_id, self.model_name, session_id)
             metrics = get_metrics_tracker()
@@ -4095,6 +4125,7 @@ class EnterpriseRAGSystem:
                         cross_encoder=getattr(self.reranker, "cross_encoder", None),
                         tools=tool_list if use_tooling else None,
                         tool_inputs=tool_inputs if use_tooling else None,
+                        enable_internet=enable_internet,
                     )
                     if v3_answer:
                         return v3_answer
@@ -5370,6 +5401,7 @@ def answer_question(
         tools: Optional[List[str]] = None,
         use_tools: bool = False,
         tool_inputs: Optional[Dict[str, Any]] = None,
+        enable_internet: bool = False,
         rag_system: Optional[EnterpriseRAGSystem] = None,
 ) -> Dict[str, Any]:
     """
@@ -5408,6 +5440,7 @@ def answer_question(
         tools=tools,
         use_tools=use_tools,
         tool_inputs=tool_inputs,
+        enable_internet=enable_internet,
     )
 
 
