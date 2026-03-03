@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 try:
     from botbuilder.core import BotFrameworkAdapter, BotFrameworkAdapterSettings, TurnContext
@@ -23,8 +23,9 @@ except ImportError:
 
 from src.api.config import Config
 from src.teams import adapter as legacy_adapter
-from src.teams.attachments import ingest_attachments, ScreeningSummary
+from src.teams.attachments import ingest_attachments, DocumentIntelligence, ScreeningSummary
 from src.teams.cards import build_card
+from src.teams.insights import generate_proactive_insights, get_domain_actions
 from src.teams.logic import TeamsChatService
 from src.teams.state import TeamsStateStore
 from src.teams.tools import TeamsToolRouter, _card_activity
@@ -148,6 +149,74 @@ def _build_screening_card(filenames, screening_results):
         filenames=", ".join(filenames[:3]) + ("..." if len(filenames) > 3 else ""),
         findings_text=findings_text,
         tools_summary=tools_summary,
+    )
+
+
+def _build_di_report_card(ingestion, log) -> Optional[Dict[str, Any]]:
+    """Build a Document Intelligence report card from ingestion results."""
+    di_results = ingestion.intelligence_results
+    if not di_results:
+        return None
+
+    # Use the first document's intelligence (primary document)
+    primary = di_results[0]
+    domain = primary.doc_type or "general"
+    domain_badge = f"[{domain.title()}]"
+
+    # Generate proactive insights via LLM (non-blocking — falls back gracefully)
+    try:
+        insights = generate_proactive_insights(
+            doc_type=domain,
+            summary=primary.summary,
+            key_entities=primary.key_entities,
+            key_facts=primary.key_facts,
+            filename=ingestion.filenames[0] if ingestion.filenames else "document",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Proactive insights generation failed (non-blocking): %s", exc)
+        insights = None
+
+    # Summary text
+    summary_text = primary.summary or "Document processed successfully."
+
+    # Insights text
+    if insights and insights.insights:
+        insights_text = "\n".join(f"- {i}" for i in insights.insights)
+    elif primary.key_facts:
+        insights_text = "\n".join(f"- {f}" for f in primary.key_facts[:3])
+    else:
+        insights_text = "- Document classified and indexed for Q&A"
+
+    # Security text from screening results
+    if ingestion.screening_results:
+        sr = ingestion.screening_results[0]
+        security_text = f"Security: {sr.risk_level} risk (score: {sr.overall_score:.0f}/100)"
+    else:
+        security_text = "Security: Screening skipped"
+
+    # Metadata text
+    chunks = primary.chunks_created or ingestion.documents_created
+    file_count = len(ingestion.filenames)
+    filenames_str = ", ".join(ingestion.filenames[:2])
+    if file_count > 2:
+        filenames_str += f" (+{file_count - 2})"
+    metadata_text = f"{filenames_str} | {chunks} chunk(s)"
+
+    # Domain-specific action buttons
+    domain_actions = get_domain_actions(domain)
+    action_data = {}
+    for i, act in enumerate(domain_actions[:3], 1):
+        action_data[f"action{i}_title"] = act.get("title", f"Action {i}")
+        action_data[f"action{i}_query"] = act.get("query", "")
+
+    return build_card(
+        "di_report_card",
+        domain_badge=domain_badge,
+        summary_text=summary_text,
+        insights_text=insights_text,
+        security_text=security_text,
+        metadata_text=metadata_text,
+        **action_data,
     )
 
 
@@ -340,22 +409,28 @@ class DocWainTeamsBot(TeamsActivityHandler):
                     except Exception:  # noqa: BLE001
                         pass  # Best-effort cleanup
 
-                success_card = build_card(
-                    "upload_success_card",
-                    message="Files ingested. You can start chatting now.",
-                    filenames=", ".join(ingestion.filenames),
-                    documents_created=str(ingestion.documents_created),
-                )
-                await self._send_safe(turn_context, _as_activity(_card_activity(success_card, text="Upload complete")), log)
+                # Build DI report card (rich domain-aware) or fall back to generic success card
+                di_card = _build_di_report_card(ingestion, log)
+                if di_card:
+                    await self._send_safe(
+                        turn_context,
+                        _as_activity(_card_activity(di_card, text="Document analyzed")),
+                        log,
+                    )
+                else:
+                    success_card = build_card(
+                        "upload_success_card",
+                        message="Files ingested. You can start chatting now.",
+                        filenames=", ".join(ingestion.filenames),
+                        documents_created=str(ingestion.documents_created),
+                    )
+                    await self._send_safe(turn_context, _as_activity(_card_activity(success_card, text="Upload complete")), log)
 
-                # Show screening summary if available
-                if ingestion.screening_results:
+                # Show screening summary if available (only when no DI card — DI card already includes security)
+                if not di_card and ingestion.screening_results:
                     screening_card = _build_screening_card(ingestion.filenames, ingestion.screening_results)
                     if screening_card:
                         await self._send_safe(turn_context, _as_activity(_card_activity(screening_card, text="Security screening complete")), log)
-
-                tools_payload = await self.tool_router.handle_action({"action": "show_tools"}, context)
-                await self._send_safe(turn_context, _as_activity(tools_payload), log)
                 return
             except Exception as exc:  # noqa: BLE001
                 log.error("Attachment ingest failed: %s", exc, exc_info=True)
@@ -401,7 +476,26 @@ class DocWainTeamsBot(TeamsActivityHandler):
             answer_result = self.chat_service.answer_question(question, context)
             answer = answer_result.answer
             response_text = answer.get("response") or "I could not generate a response."
-            sources_text = legacy_adapter.format_sources(answer.get("sources") or [])
+            sources = answer.get("sources") or []
+            sources_text = legacy_adapter.format_sources(sources)
+            grounded = answer.get("grounded", False)
+
+            # Domain badge from answer metadata
+            domain = answer.get("domain") or ""
+            domain_badge = f"[{domain.title()}]" if domain and domain != "generic" else ""
+
+            # Confidence indicator
+            source_count = len(sources)
+            if grounded and source_count >= 3:
+                confidence_text = f"High confidence ({source_count} sources)"
+            elif grounded and source_count >= 1:
+                confidence_text = f"Partial confidence ({source_count} source{'s' if source_count > 1 else ''})"
+            elif source_count > 0:
+                confidence_text = f"Low confidence ({source_count} source{'s' if source_count > 1 else ''})"
+            else:
+                confidence_text = ""
+
+            sources_toggle = f"Show sources ({source_count})" if source_count else "Show sources"
 
             # Delete the processing card before sending the answer
             if processing_response and getattr(processing_response, "id", None):
@@ -414,7 +508,10 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 "answer_card",
                 title="Answer",
                 text=response_text,
+                domain_badge=domain_badge,
+                confidence_text=confidence_text,
                 sources_text=sources_text.replace("\n\nSources:\n", "") if sources_text else "No sources available.",
+                sources_toggle_title=sources_toggle,
             )
             # Send card with text fallback — text is shown if Adaptive Card can't render
             await self._send_safe(turn_context, _as_activity(_card_activity(card, text=response_text)), log)
