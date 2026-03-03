@@ -3,7 +3,7 @@ import hashlib
 import logging
 import mimetypes
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -34,10 +34,20 @@ class AttachmentIngestError(Exception):
 
 
 @dataclass
+class ScreeningSummary:
+    risk_level: str = "LOW"
+    overall_score: float = 0.0
+    top_findings: List[str] = field(default_factory=list)
+    tools_run: int = 0
+
+
+@dataclass
 class AttachmentOutcome:
     filename: str
     documents_created: int
     doc_tag: str
+    extracted_text: str = ""
+    screening: Optional[ScreeningSummary] = None
 
 
 @dataclass
@@ -45,10 +55,21 @@ class IngestionResult:
     filenames: List[str]
     documents_created: int
     doc_tags: List[str]
+    screening_results: List[ScreeningSummary] = field(default_factory=list)
 
 
 def _attachment_type(attachment: Dict[str, Any]) -> str:
     return (attachment.get("contentType") or "").lower()
+
+
+def _attachment_content(attachment: Dict[str, Any]) -> Dict[str, Any]:
+    """Safely extract the content dict from an attachment.
+
+    Teams may set content to a string (e.g. HTML body for text/html messages)
+    or None. Always returns a dict.
+    """
+    content = attachment.get("content")
+    return content if isinstance(content, dict) else {}
 
 
 def _blob_uploads_enabled(log: logging.LoggerAdapter) -> bool:
@@ -138,23 +159,53 @@ async def _download_bytes(
 async def _resolve_auth_token(turn_context, provided_token: Optional[str]) -> str:
     if provided_token:
         return provided_token
-    # Prefer adapter-issued connector token
+    # Try multiple paths to obtain a connector token from the Bot Framework adapter
     if turn_context:
+        # Path 1: adapter.get_access_token() (some SDK versions)
         try:
             token = await turn_context.adapter.get_access_token()  # type: ignore[attr-defined]
             if token:
                 return token
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Unable to resolve connector token from adapter: %s", exc)
+        except Exception:  # noqa: BLE001
+            pass
+        # Path 2: credentials on the adapter (BotFrameworkAdapter stores MicrosoftAppCredentials)
+        try:
+            creds = getattr(turn_context.adapter, "_credentials", None) or getattr(turn_context.adapter, "credentials", None)
+            if creds and hasattr(creds, "get_token"):
+                token_obj = creds.get_token()
+                if token_obj:
+                    token_str = getattr(token_obj, "token", None) or str(token_obj)
+                    if token_str:
+                        return token_str
+        except Exception:  # noqa: BLE001
+            pass
+        # Path 3: connector_client on the turn context
+        try:
+            connector_client = turn_context.turn_state.get("ConnectorClient")
+            if connector_client and hasattr(connector_client, "config"):
+                creds = getattr(connector_client.config, "credentials", None)
+                if creds and hasattr(creds, "get_token"):
+                    token_obj = creds.get_token()
+                    if token_obj:
+                        return getattr(token_obj, "token", None) or str(token_obj)
+        except Exception:  # noqa: BLE001
+            pass
     fallback = getattr(Config.Teams, "BOT_ACCESS_TOKEN", "") or ""
     if fallback:
         return fallback
-    logger.warning("No connector token available for Teams attachment download; proceeding without auth header.")
+    logger.warning("No connector token available for Teams attachment download; will try without auth.")
     return ""
 
 
+def _build_download_headers(auth_token: str) -> Dict[str, str]:
+    """Build headers for attachment download. Skip Authorization if token is empty."""
+    if auth_token:
+        return {"Authorization": f"Bearer {auth_token}"}
+    return {}
+
+
 def _resolve_doc_tag(attachment: Dict[str, Any], filename: str) -> str:
-    content = attachment.get("content") or {}
+    content = _attachment_content(attachment)
     return (
         content.get("uniqueId")
         or content.get("id")
@@ -163,7 +214,135 @@ def _resolve_doc_tag(attachment: Dict[str, Any], filename: str) -> str:
     )
 
 
-async def _process_file_download(
+def _resolve_download_url(attachment: Dict[str, Any]) -> Optional[str]:
+    """Resolve download URL from all possible sources in the attachment."""
+    content = _attachment_content(attachment)
+    return (
+        content.get("downloadUrl")
+        or content.get("download_url")
+        or attachment.get("contentUrl")
+    )
+
+
+def _resolve_filename(attachment: Dict[str, Any]) -> str:
+    """Resolve filename from all possible sources in the attachment."""
+    content = _attachment_content(attachment)
+    return (
+        content.get("fileName")
+        or content.get("name")
+        or attachment.get("name")
+        or f"teams-upload-{uuid.uuid4()}"
+    )
+
+
+def _run_security_screening(text: str, filename: str, doc_tag: str, log: logging.LoggerAdapter) -> Optional[ScreeningSummary]:
+    """Run security-only screening (PII, secrets, private data) on extracted text.
+
+    Uses SecurityScreeningService which focuses on data protection checks only —
+    no legality, compliance, or quality checks that are irrelevant for Teams uploads.
+    """
+    try:
+        from src.screening.security_service import SecurityScreeningService
+        service = SecurityScreeningService()
+        result = service.screen_text(
+            text=text,
+            doc_id=doc_tag,
+            metadata={"filename": filename, "source": "teams_upload"},
+        )
+        risk_level = result.get("overall_risk_level", "MINIMAL")
+        overall_score = float(result.get("overall_risk_score", 0))
+        findings = result.get("security_findings", [])
+
+        # Build human-readable findings summary
+        top_findings: List[str] = []
+        pii_count = sum(1 for f in findings if f.get("finding_type") == "PII")
+        secret_count = sum(1 for f in findings if f.get("finding_type") == "SECRET")
+        private_count = sum(1 for f in findings if f.get("finding_type") == "PRIVATE_DATA")
+        if pii_count:
+            top_findings.append(f"{pii_count} PII item(s) detected (personal identifiers)")
+        if secret_count:
+            top_findings.append(f"{secret_count} secret(s)/credential(s) detected")
+        if private_count:
+            top_findings.append(f"{private_count} private business data item(s) detected")
+        if not top_findings:
+            top_findings.append("No sensitive data detected")
+
+        log.info(
+            "Security screening complete for %s: risk=%s score=%.0f pii=%d secrets=%d private=%d",
+            filename, risk_level, overall_score, pii_count, secret_count, private_count,
+        )
+        return ScreeningSummary(
+            risk_level=risk_level,
+            overall_score=overall_score,
+            top_findings=top_findings,
+            tools_run=3,  # PII + Secrets + Private Data
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Security screening failed for %s: %s", filename, exc)
+        return None
+
+
+def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: "TeamsChatContext", log: logging.LoggerAdapter) -> None:
+    """Run Document Intelligence pipeline to enrich document metadata.
+
+    Uses the 3-stage pipeline: identify → content_map → understand.
+    Results are stored in MongoDB for RAG enrichment.
+    """
+    try:
+        from src.doc_understanding.identify import identify_document
+        from src.doc_understanding.content_map import build_content_map
+        from src.doc_understanding.understand import understand_document
+
+        # Stage 1: Identify document type
+        id_result = identify_document(extracted=extracted, filename=filename)
+        doc_type = getattr(id_result, "document_type", None) or (
+            id_result.get("document_type", "other") if isinstance(id_result, dict) else "other"
+        )
+        log.info("DI identify: %s → type=%s", filename, doc_type)
+
+        # Stage 2: Build content map
+        content_map = build_content_map(extracted)
+
+        # Stage 3: Understand document (extract key entities, facts, summary)
+        understanding = understand_document(
+            extracted=extracted,
+            doc_type=doc_type,
+        )
+        log.info(
+            "DI understand: %s → entities=%d facts=%d tags=%s",
+            filename,
+            len(understanding.get("key_entities", [])) if isinstance(understanding, dict) else 0,
+            len(understanding.get("key_facts", [])) if isinstance(understanding, dict) else 0,
+            understanding.get("intent_tags", []) if isinstance(understanding, dict) else [],
+        )
+
+        # Persist to MongoDB if available
+        try:
+            from src.api.dataHandler import db
+            from src.api.config import Config
+            docs_collection = db[Config.MongoDB.DOCUMENTS]
+            update_fields = {
+                "document_type": doc_type,
+                "document_domain": doc_type,
+            }
+            if isinstance(understanding, dict):
+                update_fields["document_summary"] = understanding.get("document_summary", "")
+                update_fields["key_entities"] = understanding.get("key_entities", [])
+                update_fields["key_facts"] = understanding.get("key_facts", [])
+                update_fields["intent_tags"] = understanding.get("intent_tags", [])
+            docs_collection.update_one(
+                {"document_id": doc_tag, "subscription_id": context.subscription_id},
+                {"$set": update_fields},
+                upsert=True,
+            )
+        except Exception as db_exc:  # noqa: BLE001
+            log.debug("DI MongoDB persist skipped: %s", db_exc)
+
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Document intelligence pipeline error for %s: %s", filename, exc)
+
+
+async def _process_file_attachment(
     attachment: Dict[str, Any],
     context: TeamsChatContext,
     log: logging.LoggerAdapter,
@@ -172,27 +351,42 @@ async def _process_file_download(
     retries: int,
     max_bytes: int,
 ) -> Optional[AttachmentOutcome]:
-    content = attachment.get("content") or {}
-    download_url = content.get("downloadUrl") or content.get("download_url")
-    filename = (
-        content.get("fileName")
-        or content.get("name")
-        or attachment.get("name")
-        or f"teams-upload-{uuid.uuid4()}"
-    )
-    if not download_url:
-        raise AttachmentIngestError("Attachment missing a secure download URL.")
+    """Process any file attachment — handles both content.downloadUrl and contentUrl sources."""
+    download_url = _resolve_download_url(attachment)
+    filename = _resolve_filename(attachment)
 
-    headers = {"Authorization": f"Bearer {auth_token}"}
-    file_bytes = await _download_bytes(download_url, headers=headers, timeout=timeout, retries=retries, max_bytes=max_bytes)
-    extracted_docs = await asyncio.to_thread(fileProcessor, file_bytes, filename)
+    if not download_url:
+        raise AttachmentIngestError(f"Attachment '{filename}' has no download URL.")
+
+    log.info("Downloading attachment: %s (url_source=%s)", filename,
+             "content.downloadUrl" if _attachment_content(attachment).get("downloadUrl") else "contentUrl")
+
+    headers = _build_download_headers(auth_token)
+    try:
+        file_bytes = await _download_bytes(download_url, headers=headers, timeout=timeout, retries=retries, max_bytes=max_bytes)
+    except Exception as exc:
+        log.error("Download failed for %s: %s (url=%s...)", filename, exc, download_url[:80])
+        raise AttachmentIngestError(f"Failed to download '{filename}': {exc}")
+
+    log.info("Downloaded %s: %d bytes", filename, len(file_bytes))
+
+    try:
+        extracted_docs = await asyncio.to_thread(fileProcessor, file_bytes, filename)
+    except Exception as exc:
+        log.error("Text extraction failed for %s: %s", filename, exc, exc_info=True)
+        raise AttachmentIngestError(f"Failed to extract text from '{filename}': {exc}")
+
     if not extracted_docs:
-        log.warning("No extractable content found for attachment %s", filename)
+        log.warning("No extractable content found for %s", filename)
         return None
 
     doc_tag = _resolve_doc_tag(attachment, filename)
     documents_created = 0
+    all_text_parts: List[str] = []
+    first_extracted = None
     for doc_name, doc_content in extracted_docs.items():
+        if first_extracted is None:
+            first_extracted = doc_content
         await asyncio.to_thread(
             train_on_document,
             doc_content,
@@ -202,49 +396,38 @@ async def _process_file_download(
             doc_name=doc_name,
         )
         documents_created += 1
+        if isinstance(doc_content, str):
+            all_text_parts.append(doc_content)
+        elif hasattr(doc_content, "full_text") and doc_content.full_text:
+            all_text_parts.append(str(doc_content.full_text))
+        elif hasattr(doc_content, "text") and doc_content.text:
+            all_text_parts.append(str(doc_content.text))
+
+    log.info("Ingested %s: %d document(s), tag=%s", filename, documents_created, doc_tag)
+
+    # Run Document Intelligence pipeline (identify + understand) in background
+    # This enriches the document metadata for better RAG answers
+    if first_extracted is not None:
+        try:
+            await asyncio.to_thread(_run_document_intelligence, first_extracted, filename, str(doc_tag), context, log)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Document intelligence failed for %s (non-blocking): %s", filename, exc)
 
     _upload_to_blob(file_bytes, filename, context.subscription_id, log)
-    return AttachmentOutcome(filename=filename, documents_created=documents_created, doc_tag=str(doc_tag))
 
+    # Run security screening on the extracted text
+    extracted_text = "\n\n".join(all_text_parts)
+    screening = None
+    if extracted_text.strip():
+        screening = await asyncio.to_thread(_run_security_screening, extracted_text[:50000], filename, str(doc_tag), log)
 
-async def _process_inline_image(
-    attachment: Dict[str, Any],
-    context: TeamsChatContext,
-    log: logging.LoggerAdapter,
-    auth_token: str,
-    timeout: float,
-    retries: int,
-    max_bytes: int,
-) -> Optional[AttachmentOutcome]:
-    content_url = attachment.get("contentUrl")
-    content_type = _attachment_type(attachment)
-    if not content_url:
-        log.warning("Inline image missing contentUrl: %s", attachment)
-        return None
-
-    headers = {"Authorization": f"Bearer {auth_token}"}
-    filename = attachment.get("name") or f"teams-image-{uuid.uuid4()}"
-    file_bytes = await _download_bytes(content_url, headers=headers, timeout=timeout, retries=retries, max_bytes=max_bytes)
-    extracted_docs = await asyncio.to_thread(fileProcessor, file_bytes, filename)
-    if not extracted_docs:
-        log.warning("No extractable content found for inline image %s", filename)
-        return None
-
-    documents_created = 0
-    doc_tag = hashlib.sha256(content_url.encode("utf-8")).hexdigest()
-    for doc_name, doc_content in extracted_docs.items():
-        await asyncio.to_thread(
-            train_on_document,
-            doc_content,
-            subscription_id=context.subscription_id,
-            profile_id=context.profile_id,
-            doc_tag=doc_tag,
-            doc_name=doc_name,
-        )
-        documents_created += 1
-    _upload_to_blob(file_bytes, filename, context.subscription_id, log)
-    log.info("Processed inline image %s (%s)", filename, content_type)
-    return AttachmentOutcome(filename=filename, documents_created=documents_created, doc_tag=doc_tag)
+    return AttachmentOutcome(
+        filename=filename,
+        documents_created=documents_created,
+        doc_tag=str(doc_tag),
+        extracted_text=extracted_text[:500],
+        screening=screening,
+    )
 
 
 async def ingest_attachments(
@@ -268,40 +451,38 @@ async def ingest_attachments(
     outcomes: List[AttachmentOutcome] = []
     errors: List[str] = []
 
-    for attachment in attachments:
+    for idx, attachment in enumerate(attachments):
         content_type = _attachment_type(attachment)
+        log.info(
+            "Processing attachment %d/%d: contentType=%s name=%s has_contentUrl=%s has_downloadUrl=%s",
+            idx + 1, len(attachments), content_type,
+            attachment.get("name"),
+            bool(attachment.get("contentUrl")),
+            bool(_attachment_content(attachment).get("downloadUrl")),
+        )
         try:
-            if "file.download.info" in content_type or (attachment.get("content") or {}).get("downloadUrl") or (attachment.get("content") or {}).get("download_url"):
-                content = attachment.get("content") or {}
-                download_url = content.get("downloadUrl") or content.get("download_url")
-                if not download_url:
-                    raise AttachmentIngestError("Attachment missing a secure download URL.")
-                if token is None:
-                    token = await _resolve_auth_token(turn_context, connector_token)
-                outcome = await _process_file_download(
-                    attachment,
-                    context,
-                    log,
-                    auth_token=token,
-                    timeout=timeout,
-                    retries=retries,
-                    max_bytes=max_bytes,
-                )
-            elif content_type.startswith("image/") or attachment.get("contentUrl"):
-                if token is None:
-                    token = await _resolve_auth_token(turn_context, connector_token)
-                outcome = await _process_inline_image(
-                    attachment,
-                    context,
-                    log,
-                    auth_token=token,
-                    timeout=timeout,
-                    retries=retries,
-                    max_bytes=max_bytes,
-                )
-            else:
-                errors.append(f"Unsupported attachment type: {content_type or 'unknown'}.")
+            # Resolve download URL from any available source
+            download_url = _resolve_download_url(attachment)
+
+            if not download_url:
+                if content_type and content_type not in ("text/html", "unknown"):
+                    errors.append(f"Attachment '{attachment.get('name', 'unknown')}' has no download URL.")
+                else:
+                    errors.append(f"Unsupported attachment type: {content_type or 'unknown'}.")
                 continue
+
+            # All attachments with a download URL go through the same path
+            if token is None:
+                token = await _resolve_auth_token(turn_context, connector_token)
+            outcome = await _process_file_attachment(
+                attachment,
+                context,
+                log,
+                auth_token=token,
+                timeout=timeout,
+                retries=retries,
+                max_bytes=max_bytes,
+            )
 
             if outcome:
                 outcomes.append(outcome)
@@ -316,16 +497,18 @@ async def ingest_attachments(
             else:
                 errors.append("Attachment had no extractable content.")
         except AttachmentIngestError as exc:
+            log.warning("Attachment ingest error: %s", exc)
             errors.append(str(exc))
         except Exception as exc:  # noqa: BLE001
             log.error("Attachment processing failed: %s", exc, exc_info=True)
-            errors.append("An attachment failed to process. Please try again.")
+            errors.append(f"Failed to process '{attachment.get('name', 'unknown')}'. Please try again.")
 
     if outcomes:
         return IngestionResult(
             filenames=[out.filename for out in outcomes],
             documents_created=sum(out.documents_created for out in outcomes),
             doc_tags=[out.doc_tag for out in outcomes],
+            screening_results=[out.screening for out in outcomes if out.screening],
         )
 
     message = " ".join(errors) if errors else "No attachments were ingested."

@@ -97,14 +97,23 @@ def render_enterprise(schema: Any, intent: str, *, domain: str | None = None, st
     if result:
         result = _NER_LABEL_RE.sub("", result)
         result = _NER_INLINE_RE.sub(" ", result)
-    # Query-adaptive keyword reinforcement: ensure response echoes key query terms
+    # Query-adaptive keyword reinforcement: ensure response echoes key query terms.
+    # IMPORTANT: never prepend keyword prefix to MISSING_REASON strings — it
+    # breaks the _is_missing detection in the pipeline and hides extraction failures.
     if result and query:
-        _ql = (query or "").lower()
-        _rl = (result or "").lower()
-        if "vendor" in _ql and "vendor" not in _rl:
-            result = f"Vendor information from the documents:\n{result}"
-        if "term" in _ql and "condition" in _ql and "term" not in _rl:
-            result = f"Terms and conditions:\n{result}"
+        _rl_stripped = (result or "").strip().lower()
+        _is_missing_result = (
+            _rl_stripped.startswith("not explicitly mentioned")
+            or _rl_stripped.startswith("not enough information")
+            or _rl_stripped == MISSING_REASON.strip().lower()
+        )
+        if not _is_missing_result:
+            _ql = (query or "").lower()
+            _rl = _rl_stripped
+            if "vendor" in _ql and "vendor" not in _rl:
+                result = f"Vendor information from the documents:\n{result}"
+            if "term" in _ql and "condition" in _ql and "term" not in _rl:
+                result = f"Terms and conditions:\n{result}"
     return result
 
 

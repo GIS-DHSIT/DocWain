@@ -23,7 +23,7 @@ except ImportError:
 
 from src.api.config import Config
 from src.teams import adapter as legacy_adapter
-from src.teams.attachments import ingest_attachments
+from src.teams.attachments import ingest_attachments, ScreeningSummary
 from src.teams.cards import build_card
 from src.teams.logic import TeamsChatService
 from src.teams.state import TeamsStateStore
@@ -38,10 +38,36 @@ MICROSOFT_APP_PASSWORD = (
     or os.getenv("MICROSOFT_APP_PASSWORD")
     or os.getenv("MICROSOFT_APP_PWD")
 )
+MICROSOFT_APP_TENANT_ID = (
+    Config.Teams.BOT_APP_TENANT_ID
+    or os.getenv("MICROSOFT_APP_TENANT_ID")
+    or os.getenv("MSA_APP_TENANT_ID")
+)
+MICROSOFT_APP_TYPE = Config.Teams.BOT_APP_TYPE or "SingleTenant"
 BOT_CREDENTIALS_CONFIGURED = bool(MICROSOFT_APP_ID and MICROSOFT_APP_PASSWORD)
 
 if _BOTBUILDER_AVAILABLE and BOT_CREDENTIALS_CONFIGURED:
-    adapter_settings = BotFrameworkAdapterSettings(MICROSOFT_APP_ID, MICROSOFT_APP_PASSWORD)
+    _adapter_kwargs = {
+        "app_id": MICROSOFT_APP_ID,
+        "app_password": MICROSOFT_APP_PASSWORD,
+    }
+    # Single-tenant bots MUST set channel_auth_tenant so the adapter validates
+    # tokens issued by the specific tenant rather than the multi-tenant endpoint.
+    if MICROSOFT_APP_TYPE.lower() == "singletenant" and MICROSOFT_APP_TENANT_ID:
+        _adapter_kwargs["channel_auth_tenant"] = MICROSOFT_APP_TENANT_ID
+        logger.info(
+            "Configuring BotFrameworkAdapter for SingleTenant | tenant=%s",
+            MICROSOFT_APP_TENANT_ID,
+        )
+    elif MICROSOFT_APP_TYPE.lower() == "singletenant" and not MICROSOFT_APP_TENANT_ID:
+        logger.warning(
+            "Bot is configured as SingleTenant but MICROSOFT_APP_TENANT_ID is not set. "
+            "Token validation will likely fail. Set MICROSOFT_APP_TENANT_ID in the environment."
+        )
+    else:
+        logger.info("Configuring BotFrameworkAdapter for %s (no tenant restriction)", MICROSOFT_APP_TYPE)
+
+    adapter_settings = BotFrameworkAdapterSettings(**_adapter_kwargs)
     bot_adapter = BotFrameworkAdapter(adapter_settings)
 else:
     adapter_settings = None
@@ -65,17 +91,64 @@ def _as_activity(payload: Dict[str, Any]):
 def _log_startup_credentials():
     app_id = MICROSOFT_APP_ID or ""
     pwd_set = bool(MICROSOFT_APP_PASSWORD)
+    tenant_id = MICROSOFT_APP_TENANT_ID or ""
+    app_type = MICROSOFT_APP_TYPE or "unknown"
     guid_like = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", app_id))
+    tenant_guid_like = bool(re.fullmatch(r"[0-9a-fA-F-]{36}", tenant_id))
     logger.info(
-        "Teams bot credentials loaded | app_id_present=%s guid_like=%s password_set=%s botbuilder=%s",
+        "Teams bot credentials loaded | app_id_present=%s guid_like=%s password_set=%s "
+        "tenant_id_present=%s tenant_guid_like=%s app_type=%s botbuilder=%s",
         bool(app_id),
         guid_like,
         pwd_set,
+        bool(tenant_id),
+        tenant_guid_like,
+        app_type,
         _BOTBUILDER_AVAILABLE,
     )
 
 
 _log_startup_credentials()
+
+
+def _build_screening_card(filenames, screening_results):
+    """Build a screening summary card from screening results."""
+    if not screening_results:
+        return None
+
+    # Aggregate results across all files
+    worst_risk = "LOW"
+    risk_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+    max_score = 0.0
+    all_findings = []
+    total_tools = 0
+
+    for result in screening_results:
+        if risk_order.get(result.risk_level, 0) > risk_order.get(worst_risk, 0):
+            worst_risk = result.risk_level
+        if result.overall_score > max_score:
+            max_score = result.overall_score
+        all_findings.extend(result.top_findings)
+        total_tools = max(total_tools, result.tools_run)
+
+    risk_color = {"LOW": "Good", "MEDIUM": "Warning", "HIGH": "Attention"}.get(worst_risk, "Default")
+
+    if all_findings:
+        findings_text = "**Key findings:**\n" + "\n".join(f"- {f}" for f in all_findings[:5])
+    else:
+        findings_text = "No significant findings detected."
+
+    tools_summary = f"{total_tools} screening tool(s) applied across {len(screening_results)} file(s)"
+
+    return build_card(
+        "screening_summary_card",
+        risk_level=worst_risk,
+        risk_color=risk_color,
+        overall_score=f"{max_score:.1f}/100",
+        filenames=", ".join(filenames[:3]) + ("..." if len(filenames) > 3 else ""),
+        findings_text=findings_text,
+        tools_summary=tools_summary,
+    )
 
 
 class DocWainTeamsBot(TeamsActivityHandler):
@@ -92,7 +165,12 @@ class DocWainTeamsBot(TeamsActivityHandler):
         if MicrosoftAppCredentials is not None:
             MicrosoftAppCredentials.trust_service_url(turn_context.activity.service_url)
         try:
-            await turn_context.send_activity(activity)
+            resp = await turn_context.send_activity(activity)
+            log.info(
+                "Teams reply sent | conversation=%s activity_id=%s",
+                getattr(getattr(turn_context.activity, "conversation", None), "id", None),
+                getattr(resp, "id", None),
+            )
         except Exception as exc:  # noqa: BLE001
             is_auth = "unauthorized" in str(exc).lower() or "403" in str(exc)
             if is_auth:
@@ -150,17 +228,118 @@ class DocWainTeamsBot(TeamsActivityHandler):
         session_id = legacy_adapter.extract_session_id(activity_dict)
         context = self.chat_service.build_context(user_id=user_id, session_id=session_id)
 
-        # Automatic ingestion on file uploads
-        if turn_context.activity.attachments:
+        # Automatic ingestion on file uploads.
+        # Use the raw activity payload from turn_state (preserves attachments that
+        # BotBuilder Activity.deserialize() may silently drop) and fall back to
+        # the deserialized Activity object.
+        _raw_activity = turn_context.turn_state.get("raw_activity") or {}
+        # Filter to dicts only — Bot Framework may include non-dict values in the attachments array
+        _raw_attachments = [a for a in (_raw_activity.get("attachments") or []) if isinstance(a, dict)]
+        _sdk_attachments = turn_context.activity.attachments or []
+        log.info(
+            "Attachment check | raw_payload=%d sdk_activity=%d",
+            len(_raw_attachments),
+            len(_sdk_attachments),
+        )
+        if _raw_attachments:
+            def _att_info(a):
+                content = a.get("content")
+                has_url = bool(a.get("contentUrl") or (content.get("downloadUrl") if isinstance(content, dict) else False))
+                return (a.get("contentType"), a.get("name"), has_url)
+            log.info("Raw attachments: %s", [_att_info(a) for a in _raw_attachments])
+
+        _SKIP_CONTENT_PREFIXES = ("application/vnd.microsoft.card",)
+
+        def _is_file_attachment_dict(att: dict) -> bool:
+            ct = (att.get("contentType") or "").lower()
+            if not ct or ct == "unknown":
+                return False
+            if any(ct.startswith(skip) for skip in _SKIP_CONTENT_PREFIXES):
+                return False
+            content = att.get("content")
+            has_name = bool(att.get("name"))
+            has_content_url = bool(att.get("contentUrl"))
+            has_download_url = (content.get("downloadUrl") or content.get("download_url")) if isinstance(content, dict) else False
+            has_url = has_content_url or bool(has_download_url)
+            # Teams file download info (always a real file)
+            if "file.download.info" in ct:
+                return True
+            if "teams" in ct and "file" in ct:
+                return True
+            # Reject attachments without a name AND without a URL —
+            # these are message wrappers (e.g. Teams sends text/html for rich text)
+            if not has_name and not has_url:
+                return False
+            # Standard MIME types (PDF, Word, Excel, images, etc.)
+            if any(ct.startswith(p) for p in (
+                "application/pdf", "application/msword", "application/vnd.openxmlformats",
+                "application/vnd.ms-excel", "application/vnd.ms-powerpoint",
+                "text/plain", "text/csv", "text/html",
+                "image/png", "image/jpeg", "image/tiff", "image/gif",
+                "application/octet-stream",
+            )):
+                return True
+            # Has a downloadable URL (DirectLine/Web Chat uploads)
+            if has_url:
+                return True
+            return False
+
+        # Prefer raw payload (never lost by BotBuilder deserialization)
+        _file_attachment_dicts = [a for a in _raw_attachments if _is_file_attachment_dict(a)]
+
+        # Fallback: check SDK activity attachments if raw had nothing
+        if not _file_attachment_dicts and _sdk_attachments:
+            for a in _sdk_attachments:
+                ct = (getattr(a, "content_type", None) or "").lower()
+                if not ct or ct == "unknown":
+                    continue
+                if any(ct.startswith(skip) for skip in _SKIP_CONTENT_PREFIXES):
+                    continue
+                att_dict = a.as_dict() if hasattr(a, "as_dict") else {"contentType": ct, "name": getattr(a, "name", None), "contentUrl": getattr(a, "content_url", None)}
+                if _is_file_attachment_dict(att_dict):
+                    _file_attachment_dicts.append(att_dict)
+
+        if _file_attachment_dicts:
+            log.info("Detected %d file attachment(s) for ingestion", len(_file_attachment_dicts))
+
+            # Send immediate progress indicator so user knows upload is being processed
+            _file_names_preview = ", ".join(
+                a.get("name") or "file" for a in _file_attachment_dicts[:3]
+            )
+            if len(_file_attachment_dicts) > 3:
+                _file_names_preview += f" (+{len(_file_attachment_dicts) - 3} more)"
+            _progress_card = build_card(
+                "processing_card",
+                status_message=f"Processing {len(_file_attachment_dicts)} file(s): {_file_names_preview}",
+            )
+            _progress_response = None
+            try:
+                _progress_response = await turn_context.send_activity(
+                    _as_activity(_card_activity(_progress_card, text="Processing your upload..."))
+                )
+            except Exception:  # noqa: BLE001
+                pass  # Best-effort progress indication
+
+            # Build an activity dict with only file attachments for ingest_attachments()
+            _ingest_activity = dict(activity_dict)
+            _ingest_activity["attachments"] = _file_attachment_dicts
             try:
                 self.chat_service.ensure_collection(context.subscription_id)
                 ingestion = await ingest_attachments(
-                    activity_dict,
+                    _ingest_activity,
                     turn_context,
                     context,
                     correlation_id,
                     state_store=self.state_store,
                 )
+
+                # Remove progress card now that processing is done
+                if _progress_response and getattr(_progress_response, "id", None):
+                    try:
+                        await turn_context.delete_activity(_progress_response.id)
+                    except Exception:  # noqa: BLE001
+                        pass  # Best-effort cleanup
+
                 success_card = build_card(
                     "upload_success_card",
                     message="Files ingested. You can start chatting now.",
@@ -168,11 +347,24 @@ class DocWainTeamsBot(TeamsActivityHandler):
                     documents_created=str(ingestion.documents_created),
                 )
                 await self._send_safe(turn_context, _as_activity(_card_activity(success_card, text="Upload complete")), log)
+
+                # Show screening summary if available
+                if ingestion.screening_results:
+                    screening_card = _build_screening_card(ingestion.filenames, ingestion.screening_results)
+                    if screening_card:
+                        await self._send_safe(turn_context, _as_activity(_card_activity(screening_card, text="Security screening complete")), log)
+
                 tools_payload = await self.tool_router.handle_action({"action": "show_tools"}, context)
                 await self._send_safe(turn_context, _as_activity(tools_payload), log)
                 return
             except Exception as exc:  # noqa: BLE001
                 log.error("Attachment ingest failed: %s", exc, exc_info=True)
+                # Remove progress card on error too
+                if _progress_response and getattr(_progress_response, "id", None):
+                    try:
+                        await turn_context.delete_activity(_progress_response.id)
+                    except Exception:  # noqa: BLE001
+                        pass
                 error_card = build_card("error_card", message="Could not ingest your file. Please try again.")
                 await self._send_safe(turn_context, _as_activity(_card_activity(error_card)), log)
                 return
@@ -183,12 +375,16 @@ class DocWainTeamsBot(TeamsActivityHandler):
             await self._send_safe(turn_context, _as_activity(payload), log)
             return
 
-        # Text questions
+        # Text questions — handle special commands first
         question = legacy_adapter.extract_question(activity_dict)
-        if not question or question.lower() in {"help", "tools"}:
-            if question and question.lower() == "tools":
+        _lower_q = (question or "").lower().strip()
+        if not question or _lower_q in {"help", "tools", "delete", "delete docs", "delete documents", "delete all"}:
+            if _lower_q == "tools":
                 tools_payload = await self.tool_router.handle_action({"action": "show_tools"}, context)
                 await self._send_safe(turn_context, _as_activity(tools_payload), log)
+            elif _lower_q in {"delete", "delete docs", "delete documents", "delete all"}:
+                delete_payload = await self.tool_router.handle_action({"action": "delete_documents"}, context)
+                await self._send_safe(turn_context, _as_activity(delete_payload), log)
             else:
                 await self._send_safe(turn_context, _as_activity(_card_activity(build_card("help_card"))), log)
             return
@@ -220,7 +416,8 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 text=response_text,
                 sources_text=sources_text.replace("\n\nSources:\n", "") if sources_text else "No sources available.",
             )
-            await self._send_safe(turn_context, _as_activity(_card_activity(card)), log)
+            # Send card with text fallback — text is shown if Adaptive Card can't render
+            await self._send_safe(turn_context, _as_activity(_card_activity(card, text=response_text)), log)
 
             # Persist conversation history for context-aware follow-ups
             try:
