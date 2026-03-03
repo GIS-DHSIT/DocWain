@@ -415,13 +415,16 @@ class TestCardBuilder:
     def test_load_answer_card(self):
         card = load_card_template("answer_card")
         assert card["type"] == "AdaptiveCard"
-        assert any(b.get("text") == "{title}" for b in card["body"])
+        # Title is nested inside ColumnSet > Column > items
+        card_json = json.dumps(card)
+        assert "{title}" in card_json
+        assert "{text}" in card_json
 
     def test_build_card_substitutes_variables(self):
         card = build_card("answer_card", title="My Title", text="My Text")
-        texts = [b.get("text") for b in card["body"]]
-        assert "My Title" in texts
-        assert "My Text" in texts
+        card_json = json.dumps(card)
+        assert "My Title" in card_json
+        assert "My Text" in card_json
 
     def test_build_card_unknown_template(self):
         # Unknown templates now return a fallback card instead of raising
@@ -616,7 +619,7 @@ class TestManifest:
         manifest_path = pathlib.Path(__file__).parent.parent / "teams-app" / "manifest.json"
         data = json.loads(manifest_path.read_text())
         assert data["manifestVersion"] == "1.16"
-        assert data["version"] == "1.2.0"
+        assert data["version"] == "1.2.1"
 
     def test_manifest_has_bot(self):
         import pathlib

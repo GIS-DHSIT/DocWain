@@ -1906,11 +1906,11 @@ class TestFakeQdrantFiltering:
 class TestQueryScopeEdgeCases:
     """Test edge cases in query scope inference."""
 
-    def test_empty_query_defaults_to_targeted(self):
+    def test_empty_query_defaults_to_all_profile(self):
         from src.rag_v3.pipeline import _infer_query_scope
 
         scope = _infer_query_scope("", None, None)
-        assert scope.mode == "targeted"
+        assert scope.mode == "all_profile"
 
     def test_document_id_in_query_text(self):
         from src.rag_v3.pipeline import _infer_query_scope

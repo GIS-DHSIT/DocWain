@@ -137,11 +137,11 @@ class TestScopeInferenceMLFirst:
             scope = self._scope("John vs Bob")
         assert scope.mode == "all_profile"
 
-    # -- Default: targeted --
-    def test_default_targeted(self):
+    # -- Default: all_profile (changed from targeted) --
+    def test_default_all_profile(self):
         with patch("src.rag_v3.pipeline._try_nlp_entity", return_value=None):
             scope = self._scope("hello world")
-        assert scope.mode == "targeted"
+        assert scope.mode == "all_profile"
 
 
 class TestScopeInferenceRegexRemoved:
