@@ -1,0 +1,174 @@
+name: Deploy DocWain Teams Bot
+
+on:
+  push:
+    branches: [main, release/*]
+    paths:
+      - 'src/teams/**'
+      - 'src/main.py'
+      - 'src/api/config.py'
+      - 'teams-app/**'
+      - 'Dockerfile'
+      - '.github/workflows/deploy-teams-bot.yml'
+  workflow_dispatch:
+
+env:
+  AZURE_RESOURCE_GROUP: DocWain
+  AZURE_BOT_NAME: DocWain
+  REGISTRY: ${{ secrets.ACR_LOGIN_SERVER }}
+  IMAGE_NAME: docwain-api
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v --tb=short -q
+        env:
+          MICROSOFT_APP_ID: "test-app-id"
+          MICROSOFT_APP_PASSWORD: "test-password"
+          MICROSOFT_APP_TENANT_ID: "test-tenant-id"
+          MICROSOFT_APP_TYPE: "SingleTenant"
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v2
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image
+        id: meta
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          docker build -t "$TAG" -t "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" .
+          docker push "$TAG"
+          docker push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "tags=$TAG" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: 'docwain-api'
+          images: '${{ needs.build-and-push.outputs.image_tag }}'
+
+      - name: Configure App Settings
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az webapp config appsettings set \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --name docwain-api \
+              --settings \
+                MICROSOFT_APP_ID="${{ secrets.MICROSOFT_APP_ID }}" \
+                MICROSOFT_APP_PASSWORD="${{ secrets.MICROSOFT_APP_PASSWORD }}" \
+                MICROSOFT_APP_TENANT_ID="${{ secrets.MICROSOFT_APP_TENANT_ID }}" \
+                MICROSOFT_APP_TYPE="SingleTenant"
+
+      - name: Verify Bot Endpoint
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            CURRENT_ENDPOINT=$(az bot show \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --name ${{ env.AZURE_BOT_NAME }} \
+              --query "properties.endpoint" -o tsv)
+            EXPECTED="https://dhs-docwain-api.azure-api.net/api/teams/messages"
+            if [ "$CURRENT_ENDPOINT" != "$EXPECTED" ]; then
+              echo "::warning::Bot endpoint is '$CURRENT_ENDPOINT', updating to '$EXPECTED'"
+              az bot update \
+                --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+                --name ${{ env.AZURE_BOT_NAME }} \
+                --endpoint "$EXPECTED"
+            else
+              echo "Bot endpoint is correct: $CURRENT_ENDPOINT"
+            fi
+
+      - name: Verify Teams Channel
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            CHANNELS=$(az bot show \
+              --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
+              --name ${{ env.AZURE_BOT_NAME }} \
+              --query "properties.enabledChannels" -o tsv)
+            if echo "$CHANNELS" | grep -q "msteams"; then
+              echo "Teams channel is enabled"
+            else
+              echo "::warning::Teams channel is NOT enabled. Enable it in Azure Portal > Bot > Channels > Microsoft Teams"
+            fi
+
+      - name: Health Check
+        run: |
+          sleep 30
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://dhs-docwain-api.azure-api.net/api/admin/teams/status)
+          if [ "$STATUS" -eq 200 ]; then
+            echo "Teams bot health check passed"
+            curl -s https://dhs-docwain-api.azure-api.net/api/admin/teams/status | python3 -m json.tool
+          else
+            echo "::error::Teams bot health check failed with HTTP $STATUS"
+            exit 1
+          fi
+
+  package-manifest:
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate manifest
+        run: |
+          BOT_ID=$(jq -r '.bots[0].botId' teams-app/manifest.json)
+          EXPECTED_ID="${{ secrets.MICROSOFT_APP_ID }}"
+          if [ "$BOT_ID" != "$EXPECTED_ID" ]; then
+            echo "::error::manifest.json botId ($BOT_ID) does not match MICROSOFT_APP_ID ($EXPECTED_ID)"
+            exit 1
+          fi
+          echo "Manifest botId matches App ID"
+
+      - name: Package Teams app
+        run: |
+          mkdir -p dist
+          cd teams-app && zip -r ../dist/docwain-teams.zip manifest.json color.png outline.png
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docwain-teams-manifest
+          path: dist/docwain-teams.zip
+          retention-days: 30

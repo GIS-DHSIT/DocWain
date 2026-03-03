@@ -42,12 +42,23 @@ class ScreeningSummary:
 
 
 @dataclass
+class DocumentIntelligence:
+    doc_type: str = "general"
+    summary: str = ""
+    key_entities: List[str] = field(default_factory=list)
+    key_facts: List[str] = field(default_factory=list)
+    intent_tags: List[str] = field(default_factory=list)
+    chunks_created: int = 0
+
+
+@dataclass
 class AttachmentOutcome:
     filename: str
     documents_created: int
     doc_tag: str
     extracted_text: str = ""
     screening: Optional[ScreeningSummary] = None
+    intelligence: Optional[DocumentIntelligence] = None
 
 
 @dataclass
@@ -56,6 +67,7 @@ class IngestionResult:
     documents_created: int
     doc_tags: List[str]
     screening_results: List[ScreeningSummary] = field(default_factory=list)
+    intelligence_results: List[DocumentIntelligence] = field(default_factory=list)
 
 
 def _attachment_type(attachment: Dict[str, Any]) -> str:
@@ -282,11 +294,12 @@ def _run_security_screening(text: str, filename: str, doc_tag: str, log: logging
         return None
 
 
-def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: "TeamsChatContext", log: logging.LoggerAdapter) -> None:
+def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: "TeamsChatContext", log: logging.LoggerAdapter) -> Optional[DocumentIntelligence]:
     """Run Document Intelligence pipeline to enrich document metadata.
 
     Uses the 3-stage pipeline: identify → content_map → understand.
     Results are stored in MongoDB for RAG enrichment.
+    Returns DocumentIntelligence for use by the Teams card builder.
     """
     try:
         from src.doc_understanding.identify import identify_document
@@ -308,12 +321,18 @@ def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: 
             extracted=extracted,
             doc_type=doc_type,
         )
+        summary = ""
+        key_entities: List[str] = []
+        key_facts: List[str] = []
+        intent_tags: List[str] = []
+        if isinstance(understanding, dict):
+            summary = understanding.get("document_summary", "")
+            key_entities = understanding.get("key_entities", [])
+            key_facts = understanding.get("key_facts", [])
+            intent_tags = understanding.get("intent_tags", [])
         log.info(
             "DI understand: %s → entities=%d facts=%d tags=%s",
-            filename,
-            len(understanding.get("key_entities", [])) if isinstance(understanding, dict) else 0,
-            len(understanding.get("key_facts", [])) if isinstance(understanding, dict) else 0,
-            understanding.get("intent_tags", []) if isinstance(understanding, dict) else [],
+            filename, len(key_entities), len(key_facts), intent_tags,
         )
 
         # Persist to MongoDB if available
@@ -326,10 +345,10 @@ def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: 
                 "document_domain": doc_type,
             }
             if isinstance(understanding, dict):
-                update_fields["document_summary"] = understanding.get("document_summary", "")
-                update_fields["key_entities"] = understanding.get("key_entities", [])
-                update_fields["key_facts"] = understanding.get("key_facts", [])
-                update_fields["intent_tags"] = understanding.get("intent_tags", [])
+                update_fields["document_summary"] = summary
+                update_fields["key_entities"] = key_entities
+                update_fields["key_facts"] = key_facts
+                update_fields["intent_tags"] = intent_tags
             docs_collection.update_one(
                 {"document_id": doc_tag, "subscription_id": context.subscription_id},
                 {"$set": update_fields},
@@ -338,8 +357,17 @@ def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: 
         except Exception as db_exc:  # noqa: BLE001
             log.debug("DI MongoDB persist skipped: %s", db_exc)
 
+        return DocumentIntelligence(
+            doc_type=doc_type,
+            summary=summary,
+            key_entities=key_entities,
+            key_facts=key_facts,
+            intent_tags=intent_tags,
+        )
+
     except Exception as exc:  # noqa: BLE001
         log.warning("Document intelligence pipeline error for %s: %s", filename, exc)
+        return None
 
 
 async def _process_file_attachment(
@@ -405,11 +433,14 @@ async def _process_file_attachment(
 
     log.info("Ingested %s: %d document(s), tag=%s", filename, documents_created, doc_tag)
 
-    # Run Document Intelligence pipeline (identify + understand) in background
-    # This enriches the document metadata for better RAG answers
+    # Run Document Intelligence pipeline (identify + understand)
+    # Returns structured results for the DI report card
+    di_result: Optional[DocumentIntelligence] = None
     if first_extracted is not None:
         try:
-            await asyncio.to_thread(_run_document_intelligence, first_extracted, filename, str(doc_tag), context, log)
+            di_result = await asyncio.to_thread(_run_document_intelligence, first_extracted, filename, str(doc_tag), context, log)
+            if di_result:
+                di_result.chunks_created = documents_created
         except Exception as exc:  # noqa: BLE001
             log.warning("Document intelligence failed for %s (non-blocking): %s", filename, exc)
 
@@ -427,6 +458,7 @@ async def _process_file_attachment(
         doc_tag=str(doc_tag),
         extracted_text=extracted_text[:500],
         screening=screening,
+        intelligence=di_result,
     )
 
 
@@ -493,6 +525,7 @@ async def ingest_attachments(
                         outcome.filename,
                         outcome.doc_tag,
                         outcome.documents_created,
+                        document_type=outcome.intelligence.doc_type if outcome.intelligence else None,
                     )
             else:
                 errors.append("Attachment had no extractable content.")
@@ -509,6 +542,7 @@ async def ingest_attachments(
             documents_created=sum(out.documents_created for out in outcomes),
             doc_tags=[out.doc_tag for out in outcomes],
             screening_results=[out.screening for out in outcomes if out.screening],
+            intelligence_results=[out.intelligence for out in outcomes if out.intelligence],
         )
 
     message = " ".join(errors) if errors else "No attachments were ingested."

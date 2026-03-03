@@ -125,6 +125,8 @@ class TeamsToolRouter:
             return await self._delete_documents(context)
         if action == "confirm_delete":
             return await self._confirm_delete(context)
+        if action == "domain_query":
+            return await self._domain_query(context, query=action_value.get("query", ""))
         if action in {"help", "show_tools"}:
             return self._tools_menu(context)
 
@@ -225,16 +227,67 @@ class TeamsToolRouter:
         uploads = self.state_store.list_uploads(context.subscription_id, context.profile_id, limit=10)
         if not uploads:
             return _card_activity(build_card("error_card", message="No uploads have been ingested yet."))
-        lines = []
+
+        import time as _time
+        now = _time.time()
+
+        body = [
+            {"type": "TextBlock", "text": f"Your Documents ({len(uploads)} file{'s' if len(uploads) != 1 else ''})", "weight": "Bolder", "size": "Medium"},
+        ]
+
         for upload in uploads:
             name = upload.get("filename") or "file"
-            tag = upload.get("doc_tag") or "n/a"
-            docs = upload.get("documents_created") or 0
-            lines.append(f"- {name} (tag: {tag}, docs: {docs})")
-        return _card_activity(
-            build_card("answer_card", title="Recent uploads", text="\n".join(lines), sources_text=""),
-            text="Recent uploads",
-        )
+            doc_type = upload.get("document_type") or "general"
+            chunks = upload.get("documents_created") or 0
+            ts = upload.get("timestamp", 0)
+
+            # Friendly time ago
+            elapsed = now - ts if ts else 0
+            if elapsed < 60:
+                time_ago = "just now"
+            elif elapsed < 3600:
+                time_ago = f"{int(elapsed / 60)} min ago"
+            elif elapsed < 86400:
+                time_ago = f"{int(elapsed / 3600)} hr ago"
+            else:
+                time_ago = f"{int(elapsed / 86400)} day(s) ago"
+
+            body.append({
+                "type": "ColumnSet",
+                "separator": True,
+                "spacing": "Small",
+                "columns": [
+                    {
+                        "type": "Column",
+                        "width": "stretch",
+                        "items": [
+                            {"type": "TextBlock", "text": name, "weight": "Bolder", "size": "Small"},
+                            {"type": "TextBlock", "text": f"{chunks} chunk(s) | {time_ago}", "size": "Small", "isSubtle": True, "spacing": "None"},
+                        ],
+                    },
+                    {
+                        "type": "Column",
+                        "width": "auto",
+                        "items": [
+                            {"type": "TextBlock", "text": f"[{doc_type.title()}]", "size": "Small", "color": "Accent"},
+                        ],
+                        "verticalContentAlignment": "Center",
+                    },
+                ],
+            })
+
+        card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": body,
+            "actions": [
+                {"type": "Action.Submit", "title": "Summarize all", "data": {"action": "summarize_recent"}},
+                {"type": "Action.Submit", "title": "Delete all docs", "data": {"action": "delete_documents"}},
+                {"type": "Action.Submit", "title": "Tools", "data": {"action": "show_tools"}},
+            ],
+        }
+        return _card_activity(card, text=f"{len(uploads)} document(s) uploaded")
 
     def _set_model(self, context: TeamsChatContext, model: Optional[str]) -> Dict[str, Any]:
         if not model:
@@ -336,15 +389,105 @@ class TeamsToolRouter:
                 build_card("error_card", message="Failed to delete documents. Please try again.")
             )
 
+    async def _domain_query(self, context: TeamsChatContext, query: str) -> Dict[str, Any]:
+        """Handle domain-specific follow-up queries from DI report card buttons."""
+        if not query:
+            return _card_activity(build_card("error_card", message="No query provided."))
+        try:
+            answer = await self._ask_docwain(query, context)
+            response_text = answer.get("response") or "I could not find an answer."
+            sources_text = _format_sources(answer.get("sources"))
+
+            # Generate follow-up suggestions
+            suggestions = []
+            try:
+                from src.teams.insights import generate_followup_suggestions
+                domain = answer.get("domain") or "general"
+                sources_count = len(answer.get("sources") or [])
+                suggestions = generate_followup_suggestions(query, response_text, domain, sources_count)
+            except Exception:  # noqa: BLE001
+                pass
+
+            card = build_card(
+                "answer_card",
+                title="Answer",
+                text=response_text,
+                sources_text=sources_text or "No sources available.",
+            )
+            return _card_activity(card, text=response_text[:200])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Domain query failed: %s", exc, exc_info=True)
+            return _card_activity(
+                build_card("error_card", message="Failed to answer the query. Please try again.")
+            )
+
     def _tools_menu(self, context: TeamsChatContext) -> Dict[str, Any]:
         prefs = self.state_store.get_preferences(context.subscription_id, context.profile_id)
         model = prefs.get("model_name") or context.model_name or Config.Teams.DEFAULT_MODEL
         persona = prefs.get("persona") or context.persona or Config.Teams.DEFAULT_PERSONA
-        return _card_activity(
-            build_card(
-                "tools_menu_card",
-                default_model=model,
-                default_persona=persona,
-                open_url=DEFAULT_WEB_URL,
-            )
-        )
+
+        # Build domain-aware tool actions based on uploaded documents
+        uploads = self.state_store.list_uploads(context.subscription_id, context.profile_id, limit=10)
+        doc_types = set()
+        for u in uploads:
+            dt = u.get("document_type", "general")
+            if dt and dt != "general":
+                doc_types.add(dt)
+
+        actions = [
+            {"type": "Action.Submit", "title": "Summarize recent", "data": {"action": "summarize_recent"}},
+        ]
+
+        # Add domain-specific extraction buttons
+        if doc_types:
+            try:
+                from src.teams.insights import get_domain_actions
+                for dt in sorted(doc_types):
+                    domain_acts = get_domain_actions(dt)
+                    if domain_acts:
+                        first = domain_acts[0]
+                        actions.append({
+                            "type": "Action.Submit",
+                            "title": f"{dt.title()}: {first['title']}",
+                            "data": {"action": "domain_query", "query": first["query"]},
+                        })
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Add extract fields for any preset with matching uploads
+        _preset_map = {"invoice": "invoice", "hr": "hr", "resume": "hr", "contract": "contract",
+                       "legal": "legal", "medical": "medical", "policy": "policy"}
+        added_presets = set()
+        for dt in doc_types:
+            preset = _preset_map.get(dt)
+            if preset and preset not in added_presets:
+                added_presets.add(preset)
+                actions.append({
+                    "type": "Action.Submit",
+                    "title": f"Extract {preset} fields",
+                    "data": {"action": "extract_fields", "preset": preset},
+                })
+
+        # Fallback: show generic extract if no specific types detected
+        if not added_presets:
+            actions.append({"type": "Action.Submit", "title": "Extract fields", "data": {"action": "extract_fields"}})
+
+        actions.extend([
+            {"type": "Action.Submit", "title": "Generate content", "data": {"action": "generate_content"}},
+            {"type": "Action.Submit", "title": "List docs", "data": {"action": "list_docs"}},
+            {"type": "Action.Submit", "title": "Delete all docs", "data": {"action": "delete_documents"}},
+            {"type": "Action.Submit", "title": "Preferences", "data": {"action": "show_preferences"}},
+        ])
+
+        # Build card programmatically with dynamic actions
+        card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [
+                {"type": "TextBlock", "text": "DocWain tools", "weight": "Bolder", "size": "Medium"},
+                {"type": "TextBlock", "text": "Run actions against your uploaded documents.", "wrap": True},
+            ],
+            "actions": actions[:6],  # Teams limits to 6 actions
+        }
+        return _card_activity(card)
