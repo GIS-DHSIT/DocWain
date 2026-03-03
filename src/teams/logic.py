@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -70,13 +71,18 @@ class TeamsChatService:
         effective_model = model_name or Config.Teams.DEFAULT_MODEL
         effective_persona = persona or Config.Teams.DEFAULT_PERSONA
 
+        # Sanitize IDs for Qdrant collection names (no colons, max 64 chars)
+        def _safe_id(raw: str, fallback: str) -> str:
+            s = raw.replace(":", "-").replace("/", "-").replace("\\", "-") if raw else fallback
+            return s[:64] if len(s) > 64 else s
+
         if Config.Teams.SESSION_AS_SUBSCRIPTION:
-            subscription_id = session_id or "teams-session"
+            subscription_id = _safe_id(session_id, "teams-session")
         else:
             subscription_id = Config.Teams.DEFAULT_SUBSCRIPTION
 
         if Config.Teams.PROFILE_PER_USER:
-            profile_id = user_id or "teams_user"
+            profile_id = _safe_id(user_id, "teams_user")
         else:
             profile_id = Config.Teams.DEFAULT_PROFILE
 
@@ -110,6 +116,53 @@ class TeamsChatService:
                 exc,
             )
             raise TeamsChatError(str(exc)) from exc
+
+    def delete_all_documents(self, subscription_id: str, profile_id: str) -> int:
+        """Delete all embeddings for a Teams user's session (subscription + profile scope).
+
+        Returns the number of points deleted. This only affects the Teams-scoped
+        collection and profile — never touches the core DocWain data.
+        """
+        from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+        collection_name = build_collection_name(subscription_id)
+        try:
+            # Count points before deletion
+            count_filter = Filter(must=[
+                FieldCondition(key="subscription_id", match=MatchValue(value=str(subscription_id))),
+                FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
+            ])
+            count_result = self.client.count(
+                collection_name=collection_name,
+                count_filter=count_filter,
+                exact=True,
+            )
+            point_count = count_result.count if count_result else 0
+
+            if point_count == 0:
+                logger.info(
+                    "No documents to delete | subscription=%s profile=%s collection=%s",
+                    subscription_id, profile_id, collection_name,
+                )
+                return 0
+
+            # Delete all points matching the filter
+            self.client.delete(
+                collection_name=collection_name,
+                points_selector=count_filter,
+                wait=True,
+            )
+            logger.info(
+                "Deleted %d embedding(s) for Teams user | subscription=%s profile=%s collection=%s",
+                point_count, subscription_id, profile_id, collection_name,
+            )
+            return point_count
+        except UnexpectedResponse as exc:
+            logger.error("Failed to delete Teams documents: %s", exc)
+            raise TeamsChatError(f"Could not delete documents: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Unexpected error deleting Teams documents: %s", exc)
+            raise TeamsChatError(f"Could not delete documents: {exc}") from exc
 
     def _answer_with_internet_mode(self, question: str, context: TeamsChatContext) -> Dict[str, Any]:
         """
@@ -147,20 +200,37 @@ class TeamsChatService:
         """
         self.ensure_collection(context.subscription_id)
 
+        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 90))
+
         try:
             if dw_newron is None:
                 from src.api import dw_newron as _dw_newron
             else:
                 _dw_newron = dw_newron
-            answer = _dw_newron.answer_question(
-                query=question,
-                user_id=context.user_id,
-                profile_id=context.profile_id,
-                subscription_id=context.subscription_id,
-                model_name=context.model_name,
-                persona=context.persona,
-                session_id=context.session_id,
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    _dw_newron.answer_question,
+                    query=question,
+                    user_id=context.user_id,
+                    profile_id=context.profile_id,
+                    subscription_id=context.subscription_id,
+                    model_name=context.model_name,
+                    persona=context.persona,
+                    session_id=context.session_id,
+                )
+                answer = future.result(timeout=_RAG_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            logger.error(
+                "RAG pipeline timed out after %.0fs for Teams query | user=%s",
+                _RAG_TIMEOUT_S,
+                context.user_id,
             )
+            raise TeamsChatError(
+                "The answer is taking too long to generate. Please try a simpler question or try again shortly."
+            )
+        except TeamsChatError:
+            raise
         except Exception as exc:  # noqa: BLE001
             raise TeamsChatError(str(exc)) from exc
 

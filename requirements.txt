@@ -44,10 +44,12 @@ wandb
 whisper
 zai
 
-# Azure SDKs (Blob + core + identity)
+# Azure SDKs (Blob + core + identity + Bot management)
 azure-storage-blob
 azure-core
 azure-identity
+azure-mgmt-botservice
+azure-mgmt-resource
 
 # Azure AI Foundry / Projects SDK
 azure-ai-projects

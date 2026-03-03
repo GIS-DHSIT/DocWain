@@ -12,6 +12,7 @@
     { "type": "Action.Submit", "title": "Extract contract fields", "data": { "action": "extract_fields", "preset": "contract" } },
     { "type": "Action.Submit", "title": "Generate content", "data": { "action": "generate_content" } },
     { "type": "Action.Submit", "title": "List docs", "data": { "action": "list_docs" } },
+    { "type": "Action.Submit", "title": "Delete all docs", "data": { "action": "delete_documents" } },
     { "type": "Action.Submit", "title": "Preferences", "data": { "action": "show_preferences" } },
     { "type": "Action.Submit", "title": "Open DocWain", "data": { "action": "open_ui", "url": "{open_url}" } }
   ]
