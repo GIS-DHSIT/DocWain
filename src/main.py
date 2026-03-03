@@ -810,7 +810,30 @@ async def handle_teams_messages(request: Request):
             logger.error("Failed to deserialize Teams activity: %s", exc)
             raise HTTPException(status_code=400, detail="Invalid Teams activity payload")
 
-        turn_state = {"incoming_headers": headers, "raw_body": raw_body}
+        turn_state = {"incoming_headers": headers, "raw_body": raw_body, "raw_activity": activity_payload}
+
+        # Log raw attachment info for debugging file uploads
+        _raw_attachments = activity_payload.get("attachments") or []
+        # Filter to dicts only — Bot Framework may include string values in the attachments array
+        _raw_attachments = [a for a in _raw_attachments if isinstance(a, dict)]
+        if _raw_attachments:
+            def _att_summary(a):
+                ct = a.get("contentType")
+                name = a.get("name")
+                content = a.get("content")
+                has_url = bool(a.get("contentUrl") or (content.get("downloadUrl") if isinstance(content, dict) else False))
+                return (ct, name, has_url)
+            logger.info(
+                "Teams raw payload has %d attachment(s): %s",
+                len(_raw_attachments),
+                [_att_summary(a) for a in _raw_attachments],
+            )
+        _deserialized_atts = getattr(activity_obj, "attachments", None) or []
+        if _raw_attachments and not _deserialized_atts:
+            logger.warning(
+                "BotBuilder Activity.deserialize() lost %d attachment(s) from raw payload!",
+                len(_raw_attachments),
+            )
 
         if getattr(Config.Teams, "DIAG_MODE", False):
             logger.info(
@@ -837,8 +860,9 @@ async def handle_teams_messages(request: Request):
         actual_app_id = (activity_obj.recipient and getattr(activity_obj.recipient, "id", None)) or ""
 
         if actual_app_id and expected_app_id != actual_app_id:
-            logger.warning(
-                "Incoming activity AppId does not match configured bot AppId | expected=%s got=%s",
+            # Web Chat / DirectLine uses bot resource name as recipient.id, not the App GUID
+            logger.debug(
+                "Incoming activity recipient.id differs from configured AppId | expected=%s got=%s",
                 expected_app_id,
                 actual_app_id,
             )
