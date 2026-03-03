@@ -72,11 +72,13 @@ class TeamsStateStore:
         filename: str,
         doc_tag: str,
         documents_created: int,
+        document_type: Optional[str] = None,
     ) -> None:
         entry = {
             "filename": filename,
             "doc_tag": doc_tag,
             "documents_created": documents_created,
+            "document_type": document_type or "general",
             "timestamp": time.time(),
         }
         key = self._uploads_key(subscription_id, profile_id)
