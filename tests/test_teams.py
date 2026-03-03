@@ -424,8 +424,10 @@ class TestCardBuilder:
         assert "My Text" in texts
 
     def test_build_card_unknown_template(self):
-        with pytest.raises(FileNotFoundError):
-            build_card("nonexistent_template_xyz")
+        # Unknown templates now return a fallback card instead of raising
+        card = build_card("nonexistent_template_xyz")
+        assert card["type"] == "AdaptiveCard"
+        assert any("went wrong" in str(b.get("text", "")) for b in card.get("body", []))
 
     def test_build_card_no_mutation(self):
         original = load_card_template("answer_card")
@@ -614,7 +616,7 @@ class TestManifest:
         manifest_path = pathlib.Path(__file__).parent.parent / "teams-app" / "manifest.json"
         data = json.loads(manifest_path.read_text())
         assert data["manifestVersion"] == "1.16"
-        assert data["version"] == "1.1.0"
+        assert data["version"] == "1.2.0"
 
     def test_manifest_has_bot(self):
         import pathlib

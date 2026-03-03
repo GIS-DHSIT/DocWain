@@ -12,6 +12,9 @@ logger = logging.getLogger(__name__)
 ADAPTIVE_CARD_TYPE = "application/vnd.microsoft.card.adaptive"
 DEFAULT_WEB_URL = getattr(Config.Teams, "WEB_APP_URL", "https://www.docwain.ai")
 
+_MAX_INPUT_LEN = 2000
+_VALID_PRESETS = frozenset({"invoice", "contract", "hr", "medical", "legal", "policy"})
+
 
 def _card_activity(card: Dict[str, Any], text: Optional[str] = None) -> Dict[str, Any]:
     activity: Dict[str, Any] = {
@@ -90,6 +93,12 @@ class TeamsToolRouter:
         context = self._apply_preferences(context)
         action = str(action_value.get("action") or action_value.get("type") or "").lower()
 
+        # Sanitize user inputs
+        for key in ("query", "text", "preset", "model", "persona", "content_type"):
+            val = action_value.get(key)
+            if isinstance(val, str) and len(val) > _MAX_INPUT_LEN:
+                action_value[key] = val[:_MAX_INPUT_LEN]
+
         if action in {"summarize", "summarize_recent"}:
             return await self._summarize_recent(context)
         if action == "extract_fields":
@@ -112,6 +121,10 @@ class TeamsToolRouter:
             return self._set_preferences(context, action_value)
         if action in {"open_ui", "open_web"}:
             return self._open_ui()
+        if action == "delete_documents":
+            return await self._delete_documents(context)
+        if action == "confirm_delete":
+            return await self._confirm_delete(context)
         if action in {"help", "show_tools"}:
             return self._tools_menu(context)
 
@@ -145,13 +158,20 @@ class TeamsToolRouter:
             )
         doc_tags = [u.get("doc_tag") for u in uploads if u.get("doc_tag")]
         filenames = [u.get("filename") for u in uploads if u.get("filename")]
+        safe_preset = preset if preset in _VALID_PRESETS else None
         preset_text = ""
-        if preset == "invoice":
+        if safe_preset == "invoice":
             preset_text = "Extract invoice number, vendor, total, currency, issue date, and due date."
-        elif preset == "contract":
+        elif safe_preset == "contract":
             preset_text = "Extract parties, effective date, termination date, renewal terms, and obligations."
-        elif preset:
-            preset_text = f"Extract the key fields for preset '{preset}'."
+        elif safe_preset == "hr":
+            preset_text = "Extract candidate name, experience, education, skills, and certifications."
+        elif safe_preset == "medical":
+            preset_text = "Extract patient name, diagnosis, medications, dosage, and treatment plan."
+        elif safe_preset == "legal":
+            preset_text = "Extract parties, jurisdiction, clauses, obligations, and effective dates."
+        elif safe_preset == "policy":
+            preset_text = "Extract policy number, coverage, premium, deductible, and effective period."
         else:
             preset_text = "Extract key fields (dates, totals, parties, identifiers) from the uploaded documents."
 
@@ -271,6 +291,50 @@ class TeamsToolRouter:
             build_card("answer_card", title="DocWain Web", text=f"Open DocWain in your browser: {url}", sources_text=""),
             text=url,
         )
+
+    async def _delete_documents(self, context: TeamsChatContext) -> Dict[str, Any]:
+        """Show a confirmation card before deleting all documents."""
+        uploads = self.state_store.list_uploads(context.subscription_id, context.profile_id, limit=10)
+        if not uploads:
+            return _card_activity(
+                build_card("error_card", message="No uploaded documents found to delete.")
+            )
+        filenames = [u.get("filename", "unknown") for u in uploads]
+        return _card_activity(
+            build_card(
+                "delete_confirm_card",
+                file_count=str(len(uploads)),
+                file_list=", ".join(filenames[:5]) + ("..." if len(filenames) > 5 else ""),
+            )
+        )
+
+    async def _confirm_delete(self, context: TeamsChatContext) -> Dict[str, Any]:
+        """Actually delete all documents for this Teams user session."""
+        try:
+            deleted_count = await asyncio.to_thread(
+                self.chat_service.delete_all_documents,
+                context.subscription_id,
+                context.profile_id,
+            )
+            cleared = self.state_store.clear_uploads(context.subscription_id, context.profile_id)
+            logger.info(
+                "Teams documents deleted | subscription=%s profile=%s embeddings=%d upload_records=%d",
+                context.subscription_id, context.profile_id, deleted_count, cleared,
+            )
+            return _card_activity(
+                build_card(
+                    "answer_card",
+                    title="Documents deleted",
+                    text=f"Deleted {deleted_count} embedding(s) and {cleared} upload record(s). You can upload new documents to start fresh.",
+                    sources_text="",
+                ),
+                text="Documents deleted successfully.",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Teams document deletion failed: %s", exc, exc_info=True)
+            return _card_activity(
+                build_card("error_card", message="Failed to delete documents. Please try again.")
+            )
 
     def _tools_menu(self, context: TeamsChatContext) -> Dict[str, Any]:
         prefs = self.state_store.get_preferences(context.subscription_id, context.profile_id)

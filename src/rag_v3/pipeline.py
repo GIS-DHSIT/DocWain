@@ -116,13 +116,30 @@ _ALL_SCOPE_SIGNALS = re.compile(
 # These slip through spaCy's single-word stopword filter but should never
 # be treated as entity hints for chunk filtering.
 _ENTITY_HINT_STOP_PHRASES = frozenset({
+    # Medical document types
     "progress note", "progress notes", "pathology report", "radiology report",
     "lab results", "lab result", "vital signs", "medication list",
     "prescription list", "discharge summary", "clinical note", "clinical notes",
     "operative report", "consultation note", "patient report", "medical report",
-    "medical record", "medical records", "insurance policy", "policy document",
+    "medical record", "medical records",
+    # Document/collection references
+    "insurance policy", "policy document", "policy number",
     "invoice document", "invoice documents", "all documents", "the documents",
     "both documents", "sample invoice", "invoice number",
+    # Common domain terms spaCy may extract as entities — these are query concepts,
+    # not actual person/entity names for targeted filtering.
+    "vendor", "vendor name", "vendor information", "vendor details",
+    "payment", "payment terms", "payment details", "payment method",
+    "salary", "salary details", "compensation", "annual salary",
+    "coverage", "coverage period", "coverage details", "coverage amount",
+    "premium", "monthly premium", "premium amount",
+    "deductible", "copay", "copayment",
+    "beneficiary", "policyholder", "insured",
+    "candidate", "applicant", "employee", "employer",
+    "contract", "agreement", "terms and conditions",
+    "total", "amount", "balance", "due date", "expiry date",
+    "diagnosis", "treatment", "medication", "prescription",
+    "document", "file", "report", "summary", "information",
 })
 
 
@@ -204,8 +221,11 @@ def _infer_query_scope(
     if re.search(r"\b(?:compare|rank|vs\.?|versus)\b", lowered):
         return QueryScope(mode="all_profile")
 
-    # Default: targeted vector retrieval (standard behavior)
-    return QueryScope(mode="targeted")
+    # Default: all_profile — collectively analyze all documents unless a specific
+    # document or entity was explicitly identified above.  This prevents the common
+    # failure mode where generic queries ("What is the vendor name?") were routed to
+    # targeted mode, found no entity match, and returned "not mentioned."
+    return QueryScope(mode="all_profile")
 
 
 def _is_llm_response(extraction: Any) -> bool:

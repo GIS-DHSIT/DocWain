@@ -44,6 +44,27 @@ class TeamsStateStore:
     def _prefs_key(subscription_id: str, profile_id: str) -> str:
         return f"teams:{subscription_id}:{profile_id}:prefs"
 
+    def _cleanup_expired_memory(self) -> None:
+        """Remove expired entries from in-memory fallback stores."""
+        now = time.time()
+        expired_upload_keys = []
+        for key, uploads in self._memory_uploads.items():
+            self._memory_uploads[key] = [
+                u for u in uploads if now - u.get("timestamp", 0) < self.ttl_seconds
+            ]
+            if not self._memory_uploads[key]:
+                expired_upload_keys.append(key)
+        for key in expired_upload_keys:
+            del self._memory_uploads[key]
+
+        # Preferences don't have timestamps, so track insertion time
+        expired_pref_keys = [
+            key for key, val in self._memory_prefs.items()
+            if now - val.get("_ts", 0) > self.ttl_seconds
+        ]
+        for key in expired_pref_keys:
+            del self._memory_prefs[key]
+
     def record_upload(
         self,
         subscription_id: str,
@@ -72,6 +93,8 @@ class TeamsStateStore:
         uploads = self._memory_uploads.setdefault(key, [])
         uploads.insert(0, entry)
         self._memory_uploads[key] = uploads[: self.max_uploads]
+        if len(self._memory_uploads) > 100:
+            self._cleanup_expired_memory()
 
     def list_uploads(self, subscription_id: str, profile_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         key = self._uploads_key(subscription_id, profile_id)
@@ -89,6 +112,20 @@ class TeamsStateStore:
         if not records and key in self._memory_uploads:
             records = self._memory_uploads.get(key, [])[:limit]
         return records
+
+    def clear_uploads(self, subscription_id: str, profile_id: str) -> int:
+        """Remove all upload records for a Teams user. Returns count removed."""
+        key = self._uploads_key(subscription_id, profile_id)
+        removed = 0
+        if self.client:
+            try:
+                removed = self.client.llen(key) or 0
+                self.client.delete(key)
+                return removed
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Redis unavailable while clearing uploads; using memory: %s", exc)
+        entries = self._memory_uploads.pop(key, [])
+        return len(entries) or removed
 
     def get_preferences(self, subscription_id: str, profile_id: str) -> Dict[str, Any]:
         key = self._prefs_key(subscription_id, profile_id)
@@ -121,5 +158,8 @@ class TeamsStateStore:
                 return prefs
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Redis unavailable while setting prefs; using memory: %s", exc)
+        prefs["_ts"] = time.time()
         self._memory_prefs[key] = prefs
+        if len(self._memory_prefs) > 100:
+            self._cleanup_expired_memory()
         return prefs

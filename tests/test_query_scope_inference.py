@@ -100,13 +100,15 @@ class TestQueryScopeInference:
         assert scope.mode == "specific_document"
         assert scope.document_id == "doc-999"
 
-    def test_default_targeted(self):
+    def test_default_all_profile(self):
+        """Generic queries without entity/document references default to all_profile
+        to collectively analyze all documents."""
         scope = _infer_query_scope("what are the payment terms", None, None)
-        assert scope.mode == "targeted"
+        assert scope.mode == "all_profile"
 
-    def test_default_targeted_skills(self):
+    def test_default_all_profile_skills(self):
         scope = _infer_query_scope("skills required for this role", None, None)
-        assert scope.mode == "targeted"
+        assert scope.mode == "all_profile"
 
     def test_intent_with_entity_hints(self):
         intent = _make_intent(intent="qa", entity_hints=["Alice Smith"])
