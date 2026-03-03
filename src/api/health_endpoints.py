@@ -264,7 +264,7 @@ def liveness_check() -> Dict[str, Any]:
     }
 
 
-@health_router.post("/api/admin/reindex")
+@health_router.post("/admin/reindex")
 async def reindex_profile(body: ReindexRequest) -> Dict[str, Any]:
     """
     Clear Qdrant data for a profile (or single document) and re-embed from pickle.
@@ -343,7 +343,7 @@ async def reindex_profile(body: ReindexRequest) -> Dict[str, Any]:
         }
 
 
-@health_router.get("/api/admin/metrics/quality")
+@health_router.get("/admin/metrics/quality")
 async def quality_metrics(hours: int = 24) -> Dict[str, Any]:
     """Return pipeline quality metrics aggregated over the last N hours."""
     try:
@@ -353,7 +353,7 @@ async def quality_metrics(hours: int = 24) -> Dict[str, Any]:
         return {"error": str(exc)}
 
 
-@health_router.get("/api/admin/llm/status")
+@health_router.get("/admin/llm/status")
 async def llm_status() -> Dict[str, Any]:
     """Return the current LLM gateway status and health."""
     try:
@@ -374,7 +374,7 @@ async def llm_status() -> Dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
-@health_router.get("/api/admin/teams/status")
+@health_router.get("/admin/teams/status")
 async def teams_status() -> Dict[str, Any]:
     """Return Teams bot configuration status."""
     from src.api.config import Config
@@ -382,7 +382,10 @@ async def teams_status() -> Dict[str, Any]:
     app_id = getattr(Config.Teams, "BOT_APP_ID", None) or ""
     app_password = getattr(Config.Teams, "BOT_APP_PASSWORD", None) or ""
     shared_secret = getattr(Config.Teams, "SHARED_SECRET", None) or ""
+    tenant_id = getattr(Config.Teams, "BOT_APP_TENANT_ID", None) or ""
+    app_type = getattr(Config.Teams, "BOT_APP_TYPE", None) or "unknown"
     masked_app_id = (app_id[:8] + "...") if len(app_id) > 8 else app_id
+    masked_tenant = (tenant_id[:8] + "...") if len(tenant_id) > 8 else tenant_id
 
     bot_adapter_ready = False
     try:
@@ -408,6 +411,9 @@ async def teams_status() -> Dict[str, Any]:
     return {
         "bot_credentials_configured": bool(app_id and app_password),
         "app_id_masked": masked_app_id or "(not set)",
+        "app_type": app_type,
+        "tenant_id_masked": masked_tenant or "(not set)",
+        "tenant_id_configured": bool(tenant_id),
         "shared_secret_configured": bool(shared_secret),
         "bot_adapter_ready": bot_adapter_ready,
         "state_store_redis": redis_status,
@@ -419,7 +425,7 @@ async def teams_status() -> Dict[str, Any]:
     }
 
 
-@health_router.get("/api/admin/multi-agent/status")
+@health_router.get("/admin/multi-agent/status")
 async def multi_agent_status() -> Dict[str, Any]:
     """Return multi-agent gateway status and per-role statistics."""
     from src.api.config import Config
@@ -444,7 +450,7 @@ async def multi_agent_status() -> Dict[str, Any]:
         return {"enabled": True, "status": "error", "error": str(exc)[:200]}
 
 
-@health_router.get("/api/admin/intent-classifier/status")
+@health_router.get("/admin/intent-classifier/status")
 async def intent_classifier_status() -> Dict[str, Any]:
     """Return the trained intent classifier status."""
     try:
@@ -466,7 +472,7 @@ async def intent_classifier_status() -> Dict[str, Any]:
         return {"status": "error", "error": str(exc)[:200]}
 
 
-@health_router.get("/api/admin/line-classifier/status")
+@health_router.get("/admin/line-classifier/status")
 async def line_classifier_status() -> Dict[str, Any]:
     """Return the trained line role classifier status."""
     try:
@@ -487,7 +493,7 @@ async def line_classifier_status() -> Dict[str, Any]:
         return {"status": "error", "error": str(exc)[:200]}
 
 
-@health_router.get("/api/admin/kg/status")
+@health_router.get("/admin/kg/status")
 async def kg_status() -> Dict[str, Any]:
     """Return Knowledge Graph status, connectivity, and statistics."""
     from src.api.config import Config
@@ -543,7 +549,7 @@ async def kg_status() -> Dict[str, Any]:
     return result
 
 
-@health_router.get("/api/admin/task-routing/status")
+@health_router.get("/admin/task-routing/status")
 async def task_routing_status() -> Dict[str, Any]:
     """Return task-aware model routing status, discovered models, and per-task statistics."""
     from src.api.config import Config
@@ -597,7 +603,7 @@ async def task_routing_status() -> Dict[str, Any]:
         return {"enabled": True, "status": "error", "error": str(exc)[:200]}
 
 
-@health_router.get("/api/admin/tools/status")
+@health_router.get("/admin/tools/status")
 async def tools_status() -> Dict[str, Any]:
     """Return registered tool count and intelligence profile summary."""
     try:
@@ -623,7 +629,7 @@ async def tools_status() -> Dict[str, Any]:
     }
 
 
-@health_router.get("/api/admin/enterprise-intelligence/status")
+@health_router.get("/admin/enterprise-intelligence/status")
 async def enterprise_intelligence_status() -> Dict[str, Any]:
     """Return status of enterprise intelligence features."""
     from src.api.config import Config
@@ -689,7 +695,7 @@ async def enterprise_intelligence_status() -> Dict[str, Any]:
     }
 
 
-@health_router.get("/api/admin/web-search/status")
+@health_router.get("/admin/web-search/status")
 async def web_search_status() -> Dict[str, Any]:
     """Return web search configuration status."""
     from src.api.config import Config
@@ -711,7 +717,7 @@ async def web_search_status() -> Dict[str, Any]:
     }
 
 
-@health_router.get("/api/admin/vision-ocr/status")
+@health_router.get("/admin/vision-ocr/status")
 async def vision_ocr_status() -> Dict[str, Any]:
     """Return vision OCR engine status."""
     from src.api.config import Config
@@ -739,7 +745,7 @@ async def vision_ocr_status() -> Dict[str, Any]:
     return result
 
 
-@health_router.get("/api/admin/domain-knowledge/status")
+@health_router.get("/admin/domain-knowledge/status")
 async def domain_knowledge_status() -> Dict[str, Any]:
     """Return domain knowledge engine status."""
     from src.api.config import Config
@@ -766,7 +772,7 @@ async def domain_knowledge_status() -> Dict[str, Any]:
     return result
 
 
-@health_router.get("/api/admin/context-understanding/status")
+@health_router.get("/admin/context-understanding/status")
 async def context_understanding_status() -> Dict[str, Any]:
     """Return ML-based context understanding module status."""
     result: Dict[str, Any] = {"enabled": True, "status": "active"}
@@ -828,7 +834,7 @@ async def profile_domain_status() -> Dict[str, Any]:
     return result
 
 
-@health_router.get("/api/admin/thinking-model/status")
+@health_router.get("/admin/thinking-model/status")
 async def thinking_model_status() -> Dict[str, Any]:
     """Return lfm2.5-thinking MoE sub-agent status."""
     from src.api.config import Config
@@ -859,7 +865,7 @@ async def thinking_model_status() -> Dict[str, Any]:
     return result
 
 
-@health_router.get("/api/admin/vision-analysis/status")
+@health_router.get("/admin/vision-analysis/status")
 async def vision_analysis_status() -> Dict[str, Any]:
     """Return glm-ocr enhanced vision analysis status."""
     from src.api.config import Config

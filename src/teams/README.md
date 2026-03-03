@@ -18,8 +18,8 @@ Two adapter paths:
 
 ## Azure Bot Resource Setup
 
-1. **Create an Azure Bot resource** (Multi-Tenant) in the Azure Portal
-2. Note the **Microsoft App ID** (a GUID)
+1. **Create an Azure Bot resource** (Single-Tenant) in the Azure Portal
+2. Note the **Microsoft App ID** (a GUID) and the **Tenant ID**
 3. Under **Certificates & Secrets**, create a new client secret
 4. Under **Channels**, enable the **Microsoft Teams** channel
 5. Set the **Messaging endpoint** to `https://<your-host>/api/teams/messages`
@@ -32,6 +32,8 @@ Set these in your `.env` file:
 |----------|----------|---------|-------------|
 | `MICROSOFT_APP_ID` | Yes | — | Azure Bot App ID (GUID) |
 | `MICROSOFT_APP_PASSWORD` | Yes | — | Azure Bot client secret |
+| `MICROSOFT_APP_TENANT_ID` | Yes (Single-Tenant) | — | Azure AD / Entra ID tenant ID (GUID) |
+| `MICROSOFT_APP_TYPE` | No | `SingleTenant` | App type: `SingleTenant`, `MultiTenant`, or `UserAssignedMSI` |
 | `TEAMS_SHARED_SECRET` | No | — | Shared-secret fallback for local dev |
 | `TEAMS_SIGNATURE_ENABLED` | No | `false` | Enable HMAC request signatures |
 | `TEAMS_DEFAULT_MODEL` | No | `llama3.2` | Default LLM model |
@@ -44,6 +46,27 @@ Set these in your `.env` file:
 | `TEAMS_BOT_ACCESS_TOKEN` | No | — | Fallback token for secured downloads |
 | `TEAMS_DIAG_MODE` | No | `false` | Enable diagnostic logging |
 | `DOCWAIN_WEB_URL` | No | `https://www.docwain.ai` | Web app URL for card links |
+
+## Single-Tenant Authentication
+
+DocWain's Azure Bot is registered as **Single Tenant** (`msaAppType: SingleTenant`).
+This means the bot only accepts tokens issued by the configured Entra ID tenant.
+
+**Required environment variables for single-tenant:**
+- `MICROSOFT_APP_ID` — the bot's App Registration client ID
+- `MICROSOFT_APP_PASSWORD` — the App Registration client secret
+- `MICROSOFT_APP_TENANT_ID` — your Entra ID tenant GUID (e.g., `13a1a520-d90b-4bfe-ada0-2be3d1f3c582`)
+
+The adapter passes `channel_auth_tenant` to `BotFrameworkAdapterSettings`, which restricts
+token validation to `https://login.microsoftonline.com/<tenant_id>` instead of the
+multi-tenant common endpoint. Without this, all incoming Teams activities will fail with `401`.
+
+To verify your configuration:
+```bash
+curl https://<your-host>/api/admin/teams/status
+```
+
+The response should show `"app_type": "SingleTenant"` and `"tenant_id_configured": true`.
 
 ## Manifest Update
 
@@ -102,6 +125,7 @@ The Preferences card lets users choose their model and persona via dropdown menu
 |---------|-------|-----|
 | Bot doesn't respond | Endpoint not reachable | Check messaging endpoint URL and firewall |
 | `401 Unauthorized` on send | App ID/secret mismatch | Verify `MICROSOFT_APP_ID` and `MICROSOFT_APP_PASSWORD` |
+| `401 Unauthorized` on receive | Missing tenant ID (Single-Tenant) | Set `MICROSOFT_APP_TENANT_ID` to your Entra ID tenant GUID |
 | `403 Forbidden` outbound | Service URL not trusted | DocWain auto-trusts; check Azure Bot channel config |
 | File upload fails | Missing download URL | Ensure the file was sent via Teams attachment picker |
 | Inline images rejected | No connector token | Set `MICROSOFT_APP_ID`/`PASSWORD` or `TEAMS_BOT_ACCESS_TOKEN` |

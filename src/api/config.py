@@ -192,7 +192,7 @@ class Config:
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
         DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
-        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "llama3.2")
+        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "gpt-oss")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
         BLOB_CONNECTION_STRING = os.getenv("TEAMS_BLOB_CONNECTION_STRING", "")
@@ -207,6 +207,8 @@ class Config:
         # Support common Azure Bot env var spellings; defaults intentionally blank to force explicit configuration
         BOT_APP_ID = os.getenv("MICROSOFT_APP_ID")
         BOT_APP_PASSWORD = os.getenv("MICROSOFT_APP_PASSWORD") or os.getenv("MICROSOFT_APP_PWD")
+        BOT_APP_TENANT_ID = os.getenv("MICROSOFT_APP_TENANT_ID") or os.getenv("MSA_APP_TENANT_ID")
+        BOT_APP_TYPE = os.getenv("MICROSOFT_APP_TYPE", "SingleTenant")  # SingleTenant | MultiTenant | UserAssignedMSI
         WEB_APP_URL = os.getenv("DOCWAIN_WEB_URL", os.getenv("TEAMS_WEB_APP_URL", "https://www.docwain.ai"))
         DIAG_MODE = os.getenv("TEAMS_DIAG_MODE", "").lower() in {"1", "true", "yes", "on"}
 
