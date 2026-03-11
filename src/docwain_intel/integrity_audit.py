@@ -56,6 +56,8 @@ def _check_provenance(
     sample = facts[:_PROVENANCE_SAMPLE_SIZE]
     all_unit_text = " ".join(u.text for u in doc.units)
     all_unit_keywords = _keyword_set(all_unit_text)
+    if not all_unit_keywords:
+        return True
 
     for fact in sample:
         stored_raw = graph_store.get_fact_raw_text(fact.fact_id)
