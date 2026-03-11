@@ -5,8 +5,10 @@ to auto-tag documents WITHOUT hardcoded domain labels.
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
+import threading
 from collections import Counter
 from typing import List
 
@@ -35,6 +37,13 @@ _PASSIVE_MARKERS = frozenset({
 })
 
 _PASSIVE_SUFFIX = "ed"
+
+_MAX_TEXT_CHARS = 100_000
+
+_logger = logging.getLogger(__name__)
+
+_spacy_nlp = None
+_spacy_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -156,20 +165,35 @@ def _compute_relational_density(
     return len(extraction.facts) / unit_count
 
 
+def _get_spacy_nlp():
+    """Return a shared spaCy model instance using double-check locking."""
+    global _spacy_nlp
+    if _spacy_nlp is None:
+        with _spacy_lock:
+            if _spacy_nlp is None:
+                import spacy
+                _spacy_nlp = spacy.load("en_core_web_sm")
+    return _spacy_nlp
+
+
 def _compute_auto_tags(all_text: str) -> List[str]:
     """Extract top noun-chunk lemmas via spaCy. Returns empty list on failure."""
     if not all_text or not all_text.strip():
         return []
     try:
-        import spacy  # noqa: F811
-
-        try:
-            nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            return []
+        nlp = _get_spacy_nlp()
 
         # Process only first 100k chars to avoid memory issues
-        doc = nlp(all_text[:100_000])
+        text = all_text
+        if len(text) > _MAX_TEXT_CHARS:
+            _logger.warning(
+                "Text truncated from %d to %d chars for auto-tag extraction",
+                len(text),
+                _MAX_TEXT_CHARS,
+            )
+            text = text[:_MAX_TEXT_CHARS]
+
+        doc = nlp(text)
         chunk_counter: Counter = Counter()
         for chunk in doc.noun_chunks:
             lemma = chunk.lemma_.lower().strip()
