@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 from .models import ExtractedDocumentJSON
@@ -18,6 +19,34 @@ logger = logging.getLogger(__name__)
 
 # Feature flag — set DOCWAIN_INTEL_PIPELINE=1 to enable
 INTEL_PIPELINE_ENABLED = os.getenv("DOCWAIN_INTEL_PIPELINE", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# Intelligence Engine V2 singleton
+# ---------------------------------------------------------------------------
+
+_engine_lock = threading.Lock()
+_engine_instance = None
+
+
+def get_intelligence_engine():
+    """Return the singleton IntelligenceEngine, or None if disabled.
+
+    Gated by the ``DOCWAIN_INTEL_V2`` environment variable.
+    Set ``DOCWAIN_INTEL_V2=1`` to enable.
+    """
+    global _engine_instance
+    if os.getenv("DOCWAIN_INTEL_V2", "0") != "1":
+        return None
+
+    if _engine_instance is not None:
+        return _engine_instance
+
+    with _engine_lock:
+        if _engine_instance is not None:
+            return _engine_instance
+        from .intelligence import IntelligenceEngine
+        _engine_instance = IntelligenceEngine()
+        return _engine_instance
 
 
 def run_intel_pipeline_hook(
@@ -66,8 +95,36 @@ def route_and_assemble(
 ) -> AssembledResponse:
     """Query-time hook: route query and assemble response from pre-computed data.
 
+    When DOCWAIN_INTEL_V2 is enabled, routes through the full intelligence engine
+    first (with pronoun resolution, geometry analysis, etc.). Falls back to the
+    legacy path on failure or when the engine is disabled.
+
     Returns AssembledResponse with text, sources, and confidence.
     """
+    engine = get_intelligence_engine()
+    if engine is not None:
+        try:
+            result = engine.process_query(
+                query=query,
+                subscription_id="default",
+                profile_id="default",
+                session_id="default",
+                chunks=chunks,
+                facts=facts,
+            )
+            if result.text:
+                return AssembledResponse(
+                    text=result.text,
+                    sources=result.sources,
+                    confidence=result.confidence,
+                    route_used=result.route_used,
+                    fact_count=len(facts or []),
+                    chunk_count=len(chunks or []),
+                )
+        except Exception:
+            logger.debug("Intelligence engine failed, falling back", exc_info=True)
+
+    # Legacy path
     analysis = route_query(query)
     return assemble_response(
         query=query,
