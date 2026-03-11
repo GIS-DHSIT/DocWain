@@ -204,7 +204,7 @@ def build_document_json_from_extracted(extracted: ExtractedDocument, *, document
 
     tables: List[Table] = []
     for idx, table in enumerate(extracted.tables or []):
-        table_id = f"tbl_{_hash_text(str(idx) + (table.text or ""))}"
+        table_id = f"tbl_{_hash_text(str(idx) + (table.text or ''))}"
         headers: List[str] = []
         rows: List[List[str]] = []
         if table.csv:

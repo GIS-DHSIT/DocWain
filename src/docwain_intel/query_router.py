@@ -79,6 +79,7 @@ _RETRIEVAL_LEMMAS = frozenset({
 # Lemmas for comparison.
 _COMPARISON_LEMMAS = frozenset({
     "compare", "contrast", "differentiate", "distinguish", "versus",
+    "difference", "differ", "similarity", "similar",
 })
 
 # Lemmas for aggregation.
