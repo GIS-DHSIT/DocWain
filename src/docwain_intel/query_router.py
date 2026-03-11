@@ -3,23 +3,37 @@ from __future__ import annotations
 
 import enum
 import logging
+import re
+import threading
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+_spacy_lock = threading.Lock()
 _spacy_nlp = None
+
+# Matches null bytes and C0/C1 control characters (except common whitespace).
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+_MAX_QUERY_LENGTH = 10_000
 
 
 def _get_spacy():
+    """Load spaCy model (lazy singleton, thread-safe). Prefers en_core_web_lg."""
     global _spacy_nlp
-    if _spacy_nlp is None:
+    if _spacy_nlp is not None:
+        return _spacy_nlp
+    with _spacy_lock:
+        if _spacy_nlp is not None:  # double-check after acquiring lock
+            return _spacy_nlp
         import spacy
 
         try:
             _spacy_nlp = spacy.load("en_core_web_lg")
         except OSError:
+            logger.warning("en_core_web_lg not found, falling back to en_core_web_sm")
             _spacy_nlp = spacy.load("en_core_web_sm")
     return _spacy_nlp
 
@@ -264,9 +278,30 @@ def _compute_specificity(
     return max(0.0, min(1.0, score))
 
 
+def _sanitize_query(query: str) -> str:
+    """Strip, remove control characters, and truncate query."""
+    query = query.strip()
+    query = _CONTROL_CHAR_RE.sub("", query)
+    if len(query) > _MAX_QUERY_LENGTH:
+        query = query[:_MAX_QUERY_LENGTH]
+    return query
+
+
 def route_query(query: str) -> QueryAnalysis:
     """Classify a query and determine the optimal retrieval route."""
     if not query or not query.strip():
+        return QueryAnalysis(
+            query=query or "",
+            route=QueryRoute.GRAPH_DIRECT,
+            entities=[],
+            specificity=0.0,
+            is_conversational=True,
+            confidence=1.0,
+        )
+
+    query = _sanitize_query(query)
+
+    if not query:
         return QueryAnalysis(
             query=query,
             route=QueryRoute.GRAPH_DIRECT,
