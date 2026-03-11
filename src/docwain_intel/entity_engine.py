@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,41 +25,25 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Lazy-loaded singletons
 # ---------------------------------------------------------------------------
+_spacy_lock = threading.Lock()
 _spacy_nlp = None
-_gliner_model = None
 
 
 def _get_spacy():
-    """Load spaCy model (lazy singleton). Prefers en_core_web_lg."""
+    """Load spaCy model (lazy singleton, thread-safe). Prefers en_core_web_lg."""
     global _spacy_nlp
     if _spacy_nlp is not None:
         return _spacy_nlp
-    import spacy
-
-    for model_name in ("en_core_web_lg", "en_core_web_sm"):
-        try:
-            _spacy_nlp = spacy.load(model_name)
-            logger.info("Loaded spaCy model: %s", model_name)
+    with _spacy_lock:
+        if _spacy_nlp is not None:  # double-check after acquiring lock
             return _spacy_nlp
+        import spacy
+        try:
+            _spacy_nlp = spacy.load("en_core_web_lg")
         except OSError:
-            continue
-    raise RuntimeError("No spaCy English model found. Install en_core_web_lg or en_core_web_sm.")
-
-
-def _get_gliner():
-    """Load GLiNER model (lazy singleton, optional)."""
-    global _gliner_model
-    if _gliner_model is not None:
-        return _gliner_model
-    try:
-        from gliner import GLiNER
-
-        _gliner_model = GLiNER.from_pretrained("urchade/gliner_multi_pii-v1")
-        logger.info("Loaded GLiNER model")
-        return _gliner_model
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("GLiNER not available: %s", exc)
-        return None
+            logger.warning("en_core_web_lg not found, falling back to en_core_web_sm")
+            _spacy_nlp = spacy.load("en_core_web_sm")
+    return _spacy_nlp
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +57,7 @@ _PHONE_RE = re.compile(
     r"\d{3,4}[\s\-.]?\d{3,4}"  # main number
 )
 _URL_RE = re.compile(r"https?://[^\s<>\"]+|www\.[^\s<>\"]+")
+MAX_UNIT_TEXT_CHARS = 50_000
 _DURATION_RE = re.compile(
     r"\b\d+\s*(?:years?|months?|weeks?|days?|hours?|hrs?|minutes?|mins?)\b",
     re.IGNORECASE,
@@ -200,7 +186,8 @@ def _extract_svo_facts(
                     extraction_method="textacy_svo",
                 )
             )
-    except Exception:  # noqa: BLE001
+    except ImportError:
+        logger.debug("textacy not available, using manual SVO extraction")
         # Fallback: manual dependency parse for nsubj -> ROOT -> dobj
         for token in doc:
             if token.dep_ == "ROOT" and token.pos_ == "VERB":
@@ -227,6 +214,8 @@ def _extract_svo_facts(
                             extraction_method="dep_parse",
                         )
                     )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SVO extraction failed: %s", exc)
     return facts
 
 
@@ -385,7 +374,7 @@ def extract_entities_and_facts(doc: StructuredDocument) -> ExtractionResult:
         return ExtractionResult(document_id=doc.document_id)
 
     for unit in doc.units:
-        text = unit.text or ""
+        text = (unit.text or "")[:MAX_UNIT_TEXT_CHARS]
         if not text.strip():
             continue
 
@@ -395,8 +384,8 @@ def extract_entities_and_facts(doc: StructuredDocument) -> ExtractionResult:
             all_entities.extend(kv_ents)
             all_facts.extend(kv_facts)
             all_kv_pairs.extend(kv_pairs)
-            # Also run spaCy on the full text for additional entities
-            all_entities.extend(_extract_spacy_entities(text, unit.unit_id))
+            # Pattern entities only — spaCy NER already runs on individual values
+            # inside _extract_kv_facts(); skip redundant full-text spaCy pass
             all_entities.extend(_extract_pattern_entities(text, unit.unit_id))
             continue
 
@@ -405,8 +394,8 @@ def extract_entities_and_facts(doc: StructuredDocument) -> ExtractionResult:
             all_entities.extend(tbl_ents)
             all_facts.extend(tbl_facts)
             all_tables.extend(tbl_structured)
-            # Also run spaCy on the full text
-            all_entities.extend(_extract_spacy_entities(text, unit.unit_id))
+            # spaCy NER already runs on individual row texts inside
+            # _extract_table_facts(); skip redundant full-text spaCy pass
             continue
 
         # --- General text extraction ---
