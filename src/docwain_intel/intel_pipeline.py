@@ -129,6 +129,34 @@ def process_document(
         )
 
         # Stage 6: Storage + audit (skip if no stores)
+        # -- graph population (best-effort) ----------------------------------
+        try:
+            from .graph_adapter import get_graph_adapter
+            from .graph_populator import populate_graph
+
+            graph_adapter = graph_store or get_graph_adapter()
+            if graph_adapter is not None:
+                t0_graph = time.monotonic()
+                fp_tags = fingerprint.auto_tags if fingerprint else []
+                populate_graph(
+                    adapter=graph_adapter,
+                    extraction=extraction,
+                    structured_doc=structured,
+                    document_id=document_id,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    fingerprint_tags=fp_tags,
+                )
+                result.stage_timings["graph_populate"] = time.monotonic() - t0_graph
+                logger.info(
+                    "Pipeline stage 6 (graph): %d entities, %d facts written in %.2fs",
+                    len(extraction.entities), len(extraction.facts),
+                    result.stage_timings["graph_populate"],
+                )
+        except Exception as graph_exc:
+            logger.warning("Graph population failed (non-fatal): %s", graph_exc)
+
+        # -- integrity audit -------------------------------------------------
         if vector_store or graph_store:
             from .integrity_audit import run_integrity_audit
             t0 = time.monotonic()
