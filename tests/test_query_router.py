@@ -1,6 +1,8 @@
 """Tests for NLP-based query routing."""
+import threading
+
 import pytest
-from src.docwain_intel.query_router import route_query, QueryRoute, QueryAnalysis
+from src.docwain_intel.query_router import route_query, QueryRoute, QueryAnalysis, _sanitize_query
 
 
 class TestRouteQuery:
@@ -57,3 +59,61 @@ class TestRouteQuery:
         specific = route_query("What is John Smith's phone number?")
         vague = route_query("Tell me about the documents.")
         assert specific.specificity >= vague.specificity
+
+    def test_none_query(self):
+        """None input should be handled gracefully."""
+        analysis = route_query(None)
+        assert analysis.route == QueryRoute.GRAPH_DIRECT
+        assert analysis.is_conversational
+
+    def test_whitespace_only_query(self):
+        """Whitespace-only input should be treated as empty."""
+        analysis = route_query("   \t\n  ")
+        assert analysis.route == QueryRoute.GRAPH_DIRECT
+        assert analysis.is_conversational
+
+    def test_null_bytes_stripped(self):
+        """Null bytes and control characters should be removed."""
+        analysis = route_query("What is\x00 John's email\x01?")
+        assert len(analysis.entities) >= 1
+
+    def test_control_characters_stripped(self):
+        """C0/C1 control characters should be removed, whitespace preserved."""
+        cleaned = _sanitize_query("hello\x00\x01\x02world")
+        assert "\x00" not in cleaned
+        assert "helloworld" in cleaned
+
+    def test_query_truncation(self):
+        """Queries exceeding 10000 chars should be truncated."""
+        long_query = "a" * 20000
+        cleaned = _sanitize_query(long_query)
+        assert len(cleaned) == 10000
+
+    def test_only_control_chars_query(self):
+        """A query of only control characters should be treated as empty."""
+        analysis = route_query("\x00\x01\x02")
+        assert analysis.route == QueryRoute.GRAPH_DIRECT
+        assert analysis.is_conversational
+
+    def test_thread_safety(self):
+        """route_query should be safe to call from multiple threads."""
+        results = []
+        errors = []
+
+        def worker(q):
+            try:
+                r = route_query(q)
+                results.append(r)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=worker, args=(f"What is item {i}?",))
+            for i in range(8)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert len(errors) == 0
+        assert len(results) == 8
