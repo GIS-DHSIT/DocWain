@@ -334,8 +334,12 @@ def _deduplicate_entities(entities: List[EntitySpan]) -> List[EntitySpan]:
 def _validate_entities(
     entities: List[EntitySpan], units: List[SemanticUnit]
 ) -> List[EntitySpan]:
-    """Remove entities whose text does not appear in the source unit text."""
-    unit_text_map: Dict[str, str] = {u.unit_id: u.text.lower() for u in units}
+    """Remove entities whose text does not appear in the source unit text or heading paths."""
+    unit_text_map: Dict[str, str] = {}
+    for u in units:
+        # Include heading paths in searchable text so heading-derived entities validate
+        heading_text = " ".join(u.heading_path or []).lower()
+        unit_text_map[u.unit_id] = f"{u.text.lower()} {heading_text}"
     valid: List[EntitySpan] = []
     for ent in entities:
         source_text = unit_text_map.get(ent.unit_id, "")
@@ -372,6 +376,48 @@ def extract_entities_and_facts(doc: StructuredDocument) -> ExtractionResult:
 
     if not doc.units:
         return ExtractionResult(document_id=doc.document_id)
+
+    # Extract entities from heading paths — headings aren't standalone units
+    # but carry names/entities that must be discoverable (e.g., "Gokul Ramanathan")
+    _seen_headings: set = set()
+    _COMMON_SECTION_TITLES = frozenset({
+        "summary", "experience", "education", "skills", "certifications",
+        "work experience", "professional summary", "references", "projects",
+        "objective", "contact", "abstract", "introduction", "conclusion",
+        "appendix", "table of contents", "invoice", "agreement", "contract",
+        "terms", "scope", "services", "compensation", "confidentiality",
+    })
+    for unit in doc.units:
+        for heading in (unit.heading_path or []):
+            if heading and heading not in _seen_headings:
+                _seen_headings.add(heading)
+                # Try spaCy with context injection
+                contextualized = f"This document is about {heading}."
+                heading_ents = _extract_spacy_entities(contextualized, unit.unit_id)
+                heading_lower = heading.lower()
+                heading_ents = [e for e in heading_ents if e.text.lower() in heading_lower]
+                all_entities.extend(heading_ents)
+
+                # Name heuristic: if heading looks like a person name (2-3 capitalized
+                # words, not a common section title, no digits), add as PERSON entity.
+                # This handles names spaCy doesn't recognize (e.g., uncommon names).
+                words = heading.strip().split()
+                is_name_like = (
+                    2 <= len(words) <= 4
+                    and all(w[0].isupper() and w.isalpha() for w in words)
+                    and heading_lower not in _COMMON_SECTION_TITLES
+                    and not any(e.label == "PERSON" and e.text.lower() == heading_lower for e in heading_ents)
+                )
+                if is_name_like:
+                    all_entities.append(EntitySpan(
+                        entity_id=f"ent_{_uid()}",
+                        text=heading,
+                        normalized=heading_lower,
+                        label="PERSON",
+                        unit_id=unit.unit_id,
+                        confidence=0.75,
+                        source="heading_heuristic",
+                    ))
 
     for unit in doc.units:
         text = (unit.text or "")[:MAX_UNIT_TEXT_CHARS]
