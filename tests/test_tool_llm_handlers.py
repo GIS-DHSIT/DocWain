@@ -644,7 +644,7 @@ class TestTranslatorLLM:
         req = TranslateRequest(text="Hello world", target_lang="fr", source_lang="en")
         result = _translate_text(req)
         assert result["translated_text"] == "Bonjour le monde"
-        assert result["backend"] == "gpt-oss"
+        assert result["backend"] == "DocWain-Agent"
         assert result["iq_score"]["source"] == "llm"
 
     @patch("src.tools.llm_tools.get_tool_llm_client", return_value=None)

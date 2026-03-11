@@ -115,10 +115,8 @@ def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
     if not model_name:
         return model_name
     normalized = str(model_name).strip().lower()
-    if normalized == "docwain-agent":
-        return "gpt-oss:latest"
-    if normalized == "gpt-oss":
-        return "gpt-oss:latest"
+    if normalized in ("docwain-agent", "gpt-oss"):
+        return "qwen3:14b"
     return model_name
 
 
@@ -659,7 +657,7 @@ def _torch_cuda_available() -> bool:
 
 def _embedding_device() -> str:
     # Always use CPU for embeddings — the embedding model (bge-large, ~3GB GPU)
-    # competes with gpt-oss (14GB) for T4 16GB VRAM.  CPU embedding adds <1s
+    # competes with DocWain-Agent for T4 16GB VRAM.  CPU embedding adds <1s
     # latency but frees the GPU entirely for LLM generation.
     env_device = (os.getenv("EMBEDDING_DEVICE") or "cpu").strip().lower()
     return env_device
@@ -875,7 +873,7 @@ def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransf
     last_error = None
     _configure_hf_env()
 
-    # Always use CPU for embeddings — GPU is reserved for gpt-oss (14GB on T4 16GB).
+    # Always use CPU for embeddings — GPU is reserved for DocWain-Agent on T4 16GB.
     # bge-large-en-v1.5 (335M params) runs fine on CPU with minimal latency impact.
     device = "cpu"
 
@@ -1614,7 +1612,7 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "gpt-oss:latest")
+        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "qwen3:14b")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
@@ -2099,7 +2097,7 @@ RULES:
 5. If conversation context is provided, resolve pronouns and references
 6. Output ONLY the reformulated query, nothing else
 
-{f"CONVERSATION CONTEXT:\\n{conversation_context}\\n" if conversation_context else ""}
+{("CONVERSATION CONTEXT:" + chr(10) + conversation_context + chr(10)) if conversation_context else ""}
 USER QUERY: {query}
 
 REFORMULATED QUERY:"""
@@ -2354,7 +2352,7 @@ class QdrantRetriever:
                 elif "content_vector" in vectors and isinstance(vectors["content_vector"], dict):
                     dim = vectors["content_vector"].get("size")
             if dim is None:
-                dim = getattr(Config.Model, "EMBEDDING_DIM", None) or 768
+                dim = getattr(Config.Model, "EMBEDDING_DIM", None) or 1024
             dim = int(dim)
             self.collection_dims[collection_name] = dim
             logger.info(f"Collection '{collection_name}' expects dim={dim}")
@@ -2386,7 +2384,7 @@ class QdrantRetriever:
             model = get_model(required_dim=target_dim)
             q_dim = getattr(model, "get_sentence_embedding_dimension", lambda: None)()
             if target_dim and q_dim and target_dim != q_dim:
-                logger.warning(f"Embedding dim {q_dim} does not match collection dim {target_dim}; using model regardless")
+                raise ValueError(f"Embedding dim mismatch: model produces {q_dim} but collection expects {target_dim}")
             query_vector = model.encode(
                 query,
                 convert_to_numpy=True,
@@ -3959,42 +3957,35 @@ class EnterpriseRAGSystem:
                 except Exception as feedback_exc:
                     logger.debug("Feedback memory clear failed: %s", feedback_exc)
 
-            # Quick collection diagnostics to avoid silent empty searches
+            # Quick collection diagnostics — profile-filtered for accurate count
             try:
-                cached = _COLLECTION_COUNT_CACHE.get(collection_name)
+                _count_cache_key = f"{collection_name}:{profile_id}"
+                cached = _COLLECTION_COUNT_CACHE.get(_count_cache_key)
                 now = time.time()
                 if cached and (now - cached[0]) < _COLLECTION_COUNT_TTL_SEC:
                     total_points = cached[1]
                 else:
-                    stats = self.client.count(collection_name=collection_name, exact=False)
+                    _profile_filter = build_qdrant_filter(
+                        subscription_id=str(subscription_id),
+                        profile_id=str(profile_id),
+                    )
+                    stats = self.client.count(
+                        collection_name=collection_name,
+                        count_filter=_profile_filter,
+                        exact=False,
+                    )
                     total_points = int(getattr(stats, "count", 0) or 0)
-                    _COLLECTION_COUNT_CACHE[collection_name] = (now, total_points)
-                logger.info(f"Collection '{collection_name}' point count: {total_points}")
+                    _COLLECTION_COUNT_CACHE[_count_cache_key] = (now, total_points)
+                logger.info(f"Collection '{collection_name}' profile='{profile_id}' point count: {total_points}")
                 if total_points == 0:
-                    logger.warning(f"Collection '{collection_name}' is empty; retrieval will return no results")
+                    logger.warning(f"Collection '{collection_name}' is empty for profile '{profile_id}'; retrieval will return no results")
             except Exception as diag_exc:
                 logger.warning(f"Could not count collection '{collection_name}': {diag_exc}")
 
             if self.greeting_handler.is_positive_feedback(query):
                 feedback_response = "You're welcome! If you want me to dig into another document or topic, just let me know."
-                try:
-                    from src.intelligence.conversational_nlp import generate_conversational_response
-                    _catalog = {}
-                    if self.redis_client:
-                        from src.intelligence.redis_intel_cache import RedisIntelCache
-                        _cache = RedisIntelCache(self.redis_client)
-                        _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
-                    _resp = generate_conversational_response(
-                        query,
-                        subscription_id=subscription_id,
-                        profile_id=profile_id,
-                        collection_point_count=total_points,
-                        catalog=_catalog,
-                    )
-                    if _resp and _resp.text:
-                        feedback_response = _resp.text
-                except Exception:
-                    pass
+                # Template is fast and sufficient; skip LLM call to avoid
+                # model-swap latency.
                 return {
                     "response": feedback_response,
                     "sources": [],
@@ -4016,19 +4007,8 @@ class EnterpriseRAGSystem:
                     cache = RedisIntelCache(self.redis_client)
                     catalog = cache.get_json(cache.catalog_key(subscription_id, profile_id)) or {}
                 greeting_response = build_greeting_response(catalog)
-                try:
-                    from src.intelligence.conversational_nlp import generate_conversational_response
-                    _resp = generate_conversational_response(
-                        query,
-                        subscription_id=subscription_id,
-                        profile_id=profile_id,
-                        collection_point_count=total_points,
-                        catalog=catalog,
-                    )
-                    if _resp and _resp.text:
-                        greeting_response = _resp.text
-                except Exception:
-                    pass
+                # Template is fast and sufficient; skip LLM call to avoid
+                # model-swap latency (200s+ when Ollama has to reload models).
                 self.conversation_history.add_turn(namespace, user_id, query, greeting_response)
 
                 return {
@@ -4045,24 +4025,8 @@ class EnterpriseRAGSystem:
 
             if self.greeting_handler.is_farewell(query):
                 farewell_response = "Thanks for chatting. If you need anything else, come back anytime."
-                try:
-                    from src.intelligence.conversational_nlp import generate_conversational_response
-                    _catalog = {}
-                    if self.redis_client:
-                        from src.intelligence.redis_intel_cache import RedisIntelCache
-                        _cache = RedisIntelCache(self.redis_client)
-                        _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
-                    _resp = generate_conversational_response(
-                        query,
-                        subscription_id=subscription_id,
-                        profile_id=profile_id,
-                        collection_point_count=total_points,
-                        catalog=_catalog,
-                    )
-                    if _resp and _resp.text:
-                        farewell_response = _resp.text
-                except Exception:
-                    pass
+                # Template is fast and sufficient; skip LLM call to avoid
+                # model-swap latency.
                 self.conversation_history.clear_history(namespace, user_id)
 
                 return {
@@ -4078,38 +4042,64 @@ class EnterpriseRAGSystem:
                 }
 
             # General conversational intercept (document discovery, identity, etc.)
-            try:
-                from src.intelligence.conversational_nlp import generate_conversational_response
-                _catalog = {}
-                if self.redis_client:
-                    from src.intelligence.redis_intel_cache import RedisIntelCache
-                    _cache = RedisIntelCache(self.redis_client)
-                    _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
-                _conv_resp = generate_conversational_response(
-                    query,
-                    subscription_id=subscription_id,
-                    profile_id=profile_id,
-                    collection_point_count=total_points,
-                    catalog=_catalog,
-                )
-                if _conv_resp and _conv_resp.text:
-                    return {
-                        "response": _conv_resp.text,
-                        "sources": [],
-                        "user_id": user_id,
-                        "collection": collection_name,
-                        "request_id": request_id,
-                        "index_version": index_version,
-                        "context_found": True,
-                        "query_type": _conv_resp.intent.lower(),
-                        "grounded": True,
-                    }
-            except Exception:
-                pass
+            # Skip conversational intercept when internet is enabled — let the query
+            # reach the RAG pipeline where web search fallback can trigger.
+            if not enable_internet:
+                try:
+                    from src.intelligence.conversational_nlp import generate_conversational_response
+                    _catalog = {}
+                    if self.redis_client:
+                        from src.intelligence.redis_intel_cache import RedisIntelCache
+                        _cache = RedisIntelCache(self.redis_client)
+                        _catalog = _cache.get_json(_cache.catalog_key(subscription_id, profile_id)) or {}
+                    _conv_resp = generate_conversational_response(
+                        query,
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        collection_point_count=total_points,
+                        catalog=_catalog,
+                    )
+                    if _conv_resp and _conv_resp.text:
+                        return {
+                            "response": _conv_resp.text,
+                            "sources": [],
+                            "user_id": user_id,
+                            "collection": collection_name,
+                            "request_id": request_id,
+                            "index_version": index_version,
+                            "context_found": True,
+                            "query_type": _conv_resp.intent.lower(),
+                            "grounded": True,
+                        }
+                except Exception:
+                    pass
 
             if getattr(Config, "RAGV3", None) and getattr(Config.RAGV3, "ENABLED", False):
                 try:
                     from src.rag_v3.pipeline import run_docwain_rag_v3
+
+                    # Multi-turn context: inject conversation history for follow-up queries
+                    _v3_conv_context = None
+                    try:
+                        _v3_conv = self.conversation_history.get_context(
+                            namespace, user_id, max_turns=3, max_chars=1200,
+                        )
+                        if _v3_conv and _v3_conv.strip():
+                            # Only inject for follow-up queries (pronouns, short queries, references)
+                            _lower_q = (query or "").lower().strip()
+                            _is_followup = (
+                                any(p in _lower_q.split() for p in ("it", "its", "they", "them", "their", "theirs", "this", "that", "these", "those", "he", "she", "his", "her", "same", "above", "previous", "prior", "earlier", "aforementioned", "similar", "other", "another", "former", "latter", "said", "such", "both"))
+                                or len(_lower_q.split()) <= 4
+                                or any(w in _lower_q for w in ("the same", "more about", "what about", "how about", "also", "and what", "tell me more"))
+                            )
+                            if _is_followup:
+                                _v3_conv_context = _v3_conv
+                                logger.info(
+                                    "Multi-turn context injected: %d chars for follow-up query",
+                                    len(_v3_conv_context),
+                                )
+                    except Exception:
+                        pass  # conversation history is optional
 
                     v3_answer = run_docwain_rag_v3(
                         query=query,
@@ -4126,6 +4116,7 @@ class EnterpriseRAGSystem:
                         tools=tool_list if use_tooling else None,
                         tool_inputs=tool_inputs if use_tooling else None,
                         enable_internet=enable_internet,
+                        conversation_context=_v3_conv_context,
                     )
                     if v3_answer:
                         return v3_answer

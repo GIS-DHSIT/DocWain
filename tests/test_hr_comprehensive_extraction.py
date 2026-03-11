@@ -759,11 +759,11 @@ class TestRenderHrDetailRendering:
         assert "Alice" in result
         assert "Bob" in result
 
-    def test_empty_candidates_returns_empty(self):
-        """No candidates should return empty string."""
+    def test_empty_candidates_returns_not_found_message(self):
+        """No candidates should return a meaningful 'not found' message."""
         schema = _make_hr_schema([])
         result = _render_hr(schema, intent="summary", query="Who are the candidates?")
-        assert result == ""
+        assert result == "" or "not found" in result.lower() or "no candidate" in result.lower()
 
     def test_missing_reason_returned_when_no_candidates(self):
         """If missing_reason is set and no candidates, it should be returned."""

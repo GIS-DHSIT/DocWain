@@ -5,7 +5,6 @@ which domain it belongs to, and what fields/facts are needed from source documen
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -319,55 +318,24 @@ def list_domains() -> List[Dict[str, str]]:
 # Natural language → content type detection
 # ---------------------------------------------------------------------------
 
-_TYPE_PATTERNS: List[tuple[str, str]] = [
-    # HR domain
-    (r"\b(?:cover\s+letter|application\s+letter)\b", "cover_letter"),
-    (r"\b(?:professional\s+summary|career\s+summary|profile\s+summary)\b", "professional_summary"),
-    (r"\b(?:skills?\s+matrix|skills?\s+breakdown|competenc(?:y|ies)\s+matrix)\b", "skills_matrix"),
-    (r"\b(?:candidate\s+comparison|compare\s+candidates?|candidate\s+vs)\b", "candidate_comparison"),
-    (r"\b(?:interview\s+(?:prep|preparation|guide|questions))\b", "interview_prep"),
-    # Invoice
-    (r"\b(?:invoice\s+summary|summarize?\s+(?:the\s+)?invoices?)\b", "invoice_summary"),
-    (r"\b(?:expense\s+report|spending\s+report|expenditure\s+report)\b", "expense_report"),
-    (r"\b(?:payment\s+reminder|overdue\s+notice|payment\s+notice)\b", "payment_reminder"),
-    # Legal
-    (r"\b(?:contract\s+summary|summarize?\s+(?:the\s+)?contract)\b", "contract_summary"),
-    (r"\b(?:compliance\s+report|regulatory\s+assessment)\b", "compliance_report"),
-    (r"\b(?:risk\s+assessment|risk\s+analysis|risk\s+report)\b", "risk_assessment"),
-    # Medical
-    (r"\b(?:patient\s+summary|clinical\s+summary)\b", "patient_summary"),
-    (r"\b(?:medical\s+report|clinical\s+report)\b", "medical_report"),
-    # Report
-    (r"\b(?:executive\s+summary|exec\s+summary)\b", "executive_summary"),
-    (r"\b(?:key\s+findings?|main\s+findings?)\b", "key_findings"),
-    (r"\b(?:recommend(?:ation)?s?\s+(?:report|list)?)\b", "recommendations"),
-    # General
-    (r"\b(?:document\s+summary|summarize?\s+(?:the\s+)?document)\b", "document_summary"),
-    (r"\b(?:key\s+points?|main\s+points?|bullet\s+points?)\b", "key_points"),
-    (r"\b(?:faq|frequently\s+asked|generate\s+questions?)\b", "faq_generation"),
-    (r"\b(?:action\s+items?|to-?do\s+list|next\s+steps?)\b", "action_items"),
-    (r"\b(?:talking\s+points?|discussion\s+points?)\b", "talking_points"),
-    (r"\b(?:meeting\s+notes?|meeting\s+minutes?|meeting\s+summary)\b", "meeting_notes"),
-    # Cross-document
-    (r"\b(?:comparison\s+report|comparative\s+analysis)\b", "comparison_report"),
-    (r"\b(?:consolidated\s+summary|combined\s+summary)\b", "consolidated_summary"),
-    (r"\b(?:trend\s+analysis|trend\s+report)\b", "trend_analysis"),
-]
-
-_COMPILED_PATTERNS = [(re.compile(p, re.IGNORECASE), tid) for p, tid in _TYPE_PATTERNS]
-
-
 def detect_content_type(query: str) -> Optional[str]:
     """Detect content type ID from a natural language query.
+
+    Uses the NLU engine's content_type registry for classification
+    instead of hardcoded regex patterns.
 
     Returns the content type ID or None if no match.
     """
     if not query:
         return None
-    for pattern, type_id in _COMPILED_PATTERNS:
-        if pattern.search(query):
-            return type_id
-    return None
+    try:
+        from src.nlp.nlu_engine import get_registry, _ensure_registry, get_embedder
+        _ensure_registry("content_type")
+        reg = get_registry("content_type")
+        result = reg.classify(query, embedder=get_embedder())
+        return result.name if result else None
+    except Exception:
+        return None
 
 
 def detect_content_type_with_domain(
@@ -383,14 +351,19 @@ def detect_content_type_with_domain(
     if type_id:
         return CONTENT_TYPE_REGISTRY.get(type_id)
 
-    # Fallback: if query mentions "generate" or "create" with a domain hint
-    generate_match = re.search(
-        r"\b(?:generate|create|write|draft|produce|build)\b",
-        query,
-        re.IGNORECASE,
-    )
-    if not generate_match:
-        return None
+    # Fallback: if query has a generation/creation intent with a domain hint
+    from src.nlp.nlu_engine import parse_query
+    sem = parse_query(query)
+    _generate_verbs = {"generate", "create", "write", "draft", "produce", "build", "compose", "make"}
+    # Check both action_verbs and target_nouns — spaCy often misclassifies
+    # imperative verbs (Write, Create, Draft) as nouns
+    all_words = sem.action_verbs + sem.target_nouns
+    has_generate_action = any(v in _generate_verbs for v in all_words)
+    if not has_generate_action:
+        # Also check raw query for imperative generation verbs at start
+        import re
+        if not re.match(r"(?i)^(write|create|generate|draft|compose|build|produce|make)\b", query.strip()):
+            return None
 
     # Use domain hint to pick a default type
     domain_defaults = {

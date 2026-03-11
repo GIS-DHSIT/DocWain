@@ -30,7 +30,7 @@ class ComparisonResult:
 
 
 # Fields that are lists (set overlap/difference analysis)
-_LIST_FIELDS = {"technical_skills", "functional_skills", "certifications", "education", "achievements"}
+_LIST_FIELDS = {"technical_skills", "functional_skills", "certifications", "education", "achievements", "languages", "projects"}
 
 # Fields that are numeric
 _NUMERIC_FIELDS = {"total_years_experience"}
@@ -46,18 +46,55 @@ _FOCUS_MAP = {
     "experience": ["total_years_experience", "experience_summary"],
     "achievement": ["achievements"],
     "achievements": ["achievements"],
+    "salary": ["salary", "compensation", "total_compensation"],
+    "salaries": ["salary", "compensation", "total_compensation"],
+    "compensation": ["salary", "compensation", "total_compensation"],
+    "contact": ["email", "phone", "contact"],
+    "language": ["languages"],
+    "languages": ["languages"],
+    "project": ["projects"],
+    "projects": ["projects"],
+    "role": ["role"],
 }
 
 
-def _infer_focus_fields(query: str) -> Optional[List[str]]:
-    """Infer which fields to focus on from the query."""
-    query_lower = query.lower()
+def _infer_focus_fields(query: str, query_focus: Any = None) -> Optional[List[str]]:
+    """Infer which fields to focus on from the query and/or ML-based QueryFocus.
+
+    Uses QueryFocus.field_tags (from ML classifier) when available,
+    with keyword matching as fallback.
+    """
     focused: List[str] = []
-    for keyword, fields in _FOCUS_MAP.items():
-        if keyword in query_lower:
-            for f in fields:
-                if f not in focused:
-                    focused.append(f)
+
+    # Use ML-based field tags first (more accurate than keyword matching)
+    if query_focus and hasattr(query_focus, "field_tags") and query_focus.field_tags:
+        _TAG_TO_FIELDS = {
+            "skill": ["technical_skills", "functional_skills"],
+            "technical": ["technical_skills"],
+            "certification": ["certifications"],
+            "education": ["education"],
+            "experience": ["total_years_experience", "experience_summary"],
+            "achievement": ["achievements"],
+            "role": ["role"],
+            "summary": ["experience_summary"],
+        }
+        for tag in query_focus.field_tags:
+            tag_lower = tag.lower()
+            for key, fields in _TAG_TO_FIELDS.items():
+                if key in tag_lower:
+                    for f in fields:
+                        if f not in focused:
+                            focused.append(f)
+
+    # Fall back to keyword matching
+    if not focused:
+        query_lower = query.lower()
+        for keyword, fields in _FOCUS_MAP.items():
+            if keyword in query_lower:
+                for f in fields:
+                    if f not in focused:
+                        focused.append(f)
+
     return focused if focused else None
 
 
@@ -193,6 +230,7 @@ def compare_documents(
     contexts: list,
     query: str,
     focus_fields: Optional[List[str]] = None,
+    query_focus: Any = None,
 ) -> ComparisonResult:
     """Build structured comparison across DocumentContexts.
 
@@ -200,6 +238,7 @@ def compare_documents(
         contexts: List of DocumentContext objects (from document_context.py)
         query: User query for focus field inference
         focus_fields: Optional explicit list of fields to compare
+        query_focus: Optional QueryFocus from ML classifier for field prioritization
     """
     if not contexts:
         return ComparisonResult()
@@ -213,8 +252,8 @@ def compare_documents(
 
     documents = [ctx.document_name for ctx in contexts]
 
-    # Determine focus fields
-    effective_focus = focus_fields or _infer_focus_fields(query)
+    # Determine focus fields — use ML-based focus when available
+    effective_focus = focus_fields or _infer_focus_fields(query, query_focus=query_focus)
 
     # Build per-field values from context fields
     all_fields: Dict[str, Dict[str, Any]] = {}
@@ -258,6 +297,7 @@ def compare_documents(
 def compare_candidates_from_schema(
     candidates: list,
     query: str,
+    query_focus: Any = None,
 ) -> ComparisonResult:
     """Build comparison from pre-extracted HRSchema Candidate objects."""
     if not candidates:
@@ -271,7 +311,7 @@ def compare_candidates_from_schema(
             summary=f"Only one candidate: {documents[0]}",
         )
 
-    focus = _infer_focus_fields(query)
+    focus = _infer_focus_fields(query, query_focus=query_focus)
 
     # Build comparisons from Candidate attributes
     candidate_fields = {
@@ -283,6 +323,8 @@ def compare_candidates_from_schema(
         "total_years_experience": lambda c: c.total_years_experience,
         "experience_summary": lambda c: c.experience_summary,
         "role": lambda c: c.role,
+        "emails": lambda c: c.emails,
+        "phones": lambda c: c.phones,
     }
 
     comparisons: List[FieldComparison] = []
@@ -335,57 +377,88 @@ def render_comparison(result: ComparisonResult, intent: str = "") -> str:
     lines: List[str] = []
 
     if len(result.documents) == 2:
-        # Side-by-side format for 2 documents
+        # Table format for 2 documents (GPT-style structured comparison)
         doc_a, doc_b = result.documents[:2]
         lines.append(f"**Comparison: {doc_a} vs {doc_b}**")
         lines.append("")
 
+        header = f"| Criterion | **{doc_a}** | **{doc_b}** |"
+        separator = "|---|---|---|"
+        lines.append(header)
+        lines.append(separator)
+
         for comp in result.field_comparisons:
             pretty_name = comp.field_name.replace("_", " ").title()
-            lines.append(f"**{pretty_name}:**")
 
             if comp.comparison_type == "overlap":
+                val_a = comp.values.get(doc_a)
+                val_b = comp.values.get(doc_b)
+                cell_a = ", ".join(str(v) for v in (val_a if isinstance(val_a, list) else [val_a or "—"])[:5])
+                cell_b = ", ".join(str(v) for v in (val_b if isinstance(val_b, list) else [val_b or "—"])[:5])
+                lines.append(f"| {pretty_name} | {cell_a} | {cell_b} |")
+                # Add overlap/unique row if meaningful
                 if comp.overlap:
-                    lines.append(f"- Shared: {', '.join(comp.overlap)}")
-                if comp.differences:
-                    for doc, diff in comp.differences.items():
-                        if diff:
-                            lines.append(f"- Only {doc}: {', '.join(diff)}")
+                    shared_str = ", ".join(comp.overlap[:5])
+                    lines.append(f"| *Shared {pretty_name}* | {shared_str} | {shared_str} |")
 
             elif comp.comparison_type == "numeric":
-                for doc, val in comp.values.items():
-                    lines.append(f"- {doc}: {val}")
+                val_a = str(comp.values.get(doc_a, "—"))
+                val_b = str(comp.values.get(doc_b, "—"))
+                lines.append(f"| {pretty_name} | {val_a} | {val_b} |")
 
             elif comp.comparison_type == "text":
-                for doc, val in comp.values.items():
-                    text = str(val or "")[:200]
-                    lines.append(f"- {doc}: {text}")
+                val_a = str(comp.values.get(doc_a) or "—")[:150]
+                val_b = str(comp.values.get(doc_b) or "—")[:150]
+                lines.append(f"| {pretty_name} | {val_a} | {val_b} |")
 
-            lines.append("")
+        lines.append("")
     else:
-        # Tabular format for 3+ documents
+        # Markdown table for 3+ documents — proper structured comparison
         lines.append(f"**Comparison of {len(result.documents)} documents**")
         lines.append("")
 
+        # Build header row
+        header = "| Criterion | " + " | ".join(f"**{d}**" for d in result.documents) + " |"
+        separator = "|" + "|".join(["---"] * (len(result.documents) + 1)) + "|"
+        lines.append(header)
+        lines.append(separator)
+
         for comp in result.field_comparisons:
             pretty_name = comp.field_name.replace("_", " ").title()
-            lines.append(f"**{pretty_name}:**")
+            cells = []
             for doc in result.documents:
                 val = comp.values.get(doc)
                 if val is None:
-                    lines.append(f"- {doc}: N/A")
+                    cells.append("N/A")
                 elif isinstance(val, list):
-                    lines.append(f"- {doc}: {', '.join(str(v) for v in val)}")
+                    cells.append(", ".join(str(v) for v in val[:5]))  # cap list display
                 else:
-                    lines.append(f"- {doc}: {val}")
-            lines.append("")
+                    text = str(val)[:100]  # cap cell width
+                    cells.append(text)
+            row = f"| {pretty_name} | " + " | ".join(cells) + " |"
+            lines.append(row)
+
+        lines.append("")
 
     # Strengths summary
     has_strengths = any(strs for strs in result.strengths.values())
     if has_strengths:
-        lines.append("**Strengths:**")
+        lines.append("**Key Strengths:**")
         for doc, strs in result.strengths.items():
             if strs:
-                lines.append(f"- {doc}: {'; '.join(strs)}")
+                lines.append(f"- **{doc}**: {'; '.join(strs)}")
+        lines.append("")
+
+    # Winner / recommendation based on strength count
+    if has_strengths and len(result.documents) >= 2:
+        strength_counts = {doc: len(strs) for doc, strs in result.strengths.items()}
+        sorted_by_strength = sorted(strength_counts.items(), key=lambda kv: kv[1], reverse=True)
+        top_doc, top_count = sorted_by_strength[0]
+        runner_up_count = sorted_by_strength[1][1] if len(sorted_by_strength) > 1 else 0
+        if top_count > runner_up_count and top_count >= 2:
+            lines.append(f"**Overall**: **{top_doc}** leads with advantages in {top_count} area(s).")
+        elif top_count == runner_up_count and top_count >= 1:
+            tied = [doc for doc, cnt in sorted_by_strength if cnt == top_count]
+            lines.append(f"**Overall**: {' and '.join(tied)} are closely matched across {top_count} area(s).")
 
     return "\n".join(lines).strip()

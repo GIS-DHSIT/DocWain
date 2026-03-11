@@ -96,7 +96,7 @@ async def extract_document_endpoint(
     # Step 1: Raw extraction
     try:
         from src.api.dataHandler import fileProcessor
-        extracted = fileProcessor(file_bytes, fname)
+        extracted = fileProcessor(file_bytes, fname, content_type=file.content_type or "")
         if not extracted:
             raise HTTPException(status_code=422, detail="No content could be extracted from file")
     except HTTPException:

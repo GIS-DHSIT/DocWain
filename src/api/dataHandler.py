@@ -470,12 +470,36 @@ def decrypt_data(encrypted_value: str, encryption_key=Config.Encryption.ENCRYPTI
         return ""
 
 
-def fileProcessor(content, file):
+def fileProcessor(content, file, content_type: str = ""):
     """Processes different types of documents and extracts text or dataframe."""
     extracted_data = {}
     try:
         file_name = file.split('/')[-1]
         extractor = get_doc_extractor()
+
+        # MIME-type fallback: detect format from content_type when extension is
+        # missing or generic (e.g. ".bin", no extension at all).
+        _ct = (content_type or "").lower()
+        _ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+        _KNOWN_EXTS = {"csv", "xlsx", "xls", "json", "pdf", "docx", "doc", "pptx", "ppt", "txt"}
+        if _ext not in _KNOWN_EXTS and _ct:
+            _MIME_EXT_MAP = {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+                "application/vnd.ms-excel": "xls",
+                "application/pdf": "pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                "application/msword": "doc",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+                "application/vnd.ms-powerpoint": "ppt",
+                "text/csv": "csv",
+                "application/json": "json",
+                "text/plain": "txt",
+            }
+            mapped_ext = _MIME_EXT_MAP.get(_ct)
+            if mapped_ext:
+                logging.info(f"MIME-type fallback: '{_ct}' → .{mapped_ext} for file '{file_name}'")
+                file_name = f"{file_name}.{mapped_ext}"
+
         if content:
             logging.info(f"Extracting File {file_name}")
             if file_name.endswith(".csv"):
@@ -501,7 +525,19 @@ def fileProcessor(content, file):
                 # extract_text_from_txt handles via _smart_decode()
                 extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
             else:
-                extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
+                # Last resort: try to detect Excel by magic bytes
+                if content[:4] == b'PK\x03\x04':
+                    # ZIP-based format — could be xlsx/docx/pptx; try Excel first
+                    try:
+                        sheets = pd.read_excel(BytesIO(content), sheet_name=None)
+                        for sheet_name, df in sheets.items():
+                            key = f"{file_name}#{sheet_name}"
+                            extracted_data[key] = extractor.extract_dataframe(df, sheet_name=sheet_name)
+                        logging.info(f"Magic-byte detection: treated '{file_name}' as Excel (xlsx)")
+                    except Exception:
+                        extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
+                else:
+                    extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
         return extracted_data
     except Exception as e:
         logging.error(f"Error processing file {file}: {e}")

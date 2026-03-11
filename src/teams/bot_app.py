@@ -453,11 +453,21 @@ class DocWainTeamsBot(TeamsActivityHandler):
         # Text questions — handle special commands first
         question = legacy_adapter.extract_question(activity_dict)
         _lower_q = (question or "").lower().strip()
-        if not question or _lower_q in {"help", "tools", "delete", "delete docs", "delete documents", "delete all"}:
+        import re as _re
+        _DELETE_PHRASES = {"delete", "delete docs", "delete documents", "delete all",
+                           "remove all documents", "remove documents", "remove all docs",
+                           "clear documents", "clear all documents", "clear my documents",
+                           "delete my documents", "remove my documents", "erase documents",
+                           "remove all the documents", "delete all the documents",
+                           "clear all the documents"}
+        _is_delete_cmd = _lower_q in _DELETE_PHRASES or bool(
+            _re.search(r"(?:delete|remove|clear|erase)\s+(?:all\s+)?(?:the\s+)?(?:my\s+)?(?:document|doc|file)s?",
+                       _lower_q))
+        if not question or _lower_q in {"help", "tools"} or _is_delete_cmd:
             if _lower_q == "tools":
                 tools_payload = await self.tool_router.handle_action({"action": "show_tools"}, context)
                 await self._send_safe(turn_context, _as_activity(tools_payload), log)
-            elif _lower_q in {"delete", "delete docs", "delete documents", "delete all"}:
+            elif _is_delete_cmd:
                 delete_payload = await self.tool_router.handle_action({"action": "delete_documents"}, context)
                 await self._send_safe(turn_context, _as_activity(delete_payload), log)
             else:

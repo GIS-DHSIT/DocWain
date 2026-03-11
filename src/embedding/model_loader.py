@@ -47,7 +47,7 @@ def embed_request_context(request_id: Optional[str]):
 
 
 def _preferred_device() -> str:
-    # Always default to CPU for embeddings — GPU is reserved for the LLM (gpt-oss).
+    # Always default to CPU for embeddings — GPU is reserved for the LLM (DocWain-Agent).
     # bge-large-en-v1.5 (335M params) runs efficiently on CPU.
     env_device = (os.getenv("EMBEDDING_DEVICE") or "cpu").strip().lower()
     return env_device

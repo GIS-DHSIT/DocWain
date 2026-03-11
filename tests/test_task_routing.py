@@ -57,7 +57,7 @@ def _fake_ollama_list_response():
     """Simulates ollama.list() return value."""
     return {
         "models": [
-            {"name": "gpt-oss:latest", "size": 13_000_000_000},
+            {"name": "DocWain-Agent:latest", "size": 13_000_000_000},
             {"name": "llama3.2:latest", "size": 2_000_000_000},
             {"name": "mistral:latest", "size": 4_100_000_000},
             {"name": "deepseek-r1:latest", "size": 4_700_000_000},
@@ -112,7 +112,7 @@ class TestModelCapability:
     def test_dataclass_with_values(self):
         from src.llm.model_registry import ModelCapability
         cap = ModelCapability(
-            name="gpt-oss:latest",
+            name="DocWain-Agent:latest",
             size_bytes=13_000_000_000,
             speed_tier="heavy",
             strengths=["generation"],
@@ -153,7 +153,7 @@ class TestModelRegistry:
         from src.llm.model_registry import ModelRegistry
         reg = ModelRegistry()
         assert reg.get_available() == []
-        assert reg.get("gpt-oss:latest") is None
+        assert reg.get("DocWain-Agent:latest") is None
 
     def test_register_model(self):
         from src.llm.model_registry import ModelCapability, ModelRegistry
@@ -182,7 +182,7 @@ class TestModelRegistry:
 
     def test_get_returns_correct_model(self):
         reg = _build_populated_registry()
-        cap = reg.get("gpt-oss:latest")
+        cap = reg.get("DocWain-Agent:latest")
         assert cap is not None
         assert cap.speed_tier == "heavy"
         assert "generation" in cap.strengths
@@ -212,8 +212,8 @@ class TestModelRegistry:
     def test_best_for_generation(self):
         reg = _build_populated_registry()
         best = reg.best_for("generation")
-        # gpt-oss and gemma2 both have "generation" — gpt-oss should win (more overlap)
-        assert best in ("gpt-oss:latest", "gemma2:latest")
+        # DocWain-Agent and gemma2 both have "generation" — DocWain-Agent should win (more overlap)
+        assert best in ("DocWain-Agent:latest", "gemma2:latest")
 
     def test_best_for_vision(self):
         reg = _build_populated_registry()
@@ -228,7 +228,10 @@ class TestModelRegistry:
 
     def test_family_matching(self):
         from src.llm.model_registry import _match_family
-        assert _match_family("gpt-oss:latest") == "gpt-oss"
+        # gpt-oss maps to qwen3 via _FAMILY_MAP, but qwen3 not in _MODEL_PROFILES → None
+        assert _match_family("gpt-oss:latest") is None
+        # docwain-agent has its own profile in _MODEL_PROFILES
+        assert _match_family("docwain-agent:latest") == "docwain-agent"
         assert _match_family("llama3.2:latest") == "llama3.2"
         assert _match_family("mistral:7b") == "mistral"
         assert _match_family("deepseek-r1:latest") == "deepseek-r1"
@@ -288,7 +291,7 @@ class TestTaskModelPreferences:
             assert len(prefs) > 0, f"{task} has empty preference list"
 
     def test_generation_tasks_prefer_gpt_oss(self):
-        """Generation tasks route to gpt-oss first (MoE: reasoning tasks use lfm2.5-thinking)."""
+        """Generation tasks route to DocWain-Agent first (MoE: reasoning tasks use lfm2.5-thinking)."""
         from src.llm.task_router import TaskType, _TASK_MODEL_PREFERENCES
         gen_tasks = [
             TaskType.RESPONSE_GENERATION, TaskType.CONTENT_GENERATION,
@@ -297,10 +300,10 @@ class TestTaskModelPreferences:
             TaskType.QUERY_REWRITE, TaskType.GENERAL,
         ]
         for task in gen_tasks:
-            assert _TASK_MODEL_PREFERENCES[task][0] == "gpt-oss", f"{task} should prefer gpt-oss"
+            assert _TASK_MODEL_PREFERENCES[task][0] == "docwain-agent", f"{task} should prefer DocWain-Agent"
 
-    def test_reasoning_tasks_prefer_gpt_oss(self):
-        """All tasks route to gpt-oss first to avoid model swap contention on T4 16GB."""
+    def test_reasoning_tasks_prefer_docwain_agent(self):
+        """All tasks route to DocWain-Agent first to avoid model swap contention on T4 16GB."""
         from src.llm.task_router import TaskType, _TASK_MODEL_PREFERENCES
         reasoning_tasks = [
             TaskType.ANSWER_JUDGING, TaskType.GROUNDING_VERIFY,
@@ -308,13 +311,13 @@ class TestTaskModelPreferences:
             TaskType.INTENT_PARSE, TaskType.CONVERSATION_SUMMARY,
         ]
         for task in reasoning_tasks:
-            assert _TASK_MODEL_PREFERENCES[task][0] == "gpt-oss", f"{task} should prefer gpt-oss"
+            assert _TASK_MODEL_PREFERENCES[task][0] == "docwain-agent", f"{task} should prefer DocWain-Agent"
 
-    def test_generation_tasks_have_gpt_oss_first(self):
+    def test_generation_tasks_have_docwain_agent_first(self):
         from src.llm.task_router import TaskType, _TASK_MODEL_PREFERENCES
         gen_tasks = [TaskType.RESPONSE_GENERATION, TaskType.CONTENT_GENERATION]
         for task in gen_tasks:
-            assert _TASK_MODEL_PREFERENCES[task][0] == "gpt-oss", f"{task} should prefer gpt-oss"
+            assert _TASK_MODEL_PREFERENCES[task][0] == "docwain-agent", f"{task} should prefer DocWain-Agent"
 
     def test_judging_tasks_have_deepseek_fallback(self):
         from src.llm.task_router import TaskType, _TASK_MODEL_PREFERENCES
@@ -376,49 +379,49 @@ class TestTaskOptions:
 
 class TestTaskRouter:
     def test_select_model_full_registry(self):
-        """All tasks prefer gpt-oss to avoid model swap contention."""
+        """All tasks prefer DocWain-Agent to avoid model swap contention."""
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_populated_registry()
         router = TaskRouter(reg)
-        assert router.select_model(TaskType.QUERY_REWRITE) == "gpt-oss:latest"
+        assert router.select_model(TaskType.QUERY_REWRITE) == "DocWain-Agent:latest"
 
     def test_select_model_generation(self):
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_populated_registry()
         router = TaskRouter(reg)
-        assert router.select_model(TaskType.RESPONSE_GENERATION) == "gpt-oss:latest"
+        assert router.select_model(TaskType.RESPONSE_GENERATION) == "DocWain-Agent:latest"
 
     def test_select_model_judging(self):
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_populated_registry()
         router = TaskRouter(reg)
-        # All tasks prefer gpt-oss to avoid model swap contention
+        # All tasks prefer DocWain-Agent to avoid model swap contention
         selected = router.select_model(TaskType.ANSWER_JUDGING)
-        assert selected == "gpt-oss:latest"
+        assert selected == "DocWain-Agent:latest"
 
     def test_select_model_extraction(self):
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_populated_registry()
         router = TaskRouter(reg)
-        assert router.select_model(TaskType.STRUCTURED_EXTRACTION) == "gpt-oss:latest"
+        assert router.select_model(TaskType.STRUCTURED_EXTRACTION) == "DocWain-Agent:latest"
 
     def test_select_model_fallback_when_preferred_unavailable(self):
         from src.llm.model_registry import ModelCapability, ModelRegistry
         from src.llm.task_router import TaskRouter, TaskType
-        # Registry with only gpt-oss
+        # Registry with only DocWain-Agent
         reg = ModelRegistry()
-        reg.register(ModelCapability(name="gpt-oss:latest", strengths=["generation"]))
+        reg.register(ModelCapability(name="DocWain-Agent:latest", strengths=["generation"]))
         router = TaskRouter(reg)
-        # QUERY_REWRITE prefers llama3.2, but it's not available → falls to gemma2 → not available → gpt-oss
+        # QUERY_REWRITE prefers llama3.2, but it's not available → falls to gemma2 → not available → DocWain-Agent
         selected = router.select_model(TaskType.QUERY_REWRITE)
-        assert selected == "gpt-oss:latest"
+        assert selected == "DocWain-Agent:latest"
 
     def test_select_model_empty_registry_ultimate_fallback(self):
         from src.llm.model_registry import ModelRegistry
         from src.llm.task_router import TaskRouter, TaskType
         reg = ModelRegistry()
         router = TaskRouter(reg)
-        assert router.select_model(TaskType.GENERAL) == "gpt-oss:latest"
+        assert router.select_model(TaskType.GENERAL) == "DocWain-Agent:latest"
 
     def test_get_options_returns_dict(self):
         from src.llm.task_router import TaskRouter, TaskType
@@ -467,10 +470,10 @@ class TestTaskRouter:
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_populated_registry()
         router = TaskRouter(reg)
-        # Empty string means "use auto-routing" — INTENT_PARSE prefers gpt-oss
+        # Empty string means "use auto-routing" — INTENT_PARSE prefers DocWain-Agent
         with patch("src.llm.task_router.TaskRouter._config_override", return_value=None):
             result = router.select_model(TaskType.INTENT_PARSE)
-            assert result == "gpt-oss:latest"
+            assert result == "DocWain-Agent:latest"
 
     def test_partial_registry_walks_preference(self):
         from src.llm.model_registry import ModelCapability, ModelRegistry
@@ -480,7 +483,7 @@ class TestTaskRouter:
         reg.register(ModelCapability(name="mistral:latest", strengths=["structured_extraction"]))
         reg.register(ModelCapability(name="gemma2:latest", strengths=["generation"]))
         router = TaskRouter(reg)
-        # QUERY_REWRITE prefers [gpt-oss, mistral, llama3.2] → gpt-oss missing → mistral
+        # QUERY_REWRITE prefers [DocWain-Agent, mistral, llama3.2] → DocWain-Agent missing → mistral
         assert router.select_model(TaskType.QUERY_REWRITE) == "mistral:latest"
 
     def test_select_model_deterministic(self):
@@ -599,8 +602,8 @@ class TestTaskAwareGateway:
         from src.llm.multi_agent import TaskAwareGateway
         gw = self._make_gateway()
         fake = _FakeLLM("routed response")
-        # Inject fake client directly — all tasks prefer gpt-oss first
-        gw._model_clients["gpt-oss:latest"] = fake
+        # Inject fake client directly — all tasks prefer DocWain-Agent first
+        gw._model_clients["DocWain-Agent:latest"] = fake
         result = gw.generate_for_task(TaskType.QUERY_REWRITE, "test prompt")
         assert result == "routed response"
         assert len(fake.calls) == 1
@@ -609,7 +612,7 @@ class TestTaskAwareGateway:
         from src.llm.task_router import TaskType
         gw = self._make_gateway()
         fake = _FakeLLM("ok")
-        gw._model_clients["gpt-oss:latest"] = fake
+        gw._model_clients["DocWain-Agent:latest"] = fake
         gw.generate_for_task(TaskType.QUERY_REWRITE, "prompt1")
         gw.generate_for_task(TaskType.QUERY_REWRITE, "prompt2")
         stats = gw.get_task_stats()
@@ -620,8 +623,8 @@ class TestTaskAwareGateway:
         from src.llm.task_router import TaskType
         gw = self._make_gateway()
         fake = _FakeLLM("meta response")
-        # INTENT_PARSE routes to gpt-oss (all tasks prefer gpt-oss)
-        gw._model_clients["gpt-oss:latest"] = fake
+        # INTENT_PARSE routes to DocWain-Agent (all tasks prefer DocWain-Agent)
+        gw._model_clients["DocWain-Agent:latest"] = fake
         text, meta = gw.generate_with_metadata_for_task(TaskType.INTENT_PARSE, "prompt")
         assert text == "meta response"
         assert meta["task_type"] == "intent_parse"
@@ -642,7 +645,7 @@ class TestTaskAwareGateway:
         from src.llm.task_router import TaskType, task_scope
         gw = self._make_gateway()
         fast_fake = _FakeLLM("fast response")
-        gw._model_clients["gpt-oss:latest"] = fast_fake
+        gw._model_clients["DocWain-Agent:latest"] = fast_fake
         with task_scope(TaskType.QUERY_REWRITE):
             result = gw.generate("test prompt")
         assert result == "fast response"
@@ -651,8 +654,8 @@ class TestTaskAwareGateway:
         from src.llm.task_router import TaskType, task_scope
         gw = self._make_gateway()
         fake = _FakeLLM("metadata response")
-        # ANSWER_JUDGING routes to gpt-oss (all tasks prefer gpt-oss)
-        gw._model_clients["gpt-oss:latest"] = fake
+        # ANSWER_JUDGING routes to DocWain-Agent (all tasks prefer DocWain-Agent)
+        gw._model_clients["DocWain-Agent:latest"] = fake
         with task_scope(TaskType.ANSWER_JUDGING):
             text, meta = gw.generate_with_metadata("test prompt")
         assert text == "metadata response"
@@ -668,11 +671,11 @@ class TestTaskAwareGateway:
         assert result == "fallback response"
 
     def test_all_tasks_route_to_gpt_oss(self):
-        """All tasks route to gpt-oss to avoid model swap contention on T4 16GB."""
+        """All tasks route to DocWain-Agent to avoid model swap contention on T4 16GB."""
         from src.llm.task_router import TaskType, task_scope
         gw = self._make_gateway()
-        gpt_fake = _FakeLLM("gpt-oss response")
-        gw._model_clients["gpt-oss:latest"] = gpt_fake
+        gpt_fake = _FakeLLM("DocWain-Agent response")
+        gw._model_clients["DocWain-Agent:latest"] = gpt_fake
 
         with task_scope(TaskType.QUERY_REWRITE):
             r1 = gw.generate("q1")
@@ -681,15 +684,15 @@ class TestTaskAwareGateway:
         with task_scope(TaskType.ANSWER_JUDGING):
             r3 = gw.generate("q3")
 
-        assert r1 == "gpt-oss response"        # Generation → gpt-oss
-        assert r2 == "gpt-oss response"        # Generation → gpt-oss
-        assert r3 == "gpt-oss response"         # Reasoning → gpt-oss (no swap)
+        assert r1 == "DocWain-Agent response"        # Generation → DocWain-Agent
+        assert r2 == "DocWain-Agent response"        # Generation → DocWain-Agent
+        assert r3 == "DocWain-Agent response"         # Reasoning → DocWain-Agent (no swap)
 
     def test_get_stats_includes_task_routing(self):
         from src.llm.task_router import TaskType
         gw = self._make_gateway()
         fake = _FakeLLM("ok")
-        gw._model_clients["gpt-oss:latest"] = fake
+        gw._model_clients["DocWain-Agent:latest"] = fake
         gw.generate_for_task(TaskType.QUERY_REWRITE, "p")
         stats = gw.get_stats()
         assert "task_routing" in stats
@@ -699,7 +702,7 @@ class TestTaskAwareGateway:
         from src.llm.task_router import TaskType
         gw = self._make_gateway()
         fake = _FakeLLM("ok")
-        gw._model_clients["gpt-oss:latest"] = fake
+        gw._model_clients["DocWain-Agent:latest"] = fake
         gw.generate_for_task(TaskType.QUERY_REWRITE, "prompt")
         # The options should have been passed to generate
         assert len(fake.calls) == 1
@@ -711,16 +714,16 @@ class TestTaskAwareGateway:
         from src.llm.task_router import TaskType
         gw = self._make_gateway()
         fake = _FakeLLM("ok")
-        gw._model_clients["gpt-oss:latest"] = fake
+        gw._model_clients["DocWain-Agent:latest"] = fake
         # Pass string instead of enum
         result = gw.generate_for_task("query_rewrite", "prompt")
         assert result == "ok"
 
     def test_concurrent_task_routing(self):
-        """All tasks use gpt-oss — concurrent requests hit the same model."""
+        """All tasks use DocWain-Agent — concurrent requests hit the same model."""
         from src.llm.task_router import TaskType, task_scope
         gw = self._make_gateway()
-        gw._model_clients["gpt-oss:latest"] = _FakeLLM("gpt-oss response")
+        gw._model_clients["DocWain-Agent:latest"] = _FakeLLM("DocWain-Agent response")
         results = {}
 
         def _worker(tid, task):
@@ -733,8 +736,8 @@ class TestTaskAwareGateway:
         t2.start()
         t1.join(timeout=5)
         t2.join(timeout=5)
-        assert results[1] == "gpt-oss response"
-        assert results[2] == "gpt-oss response"
+        assert results[1] == "DocWain-Agent response"
+        assert results[2] == "DocWain-Agent response"
 
     def test_error_tracking(self):
         from src.llm.task_router import TaskType
@@ -742,7 +745,7 @@ class TestTaskAwareGateway:
         # Client that always fails
         failing_fake = MagicMock()
         failing_fake.generate.side_effect = RuntimeError("boom")
-        gw._model_clients["gpt-oss:latest"] = failing_fake
+        gw._model_clients["DocWain-Agent:latest"] = failing_fake
         result = gw.generate_for_task(TaskType.QUERY_REWRITE, "prompt")
         assert result == "fallback"
         stats = gw.get_task_stats()
@@ -755,7 +758,7 @@ class TestTaskAwareGateway:
         # After generate_for_task, a client should be created (or fail)
         with patch("src.llm.clients.OllamaClient", return_value=_FakeLLM("ok")):
             gw.generate_for_task(TaskType.QUERY_REWRITE, "prompt")
-        assert "gpt-oss:latest" in gw._model_clients
+        assert "DocWain-Agent:latest" in gw._model_clients
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -813,8 +816,8 @@ class TestBackwardCompat:
         reg = _build_populated_registry()
         router = TaskRouter(reg)
         gw = TaskAwareGateway(router=router)
-        assert gw.get_role_model(AgentRole.CLASSIFIER) == "gpt-oss:latest"
-        assert gw.get_role_model(AgentRole.GENERATOR) == "gpt-oss:latest"
+        assert gw.get_role_model(AgentRole.CLASSIFIER) == "DocWain-Agent:latest"
+        assert gw.get_role_model(AgentRole.GENERATOR) == "DocWain-Agent:latest"
 
     def test_list_roles(self):
         from src.llm.multi_agent import TaskAwareGateway
@@ -987,7 +990,7 @@ class TestConfigTaskRouting:
 
     def test_fallback_model_default(self):
         from src.api.config import Config
-        assert Config.TaskRouting.FALLBACK_MODEL == "gpt-oss:latest"
+        assert Config.TaskRouting.FALLBACK_MODEL == "DocWain-Agent:latest"
 
     def test_per_task_overrides_empty_by_default(self):
         from src.api.config import Config

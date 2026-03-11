@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header
@@ -43,22 +42,69 @@ _LANG_CODE_MAP = {
     "persian": "fa", "swahili": "sw", "catalan": "ca",
 }
 
-_TRANSLATE_PATTERN = re.compile(
-    r"translat(?:e|ion)\s+(?:this\s+)?(?:(?:in)?to|in)\s+"
-    r"(\w+)"                                         # target language name
-    r"(?:\s*[:\-]\s*|\s*[.]\s+|\s+)(.*)",            # separator then text
-    re.IGNORECASE | re.DOTALL,
-)
+_KNOWN_LANGUAGES = frozenset(_LANG_CODE_MAP.keys()) | {"english"}
 
-# Broader pattern: "convert to english", "in english", "to french"
-_CONVERT_PATTERN = re.compile(
-    r"(?:convert|change|transform)\s+(?:.*?\s+)?(?:(?:in)?to|in)\s+(\w+)",
-    re.IGNORECASE,
-)
-_TO_LANG_PATTERN = re.compile(
-    r"(?:(?:in)?to|in)\s+(english|french|spanish|german|dutch|chinese|japanese|korean|arabic|hindi|portuguese|russian|italian|turkish|polish|swedish|norwegian|danish|finnish|greek|czech|romanian|hungarian|thai|vietnamese|indonesian|malay|hebrew|ukrainian|tamil|telugu|bengali|urdu|persian|swahili|catalan)",
-    re.IGNORECASE,
-)
+
+def _spacy_extract_translation_intent(query: str):
+    """Use spaCy to detect translation intent and extract target language.
+
+    Returns (target_language_name, remaining_text) or (None, None).
+    Detects verbs like translate/convert/change and finds the target language
+    as a noun/proper noun argument in the sentence structure.
+    """
+    try:
+        from src.nlp.nlu_engine import _get_nlp
+        nlp = _get_nlp()
+        if nlp is None:
+            return None, None
+
+        doc = nlp(query)
+        _TRANSLATE_VERBS = {"translate", "convert", "change", "transform"}
+        translate_verb = None
+        for token in doc:
+            if token.pos_ == "VERB" and token.lemma_.lower() in _TRANSLATE_VERBS:
+                translate_verb = token
+                break
+
+        if translate_verb is None:
+            # Check for noun form "translation"
+            for token in doc:
+                if token.lemma_.lower() == "translation" and token.pos_ == "NOUN":
+                    translate_verb = token
+                    break
+
+        if translate_verb is None:
+            # No translation verb — check for "to/in <language>" pattern
+            for token in doc:
+                if token.text.lower() in ("to", "into", "in") and token.dep_ == "prep":
+                    for child in token.children:
+                        lang_name = child.text.lower()
+                        if lang_name in _KNOWN_LANGUAGES:
+                            return lang_name, ""
+            return None, None
+
+        # Found translation verb — search for target language in its subtree
+        for token in translate_verb.subtree:
+            if token == translate_verb:
+                continue
+            lang_name = token.text.lower()
+            if lang_name in _KNOWN_LANGUAGES:
+                # Extract text after the language mention (if any)
+                remaining = query[token.idx + len(token.text):].strip().lstrip(":-. ")
+                return lang_name, remaining
+
+        # Also check for preposition children: "translate to french"
+        for token in doc:
+            if token.head == translate_verb and token.dep_ == "prep":
+                for child in token.children:
+                    lang_name = child.text.lower()
+                    if lang_name in _KNOWN_LANGUAGES:
+                        remaining = query[child.idx + len(child.text):].strip().lstrip(":-. ")
+                        return lang_name, remaining
+
+    except Exception:
+        pass
+    return None, None
 
 
 # ── LLM translation ────────────────────────────────────────────────
@@ -190,29 +236,11 @@ def _parse_translation_request(payload: Dict[str, Any]) -> TranslateRequest:
     # When pipeline-dispatched, prefer chunk content over query as source text
     source_text = chunk_text if chunk_text and len(chunk_text) > len(query) else ""
 
-    # 1. Try "translate to <lang>: <text>" pattern
-    m = _TRANSLATE_PATTERN.search(query)
-    if m:
-        lang_name = m.group(1).lower().strip()
-        inline_text = m.group(2).strip()
+    # 1. spaCy-based translation intent detection
+    lang_name, inline_text = _spacy_extract_translation_intent(query)
+    if lang_name:
         target_lang = _LANG_CODE_MAP.get(lang_name, lang_name[:2] if len(lang_name) >= 2 else "en")
-        text = source_text or inline_text or query
-        return TranslateRequest(text=text, target_lang=target_lang, source_lang=inp.get("source_lang"))
-
-    # 2. Try "convert to <lang>" pattern
-    m = _CONVERT_PATTERN.search(query)
-    if m:
-        lang_name = m.group(1).lower().strip()
-        target_lang = _LANG_CODE_MAP.get(lang_name, lang_name[:2] if len(lang_name) >= 2 else "en")
-        text = source_text or query
-        return TranslateRequest(text=text, target_lang=target_lang, source_lang=inp.get("source_lang"))
-
-    # 3. Try "to/in english" pattern
-    m = _TO_LANG_PATTERN.search(query)
-    if m:
-        lang_name = m.group(1).lower().strip()
-        target_lang = _LANG_CODE_MAP.get(lang_name, lang_name[:2] if len(lang_name) >= 2 else "en")
-        text = source_text or query
+        text = source_text or (inline_text if inline_text else query)
         return TranslateRequest(text=text, target_lang=target_lang, source_lang=inp.get("source_lang"))
 
     # 4. Fallback: use LLM to detect target language from query
@@ -250,12 +278,12 @@ def _translate_text(request: TranslateRequest) -> Dict[str, Any]:
             "detected_lang": detected,
             "flagged_terms": llm_result.get("flagged_terms", []),
             "quality_notes": llm_result.get("quality_notes", ""),
-            "backend": "gpt-oss",
+            "backend": "DocWain-Agent",
             "warnings": [],
             "iq_score": iq.as_dict(),
             "rendered": (
                 f"{llm_result['translated_text']}\n\n"
-                f"*Translated from {detected} to {request.target_lang} (gpt-oss)*"
+                f"*Translated from {detected} to {request.target_lang} (DocWain-Agent)*"
             ),
         }
 

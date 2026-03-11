@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
-    "gpt-oss": {
+    "docwain-agent": {
         "speed_tier": "heavy",
         "strengths": ["generation", "instruction_following", "creative", "tool_calling", "reasoning"],
         "supports_json_mode": True,
@@ -84,6 +84,15 @@ _MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "supports_tool_calling": True,
         "context_window": 131072,
     },
+    "docwain-agent-v2": {
+        "speed_tier": "heavy",
+        "strengths": ["classification", "intent_parsing", "structured_extraction", "json_generation"],
+        "supports_json_mode": True,
+        "supports_cot": False,
+        "supports_vision": False,
+        "supports_tool_calling": False,
+        "context_window": 4096,
+    },
 }
 
 # Requirement → preferred strength tags (ordered by relevance)
@@ -121,7 +130,7 @@ def _match_family(model_name: str) -> Optional[str]:
     if base in _MODEL_PROFILES:
         return base
     # Prefix match (e.g. "llama3.2-vision" → "llama3.2", "lfm2.5-thinking" → "lfm2.5-thinking")
-    _FAMILY_MAP = {"lfm2": "lfm2.5-thinking"}
+    _FAMILY_MAP = {"lfm2": "lfm2.5-thinking", "gpt-oss": "qwen3", "docwain-agent": "qwen3"}
     for alias, family in _FAMILY_MAP.items():
         if base.startswith(alias) and family in _MODEL_PROFILES:
             return family

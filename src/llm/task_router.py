@@ -8,6 +8,7 @@ task so the gateway can route transparently.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from contextlib import contextmanager
 from enum import Enum
@@ -44,25 +45,25 @@ class TaskType(str, Enum):
 # ---------------------------------------------------------------------------
 
 _TASK_MODEL_PREFERENCES: Dict[TaskType, List[str]] = {
-    # --- Generation tasks: gpt-oss first (1.2B too small for long text) ---
-    TaskType.RESPONSE_GENERATION:    ["gpt-oss", "gemma2", "mistral"],
-    TaskType.CONTENT_GENERATION:     ["gpt-oss", "gemma2", "mistral"],
-    TaskType.COMPLEX_EXTRACTION:     ["gpt-oss", "mistral", "gemma2"],
-    TaskType.TOOL_EXECUTION:         ["gpt-oss", "mistral", "gemma2"],
-    TaskType.STRUCTURED_EXTRACTION:  ["gpt-oss", "mistral", "gemma2"],
-    TaskType.DOCUMENT_UNDERSTANDING: ["gpt-oss", "mistral", "gemma2"],
-    TaskType.QUERY_REWRITE:          ["gpt-oss", "mistral", "llama3.2"],
-    # --- Reasoning/analysis tasks: gpt-oss first to avoid model swap contention ---
+    # --- Generation tasks: docwain-agent first (1.2B too small for long text) ---
+    TaskType.RESPONSE_GENERATION:    ["docwain-agent", "gemma2", "mistral"],
+    TaskType.CONTENT_GENERATION:     ["docwain-agent", "gemma2", "mistral"],
+    TaskType.COMPLEX_EXTRACTION:     ["docwain-agent", "mistral", "gemma2"],
+    TaskType.TOOL_EXECUTION:         ["docwain-agent", "mistral", "gemma2"],
+    TaskType.STRUCTURED_EXTRACTION:  ["docwain-agent", "mistral", "gemma2"],
+    TaskType.DOCUMENT_UNDERSTANDING: ["docwain-agent", "mistral", "gemma2"],
+    TaskType.QUERY_REWRITE:          ["docwain-agent", "mistral", "llama3.2"],
+    # --- Reasoning/analysis tasks: docwain-agent first to avoid model swap contention ---
     # On T4 16GB, model swaps cost 10-30s + cause 500 errors. Keep everything
-    # on gpt-oss until a second GPU is available.
-    TaskType.ANSWER_JUDGING:         ["gpt-oss", "lfm2.5-thinking", "deepseek-r1"],
-    TaskType.GROUNDING_VERIFY:       ["gpt-oss", "lfm2.5-thinking", "deepseek-r1"],
-    TaskType.AGENT_REASONING:        ["gpt-oss", "lfm2.5-thinking", "deepseek-r1"],
-    TaskType.QUERY_CLASSIFICATION:   ["gpt-oss", "lfm2.5-thinking", "llama3.2"],
-    TaskType.INTENT_PARSE:           ["gpt-oss", "lfm2.5-thinking", "mistral"],
-    TaskType.CONVERSATION_SUMMARY:   ["gpt-oss", "lfm2.5-thinking", "gemma2"],
+    # on DocWain-Agent until a second GPU is available.
+    TaskType.ANSWER_JUDGING:         ["docwain-agent", "lfm2.5-thinking", "deepseek-r1"],
+    TaskType.GROUNDING_VERIFY:       ["docwain-agent", "lfm2.5-thinking", "deepseek-r1"],
+    TaskType.AGENT_REASONING:        ["docwain-agent", "lfm2.5-thinking", "deepseek-r1"],
+    TaskType.QUERY_CLASSIFICATION:   ["docwain-agent", "lfm2.5-thinking", "llama3.2"],
+    TaskType.INTENT_PARSE:           ["docwain-agent", "lfm2.5-thinking", "mistral"],
+    TaskType.CONVERSATION_SUMMARY:   ["docwain-agent", "lfm2.5-thinking", "gemma2"],
     # --- General fallback ---
-    TaskType.GENERAL:                ["gpt-oss", "mistral", "gemma2"],
+    TaskType.GENERAL:                ["docwain-agent", "mistral", "gemma2"],
 }
 
 # ---------------------------------------------------------------------------
@@ -134,7 +135,7 @@ class TaskRouter:
     def select_model(self, task: TaskType) -> str:
         """Walk preference list for *task*, return first available model.
 
-        Falls back to first available model overall, then ``gpt-oss:latest``.
+        Falls back to first available model overall, then ``DocWain-Agent:latest``.
         """
         # Check config overrides first
         override = self._config_override(task)
@@ -155,7 +156,7 @@ class TaskRouter:
             return available[0].name
 
         # Ultimate fallback
-        return "gpt-oss:latest"
+        return "DocWain-Agent:latest"
 
     def get_options(self, task: TaskType) -> Dict[str, Any]:
         """Return generation parameter overrides for *task*."""
@@ -194,5 +195,24 @@ class TaskRouter:
 
     @staticmethod
     def _config_option_overrides(task: TaskType) -> Optional[Dict[str, Any]]:
-        """Reserved for future per-task option overrides from config."""
-        return None
+        """Load per-task option overrides from environment variables.
+
+        Convention: TASK_{TASK_NAME}_{PARAM} (e.g., TASK_RESPONSE_GENERATION_TEMPERATURE=0.5)
+        Supported params: TEMPERATURE, NUM_PREDICT, NUM_CTX, TOP_P
+        """
+        prefix = f"TASK_{task.value.upper()}_"
+        overrides: Dict[str, Any] = {}
+        _PARAM_TYPES = {
+            "TEMPERATURE": float,
+            "NUM_PREDICT": int,
+            "NUM_CTX": int,
+            "TOP_P": float,
+        }
+        for param, typ in _PARAM_TYPES.items():
+            val = os.environ.get(f"{prefix}{param}")
+            if val is not None:
+                try:
+                    overrides[param.lower()] = typ(val)
+                except (TypeError, ValueError):
+                    pass
+        return overrides if overrides else None

@@ -168,7 +168,7 @@ def classify_document_type(
     filename: str,
     model_name: Optional[str] = None,
 ) -> tuple[str, float]:
-    # LLM-first: gpt-oss provides accurate classification with full context understanding
+    # LLM-first: DocWain-Agent provides accurate classification with full context understanding
     llm = _ollama_classify(text_sample, tables_sample, filename, model_name)
     if llm:
         doc_type, conf = llm
@@ -207,6 +207,13 @@ def identify_document(
         text_sample = text_sample or ""
 
     doc_type, confidence = classify_document_type(text_sample, tables_sample, filename, model_name=model_name)
+
+    # Normalize to canonical domain labels for consistency across all classifiers
+    try:
+        from src.intelligence.domain_classifier import normalize_domain
+        doc_type = normalize_domain(doc_type)
+    except ImportError:
+        pass
 
     file_format = filename.split(".")[-1].lower() if filename and "." in filename else None
 

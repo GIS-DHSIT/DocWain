@@ -925,8 +925,8 @@ class TestHealthEndpoint:
     """Test the GET /api/admin/tools/status health check."""
 
     # health_router is mounted under api_router (prefix=/api), so full path
-    # is /api + /api/admin/tools/status = /api/api/admin/tools/status
-    _URL = "/api/api/admin/tools/status"
+    # is /api + /admin/tools/status = /api/admin/tools/status
+    _URL = "/api/admin/tools/status"
 
     def test_tools_status_returns_200(self):
         from fastapi.testclient import TestClient

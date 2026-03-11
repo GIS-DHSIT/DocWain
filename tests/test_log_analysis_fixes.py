@@ -92,8 +92,8 @@ class TestGroundingGate:
         from src.api.config import Config
         assert Config.Quality.GROUNDING_GATE_CRITICAL_TH == 0.30
 
-    def test_grounding_gate_skips_llm_responses(self):
-        """LLM responses bypass grounding gate (already grounded against chunks)."""
+    def test_grounding_gate_catches_ungrounded_llm_responses(self):
+        """LLM responses go through grounding gate — fabricated answers get blocked."""
         from src.rag_v3.pipeline import _extract_render_judge
         from src.rag_v3.types import LLMBudget, LLMResponseSchema
 
@@ -113,7 +113,7 @@ class TestGroundingGate:
         chunks = [FakeChunk()]
         budget = LLMBudget(llm_client=None, max_calls=2)
 
-        # LLM responses now bypass grounding gate (grounded by LLM context)
+        # LLM responses now go through grounding gate — fabricated answers get blocked
         with patch("src.api.config.Config.Quality.GROUNDING_GATE_ENABLED", True), \
              patch("src.api.config.Config.Quality.GROUNDING_GATE_CRITICAL_TH", 0.99):
             sanitized, verdict = _extract_render_judge(
@@ -124,8 +124,8 @@ class TestGroundingGate:
                 budget=budget,
                 correlation_id="test-cid",
             )
-            # LLM response passes through without grounding gate blocking
-            assert "fabricated" in sanitized.lower()
+            # Ungrounded LLM response should be blocked — replaced with evidence fallback
+            assert "fabricated" not in sanitized.lower() or verdict.status == "fail"
 
 
 # ── Fix #3: LLM extract timeout handling ──────────────────────────────
@@ -160,11 +160,13 @@ class TestLLMExtractTimeout:
 
     def test_chunked_token_threshold(self):
         from src.rag_v3.llm_extract import LLM_CHUNKED_TOKEN_THRESHOLD
-        assert LLM_CHUNKED_TOKEN_THRESHOLD == 2000
+        assert LLM_CHUNKED_TOKEN_THRESHOLD == 3000
 
     def test_timeout_is_reasonable(self):
         from src.rag_v3.llm_extract import LLM_EXTRACT_TIMEOUT_S
-        assert LLM_EXTRACT_TIMEOUT_S <= 30.0
+        # Qwen3 thinking tokens consume ~1K from num_predict budget (~22s at 45tok/s),
+        # plus content generation (~22s) + prompt overhead = 45-90s on T4 GPU
+        assert LLM_EXTRACT_TIMEOUT_S <= 120.0
 
 
 # ── Fix #4: Query rewrite improvements ────────────────────────────────

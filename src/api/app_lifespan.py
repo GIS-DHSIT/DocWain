@@ -168,39 +168,42 @@ def initialize_app_state(app: FastAPI) -> AppState:
             ollama_client = task_aware_gateway
             logger.info("TaskAwareGateway active — task routing enabled")
 
-            # Pin gpt-oss in GPU memory to eliminate model swap latency.
-            # First evict non-essential models to free GPU memory for gpt-oss (13GB).
+            # Pin DocWain-Agent (Qwen3-8B) in GPU memory to eliminate model swap latency.
+            # First evict non-essential models to free GPU memory.
             try:
                 import ollama as _ollama
 
-                # Evict ALL other models to make room for gpt-oss (14GB on T4 16GB)
-                # T4 can only hold one large model; gpt-oss is the critical generation model
+                # Evict ALL other models to make room for DocWain-Agent
                 try:
                     _running = _ollama.ps()
                     for _m in getattr(_running, "models", []) or []:
                         _name = getattr(_m, "name", "") or ""
-                        if _name and "gpt-oss" not in _name:
+                        if _name and "docwainagent" not in _name.lower().replace("-", "").replace("_", ""):
                             try:
                                 _ollama.generate(model=_name, prompt="", options={"num_predict": 0}, keep_alive="0s")
-                                logger.info("Evicted %s from GPU to make room for gpt-oss", _name)
+                                logger.info("Evicted %s from GPU to make room for DocWain-Agent", _name)
                             except Exception:  # noqa: BLE001
                                 pass
                 except Exception:  # noqa: BLE001
                     pass
 
                 _ollama.generate(
-                    model="gpt-oss:latest",
+                    model="qwen3:14b",
                     prompt="ping",
-                    options={"num_predict": 1},
+                    options={"num_predict": 1, "num_ctx": 8192},
                     keep_alive="24h",
                 )
-                logger.info("gpt-oss pinned in GPU memory (keep_alive=24h)")
+                logger.info("qwen3:14b pinned in GPU memory (keep_alive=24h, num_ctx=8192)")
+
+                # DocWain-Agent-v2 (TaskSpec model) — DISABLED.
+                # Loading this 4.9GB model alongside DocWain-Agent (13GB) exceeds T4 16GB.
+                # TaskSpec uses NLU fallback (CPU-based, <50ms) instead.
+
             except Exception as _pin_exc:  # noqa: BLE001
-                logger.warning("gpt-oss pinning FAILED — expect model swap latency: %s", _pin_exc)
+                logger.warning("DocWain-Agent pinning FAILED — expect model swap latency: %s", _pin_exc)
 
             # NOTE: lfm2.5-thinking (1GB) loads on-demand in ~3s — no need to pin.
-            # T4 16GB cannot hold both gpt-oss (14GB) and lfm2.5-thinking simultaneously.
-            # lfm2.5-thinking is used for reasoning tasks and will load when needed.
+            # T4 16GB cannot hold both DocWain-Agent and lfm2.5-thinking simultaneously.
         except Exception as exc:  # noqa: BLE001
             logger.warning("Task routing init failed (continuing with single-model): %s", exc)
 
@@ -304,6 +307,26 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # noqa: BLE001
         logger.debug("spaCy pre-load skipped: %s", exc)
 
+    # Validate embedding dimension at startup
+    if state.embedding_model:
+        try:
+            test_vec = state.embedding_model.encode("dimension validation test",
+                                                     convert_to_numpy=True,
+                                                     normalize_embeddings=True)
+            actual_dim = len(test_vec)
+            expected_dim = int(getattr(Config.Model, "EMBEDDING_DIM", 1024))
+            if actual_dim != expected_dim:
+                raise ValueError(
+                    f"Embedding dimension mismatch: model produces {actual_dim}d vectors "
+                    f"but Config.Model.EMBEDDING_DIM={expected_dim}. "
+                    f"Fix EMBEDDING_DIM env var or change the embedding model."
+                )
+            logger.info("Embedding dimension validated: %dd", actual_dim)
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("Embedding dimension validation skipped: %s", exc)
+
     # Pre-train intent classifier (fast, <2s on CPU)
     if state.embedding_model:
         try:
@@ -330,6 +353,24 @@ async def lifespan(app: FastAPI):
             logger.info("Field importance classifier ready at startup")
         except Exception as exc:  # noqa: BLE001
             logger.warning("Field importance classifier startup training skipped: %s", exc)
+
+    # Pre-warm NLU registries (batch-encodes all category descriptions once)
+    try:
+        from src.nlp.nlu_engine import classify_intent, classify_domain_task
+        classify_intent("warmup")
+        classify_domain_task("warmup")
+        logger.info("NLU registries pre-warmed at startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("NLU registry pre-warm skipped: %s", exc)
+
+    # Pre-warm domain classifier centroids
+    try:
+        from src.intelligence.domain_classifier import _build_centroids
+        if state.embedding_model:
+            _build_centroids(state.embedding_model)
+            logger.info("Domain classifier centroids pre-warmed at startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Domain classifier pre-warm skipped: %s", exc)
 
     # Initialize Vision OCR client (lazy availability check)
     if getattr(Config, "VisionOCR", None) and getattr(Config.VisionOCR, "ENABLED", True):
@@ -371,7 +412,11 @@ async def lifespan(app: FastAPI):
             _az_key = getattr(_cloud_cfg, "AZURE_OPENAI_API_KEY", "")
             if _az_ep and _az_key:
                 try:
-                    _openai = OpenAIClient(endpoint=_az_ep, api_key=_az_key, deployment=getattr(_cloud_cfg, "AZURE_DEPLOYMENT", "gpt-4o"))
+                    _openai = OpenAIClient(
+                        endpoint=_az_ep, api_key=_az_key,
+                        deployment=getattr(_cloud_cfg, "AZURE_DEPLOYMENT", "gpt-4.1"),
+                        api_version=getattr(_cloud_cfg, "AZURE_API_VERSION", "2024-05-01-preview"),
+                    )
                 except Exception:
                     pass
             _cl_key = getattr(_cloud_cfg, "CLAUDE_API_KEY", "")

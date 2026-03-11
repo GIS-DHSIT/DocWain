@@ -213,7 +213,7 @@ def extract_diagram_structure(
     MoE routing:
       1. If ``image`` provided → try glm-ocr vision-first (rich visual analysis)
       2. If vision fails or no image → use lfm2.5-thinking for text-based extraction
-         (faster reasoning than gpt-oss for structure extraction)
+         (faster reasoning than DocWain-Agent for structure extraction)
       3. Fallback to pattern-based text extraction
 
     Args:

@@ -141,13 +141,9 @@ def test_retrieval_failure_returns_controlled_error():
     assert "unknown" not in msg.lower()
 
 
-def test_model_consistency_docwain_agent_maps_to_gpt_oss():
-    assert dw_newron._resolve_model_alias("DocWain-Agent") == "gpt-oss:latest"
-    try:
-        from src.runtime.model_alias import normalize_model_name
-    except ImportError:
-        pytest.skip("Module removed")
-    assert normalize_model_name("DocWain-Agent") == "gpt-oss:latest"
+def test_model_consistency_docwain_agent_resolves():
+    assert dw_newron._resolve_model_alias("DocWain-Agent") == "qwen3:14b"
+    assert dw_newron._resolve_model_alias("gpt-oss") == "qwen3:14b"
 
 
 def test_text_content_separation():

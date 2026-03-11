@@ -77,6 +77,29 @@ class LLMGateway:
                 self._stats["errors"] += 1
             raise
 
+    def chat_with_metadata(self, messages, **kwargs) -> Tuple[str, Dict[str, Any]]:
+        """Chat-based generation with system/user role separation.
+
+        Delegates to underlying client's chat_with_metadata for proper
+        role-separated prompts (produces better results than raw generate).
+        """
+        with self._stats_lock:
+            self._stats["calls"] += 1
+            self._stats.setdefault(self.backend, 0)
+            self._stats[self.backend] += 1
+        try:
+            if hasattr(self._client, "chat_with_metadata"):
+                return self._client.chat_with_metadata(messages, **kwargs)
+            # Fallback: concatenate messages into a single prompt
+            prompt = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
+            )
+            return self.generate_with_metadata(prompt, **kwargs)
+        except Exception:
+            with self._stats_lock:
+                self._stats["errors"] += 1
+            raise
+
     def get_stats(self) -> Dict[str, Any]:
         """Return per-backend call statistics."""
         with self._stats_lock:

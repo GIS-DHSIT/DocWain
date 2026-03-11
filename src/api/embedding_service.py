@@ -2564,7 +2564,7 @@ def _process_blob(
                             vector=[float(x) for x in _mr_vectors[i]],
                             payload=_payload,
                         ))
-                    from src.api.vector_store import get_vector_store
+                    from src.api.dataHandler import get_vector_store
                     _vs = get_vector_store()
                     _vs.client.upsert(collection_name=_mr_collection, points=_mr_points)
                     total_upserted += len(_mr_points)

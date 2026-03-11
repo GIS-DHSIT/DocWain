@@ -172,8 +172,9 @@ class AgentOrchestrator:
 
     @staticmethod
     def _resolve_model(model_name: str) -> str:
-        if str(model_name).strip().lower() == "docwain-agent":
-            return "gpt-oss:latest"
+        normalized = str(model_name).strip().lower()
+        if normalized in ("docwain-agent", "gpt-oss"):
+            return "qwen3:14b"
         return model_name
 
     @staticmethod

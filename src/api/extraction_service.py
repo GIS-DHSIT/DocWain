@@ -629,6 +629,13 @@ def _resolve_authoritative_domain(
         result = {"domain": mapped, "confidence": max(doc_type_confidence, 0.5), "source": "doc_type_mapping"}
         return result
 
+    # Normalize final domain through canonical map
+    try:
+        from src.intelligence.domain_classifier import normalize_domain
+        result["domain"] = normalize_domain(result["domain"])
+    except ImportError:
+        pass
+
     return result
 
 
@@ -1268,7 +1275,7 @@ def extract_uploaded_document(
     emit_progress(document_id, "extraction", 0.05, "Starting document extraction")
 
     try:
-        extracted = fileProcessor(file_bytes, filename)
+        extracted = fileProcessor(file_bytes, filename, content_type=content_type or "")
         if not extracted:
             raise ValueError("No content extracted from file")
     except Exception as exc:  # noqa: BLE001

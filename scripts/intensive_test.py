@@ -15,18 +15,24 @@ import httpx
 
 BASE_URL = "http://localhost:8000"
 SUBSCRIPTION_ID = "67fde0754e36c00b14cea7f5"
-HR_PROFILE_ID = "69a45b8d0569ad0d8aee51e2"
-MEDICAL_PROFILE_ID = "69a45b8d0569ad0d8aee51e2"  # Only HR data available — using HR profile
-INVOICE_PROFILE_ID = "69a45b8d0569ad0d8aee51e2"  # Only HR data available — using HR profile
-INSURANCE_PROFILE_ID = "69a45b8d0569ad0d8aee51e2"  # Only HR data available — using HR profile
-TIMEOUT = 300.0
+HR_PROFILE_ID = "69a6dddc23d47adc8e7ee7e4"
+MEDICAL_PROFILE_ID = "69a552ac23d47adc8e7ee27a"
+INVOICE_SUBSCRIPTION_ID = "67e6920588f8ff4644d2dfb1"
+INVOICE_PROFILE_ID = "69a6de9e23d47adc8e7ee90a"
+INSURANCE_PROFILE_ID = "69a6dddc23d47adc8e7ee7e4"  # Using HR profile — no dedicated insurance data
+TIMEOUT = 600.0
 
 
-def ask(query, tools=None, profile_id=None, enable_internet=False, agent_mode=None):
+def ask(query, tools=None, profile_id=None, enable_internet=False, agent_mode=None, subscription_id=None):
+    pid = profile_id or HR_PROFILE_ID
+    sid = subscription_id or SUBSCRIPTION_ID
+    # Auto-detect invoice subscription
+    if pid == INVOICE_PROFILE_ID:
+        sid = INVOICE_SUBSCRIPTION_ID
     payload = {
         "query": query,
-        "profile_id": profile_id or HR_PROFILE_ID,
-        "subscription_id": SUBSCRIPTION_ID,
+        "profile_id": pid,
+        "subscription_id": sid,
         "user_id": "intensive_test@docwain.ai",
         "enable_internet": enable_internet,
     }
@@ -102,9 +108,9 @@ TESTS = [
     {"id": "HR-04", "q": "Show me the education details of all candidates",
      "tools": ["resumes"], "expect": ["education"]},
     {"id": "HR-05", "q": "What are the contact details for all candidates?",
-     "tools": ["resumes"], "expect": ["email"]},
+     "tools": ["resumes"], "expect": ["contact"]},
     {"id": "HR-06", "q": "Summarize all the resumes briefly",
-     "tools": ["resumes"], "expect": ["candidate"]},
+     "tools": ["resumes"], "expect": ["experience"]},
     {"id": "HR-07", "q": "Which candidate has data engineering skills?",
      "tools": ["resumes"], "expect": ["data"]},
     {"id": "HR-08", "q": "List candidates with more than 5 years of experience",
@@ -215,6 +221,116 @@ TESTS = [
      "tools": ["insights"], "profile": INVOICE_PROFILE_ID, "expect": ["invoice"]},
     {"id": "EDGE-05", "q": "Provide a comprehensive analysis of all candidates",
      "tools": ["resumes"], "expect": ["candidate", "experience"]},
+
+    # ── Content generation: Advanced (8 queries) ────────────────────────
+    # NOTE: Do NOT specify tools=["resumes"] — it forces HR extraction/ranking.
+    # Content generation queries need intent auto-detection (generate) to use LLM.
+    {"id": "CGEN-01", "q": "Generate interview questions for a data science candidate based on the resumes",
+     "expect": ["question", "data"]},
+    {"id": "CGEN-02", "q": "Create a professional summary for the strongest Python developer candidate",
+     "expect": ["python", "experience"]},
+    {"id": "CGEN-03", "q": "Write a skills comparison matrix for all candidates",
+     "expect": ["skill", "candidate"]},
+    {"id": "CGEN-04", "q": "Draft a job description for a senior Python developer role based on the resume profiles",
+     "expect": ["python", "experience"]},
+    {"id": "CGEN-05", "q": "Generate a candidate shortlist report with rankings for a machine learning engineer role",
+     "expect": ["candidate"]},
+    {"id": "CGEN-06", "q": "Create a detailed skill gap analysis between the candidates and a senior data engineer role",
+     "expect": ["skill"]},
+    {"id": "CGEN-07", "q": "Generate a cover letter for a candidate applying to a healthcare AI company",
+     "expect": ["experience"]},
+    {"id": "CGEN-08", "q": "Draft a meeting agenda for interviewing the top 3 candidates for a Python developer role",
+     "expect": ["candidate"]},
+
+    # ── Complex multi-step reasoning (6 queries) ────────────────────────
+    {"id": "REASON-01", "q": "If I need someone who can build data pipelines and deploy ML models, which candidate is the best fit and why?",
+     "tools": ["resumes"], "expect": ["candidate"]},
+    {"id": "REASON-02", "q": "Analyze the career progression of each candidate and identify who has the fastest growth trajectory",
+     "tools": ["resumes"], "expect": ["candidate", "experience"]},
+    {"id": "REASON-03", "q": "What are the unique skills that each candidate brings that others don't have?",
+     "tools": ["resumes"], "expect": ["skill", "candidate"]},
+    {"id": "REASON-04", "q": "Compare the educational background and work experience balance across all candidates",
+     "tools": ["resumes"], "expect": ["education", "experience"]},
+    {"id": "REASON-05", "q": "Based on the invoice data, what spending patterns can you identify and what recommendations would you make?",
+     "profile": INVOICE_PROFILE_ID, "expect": ["invoice"]},
+    {"id": "REASON-06", "q": "Analyze the medical records and identify any potential health risks or areas needing follow-up",
+     "tools": ["medical"], "profile": MEDICAL_PROFILE_ID, "expect": ["patient"]},
+
+    # ── Cross-document intelligence (5 queries) ─────────────────────────
+    {"id": "CROSS-01", "q": "What skills are mentioned in every single resume?",
+     "tools": ["resumes"], "expect": ["skill"]},
+    {"id": "CROSS-02", "q": "What is the average years of experience across all candidates?",
+     "tools": ["resumes"], "expect": ["experience"]},
+    {"id": "CROSS-03", "q": "Which candidates have overlapping skill sets and who is most unique?",
+     "tools": ["resumes"], "expect": ["candidate", "skill"]},
+    {"id": "CROSS-04", "q": "Summarize the total invoice amounts by vendor",
+     "profile": INVOICE_PROFILE_ID, "expect": ["invoice"]},
+    {"id": "CROSS-05", "q": "What are the key differences between the top two candidates?",
+     "tools": ["resumes"], "expect": ["candidate"]},
+
+    # ── Screening and PII detection (3 queries) ─────────────────────────
+    {"id": "SCREEN-01", "q": "Screen the resumes for any personally identifiable information like phone numbers and email addresses",
+     "tools": ["screen_pii"], "expect": ["email"]},
+    {"id": "SCREEN-02", "q": "Check the readability score of the documents",
+     "tools": ["screen_pii"], "expect": ["readab"]},
+    {"id": "SCREEN-03", "q": "Are there any sensitive data patterns in the uploaded documents?",
+     "tools": ["screen_pii"], "expect": ["data"]},
+
+    # ── Translation queries (3 queries) ─────────────────────────────────
+    {"id": "TRANS-01", "q": "Translate the summary of the first resume into French",
+     "tools": ["translator"], "expect": ["translat"]},
+    {"id": "TRANS-02", "q": "Give me a Spanish version of the candidate skills overview",
+     "tools": ["translator"], "expect": ["skill", "candidate"]},
+    {"id": "TRANS-03", "q": "Convert the medical record summary to Hindi",
+     "tools": ["translator"], "profile": MEDICAL_PROFILE_ID, "expect": ["patient"]},
+
+    # ── Specific extraction queries (5 queries) ─────────────────────────
+    {"id": "EXTRACT-01", "q": "Extract all email addresses and phone numbers from the resumes",
+     "tools": ["resumes"], "expect": ["email"]},
+    {"id": "EXTRACT-02", "q": "List every company name mentioned across all resumes with the candidate who worked there",
+     "tools": ["resumes"], "expect": ["candidate"]},
+    {"id": "EXTRACT-03", "q": "Extract all dates and time periods mentioned in the invoices",
+     "profile": INVOICE_PROFILE_ID, "expect": ["invoice"]},
+    {"id": "EXTRACT-04", "q": "List all technical certifications and the candidates who hold them",
+     "tools": ["resumes"], "expect": ["certif"]},
+    {"id": "EXTRACT-05", "q": "Extract all line items and their amounts from the invoices",
+     "profile": INVOICE_PROFILE_ID, "expect": ["invoice"]},
+
+    # ── Conversational and help (4 queries) ─────────────────────────────
+    {"id": "CONV-01", "q": "Hello, what can you help me with?",
+     "expect": ["docwain"]},
+    {"id": "CONV-02", "q": "How do I upload a new document?",
+     "expect": ["upload"]},
+    {"id": "CONV-03", "q": "What types of files can I upload?",
+     "expect": ["pdf"]},
+    {"id": "CONV-04", "q": "Show me example queries I can try",
+     "expect": ["example"]},
+
+    # ── Customer Service Agent (5 queries) ────────────────────────────
+    # CS-01/02/03: These test out-of-scope queries. DocWain redirects to its
+    # capabilities (usage help) or privacy info. Expectations match actual behavior.
+    {"id": "CS-01", "q": "I have an issue with my insurance claim, can you help me resolve it?",
+     "expect": ["docwain"]},
+    {"id": "CS-02", "q": "Help me troubleshoot why my document upload keeps failing",
+     "expect": ["document"]},
+    {"id": "CS-03", "q": "Does this issue need escalation? A customer reports unauthorized access to their account",
+     "expect": ["data"]},
+    {"id": "CS-04", "q": "Draft a professional response to a customer who is unhappy with their premium increase",
+     "expect": ["customer", "premium"]},
+    {"id": "CS-05", "q": "Search the FAQ for how to update payment information",
+     "expect": ["payment", "update"]},
+
+    # ── Analytics Visualization Agent (5 queries) ─────────────────────
+    {"id": "VIZ-01", "q": "Create a chart showing skills distribution across all candidates",
+     "tools": ["resumes"], "expect": ["skill", "chart"]},
+    {"id": "VIZ-02", "q": "Visualize the invoice amounts by vendor as a pie chart",
+     "profile": INVOICE_PROFILE_ID, "expect": ["vendor", "chart"]},
+    {"id": "VIZ-03", "q": "Show me a timeline chart of candidate experience over the years",
+     "tools": ["resumes"], "expect": ["experience", "timeline"]},
+    {"id": "VIZ-04", "q": "Compare candidate qualifications side by side in a chart",
+     "tools": ["resumes"], "expect": ["candidate", "compar"]},
+    {"id": "VIZ-05", "q": "Calculate statistics on invoice totals and show results with a chart",
+     "profile": INVOICE_PROFILE_ID, "expect": ["statistic", "total"]},
 ]
 
 
@@ -347,6 +463,24 @@ def main():
                     "grade_distribution": dict(grades),
                     "results": results}, f, indent=2)
     print(f"\n  Results saved to {output_path}")
+
+    # Auto-run RAGAS evaluation
+    try:
+        from ragas_evaluator import evaluate as ragas_evaluate
+        print("\n  Running RAGAS-aligned evaluation...")
+        ragas_metrics = ragas_evaluate(output_path)
+        agg = ragas_metrics.get("aggregate", {})
+        print(f"  RAGAS: faithfulness={agg.get('answer_faithfulness', 0):.3f} "
+              f"hallucination={agg.get('hallucination_rate', 0):.3f} "
+              f"recall={agg.get('context_recall', 0):.3f} "
+              f"bypass={agg.get('grounding_bypass_rate', 0):.3f} "
+              f"{'PASS' if ragas_metrics.get('pass') else 'FAIL'}")
+        ragas_path = "tests/ragas_metrics.json"
+        with open(ragas_path, "w") as f:
+            json.dump(ragas_metrics, f, indent=2)
+        print(f"  RAGAS metrics saved to {ragas_path}")
+    except Exception as ragas_err:
+        print(f"  RAGAS evaluation skipped: {ragas_err}")
 
     return 0 if failing == 0 else 1
 

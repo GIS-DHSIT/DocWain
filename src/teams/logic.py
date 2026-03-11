@@ -156,6 +156,21 @@ class TeamsChatService:
                 "Deleted %d embedding(s) for Teams user | subscription=%s profile=%s collection=%s",
                 point_count, subscription_id, profile_id, collection_name,
             )
+
+            # Invalidate cached counts so next query sees zero
+            try:
+                from src.api.dw_newron import _COLLECTION_COUNT_CACHE
+                _count_cache_key = f"{collection_name}:{profile_id}"
+                _COLLECTION_COUNT_CACHE.pop(_count_cache_key, None)
+                _COLLECTION_COUNT_CACHE.pop(collection_name, None)
+            except Exception:
+                pass
+            try:
+                from src.intelligence.conversational_nlp import _DOC_SUMMARY_CACHE
+                _DOC_SUMMARY_CACHE.pop(f"{subscription_id}:{profile_id}", None)
+            except Exception:
+                pass
+
             return point_count
         except UnexpectedResponse as exc:
             logger.error("Failed to delete Teams documents: %s", exc)
@@ -200,7 +215,7 @@ class TeamsChatService:
         """
         self.ensure_collection(context.subscription_id)
 
-        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 90))
+        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 300))
 
         try:
             if dw_newron is None:

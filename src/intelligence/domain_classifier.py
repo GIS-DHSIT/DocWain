@@ -42,6 +42,8 @@ _DOMAIN_PROTOTYPES: Dict[str, List[str]] = {
         "Skills include Python, Java, project management, and team leadership.",
         "Career objective: seeking a senior developer role in fintech.",
         "Bachelor of Science in Computer Science from MIT, graduated 2018.",
+        "Professional certifications: AWS Solutions Architect, PMP, Scrum Master.",
+        "References available upon request. Languages: English, Spanish fluent.",
     ],
     "tax": [
         "Federal income tax return for the fiscal year 2024.",
@@ -82,6 +84,8 @@ _DOMAIN_PROTOTYPES: Dict[str, List[str]] = {
         "In witness whereof the parties have executed this contract.",
         "Governing law: this agreement shall be governed by New York law.",
         "Indemnification clause: Party A shall indemnify Party B against claims.",
+        "Non-disclosure agreement: confidential information shall not be disclosed.",
+        "Force majeure: neither party shall be liable for acts beyond reasonable control.",
     ],
     "policy": [
         "Insurance policy number POL-2024-5678 effective January 1 2024.",
@@ -96,6 +100,8 @@ _DOMAIN_PROTOTYPES: Dict[str, List[str]] = {
         "Product specification sheet with technical parameters.",
         "Meeting minutes from the quarterly business review.",
         "Research report analyzing market trends and competitive landscape.",
+        "Training guide with step-by-step instructions for new employees.",
+        "Project proposal outlining scope, timeline, and resource requirements.",
     ],
 }
 
@@ -158,8 +164,12 @@ def _semantic_classify(text: str, metadata: Optional[Dict[str, Any]] = None) -> 
         if not centroids:
             return None
 
-        # Encode the document text (use first 2000 chars for speed)
-        sample = (text or "")[:2000]
+        # Stratified sample: header + middle + tail captures both preamble and body content
+        _raw = text or ""
+        if len(_raw) > 3000:
+            sample = _raw[:1000] + " " + _raw[len(_raw)//2 - 250:len(_raw)//2 + 250] + " " + _raw[-500:]
+        else:
+            sample = _raw[:2000]
         if len(sample.strip()) < 20:
             return None
 
@@ -187,9 +197,13 @@ def _semantic_classify(text: str, metadata: Optional[Dict[str, Any]] = None) -> 
         best_domain, best_score = ranked[0]
         second_domain, second_score = ranked[1] if len(ranked) > 1 else ("generic", 0.0)
 
-        # Confidence: gap between top-1 and top-2
+        # Confidence: relative gap ratio between top-1 and top-2
+        # Using ratio instead of absolute gap for consistency with keyword fallback
         gap = best_score - second_score
-        confident = gap >= 0.04 and best_score >= 0.35
+        gap_ratio = gap / (best_score + second_score + 1e-6)
+        # High absolute scores (>= 0.70) with clear leads (gap >= 0.05) are confident
+        # even if the gap_ratio is narrow (common when related domains score similarly)
+        confident = (gap_ratio >= 0.10 and best_score >= 0.35) or (best_score >= 0.70 and gap >= 0.05)
 
         # If top domain is generic and second is close, prefer generic
         # (avoids forcing a specific domain on truly generic documents)
@@ -320,7 +334,8 @@ def _keyword_fallback_classify(
         )
 
     confidence = best_score / max(best_score + second_score, 1.0)
-    uncertain = confidence < 0.55 or best_score < 2.0
+    gap_ratio = (best_score - second_score) / (best_score + second_score + 1e-6)
+    uncertain = gap_ratio < 0.10 or best_score < 2.0
 
     return DomainClassification(
         domain=best_domain, confidence=confidence, scores=scores,
@@ -393,6 +408,47 @@ def reset_centroids() -> None:
     """Clear cached centroids (for testing)."""
     global _centroids
     _centroids = None
+
+
+# ── Canonical domain normalization ──────────────────────────────────────
+# Maps legacy/variant labels from all classifiers to a canonical set.
+# Unknown labels pass through as-is (enabling generic analysis of any doc type).
+_CANONICAL_DOMAIN_MAP: Dict[str, str] = {
+    # Classifier 1 (document_classifier.py) enum names
+    "RESUME": "resume", "CV": "resume",
+    "INVOICE": "invoice", "PURCHASE_ORDER": "invoice",
+    "BANK_STATEMENT": "financial", "TAX_DOCUMENT": "financial",
+    "MEDICAL_RECORD": "medical",
+    "LEGAL_DOCUMENT": "legal", "LEGAL_CONTRACT": "legal",
+    "INSURANCE_CLAIM": "policy",
+    "GENERIC": "general",
+    # Classifier 3 (identify.py) labels
+    "contract": "legal", "statement": "financial",
+    "brochure": "general", "presentation": "general",
+    "report": "general", "other": "general",
+    # Synonyms
+    "purchase_order": "invoice", "bank_statement": "financial",
+    "tax": "financial", "insurance": "policy",
+    "generic": "general",
+}
+
+
+def normalize_domain(label: str) -> str:
+    """Normalize any domain label to a canonical form.
+
+    Known domains map to their canonical name. Unknown labels pass through
+    unchanged (lowercase, stripped) — this enables generic analysis of
+    document types not in the predefined set.
+    """
+    cleaned = (label or "").strip()
+    # Check both original and lowercased
+    canonical = _CANONICAL_DOMAIN_MAP.get(cleaned)
+    if canonical:
+        return canonical
+    canonical = _CANONICAL_DOMAIN_MAP.get(cleaned.lower())
+    if canonical:
+        return canonical
+    return cleaned.lower() or "general"
 
 
 # Keep for backward compat — some modules import these

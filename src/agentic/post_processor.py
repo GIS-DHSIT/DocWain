@@ -189,9 +189,7 @@ class PostProcessor:
         name = str(source.get("source_name") or "").strip()
         if not name:
             return ""
-        page = source.get("page") or "N/A"
-        section = source.get("section") or "Section"
-        return f"({name}, Page {page}, Section: {section})"
+        return f"(Source: {name})"
 
     @staticmethod
     def _rewrite_banned_opener(text: str, *, opener: Optional[str] = None) -> str:

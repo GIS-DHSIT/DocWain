@@ -39,6 +39,7 @@ class QueryFocus:
     query_embedding: Optional[Any] = field(default=None, repr=False)
     field_probabilities: Optional[Dict[str, float]] = field(default=None, repr=False)
     _embedder: Optional[Any] = field(default=None, repr=False)
+    _raw_query: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,7 @@ _STOP = frozenset({
 # Section-kind map (mirrors retrieve._QUERY_SECTION_MAP but returns ALL)
 # ---------------------------------------------------------------------------
 _SECTION_MAP = [
+    # HR/Resume sections
     (("skills", "technical skills", "tech stack", "tools", "technologies", "frameworks", "programming"), "skills_technical"),
     (("soft skills", "functional skills", "communication", "leadership"), "skills_functional"),
     (("education", "degree", "university", "academic", "qualification"), "education"),
@@ -64,6 +66,24 @@ _SECTION_MAP = [
     (("summary", "objective", "profile", "overview", "about"), "summary_objective"),
     (("contact", "email", "phone", "address"), "identity_contact"),
     (("achievement", "award", "accomplishment"), "achievements"),
+    # Medical sections
+    (("diagnosis", "condition", "assessment", "impression"), "diagnosis"),
+    (("medication", "prescription", "drug", "dosage", "treatment", "therapy"), "treatment"),
+    (("lab result", "test result", "blood work", "vitals", "laboratory"), "lab_results"),
+    (("allergy", "allergies", "medical history", "surgical history"), "medical_history"),
+    # Legal sections
+    (("clause", "provision", "article", "section"), "clause"),
+    (("liability", "indemnification", "indemnity"), "liability"),
+    (("termination", "cancellation", "exit"), "termination"),
+    (("confidentiality", "non-disclosure", "nda"), "confidentiality"),
+    # Invoice sections
+    (("line item", "product", "service", "description"), "items"),
+    (("total", "subtotal", "amount due", "balance", "grand total"), "totals"),
+    (("payment term", "due date", "net 30", "net 60"), "payment_terms"),
+    # Policy sections
+    (("coverage", "benefit", "protection", "insured"), "coverage"),
+    (("exclusion", "exception", "limitation"), "exclusions"),
+    (("claim", "filing", "procedure"), "claims"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -99,17 +119,63 @@ _FIELD_FOCUS_MAP = {
     "amount": {"totals"},
     "balance": {"totals"},
     "subtotal": {"totals"},
+    "tax": {"totals"},
+    "discount": {"totals"},
+    "price": {"totals", "items"},
+    "cost": {"totals", "items"},
     "item": {"items"},
     "product": {"items"},
     "line item": {"items"},
+    "quantity": {"items"},
     "vendor": {"parties"},
     "customer": {"parties"},
+    "supplier": {"parties"},
     "bill": {"parties", "totals"},
+    "invoice number": {"identifiers"},
+    "purchase order": {"identifiers"},
+    "due date": {"terms"},
+    "payment": {"terms", "totals"},
     # Legal-focused
     "clause": {"clauses"},
     "liability": {"clauses"},
     "obligation": {"clauses"},
+    "indemnification": {"clauses"},
+    "warranty": {"clauses"},
+    "termination": {"clauses"},
+    "confidentiality": {"clauses"},
+    "governing law": {"clauses"},
     "term": {"terms"},
+    "effective date": {"terms"},
+    "renewal": {"terms"},
+    "notice period": {"terms"},
+    "penalty": {"terms", "clauses"},
+    # Medical-focused
+    "diagnosis": {"diagnosis"},
+    "condition": {"diagnosis"},
+    "symptom": {"diagnosis"},
+    "medication": {"treatment"},
+    "prescription": {"treatment"},
+    "drug": {"treatment"},
+    "dosage": {"treatment"},
+    "treatment": {"treatment"},
+    "therapy": {"treatment"},
+    "lab": {"lab_results"},
+    "test result": {"lab_results"},
+    "blood": {"lab_results"},
+    "vitals": {"lab_results"},
+    "allergy": {"medical_history"},
+    "allergies": {"medical_history"},
+    "history": {"medical_history", "experience"},
+    "surgery": {"medical_history"},
+    # Policy-focused
+    "coverage": {"coverage"},
+    "premium": {"coverage"},
+    "deductible": {"coverage"},
+    "exclusion": {"exclusions"},
+    "rider": {"coverage"},
+    "beneficiary": {"parties"},
+    "claim": {"claims"},
+    "policyholder": {"parties"},
 }
 
 _EXHAUSTIVE_RE = re.compile(
@@ -176,10 +242,18 @@ def build_query_focus(
             log.debug("Field classifier prediction failed", exc_info=True)
 
     # --- Keyword fallback: only when ML classifier produced nothing ---
+    # Use word-boundary matching to prevent false positives
+    # (e.g., "term" matching "terminal", "art" matching "article")
     if not field_tags:
         for keyword, tags in _FIELD_FOCUS_MAP.items():
-            if keyword in lowered:
-                field_tags.update(tags)
+            if " " in keyword:
+                # Multi-word keywords: exact substring match is fine
+                if keyword in lowered:
+                    field_tags.update(tags)
+            else:
+                # Single-word keywords: require word boundary
+                if re.search(r'\b' + re.escape(keyword) + r'\b', lowered):
+                    field_tags.update(tags)
 
     # --- section kinds (return ALL matching, not just first) ---
     section_kinds: list[str] = []
@@ -206,6 +280,7 @@ def build_query_focus(
         query_embedding=query_embedding,
         field_probabilities=field_probabilities,
         _embedder=embedder,
+        _raw_query=query,
     )
 
 
@@ -220,24 +295,73 @@ def score_chunk_relevance(chunk: Any, focus: QueryFocus) -> float:
     return _raw_chunk_score(chunk, focus)
 
 
+def _assess_query_complexity(query: str) -> str:
+    """Classify query complexity for adaptive weight selection.
+
+    Entity-aware: queries with proper nouns (names, specific terms) are
+    treated as more specific even if they're long, because the entities
+    serve as strong retrieval anchors.
+    """
+    if not query or not query.strip():
+        return "balanced"  # Default for missing/empty query
+    tokens = query.split()
+    n = len(tokens)
+
+    # Detect entity-rich queries (proper nouns = specific intent)
+    _entity_count = sum(1 for t in tokens if t[0:1].isupper() and len(t) > 2
+                        and t.lower() not in _STOP)
+
+    # Short specific queries (1-4 tokens with a specific term)
+    if n <= 4:
+        return "short_specific"
+    # Entity-rich longer queries are still specific (e.g., "Compare John Smith and Sarah Chen")
+    if _entity_count >= 2 and n <= 10:
+        return "short_specific"
+    # Long queries (8+ tokens) tend to be vague/conversational
+    if n >= 8:
+        return "long_vague"
+    return "balanced"
+
+
+# Adaptive weights keyed by complexity: (semantic, keyword, section, reranker)
+_ADAPTIVE_WEIGHTS = {
+    "short_specific": (0.10, 0.35, 0.25, 0.30),
+    "balanced":       (0.25, 0.20, 0.20, 0.35),
+    "long_vague":     (0.35, 0.10, 0.15, 0.40),
+}
+_ADAPTIVE_WEIGHTS_FALLBACK = {
+    "short_specific": (0.00, 0.40, 0.25, 0.35),
+    "balanced":       (0.00, 0.35, 0.25, 0.40),
+    "long_vague":     (0.00, 0.20, 0.25, 0.55),
+}
+
+
 def _raw_chunk_score(chunk: Any, focus: QueryFocus) -> float:
     """Weighted combination of scoring signals.
 
-    When a query embedding is available (ML mode):
-        0.35 * semantic + 0.15 * keyword + 0.25 * section + 0.25 * reranker
-    Fallback (keyword-only mode):
-        0.40 * keyword + 0.30 * section + 0.30 * reranker
+    Weights are adaptive based on query complexity:
+    - **short_specific** (1-4 tokens): keyword-heavy (exact term matching)
+    - **balanced** (5-7 tokens): even spread across signals
+    - **long_vague** (8+ tokens): semantic/reranker-heavy (meaning over words)
+
+    Reranker (cross-encoder) gets highest weight because it's trained on
+    relevance.  Keyword overlap is raised vs semantic to catch exact domain
+    terms (invoice number, patient name) that embeddings may dilute.
     """
+    complexity = _assess_query_complexity(focus._raw_query or "")
+
     kw_score = _keyword_overlap_score(chunk, focus)
     sect_score = _section_affinity_score(chunk, focus)
     reranker_score = _normalized_reranker_score(chunk)
 
     if focus.query_embedding is not None:
         sem_score = _semantic_similarity_score(chunk, focus)
-        return 0.35 * sem_score + 0.15 * kw_score + 0.25 * sect_score + 0.25 * reranker_score
+        w_sem, w_kw, w_sect, w_rr = _ADAPTIVE_WEIGHTS.get(complexity, _ADAPTIVE_WEIGHTS["balanced"])
+        return w_sem * sem_score + w_kw * kw_score + w_sect * sect_score + w_rr * reranker_score
 
-    # Fallback: keyword-only weights (unchanged from original)
-    return 0.4 * kw_score + 0.3 * sect_score + 0.3 * reranker_score
+    # Fallback: keyword-only weights — reranker weighted highest
+    _, w_kw, w_sect, w_rr = _ADAPTIVE_WEIGHTS_FALLBACK.get(complexity, _ADAPTIVE_WEIGHTS_FALLBACK["balanced"])
+    return w_kw * kw_score + w_sect * sect_score + w_rr * reranker_score
 
 
 # ---------------------------------------------------------------------------
@@ -330,8 +454,11 @@ def _section_affinity_score(chunk: Any, focus: QueryFocus) -> float:
     for fk in focus.section_kinds:
         if fk == chunk_kind:
             return 1.0
-        # Partial match: "skills_technical" matches if focus has "experience" (adjacent)
-        if fk in chunk_kind or chunk_kind in fk:
+        # Partial match: check if kinds share a root component
+        # (e.g., "skills_technical" and "skills" share "skills")
+        fk_parts = set(fk.split("_"))
+        ck_parts = set(chunk_kind.split("_"))
+        if fk_parts & ck_parts:
             return 0.7
 
     return 0.0
@@ -437,9 +564,12 @@ def filter_chunks_by_focus(
     scored.sort(key=lambda pair: pair[0], reverse=True)
 
     if focus.is_exhaustive:
+        # Exhaustive queries keep all chunks, but always respect caller's top_k cap
         return [c for _, c in scored[:top_k]]
 
     # Keep chunks above threshold, with min_keep guarantee
+    # Threshold 0.15 (documented) — not 0.25 which was too aggressive
+    # and dropped legitimate evidence scoring 0.15-0.24
     above = [(s, c) for s, c in scored if s >= 0.15]
     if len(above) < min_keep:
         result = [c for _, c in scored[:min_keep]]
