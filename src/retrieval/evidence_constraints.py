@@ -116,7 +116,7 @@ class EvidenceConstraints:
 
         total = sum(value for _, value in coverage_items)
         ratio = total / max(len(coverage_items), 1)
-        missing = [name for name, value in coverage_items if value < 0.5]
+        missing = [name for name, value in coverage_items if value < 0.6]
         breakdown = {name: round(value, 3) for name, value in coverage_items}
         satisfied = ratio >= min_ratio
         return EvidenceCoverage(satisfied, ratio, missing, breakdown)

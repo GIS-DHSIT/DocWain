@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -16,60 +16,28 @@ _STOPWORDS = {
     "does", "do", "did", "can", "could", "should", "would", "may", "might", "will", "shall",
 }
 
-_INTENT_PATTERNS = {
-    "feedback": [
-        r"\bwrong answer\b",
-        r"\bnot correct\b",
-        r"\bdoesn'?t help\b",
-        r"\bfeedback\b",
-        r"\bthis is wrong\b",
-    ],
-    "troubleshooting": [
-        r"\berror\b",
-        r"\bexception\b",
-        r"\bfailed\b",
-        r"\bnot working\b",
-        r"\bissue\b",
-        r"\bproblem\b",
-        r"\btimeout\b",
-        r"\bstack trace\b",
-    ],
-    "instruction/how-to": [
-        r"\bhow to\b",
-        r"\bsteps\b",
-        r"\bprocedure\b",
-        r"\bconfigure\b",
-        r"\bsetup\b",
-        r"\binstall\b",
-        r"\bguide\b",
-        r"\bprocess\b",
-    ],
-    "comparison": [
-        r"\bcompare\b",
-        r"\bvs\.?\b",
-        r"\bversus\b",
-        r"\bdifference between\b",
-        r"\bcontrast\b",
-    ],
-    "summarization": [
-        r"\bsummarize\b",
-        r"\bsummary\b",
-        r"\boverview\b",
-        r"\bbrief\b",
-        r"\bhigh[- ]level\b",
-        r"\btl;dr\b",
-    ],
-    "deep_analysis": [
-        r"\banaly[sz]e\b",
-        r"\broot cause\b",
-        r"\bimplication\b",
-        r"\brisk\b",
-        r"\btrade[- ]off\b",
-        r"\bimpact\b",
-        r"\bdeep dive\b",
-        r"\bevaluate\b",
-    ],
-}
+
+def _nlu_detect_intent(query: str) -> Optional[str]:
+    """Detect query intent using NLU engine."""
+    try:
+        from src.nlp.nlu_engine import classify_intent
+        intent = classify_intent(query)
+        # Map NLU engine intents to query analyzer intents
+        _NLU_TO_ANALYZER = {
+            "comparison": "comparison",
+            "ranking": "comparison",  # ranking is a type of comparison
+            "summary": "summarization",
+            "cross_document": "deep_analysis",
+            "analytics": "deep_analysis",
+            "reasoning": "deep_analysis",
+            "factual": None,  # factual doesn't map to any special intent
+            "timeline": None,
+            "multi_field": None,
+        }
+        return _NLU_TO_ANALYZER.get(intent)
+    except Exception:
+        return None
+
 
 _NUMERIC_HINTS = [
     "how many",
@@ -129,8 +97,6 @@ _DATE_PATTERN = re.compile(
 _NUMBER_PATTERN = re.compile(r"\b\d+[\d,\.]*\b")
 
 _ERROR_TOKEN_PATTERN = re.compile(r"\b[A-Z]{2,}[\w-]*\d+[\w-]*\b")
-
-_COMPARISON_PATTERN = re.compile(r"(.+?)\s+(?:vs\.?|versus|compare)\s+(.+)", re.IGNORECASE)
 
 _QUOTED_PATTERN = re.compile(r"['\"]([^'\"]{2,})['\"]")
 
@@ -204,10 +170,9 @@ class QueryAnalyzer:
 
     @staticmethod
     def _detect_intent(lowered: str) -> str:
-        for intent, patterns in _INTENT_PATTERNS.items():
-            for pattern in patterns:
-                if re.search(pattern, lowered):
-                    return intent
+        nlu_intent = _nlu_detect_intent(lowered)
+        if nlu_intent is not None:
+            return nlu_intent
         if any(hint in lowered for hint in _NUMERIC_HINTS) or _NUMBER_PATTERN.search(lowered):
             return "numeric_lookup"
         if any(hint in lowered for hint in _FIELD_HINTS):
@@ -226,20 +191,44 @@ class QueryAnalyzer:
 
     @staticmethod
     def _extract_entities(query: str) -> List[str]:
+        """Extract named entities from the query using spaCy NER."""
         entities: List[str] = []
-        for match in re.findall(r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){0,2}\b", query):
-            cleaned = match.strip()
-            if cleaned and cleaned.lower() not in _STOPWORDS and cleaned not in entities:
-                entities.append(cleaned)
-        for match in re.findall(r"\b[A-Z]{2,}\b", query):
-            if match not in entities:
-                entities.append(match)
+        try:
+            import spacy
+            nlp = spacy.load("en_core_web_sm")
+            doc = nlp(query)
+            for ent in doc.ents:
+                cleaned = ent.text.strip()
+                if cleaned and cleaned.lower() not in _STOPWORDS and cleaned not in entities:
+                    entities.append(cleaned)
+            # Also include proper nouns not caught by NER
+            for token in doc:
+                if token.pos_ == "PROPN" and len(token.text) > 1:
+                    word = token.text.strip()
+                    if word and word.lower() not in _STOPWORDS and word not in entities:
+                        entities.append(word)
+        except Exception:
+            # Fallback: find capitalized words
+            for word in query.split():
+                word = word.strip(".,!?;:\"'()[]{}")
+                if word and word[0].isupper() and len(word) > 1:
+                    if word.lower() not in _STOPWORDS and word not in entities:
+                        entities.append(word)
         return entities[:6]
 
     @staticmethod
     def _extract_keywords(query: str) -> List[str]:
-        tokens = re.findall(r"[A-Za-z0-9]{3,}", query.lower())
-        keywords = [tok for tok in tokens if tok not in _STOPWORDS]
+        """Extract meaningful keywords using spaCy lemmatization."""
+        try:
+            from src.nlp.nlu_engine import parse_query
+            sem = parse_query(query)
+            keywords = sem.action_verbs + sem.target_nouns + sem.context_words
+            return list(dict.fromkeys(keywords))[:6]
+        except Exception:
+            pass
+        # Fallback: simple tokenization
+        tokens = [w for w in query.lower().split() if len(w) >= 3]
+        keywords = [tok.strip(".,!?;:\"'()[]{}") for tok in tokens if tok.strip(".,!?;:\"'()[]{}") not in _STOPWORDS]
         return list(dict.fromkeys(keywords))[:6]
 
     @staticmethod
@@ -261,14 +250,40 @@ class QueryAnalyzer:
 
     @staticmethod
     def _extract_comparison_entities(query: str) -> List[str]:
-        match = _COMPARISON_PATTERN.search(query)
-        if not match:
-            return []
-        left = match.group(1).strip(" -:,.")
-        right = match.group(2).strip(" -:,.")
-        if not left or not right:
-            return []
-        return [left, right]
+        """Extract entities being compared using spaCy dependency parsing."""
+        try:
+            from src.nlp.nlu_engine import _get_nlp
+            nlp = _get_nlp()
+            if nlp is not None:
+                doc = nlp(query)
+                # Find comparison conjunctions (X vs Y, X versus Y, compare X and Y)
+                for token in doc:
+                    if token.text.lower() in ("vs", "vs.", "versus"):
+                        # Get left and right sides
+                        left_tokens = [t.text for t in doc[:token.i] if not t.is_punct and not t.is_space]
+                        right_tokens = [t.text for t in doc[token.i + 1:] if not t.is_punct and not t.is_space]
+                        if left_tokens and right_tokens:
+                            return [" ".join(left_tokens).strip(" -:,."),
+                                    " ".join(right_tokens).strip(" -:,.")]
+                    elif token.lemma_ == "compare" and token.pos_ == "VERB":
+                        # Extract objects of "compare"
+                        entities = []
+                        for child in token.subtree:
+                            if child.pos_ in ("NOUN", "PROPN") and child.dep_ in ("dobj", "pobj", "conj"):
+                                entities.append(child.text)
+                        if len(entities) >= 2:
+                            return entities[:2]
+        except Exception:
+            pass
+        # Regex fallback when spaCy is unavailable
+        import re as _re
+        vs_match = _re.search(r'(?i)\b(\w+)\s+(?:vs\.?|versus)\s+(\w+)', query)
+        if vs_match:
+            return [vs_match.group(1), vs_match.group(2)]
+        compare_match = _re.search(r'(?i)\bcompare\s+(\w+)\s+(?:and|&|with)\s+(\w+)', query)
+        if compare_match:
+            return [compare_match.group(1), compare_match.group(2)]
+        return []
 
     @staticmethod
     def _output_format_preference(intent: str, lowered: str) -> str:
@@ -283,7 +298,7 @@ class QueryAnalyzer:
     @staticmethod
     def _explicitness_score(query: str, entities: List[str], keywords: List[str], phrases: List[str]) -> float:
         score = 0.0
-        tokens = re.findall(r"[A-Za-z0-9]{2,}", query)
+        tokens = [w for w in query.split() if len(w) >= 2]
         if len(tokens) >= 6:
             score += 0.1
         if entities:
@@ -292,7 +307,7 @@ class QueryAnalyzer:
             score += 0.2
         if phrases:
             score += 0.2
-        if _NUMBER_PATTERN.search(query):
+        if any(c.isdigit() for c in query):
             score += 0.2
         return min(score, 1.0)
 

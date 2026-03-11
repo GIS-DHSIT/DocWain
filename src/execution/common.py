@@ -71,6 +71,11 @@ def normalize_answer(answer: Any) -> Dict[str, Any]:
         response_text = answer.get("response") or answer.get("answer") or ""
         if isinstance(response_text, str):
             response_text = _sanitize_response_text(response_text)
+        # Extract media from answer or from metadata.media
+        media = answer.get("media")
+        if media is None and isinstance(meta.get("media"), list):
+            media = meta.pop("media")
+
         structured = {
             "response": response_text,
             "sources": answer.get("sources", []),
@@ -78,8 +83,10 @@ def normalize_answer(answer: Any) -> Dict[str, Any]:
             "context_found": answer.get("context_found", False),
             "metadata": meta,
         }
+        if media:
+            structured["media"] = media
         for k, v in answer.items():
-            if k in {"response", "answer", "sources", "metadata"}:
+            if k in {"response", "answer", "sources", "metadata", "media"}:
                 continue
             structured["metadata"][k] = v
         structured["metadata"] = structured.get("metadata") or {}
@@ -99,3 +106,67 @@ def chunk_text_stream(text: str, chunk_size: int = 256) -> Iterable[str]:
         return
     for idx in range(0, len(text), chunk_size):
         yield text[idx: idx + chunk_size]
+
+
+def chunk_text_stream_with_metadata(
+    text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    chunk_size: int = 256,
+) -> Iterable[str]:
+    """Stream text chunks followed by a final JSON metadata event.
+
+    The final chunk is a JSON line prefixed with '\\n\\n[META]' containing
+    grounding signals: grounded, confidence, evidence_coverage, sources.
+    Clients can detect this sentinel and parse the metadata.
+    """
+    import json as _json
+
+    if not text:
+        yield ""
+    else:
+        pos = 0
+        while pos < len(text):
+            end = min(pos + chunk_size, len(text))
+            if end < len(text):
+                # Find last good break point within chunk
+                chunk = text[pos:end]
+                # Prefer breaking at: newline > sentence end > table row boundary > space
+                last_nl = chunk.rfind('\n')
+                last_sent = max(chunk.rfind('. '), chunk.rfind('.\n'),
+                                chunk.rfind('? '), chunk.rfind('! '))
+                last_pipe_nl = chunk.rfind('|\n')  # Table row boundary
+
+                best_break = max(last_nl, last_sent, last_pipe_nl)
+                if best_break > chunk_size * 0.4:  # At least 40% of target size
+                    end = pos + best_break + 1
+
+            chunk_text = text[pos:end]
+            if chunk_text:  # Skip empty chunks
+                yield chunk_text
+            pos = end
+
+    # Emit final metadata event with confidence signals
+    if metadata:
+        meta_payload = {}
+        # Extract key grounding fields
+        if "grounded" in metadata:
+            meta_payload["grounded"] = metadata["grounded"]
+        if "context_found" in metadata:
+            meta_payload["context_found"] = metadata["context_found"]
+        # Confidence from nested metadata
+        raw_meta = metadata.get("metadata", {})
+        if isinstance(raw_meta, dict):
+            confidence = raw_meta.get("confidence", {})
+            if isinstance(confidence, dict):
+                meta_payload["confidence"] = confidence.get("score", -1)
+                dims = confidence.get("dimensions", {})
+                if isinstance(dims, dict):
+                    meta_payload["evidence_coverage"] = dims.get("evidence_coverage", -1)
+            judge = raw_meta.get("judge", {})
+            if isinstance(judge, dict):
+                meta_payload["judge_status"] = judge.get("status", "unknown")
+            if raw_meta.get("thinking_used"):
+                meta_payload["thinking_used"] = True
+
+        if meta_payload:
+            yield f"\n\n[META]{_json.dumps(meta_payload)}"

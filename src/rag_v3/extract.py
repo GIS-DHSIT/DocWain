@@ -33,7 +33,7 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
-EXTRACT_TIMEOUT_MS = 30000
+EXTRACT_TIMEOUT_MS = 15000  # 60s→15s: deterministic LLM fallback should be fast, not retry-length
 
 @dataclass
 class ExtractionResult:
@@ -57,11 +57,31 @@ _HR_HINTS = {"resume", "curriculum vitae", "cv", "candidate"}
 
 _LEGAL_HINTS = {"agreement", "contract", "clause", "terms", "warranty", "liability"}
 
-_PRODUCT_INTENTS = {"item", "items", "product", "products", "service", "services", "line item", "line items"}
+def _nlu_subintent(query: str) -> Optional[str]:
+    """Classify sub-intent using NLU engine (replaces keyword sets)."""
+    try:
+        from src.nlp.nlu_engine import classify_query_subintent
+        return classify_query_subintent(query)
+    except Exception:
+        return None
 
-_TOTAL_INTENTS = {"total", "amount due", "balance", "subtotal"}
-_CONTACT_INTENTS = {"contact", "contacts", "email", "emails", "phone", "phones", "reach", "linkedin"}
-_FIT_INTENTS = {"fit", "fitting", "suitable", "suitability", "best", "top", "most", "match"}
+
+_CONTACT_KEYWORDS = frozenset({
+    "contact", "contacts", "email", "emails", "phone", "phones",
+    "reach", "linkedin", "number", "address", "mobile",
+})
+
+def _nlu_is_contact(query: str) -> bool:
+    """Check if query asks for contact information using NLU + keyword fallback."""
+    ql = (query or "").lower()
+    # Fast keyword check first — reliable for common patterns
+    if any(w in ql for w in _CONTACT_KEYWORDS):
+        return True
+    try:
+        from src.nlp.nlu_engine import is_contact_query
+        return is_contact_query(query)
+    except Exception:
+        return False
 
 
 def schema_extract(
@@ -79,7 +99,8 @@ def schema_extract(
     intent_parse: Any = None,
 ) -> ExtractionResult:
     domain, intent = _infer_domain_intent(query, chunks, domain_hint=domain_hint,
-                                          intent_hint=intent_hint, intent_parse=intent_parse)
+                                          intent_hint=intent_hint, intent_parse=intent_parse,
+                                          correlation_id=correlation_id)
 
     # Handle domain mismatch: query asks for a domain that doesn't match the actual chunks
     if domain == "mismatch":
@@ -95,18 +116,22 @@ def schema_extract(
         schema = GenericSchema(facts=FieldValuesField(items=[FieldValue(label=None, value=msg, evidence_spans=[])]))
         return ExtractionResult(domain=chunk_domain, intent=intent, schema=schema)
 
-    schema = _deterministic_extract(domain, intent, query, chunks, query_focus=query_focus, embedder=embedder)
+    # LLM-first architecture: When LLM is available, use it as the primary
+    # extraction path. The LLM understands user intent and produces structured,
+    # query-aware responses. Deterministic extraction is the fallback when
+    # LLM is unavailable or fails.
+    schema = None
+    _used_llm = False
 
-    completeness = _schema_completeness(schema)
-    if completeness < 0.4 and llm_client and budget.consume():
+    if llm_client and budget.consume():
         llm_schema = _llm_extract(domain, intent, query, chunks, llm_client, correlation_id)
         if llm_schema is not None:
-            if completeness == 0.0:
-                # Fully empty — use LLM result directly
-                schema = llm_schema
-            else:
-                # Partially populated — merge (deterministic values preserved, LLM fills gaps)
-                schema = _merge_schemas(schema, llm_schema)
+            schema = llm_schema
+            _used_llm = True
+
+    # Fallback to deterministic extraction if LLM unavailable or failed
+    if schema is None:
+        schema = _deterministic_extract(domain, intent, query, chunks, query_focus=query_focus, embedder=embedder)
 
     if _detect_multi_entity_collision(domain, schema, chunks, scope_document_id, intent):
         schema = _build_multi_entity_schema(domain, schema, chunks)
@@ -216,9 +241,18 @@ def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
         return None
 
     best = max(domain_counts, key=domain_counts.get)
+
+    # Normalize through canonical domain map for consistency across classifiers
+    try:
+        from src.intelligence.domain_classifier import normalize_domain
+        best = normalize_domain(best)
+    except ImportError:
+        pass
+
     domain_map = {
         "resume": "hr", "hr": "hr", "cv": "hr",
         "invoice": "invoice", "billing": "invoice", "purchase_order": "invoice",
+        "financial": "invoice",
         "legal": "legal", "contract": "legal",
         "medical": "medical", "clinical": "medical", "patient": "medical",
         "policy": "policy", "insurance": "policy",
@@ -257,6 +291,7 @@ def _infer_domain_intent(
     domain_hint: Optional[str] = None,
     intent_hint: Optional[str] = None,
     intent_parse: Any = None,
+    correlation_id: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Infer domain from chunk metadata and query intent from keywords.
 
@@ -268,8 +303,11 @@ def _infer_domain_intent(
     # Cross-check: flag mismatch when query asks for invoice/legal but chunks are HR
     # (prevents InvoiceSchema extraction from resume text)
     # Trust query override when it says HR — user may be correcting misclassified chunks
+    strategy_used = "fallback"
     domain = (domain_hint or "").strip().lower()
-    if not domain or domain == "generic":
+    if domain and domain != "generic":
+        strategy_used = "hint"
+    else:
         query_domain = _ml_query_domain(query, intent_parse=intent_parse)
         chunk_domain = _majority_chunk_domain(chunks)
         if query_domain and chunk_domain:
@@ -285,9 +323,11 @@ def _infer_domain_intent(
             c_family = _DOMAIN_FAMILY.get(chunk_domain, "generic")
             # Only flag mismatch for genuinely incompatible specific domains.
             # Invoice mismatch is reliable (invoice vs non-invoice is clear).
+            # Medical mismatch is reliable (medical vs non-medical is clear,
+            # content validators confirm via patient/diagnosis/medication terms).
             # Legal/policy mismatch is unreliable — "terms", "treatment plan"
             # etc. trigger false positives across medical/policy domains.
-            _MISMATCH_DOMAINS = {"invoice"}
+            _MISMATCH_DOMAINS = {"invoice", "medical"}
             _any_matching = False
             for _c in (chunks or []):
                 _cm = getattr(_c, "meta", None) or {}
@@ -296,38 +336,125 @@ def _infer_domain_intent(
                     _any_matching = True
                     break
             if q_family != c_family and q_family in _MISMATCH_DOMAINS and not _any_matching:
-                # Query asks for invoice/legal but NO chunks match that domain → mismatch
+                # Query asks for invoice/medical but NO chunks match that domain → mismatch
                 domain = "mismatch"
+                strategy_used = "ml_classifier"
             else:
                 # Domains match, or query says HR/generic/report — prefer chunk domain
                 # when query domain is ambiguous (report/generic), otherwise trust query
                 domain = chunk_domain if q_family == "generic" else query_domain
+                strategy_used = "ml_classifier" if q_family != "generic" else "chunk_metadata"
         elif query_domain:
             domain = query_domain
+            strategy_used = "ml_classifier"
         elif chunk_domain:
             domain = chunk_domain
+            strategy_used = "chunk_metadata"
         else:
             domain = "generic"
 
     intent = _normalize_intent_hint(intent_hint) or "summary"
     lowered_query = (query or "").lower()
 
-    # Domain-agnostic intent detection
-    if intent == "summary" and any(word in lowered_query for word in _CONTACT_INTENTS):
-        intent = "contact"
-    elif intent == "summary" and ("rank" in lowered_query or "ranking" in lowered_query or any(word in lowered_query for word in _FIT_INTENTS)):
-        intent = "rank"
-    elif intent == "summary" and "compare" in lowered_query:
-        intent = "compare"
-    elif intent == "summary" and ("list" in lowered_query or "candidates" in lowered_query):
-        intent = "list"
-    elif intent == "summary" and any(word in lowered_query for word in _TOTAL_INTENTS):
-        intent = "totals"
-    elif intent == "summary" and any(word in lowered_query for word in _PRODUCT_INTENTS):
-        intent = "products_list"
-    elif intent == "summary":
-        intent = "facts"
+    # Domain-agnostic intent detection using NLU
+    if intent == "summary":
+        # Check contact first (highest priority — LLMs often refuse contact info)
+        if _nlu_is_contact(query):
+            intent = "contact"
+        else:
+            # 1. spaCy structural analysis — action verbs are unambiguous signals
+            #    Note: spaCy often misclassifies imperative verbs (Compare, List,
+            #    Show) as NOUN/PROPN, placing them in target_nouns instead of
+            #    action_verbs.  Check ALL extracted words against verb sets.
+            _verb_intent = None
+            try:
+                from src.nlp.nlu_engine import parse_query
+                sem = parse_query(query)
+                _COMPARE_VERBS = {"compare", "contrast", "versus", "differentiate", "distinguish"}
+                _RANK_VERBS = {"rank", "rate", "score", "order", "shortlist", "prioritize"}
+                _LIST_VERBS = {"list", "show", "enumerate", "display", "pull", "give",
+                               "present", "exhibit", "retrieve", "fetch", "extract"}
+                _SUMMARIZE_VERBS = {"summarize", "summarise", "condense", "outline",
+                                     "brief", "recap", "overview"}
+                _ANALYZE_VERBS = {"analyze", "analyse", "assess", "evaluate", "review",
+                                   "examine", "investigate", "study", "inspect"}
+                _EXPLAIN_VERBS = {"explain", "describe", "understand", "reason",
+                                   "cause", "because", "clarify", "elaborate",
+                                   "justify", "interpret"}
+                _all_words = set(sem.action_verbs) | set(sem.target_nouns) | set(sem.context_words)
+                # Also check raw query for "why/how does/what caused" patterns
+                _ql = query.lower()
+                _has_reasoning_pattern = any(p in _ql for p in (
+                    "why ", "how does", "how did", "what caused", "what led to",
+                    "reason for", "explain ", "what is the cause",
+                ))
+                if any(v in _COMPARE_VERBS for v in _all_words):
+                    _verb_intent = "compare"
+                elif any(v in _RANK_VERBS for v in _all_words):
+                    _verb_intent = "rank"
+                elif any(v in _LIST_VERBS for v in _all_words):
+                    _verb_intent = "list"
+                elif any(v in _SUMMARIZE_VERBS for v in _all_words):
+                    _verb_intent = "summary"
+                elif any(v in _ANALYZE_VERBS for v in _all_words) or _has_reasoning_pattern:
+                    _verb_intent = "analysis"
+                elif any(v in _EXPLAIN_VERBS for v in _all_words):
+                    _verb_intent = "analysis"
+            except Exception:
+                pass
 
+            if _verb_intent:
+                intent = _verb_intent
+            else:
+                # 2. NLU sub-intent classification (semantic similarity)
+                subintent = _nlu_subintent(query)
+                _SUBINTENT_MAP = {
+                    "contact": "contact",
+                    "fit_rank": "rank",
+                    "totals": "totals",
+                    "product_item": "products_list",
+                }
+                # Guard: disambiguate "totals" from "terms/conditions" using
+                # spaCy target nouns — "payment terms" is about conditions,
+                # not amounts.  Also require at least one financial/numeric
+                # noun to avoid misclassifying generic questions like
+                # "what is the weather?" as totals.
+                if subintent == "totals":
+                    try:
+                        _tsem = parse_query(query)
+                        _NON_TOTAL_NOUNS = {"term", "terms", "condition", "conditions",
+                                            "policy", "deadline"}
+                        _TOTAL_CONFIRM_NOUNS = {"total", "amount", "sum", "cost", "price",
+                                                "balance", "invoice", "payment", "bill",
+                                                "charge", "fee", "dollar", "money", "budget"}
+                        if any(n in _NON_TOTAL_NOUNS for n in _tsem.target_nouns):
+                            subintent = None  # not a totals query
+                        elif not any(n in _TOTAL_CONFIRM_NOUNS for n in
+                                     set(_tsem.target_nouns) | set(_tsem.context_words)):
+                            subintent = None  # no financial signal — likely misclassified
+                    except Exception:
+                        pass
+                # Guard: "product_item" requires product/item-related nouns
+                if subintent == "product_item":
+                    try:
+                        _psem = parse_query(query)
+                        _PRODUCT_NOUNS = {"product", "item", "line", "goods", "merchandise",
+                                          "order", "sku", "quantity", "unit", "catalog"}
+                        if not any(n in _PRODUCT_NOUNS for n in
+                                   set(_psem.target_nouns) | set(_psem.context_words)):
+                            subintent = None
+                    except Exception:
+                        pass
+                if subintent and subintent in _SUBINTENT_MAP:
+                    intent = _SUBINTENT_MAP[subintent]
+                else:
+                    intent = "facts"
+
+    logger.info(
+        "Domain/intent resolved: domain=%s intent=%s strategy=%s",
+        domain, intent, strategy_used,
+        extra={"stage": "infer_domain_intent", "correlation_id": correlation_id},
+    )
     return domain, intent
 
 
@@ -368,7 +495,6 @@ def _extract_document_intelligence(query: str, chunks: List[Any], *, query_focus
     rather than relying on domain classification.
     """
     keywords = _keywords(query)
-    _, intent = _infer_domain_intent(query, chunks)
     facts: List[FieldValue] = []
 
     # ── Phase 1: Group chunks by document ───────────────────────────────
@@ -452,7 +578,7 @@ def _extract_document_intelligence(query: str, chunks: List[Any], *, query_focus
                     ))
 
     # ── Phase 4: Score and sort by query relevance ──────────────────────
-    facts = _score_and_sort_facts(facts, keywords, query, intent=intent)
+    facts = _score_and_sort_facts(facts, keywords, query)
 
     # ── Phase 4b: Query-focus soft cap — when focus has clear field_tags,
     # limit non-matching facts to 3 per document to emphasize relevant content.
@@ -1137,14 +1263,18 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
             combined_text = " ".join([t for _, t in all_texts])
 
             # Fallback: Extract name from identity/contact sections first
+            # Handle both bare keys and compound keys (e.g., "summary_objective:Career Objective")
             if not cand.name:
                 for sec_kind in ("identity_contact", "contact", "summary_objective"):
-                    if sec_kind in sections and not cand.name:
-                        for _, sec_text, _ in sections[sec_kind]:
-                            name = _extract_name_from_text(sec_text)
-                            if name:
-                                cand.name = name
-                                break
+                    if cand.name:
+                        break
+                    for skey, sval in sections.items():
+                        if skey == sec_kind or skey.startswith(f"{sec_kind}:"):
+                            for _, sec_text, _ in sval:
+                                name = _extract_name_from_text(sec_text)
+                                if name:
+                                    cand.name = name
+                                    break
 
             # Fallback: Extract name from all combined text
             if not cand.name:
@@ -1831,47 +1961,59 @@ def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSch
 
 
 def _schema_completeness(schema) -> float:
-    """Return ratio of populated fields (0.0=empty, 1.0=full).
+    """Return weighted ratio of populated fields (0.0=empty, 1.0=full).
 
-    Used to decide whether LLM should fill gaps in a partially-populated
-    deterministic extraction.
+    Uses domain-specific field weights — critical fields (names, items, parties)
+    carry higher weight than optional fields. This ensures a schema with just
+    optional fields but missing core fields triggers LLM refinement.
     """
     if isinstance(schema, InvoiceSchema):
-        fields = [
-            bool(schema.items and schema.items.items),
-            bool(schema.totals and schema.totals.items),
-            bool(schema.parties and schema.parties.items),
-            bool(schema.terms and schema.terms.items),
-            bool(getattr(schema, "invoice_metadata", None) and schema.invoice_metadata.items),
+        # items and parties are critical; totals important; terms/metadata optional
+        weighted = [
+            (bool(schema.items and schema.items.items), 0.30),
+            (bool(schema.totals and schema.totals.items), 0.25),
+            (bool(schema.parties and schema.parties.items), 0.25),
+            (bool(schema.terms and schema.terms.items), 0.10),
+            (bool(getattr(schema, "invoice_metadata", None) and schema.invoice_metadata.items), 0.10),
         ]
     elif isinstance(schema, HRSchema):
         cands = (schema.candidates.items if schema.candidates else None) or []
         has_name = any(c.name for c in cands)
         has_skills = any(c.technical_skills for c in cands)
-        has_exp = any(getattr(c, "experience_summary", None) for c in cands)
-        fields = [has_name, has_skills, has_exp, bool(cands)]
+        has_exp = any(getattr(c, "experience_summary", None) or getattr(c, "total_years_experience", None) for c in cands)
+        has_education = any(getattr(c, "education", None) for c in cands)
+        has_contact = any(getattr(c, "emails", None) or getattr(c, "phones", None) for c in cands)
+        # Name is critical; skills and experience are important
+        weighted = [
+            (has_name, 0.30),
+            (has_skills, 0.25),
+            (has_exp, 0.20),
+            (has_education, 0.15),
+            (has_contact, 0.10),
+        ]
     elif isinstance(schema, LegalSchema):
-        fields = [
-            bool(schema.clauses and schema.clauses.items),
-            bool(schema.parties and schema.parties.items),
-            bool(schema.obligations and schema.obligations.items),
+        weighted = [
+            (bool(schema.clauses and schema.clauses.items), 0.40),
+            (bool(schema.parties and schema.parties.items), 0.35),
+            (bool(schema.obligations and schema.obligations.items), 0.25),
         ]
     elif isinstance(schema, MedicalSchema):
-        fields = [
-            bool(schema.patient_info and schema.patient_info.items),
-            bool(schema.diagnoses and schema.diagnoses.items),
-            bool(schema.medications and schema.medications.items),
-            bool(schema.procedures and schema.procedures.items),
-            bool(schema.lab_results and schema.lab_results.items),
-            bool(schema.vitals and schema.vitals.items),
+        # Patient info and diagnoses are critical
+        weighted = [
+            (bool(schema.patient_info and schema.patient_info.items), 0.25),
+            (bool(schema.diagnoses and schema.diagnoses.items), 0.25),
+            (bool(schema.medications and schema.medications.items), 0.20),
+            (bool(schema.procedures and schema.procedures.items), 0.15),
+            (bool(schema.lab_results and schema.lab_results.items), 0.10),
+            (bool(schema.vitals and schema.vitals.items), 0.05),
         ]
     elif isinstance(schema, PolicySchema):
-        fields = [
-            bool(schema.policy_info and schema.policy_info.items),
-            bool(schema.coverage and schema.coverage.items),
-            bool(schema.premiums and schema.premiums.items),
-            bool(schema.exclusions and schema.exclusions.items),
-            bool(schema.terms and schema.terms.items),
+        weighted = [
+            (bool(schema.policy_info and schema.policy_info.items), 0.25),
+            (bool(schema.coverage and schema.coverage.items), 0.25),
+            (bool(schema.premiums and schema.premiums.items), 0.20),
+            (bool(schema.exclusions and schema.exclusions.items), 0.15),
+            (bool(schema.terms and schema.terms.items), 0.15),
         ]
     elif isinstance(schema, GenericSchema):
         facts = (schema.facts.items if schema.facts else None) or []
@@ -1882,10 +2024,7 @@ def _schema_completeness(schema) -> float:
     else:
         return 0.0
 
-    total = len(fields)
-    if total == 0:
-        return 0.0
-    return sum(1 for f in fields if f) / total
+    return sum(w for present, w in weighted if present)
 
 
 def _merge_schemas(deterministic, llm_result):
@@ -2058,7 +2197,7 @@ def _generate_extract_response(
     options = {
         "num_predict": 512,
         "max_output_tokens": 512,
-        "num_ctx": 4096,
+        "num_ctx": 8192,  # Fixed to match llm_extract.py — avoids Ollama model reloads
         "stop": [],
     }
     def _call():
@@ -2398,14 +2537,47 @@ def _extract_full_text_content(text: str) -> str:
 
 # Section header patterns used for boundary detection in full-document chunks
 _SECTION_HEADER_MAP = {
-    "summary_objective": ["SUMMARY", "PROFESSIONAL SUMMARY", "OBJECTIVE", "PROFILE", "ABOUT ME", "CAREER OBJECTIVE"],
-    "experience": ["WORK EXPERIENCE", "PROFESSIONAL EXPERIENCE", "EMPLOYMENT", "CAREER HISTORY", "EMPLOYMENT HISTORY"],
-    "skills_technical": ["TECHNICAL SKILLS", "SKILLS", "TECHNOLOGIES", "TECH STACK", "KEY SKILLS", "CORE COMPETENCIES"],
-    "skills_functional": ["FUNCTIONAL SKILLS", "SOFT SKILLS", "BUSINESS SKILLS"],
-    "certifications": ["CERTIFICATIONS", "CERTIFICATES", "CREDENTIALS", "LICENSES"],
-    "education": ["EDUCATION", "ACADEMIC", "QUALIFICATIONS", "DEGREES", "ACADEMIC BACKGROUND"],
-    "achievements": ["ACHIEVEMENTS", "AWARDS", "HONORS", "ACCOMPLISHMENTS", "RECOGNITION"],
-    "identity_contact": ["CONTACT", "PERSONAL DETAILS", "CONTACT INFORMATION"],
+    "summary_objective": [
+        "SUMMARY", "PROFESSIONAL SUMMARY", "OBJECTIVE", "PROFILE", "ABOUT ME", "CAREER OBJECTIVE",
+        "EXECUTIVE SUMMARY", "PERSONAL STATEMENT", "CAREER SUMMARY", "PROFESSIONAL PROFILE", "OVERVIEW",
+    ],
+    "experience": [
+        "WORK EXPERIENCE", "PROFESSIONAL EXPERIENCE", "EMPLOYMENT", "CAREER HISTORY", "EMPLOYMENT HISTORY",
+        "RELEVANT EXPERIENCE", "PROJECT EXPERIENCE", "PROJECTS", "KEY PROJECTS", "SELECTED PROJECTS",
+        "INTERNSHIPS", "TRAINING", "WORK HISTORY", "PROFESSIONAL HISTORY",
+    ],
+    "skills_technical": [
+        "TECHNICAL SKILLS", "SKILLS", "TECHNOLOGIES", "TECH STACK", "KEY SKILLS", "CORE COMPETENCIES",
+        "TOOLS", "TECHNICAL PROFICIENCY", "AREAS OF EXPERTISE", "TECHNICAL EXPERTISE",
+        "PROGRAMMING LANGUAGES", "FRAMEWORKS",
+    ],
+    "skills_functional": [
+        "FUNCTIONAL SKILLS", "SOFT SKILLS", "BUSINESS SKILLS",
+        "INTERPERSONAL SKILLS", "TRANSFERABLE SKILLS", "KEY COMPETENCIES", "LEADERSHIP SKILLS",
+    ],
+    "certifications": [
+        "CERTIFICATIONS", "CERTIFICATES", "CREDENTIALS", "LICENSES",
+        "PROFESSIONAL DEVELOPMENT", "TRAINING AND CERTIFICATIONS", "LICENSES AND CERTIFICATIONS",
+    ],
+    "education": [
+        "EDUCATION", "ACADEMIC", "QUALIFICATIONS", "DEGREES", "ACADEMIC BACKGROUND",
+        "ACADEMIC QUALIFICATIONS", "EDUCATIONAL BACKGROUND", "ACADEMIC CREDENTIALS", "TRAINING AND EDUCATION",
+    ],
+    "achievements": [
+        "ACHIEVEMENTS", "AWARDS", "HONORS", "ACCOMPLISHMENTS", "RECOGNITION",
+        "KEY ACHIEVEMENTS", "NOTABLE ACHIEVEMENTS", "PUBLICATIONS", "PUBLICATIONS AND RESEARCH", "PATENTS",
+    ],
+    "identity_contact": [
+        "CONTACT", "PERSONAL DETAILS", "CONTACT INFORMATION",
+        "PERSONAL INFORMATION", "BIO DATA", "BIODATA", "CONTACT DETAILS",
+    ],
+    "projects": [
+        "PROJECTS", "KEY PROJECTS", "SELECTED PROJECTS", "PROJECT EXPERIENCE",
+        "PERSONAL PROJECTS", "ACADEMIC PROJECTS",
+    ],
+    "languages": ["LANGUAGES", "LANGUAGE SKILLS", "LANGUAGE PROFICIENCY"],
+    "references": ["REFERENCES", "PROFESSIONAL REFERENCES"],
+    "volunteer": ["VOLUNTEER", "VOLUNTEER EXPERIENCE", "COMMUNITY SERVICE", "EXTRACURRICULAR"],
 }
 
 # All headers flattened for boundary detection
@@ -2694,7 +2866,7 @@ def _extract_contact_fields_comprehensive(text: str) -> Dict[str, List[str]]:
             if parts:
                 first_part = parts[0]
                 words = first_part.split()
-                if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
+                if 2 <= len(words) <= 4 and all(w[0].isupper() or not w[0].islower() for w in words if w):
                     if '@' not in first_part and not any(c.isdigit() for c in first_part):
                         if not any(h in first_part.lower() for h in ['skills', 'experience', 'education', 'certification']):
                             # Use _looks_like_name validation to filter out phrases
@@ -2778,8 +2950,69 @@ def _span(chunk_id: str, snippet: str) -> EvidenceSpan:
     return EvidenceSpan(chunk_id=str(chunk_id), snippet=cleaned[:120])
 
 
+_FIELD_EQUIVALENCE = {
+    # Invoice totals
+    "total price": "total amount",
+    "total cost": "total amount",
+    "grand total": "total amount",
+    "net total": "total amount",
+    "amount due": "total amount",
+    "balance due": "total amount",
+    "total payable": "total amount",
+    # Invoice parties
+    "bill to": "billed to",
+    "sold to": "billed to",
+    "ship to": "shipping address",
+    "deliver to": "shipping address",
+    "vendor": "supplier",
+    "seller": "supplier",
+    # Dates
+    "invoice date": "date",
+    "bill date": "date",
+    "due date": "payment due date",
+    "pay by": "payment due date",
+    # HR/Resume
+    "phone number": "phone",
+    "mobile": "phone",
+    "mobile number": "phone",
+    "cell": "phone",
+    "email address": "email",
+    "e mail": "email",
+    "work experience": "experience",
+    "professional experience": "experience",
+    "employment history": "experience",
+    "career history": "experience",
+    "tech skills": "technical skills",
+    "key skills": "technical skills",
+    "core competencies": "technical skills",
+    "soft skills": "functional skills",
+    "interpersonal skills": "functional skills",
+    # Medical
+    "patient name": "patient",
+    "patient id": "patient identifier",
+    "mrn": "patient identifier",
+    "medical record number": "patient identifier",
+    "diagnosis": "diagnoses",
+    "assessment": "diagnoses",
+    "impression": "diagnoses",
+    "medicines": "medications",
+    "drugs": "medications",
+    "prescriptions": "medications",
+    "rx": "medications",
+}
+
+
 def _normalize_key(text: str) -> str:
-    return re.sub(r"\W+", " ", text.lower()).strip()
+    normalized = re.sub(r"\W+", " ", text.lower()).strip()
+    # For label:value patterns, canonicalize the label
+    if ":" in text:
+        colon_idx = text.index(":")
+        raw_label = re.sub(r"\W+", " ", text[:colon_idx].lower()).strip()
+        canonical = _FIELD_EQUIVALENCE.get(raw_label)
+        if canonical:
+            raw_value = re.sub(r"\W+", " ", text[colon_idx + 1:].lower()).strip()
+            return f"{canonical} {raw_value}" if raw_value else canonical
+    return normalized
 
 
 def _is_bullet_item(line: str) -> bool:
@@ -2895,8 +3128,8 @@ def _normalize_intent_hint(value: Optional[str]) -> Optional[str]:
         return normalized
     if normalized in {"list", "listing"}:
         return "candidate_list"
-    if normalized in {"qa", "answer", "facts"}:
-        return "summary"
+    if normalized in {"qa", "answer", "facts", "factual"}:
+        return "factual"
     return None
 
 
@@ -3186,10 +3419,6 @@ def _looks_like_name(value: str) -> bool:
     if any(kw in value_lower for kw in institution_keywords):
         return False
 
-    # If value contains more than 4 non-hyphen words, it's likely not a name
-    if len(parts) > 4:
-        return False
-
     # Check for common words that indicate it's not a name
     non_name_words = {
         # Business/management terms
@@ -3230,8 +3459,8 @@ def _looks_like_name(value: str) -> bool:
 
     if len(parts) == 1:
         token = parts[0]
-        return token[:1].isupper() and len(token) >= 3
-    return all(p[:1].isupper() for p in parts)
+        return (token[:1].isupper() or (token[:1].isalpha() and not token[:1].islower())) and len(token) >= 3
+    return all(p[:1].isupper() or (p[:1].isalpha() and not p[:1].islower()) for p in parts)
 
 
 def _smart_title_case(text: str) -> str:
@@ -3358,7 +3587,7 @@ def _extract_name_from_text(text: str) -> Optional[str]:
                 first_part = parts[0]
                 # Check if first part looks like a name (2-4 words, capitalized)
                 words = first_part.split()
-                if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
+                if 2 <= len(words) <= 4 and all(w[0].isupper() or not w[0].islower() for w in words if w):
                     # Filter out non-names
                     if not any(w.lower() in ['resume', 'cv', 'page', 'date', 'mr', 'ms', 'mrs', 'dr'] for w in words):
                         if '@' not in first_part and not any(c.isdigit() for c in first_part):
@@ -3374,7 +3603,7 @@ def _extract_name_from_text(text: str) -> Optional[str]:
         # Pattern 2: Line with 2-4 capitalized words — validate with _looks_like_name()
         words = line.split()
         if 2 <= len(words) <= 4:
-            if all(w[0].isupper() for w in words if w):
+            if all(w[0].isupper() or (w[0].isalpha() and not w[0].islower()) for w in words if w):
                 if '@' not in line and not any(c.isdigit() for c in line):
                     if _looks_like_name(line):
                         return line
@@ -3793,6 +4022,8 @@ def extract_schema(
     intent_parse: Any = None,
     redis_client: Any = None,
     use_thinking: bool = False,
+    task_spec: Any = None,
+    conversation_context: Optional[str] = None,
 ) -> ExtractionResult:
     """Extract structured data from chunks.
 
@@ -3828,9 +4059,11 @@ def extract_schema(
         c_family = _DOMAIN_FAMILY.get(chunk_domain, "generic")
         # Only flag mismatch for genuinely incompatible specific domains.
         # Invoice mismatch is reliable (invoice vs non-invoice is clear).
+        # Medical mismatch is reliable (medical vs non-medical is clear,
+        # content validators confirm via patient/diagnosis/medication terms).
         # Legal/policy mismatch is unreliable — "terms", "treatment plan"
         # etc. trigger false positives across medical/policy domains.
-        _MISMATCH_DOMAINS = {"invoice"}
+        _MISMATCH_DOMAINS = {"invoice", "medical"}
         _any_matching = False
         for _c in (chunks or []):
             _cm = getattr(_c, "meta", None) or {}
@@ -3852,26 +4085,96 @@ def extract_schema(
 
     # Contact queries use deterministic extraction directly — LLMs often refuse
     # to share personal contact details due to safety guardrails.
-    _is_contact_query = any(
-        kw in (query or "").lower()
-        for kw in ("contact", "email", "phone", "linkedin", "reach", "call")
-    )
+    _is_contact_query = _nlu_is_contact(query)
 
     # When a tool explicitly sets the domain (e.g., tools=resume-analysis),
     # prefer the structured deterministic extractor which produces typed schemas
     # (HRSchema with Candidate objects, InvoiceSchema, etc.) instead of LLM
     # free-text that loses structure.
-    # When domain is confidently detected from chunks (structured document types),
-    # prefer the deterministic extractor which produces typed schemas and avoids
-    # slow/unreliable LLM calls. This is generic — any structured domain
-    # (invoice, medical, legal, policy, hr) benefits from deterministic extraction
-    # when chunks clearly belong to that domain.
+    #
+    # IMPORTANT: For analytical/reasoning queries (ranking, comparison, summary,
+    # generate, reasoning), ALWAYS prefer LLM over deterministic — the LLM
+    # understands the query intent and produces a targeted answer, while
+    # deterministic just dumps raw schema data regardless of the question asked.
+    # Only prefer deterministic for simple factual/extract queries on structured
+    # domains, or when tool domain is explicitly set.
     _structured_domains = {"invoice", "medical", "legal", "policy", "hr"}
     _domain_confident = chunk_domain in _structured_domains
-    # Also trust query_domain when it explicitly names a structured domain
-    # (e.g., "total amounts on all invoices" → query_domain="invoice")
     _query_domain_confident = query_domain in _structured_domains
-    _prefer_deterministic = _tool_domain_active or _domain_confident or _query_domain_confident
+    # Intents that REQUIRE LLM intelligence (never use deterministic for these)
+    _llm_required_intents = {
+        "rank", "ranking", "compare", "comparison", "summarize", "summary",
+        "generate", "reasoning", "analyze",
+        "cross_document", "analytics", "multi_field", "timeline",
+    }
+    _intent_str = (intent_hint or "").lower().strip()
+    # Also check TaskSpec intent (NLU-based, may differ from LLM intent parser)
+    _taskspec_intent = ""
+    if task_spec and hasattr(task_spec, "intent"):
+        _taskspec_intent = (task_spec.intent or "").lower().strip()
+    _needs_llm = _intent_str in _llm_required_intents or _taskspec_intent in _llm_required_intents
+    # Extra check: detect content generation verbs in query itself
+    import re as _re_extract
+    _has_generate_verbs = _re_extract.search(
+        r"\b(generate|create|write|draft|compose|prepare|produce)\b",
+        (query or "").lower(),
+    )
+    if not _needs_llm and _has_generate_verbs:
+        _needs_llm = True
+    # Extra check: detect comparison/table signals in query itself
+    _has_comparison_signals = _re_extract.search(
+        r"\b(compare|comparison|versus|vs\.?|side.by.side|table format|each candidate|all candidates|rank all|rank the)\b",
+        (query or "").lower(),
+    )
+    if not _needs_llm and _has_comparison_signals:
+        _needs_llm = True
+        _intent_str = "comparison"
+        intent_hint = "comparison"
+    # When TaskSpec or query verbs indicate content generation, override the
+    # LLM parser intent so downstream (llm_extract, template selection) uses
+    # the correct "generate" intent instead of a misclassified "rank"/"extract".
+    if _taskspec_intent == "generate" or _has_generate_verbs:
+        _intent_str = "generate"
+        intent_hint = "generate"
+    # Prefer deterministic when: (a) tool domain is explicitly set AND intent
+    # is simple extraction, OR (b) domain is confidently structured AND intent is
+    # simple factual/extract (not analytical).  For analytical intents, LLM always
+    # wins because it understands what the user is actually asking.
+    # (c) LATENCY: For structured domains with simple factual/extract intents,
+    # deterministic is faster (0.5s vs 15-45s LLM) AND more reliable — the LLM
+    # often returns empty for medical/policy structured queries.
+    _simple_intents = {"factual", "extraction", "extract", "qa", "list", "contact", ""}
+
+    # Detect complex queries that need LLM even for "simple" intents:
+    # Multi-part queries, conditional logic, or synthesis across many fields
+    _query_lower = (query or "").lower()
+    _is_complex_query = (
+        _intent_str in ("comparison", "ranking", "reasoning", "cross_document", "analytics")
+        or _query_lower.count(" and ") >= 2  # "Name and skills and experience"
+        or (" with " in _query_lower and any(w in _query_lower for w in ("who", "which", "that")))
+        or any(w in _query_lower for w in ("explain", "why", "how does", "what makes", "describe",
+                                               "tell me about", "give me a summary", "summarize",
+                                               "overview", "brief summary", "profile"))
+        or any(w in _query_lower for w in ("total", "sum", "aggregate", "average", "count", "how many"))  # Aggregation queries need LLM computation
+        or any(w in _query_lower for w in ("common", "shared", "across all"))  # Cross-document synthesis
+        or (len(chunks) > 8 and len(_query_lower.split()) > 10)  # Long query + many chunks
+    )
+
+    _prefer_deterministic = (
+        _is_contact_query
+        or (_tool_domain_active and not _needs_llm)
+        or ((_domain_confident or _query_domain_confident) and not _needs_llm
+            and _intent_str in _simple_intents and not _is_complex_query)
+    )
+    logger.info(
+        "Extraction strategy: prefer_deterministic=%s (chunk_domain=%s query_domain=%s "
+        "domain_confident=%s query_domain_confident=%s intent=%r needs_llm=%s simple=%s "
+        "complex_query=%s contact=%s tool=%s)",
+        _prefer_deterministic, chunk_domain, query_domain,
+        _domain_confident, _query_domain_confident, _intent_str,
+        _needs_llm, _intent_str in _simple_intents, _is_complex_query,
+        _is_contact_query, _tool_domain_active,
+    )
 
     # ── ML-based context understanding (enriches LLM prompts) ──────────
     # Skip when deterministic extraction is preferred — context understanding
@@ -3886,6 +4189,7 @@ def extract_schema(
                 chunks=chunks,
                 embedder=embedder,
                 domain_hint=chunk_domain or query_domain or domain,
+                intent_hint=_intent_str or intent_hint,
             )
             if _context_intelligence:
                 logger.info(
@@ -3918,7 +4222,9 @@ def extract_schema(
             logger.debug("Multi-resolution context skipped: %s", _mr_exc)
 
     # STRATEGY 1: LLM-first generic extraction (preferred when no tool domain)
+    _llm_already_tried = False
     if llm_client and budget.allow() and not _is_contact_query and not _prefer_deterministic:
+        _llm_already_tried = True
         try:
             llm_result = llm_extract_and_respond(
                 query=query,
@@ -3934,6 +4240,8 @@ def extract_schema(
                 context_intelligence=_context_intelligence,
                 use_thinking=use_thinking,
                 multi_resolution_context=_multi_res_ctx,
+                task_spec=task_spec,
+                conversation_context=conversation_context,
             )
             if llm_result is not None:
                 # Use chunk-based domain (more reliable than query override)
@@ -3955,6 +4263,53 @@ def extract_schema(
                 extra={"stage": "extract", "correlation_id": correlation_id},
             )
 
+        # GENERATE INTENT RESILIENCE: When intent=generate and first LLM attempt
+        # failed (timeout/error), retry with fewer chunks and simplified context.
+        # Content generation (cover letters, summaries, etc.) MUST use LLM — a
+        # deterministic HRSchema ranking is never a valid response for "write me a
+        # cover letter".
+        if _intent_str == "generate" and _llm_already_tried and llm_client and budget.allow():
+            logger.info(
+                "Generate intent: retrying LLM with reduced chunks after initial failure",
+                extra={"stage": "extract", "correlation_id": correlation_id, "method": "generate_retry"},
+            )
+            # Use top 5 chunks only (less context = faster generation)
+            _retry_chunks = chunks[:5] if len(chunks) > 5 else chunks
+            try:
+                llm_result = llm_extract_and_respond(
+                    query=query,
+                    chunks=_retry_chunks,
+                    llm_client=llm_client,
+                    budget=budget,
+                    correlation_id=correlation_id,
+                    intent=intent_hint,
+                    num_documents=_count_unique_documents(_retry_chunks),
+                    tool_context=tool_context,
+                    domain=chunk_domain or query_domain or domain or "generic",
+                    redis_client=redis_client,
+                    context_intelligence=None,  # Skip heavy context for retry
+                    use_thinking=False,
+                    multi_resolution_context=None,
+                    task_spec=task_spec,
+                )
+                if llm_result is not None:
+                    inferred = chunk_domain or query_domain or domain or "generic"
+                    logger.info(
+                        "Generate retry succeeded with %d chunks (domain=%s)",
+                        len(_retry_chunks), inferred,
+                        extra={"stage": "extract", "correlation_id": correlation_id, "method": "generate_retry"},
+                    )
+                    return ExtractionResult(
+                        domain=inferred,
+                        intent="generate",
+                        schema=llm_result,
+                    )
+            except Exception as _retry_exc:
+                logger.warning(
+                    "Generate retry also failed: %s", _retry_exc,
+                    extra={"stage": "extract", "correlation_id": correlation_id},
+                )
+
     # STRATEGY 2: Deterministic extraction (domain-aware, structured schemas)
     # When tool domain is set, this is the preferred path (structured output).
     # Use query_domain as domain_hint when chunk metadata disagrees but query is clear
@@ -3973,12 +4328,137 @@ def extract_schema(
         intent_parse=intent_parse,
     )
 
+    # CONTACT QUERY LLM FALLBACK: When deterministic extraction for a contact
+    # query produced nothing useful, fall back to LLM extraction.  Contact info
+    # may be embedded in free-text paragraphs that the deterministic parser misses.
+    if _is_contact_query and llm_client and budget.allow() and not _llm_already_tried:
+        from src.rag_v3.pipeline import _has_valid_deterministic_extraction
+        if not _has_valid_deterministic_extraction(deterministic_result.schema):
+            logger.info(
+                "Contact query: deterministic extraction empty, falling back to LLM",
+                extra={"stage": "extract", "correlation_id": correlation_id, "method": "contact_llm_fallback"},
+            )
+            try:
+                llm_result = llm_extract_and_respond(
+                    query=query,
+                    chunks=chunks,
+                    llm_client=llm_client,
+                    budget=budget,
+                    correlation_id=correlation_id,
+                    intent=intent_hint or "contact",
+                    num_documents=_count_unique_documents(chunks),
+                    tool_context=tool_context,
+                    domain=chunk_domain or query_domain or domain or "generic",
+                    redis_client=redis_client,
+                    context_intelligence=None,
+                    use_thinking=False,
+                    multi_resolution_context=None,
+                    task_spec=task_spec,
+                    conversation_context=conversation_context,
+                )
+                if llm_result is not None:
+                    inferred = chunk_domain or query_domain or domain or "generic"
+                    logger.info(
+                        "Contact LLM fallback succeeded (domain=%s)", inferred,
+                        extra={"stage": "extract", "correlation_id": correlation_id},
+                    )
+                    return ExtractionResult(
+                        domain=inferred,
+                        intent="contact",
+                        schema=llm_result,
+                    )
+            except Exception as _contact_exc:
+                logger.warning(
+                    "Contact LLM fallback failed: %s", _contact_exc,
+                    extra={"stage": "extract", "correlation_id": correlation_id},
+                )
+
+    # GENERATE INTENT GUARD: When intent=generate but deterministic produced a
+    # structured schema (HRSchema, InvoiceSchema, etc.), convert the schema to
+    # prompt context and retry with LLM — a structured ranking table is never
+    # what the user wants for "write a cover letter" or "create interview questions".
+    if _intent_str == "generate":
+        _det_schema = deterministic_result.schema
+        _is_structured = isinstance(_det_schema, (HRSchema, InvoiceSchema, MedicalSchema, LegalSchema, PolicySchema))
+        if _is_structured and llm_client and budget.allow():
+            logger.info(
+                "Generate intent: converting deterministic %s schema to LLM context for content generation",
+                type(_det_schema).__name__,
+                extra={"stage": "extract", "correlation_id": correlation_id},
+            )
+            # Build schema context string to enrich the LLM prompt
+            _schema_facts = []
+            if isinstance(_det_schema, HRSchema) and _det_schema.candidates and getattr(_det_schema.candidates, "items", None):
+                for _cand in _det_schema.candidates.items:
+                    if _cand.name:
+                        _schema_facts.append(f"Candidate: {_cand.name}")
+                    if _cand.skills and getattr(_cand.skills, "items", None):
+                        _schema_facts.append(f"Skills: {', '.join(s.value or '' for s in _cand.skills.items if s.value)}")
+                    if _cand.experience and getattr(_cand.experience, "items", None):
+                        _schema_facts.append(f"Experience: {', '.join(e.value or '' for e in _cand.experience.items if e.value)}")
+                    if _cand.education and getattr(_cand.education, "items", None):
+                        _schema_facts.append(f"Education: {', '.join(ed.value or '' for ed in _cand.education.items if ed.value)}")
+            _schema_context = "\n".join(_schema_facts) if _schema_facts else None
+            # Inject schema context into tool_context for the LLM
+            _gen_tool_ctx = dict(tool_context) if tool_context else {}
+            if _schema_context:
+                _gen_tool_ctx["extracted_profile"] = _schema_context
+            try:
+                llm_result = llm_extract_and_respond(
+                    query=query,
+                    chunks=chunks[:8] if len(chunks) > 8 else chunks,
+                    llm_client=llm_client,
+                    budget=budget,
+                    correlation_id=correlation_id,
+                    intent="generate",
+                    num_documents=_count_unique_documents(chunks),
+                    tool_context=_gen_tool_ctx,
+                    domain=chunk_domain or query_domain or domain or "generic",
+                    redis_client=redis_client,
+                    context_intelligence=_context_intelligence,
+                    use_thinking=False,
+                    multi_resolution_context=None,
+                    task_spec=task_spec,
+                    conversation_context=conversation_context,
+                )
+                if llm_result is not None:
+                    inferred = deterministic_result.domain or chunk_domain or "generic"
+                    logger.info(
+                        "Generate intent LLM retry succeeded (domain=%s)", inferred,
+                        extra={"stage": "extract", "correlation_id": correlation_id, "method": "generate_schema_retry"},
+                    )
+                    return ExtractionResult(
+                        domain=inferred,
+                        intent="generate",
+                        schema=llm_result,
+                    )
+            except Exception as _gen_exc:
+                logger.warning(
+                    "Generate intent LLM retry failed: %s", _gen_exc,
+                    extra={"stage": "extract", "correlation_id": correlation_id},
+                )
+            # If LLM also failed, return a helpful placeholder
+            _gen_msg = (
+                "I understand you're asking me to generate content. "
+                "Let me try to create that for you based on the available documents."
+            )
+            _gen_schema = GenericSchema(
+                facts=FieldValuesField(items=[FieldValue(label=None, value=_gen_msg, evidence_spans=[])])
+            )
+            return ExtractionResult(
+                domain=deterministic_result.domain,
+                intent="generate",
+                schema=_gen_schema,
+            )
+
     # STRATEGY 3: LLM fallback when deterministic extraction produced nothing
     # Deterministic extraction relies on line-segmented text; it fails on OCR blobs
     # without line breaks.  In that case, let the LLM synthesize from raw chunks.
+    # SKIP if Strategy 1 already tried LLM and failed — no point retrying the same
+    # LLM call which will just add another 30-60s of latency with no result.
     from src.rag_v3.pipeline import _has_valid_deterministic_extraction
     _det_ok = _has_valid_deterministic_extraction(deterministic_result.schema)
-    if _det_ok or not llm_client or not budget.allow():
+    if _det_ok or not llm_client or not budget.allow() or _llm_already_tried or _prefer_deterministic:
         return deterministic_result
 
     logger.info(
@@ -4001,6 +4481,8 @@ def extract_schema(
             context_intelligence=_context_intelligence,
             use_thinking=use_thinking,
             multi_resolution_context=_multi_res_ctx,
+            task_spec=task_spec,
+            conversation_context=conversation_context,
         )
         if llm_result is not None:
             inferred = deterministic_result.domain or chunk_domain or "generic"

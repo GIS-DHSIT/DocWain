@@ -134,9 +134,12 @@ class TestRenderComparison:
         )
         rendered = render_comparison(result, "compare")
         assert "**Comparison: A.pdf vs B.pdf**" in rendered
-        assert "Shared: Python" in rendered
-        assert "Only A.pdf: Java" in rendered
-        assert "Only B.pdf: Go" in rendered
+        # Table format: shared skills row and per-doc values
+        assert "| Criterion |" in rendered
+        assert "| Technical Skills |" in rendered
+        assert "Python" in rendered
+        assert "Java" in rendered
+        assert "Go" in rendered
 
     def test_render_comparison_three_docs(self):
         result = ComparisonResult(
@@ -153,9 +156,10 @@ class TestRenderComparison:
         )
         rendered = render_comparison(result, "compare")
         assert "**Comparison of 3 documents**" in rendered
-        assert "A.pdf: Developer" in rendered
-        assert "B.pdf: Manager" in rendered
-        assert "C.pdf: Analyst" in rendered
+        # 3+ docs use markdown table format
+        assert "Developer" in rendered
+        assert "Manager" in rendered
+        assert "Analyst" in rendered
 
     def test_compare_candidates_from_schema(self):
         cand_a = _make_candidate(

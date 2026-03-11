@@ -131,7 +131,7 @@ def run_agent_mode(
     # --- Domain agent detection ----------------------------------------
     # Check if the query requires a specialized domain agent (e.g. "generate
     # interview questions") before the standard retrieval pipeline.
-    # MoE: reasoning agents use lfm2.5-thinking, generation agents use gpt-oss.
+    # MoE: reasoning agents use lfm2.5-thinking, generation agents use DocWain-Agent.
     try:
         from src.agentic.domain_agents import detect_agent_task, get_domain_agent
         _agent_det = detect_agent_task(str(query_text))

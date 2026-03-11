@@ -192,7 +192,7 @@ class FakeMetrics:
 def _build_rag(fake_llm, chunk_text="Candidate summary.", metadata=None):
     rag = EnterpriseRAGSystem.__new__(EnterpriseRAGSystem)
     rag.llm_client = fake_llm
-    rag.model_name = "gpt-oss:latest"
+    rag.model_name = "DocWain-Agent:latest"
     rag.client = FakeQdrantClient(chunk_text=chunk_text, metadata=metadata)
     rag.model = SimpleNamespace(encode=lambda text, **kw: [[0.1, 0.1, 0.1, 0.1]])  # mock encode for v3
     rag.retriever = SimpleNamespace(expand_with_neighbors=lambda **kwargs: kwargs["seed_chunks"])

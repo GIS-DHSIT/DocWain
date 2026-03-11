@@ -151,8 +151,10 @@ class EntityRegister:
 
 _PERSON_PATTERNS = [
     re.compile(r"\b(?:about|for|of)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"),
-    re.compile(r"^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'s\b"),
+    re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'s\b"),
     re.compile(r"\bName:\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)"),
+    # Comparison patterns: "X and Y", "X vs Y"
+    re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:and|vs\.?|versus|&)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b"),
 ]
 
 _DOCUMENT_PATTERNS = [
@@ -166,7 +168,14 @@ _DOCUMENT_PATTERNS = [
 
 _TOPIC_PATTERNS = [
     re.compile(
-        r"\b(skills?|experience|education|certifications?|salary|contact|summary|qualifications?)\b",
+        r"\b(skills?|experience|education|certifications?|salary|contact|summary|qualifications?"
+        r"|strengths?|weaknesses?|requirements?|responsibilities|achievements?"
+        r"|projects?|languages?|references?|volunteer|objective|hobbies"
+        r"|diagnosis|treatment|medication|symptoms?|allergies|vitals?"
+        r"|clause|liability|obligations?|terms|indemnification|termination"
+        r"|payment|total|amount|vendor|due\s+date|line\s+items?"
+        r"|coverage|premium|exclusions?|deductible|beneficiary"
+        r")\b",
         re.I,
     ),
 ]
@@ -178,6 +187,28 @@ _STOP_NAMES = {
     "document", "resume", "invoice", "file", "report", "profile",
     "technical", "functional", "experience", "education", "skills",
     "name", "python", "java", "docker",
+}
+
+# Topic continuity — map topic keywords to broader topic groups
+_TOPIC_GROUPS: Dict[str, str] = {
+    "skills": "qualifications", "skill": "qualifications",
+    "certifications": "qualifications", "certification": "qualifications",
+    "qualifications": "qualifications", "competencies": "qualifications",
+    "experience": "career", "work history": "career", "employment": "career",
+    "career": "career", "role": "career", "position": "career",
+    "education": "education", "degree": "education", "university": "education",
+    "training": "education", "academic": "education",
+    "salary": "compensation", "compensation": "compensation", "pay": "compensation",
+    "benefits": "compensation", "package": "compensation",
+    "contact": "contact", "email": "contact", "phone": "contact", "address": "contact",
+    "diagnosis": "medical", "treatment": "medical", "medication": "medical",
+    "symptoms": "medical", "lab": "medical", "vitals": "medical",
+    "clause": "legal", "liability": "legal", "obligation": "legal",
+    "terms": "legal", "agreement": "legal", "contract": "legal",
+    "payment": "financial", "invoice": "financial", "amount": "financial",
+    "total": "financial", "due": "financial", "vendor": "financial",
+    "coverage": "policy", "premium": "policy", "exclusion": "policy",
+    "deductible": "policy", "policyholder": "policy",
 }
 
 _PRONOUN_MAP = {
@@ -201,9 +232,11 @@ class ConversationEntityExtractor:
         names = []
         for pattern in _PERSON_PATTERNS:
             for match in pattern.finditer(text):
-                name = match.group(1).strip()
-                if name.lower() not in _STOP_NAMES and len(name) > 1:
-                    names.append(name)
+                # Handle patterns with multiple groups (e.g., "X and Y")
+                for gi in range(1, pattern.groups + 1):
+                    name = (match.group(gi) or "").strip()
+                    if name and name.lower() not in _STOP_NAMES and len(name) > 1:
+                        names.append(name)
         return list(dict.fromkeys(names))
 
     @staticmethod
@@ -218,10 +251,19 @@ class ConversationEntityExtractor:
     @staticmethod
     def extract_topics(text: str) -> List[str]:
         """Extract topic keywords from text."""
+        # Words where stripping trailing 's' would corrupt them
+        _NO_STRIP = frozenset({
+            "diagnosis", "analysis", "basis", "emphasis", "synopsis",
+            "thesis", "hypothesis", "crisis", "vitals", "details",
+            "terms", "conditions", "items",
+        })
         topics = []
         for pattern in _TOPIC_PATTERNS:
             for match in pattern.finditer(text):
-                topics.append(match.group(0).lower().rstrip("s"))
+                raw = match.group(0).lower()
+                if raw not in _NO_STRIP and raw.endswith("s") and not raw.endswith("ss"):
+                    raw = raw.rstrip("s")
+                topics.append(raw)
         return list(dict.fromkeys(topics))
 
     @staticmethod
@@ -255,6 +297,20 @@ _FOLLOWUP_MENTION_RE = re.compile(
     re.I,
 )
 
+_IMPLICIT_COMPARISON_RE = re.compile(
+    r"(?:what\s+about|how\s+about|how\s+(?:does|do|did)\s+\w+\s+(?:compare|differ|stack\s+up))"
+    r"|(?:better\s+than|worse\s+than|compared?\s+(?:to|with))"
+    r"|(?:and\s+what\s+about|versus|vs\.?\s)",
+    re.IGNORECASE,
+)
+
+# "the same" / "another" / "a different" reference patterns
+_ANAPHORIC_REF_RE = re.compile(
+    r"\b(?:the\s+same|another|a\s+different|the\s+other|the\s+next|the\s+previous)\s+"
+    r"(candidate|person|document|file|resume|invoice|patient|contract|policy|report)\b",
+    re.IGNORECASE,
+)
+
 
 class ConversationContextResolver:
     """Resolves pronouns and references using the EntityRegister."""
@@ -266,6 +322,8 @@ class ConversationContextResolver:
     def resolve(self, query: str) -> str:
         resolved = query
         resolved = self._resolve_followup_references(resolved)
+        resolved = self._resolve_implicit_comparison(resolved)
+        resolved = self._resolve_anaphoric_refs(resolved)
         resolved = self._resolve_ordinals(resolved)
         resolved = self._resolve_pronouns(resolved)
         resolved = self._resolve_demonstratives(resolved)
@@ -278,6 +336,10 @@ class ConversationContextResolver:
         if _ORDINAL_RE.search(query):
             return True
         if _FOLLOWUP_REFERENCE_RE.search(query) or _FOLLOWUP_MENTION_RE.search(query):
+            return True
+        if _IMPLICIT_COMPARISON_RE.search(query):
+            return True
+        if _ANAPHORIC_REF_RE.search(query):
             return True
         return False
 
@@ -309,6 +371,31 @@ class ConversationContextResolver:
                 return turn.assistant_response[start:end].strip()
         return None
 
+    def _resolve_implicit_comparison(self, query: str) -> str:
+        """Inject prior entity context when an implicit comparison is detected."""
+        if not _IMPLICIT_COMPARISON_RE.search(query):
+            return query
+        prior_entities = self._get_recent_entities(max_entities=2)
+        if prior_entities:
+            context_note = f" [Previously discussed: {', '.join(prior_entities)}]"
+            return query + context_note
+        return query
+
+    def _get_recent_entities(self, max_entities: int = 2) -> List[str]:
+        """Retrieve the most recently seen entity names from the register."""
+        all_entities = sorted(
+            self.register.entities.values(),
+            key=lambda e: e.last_seen_turn,
+            reverse=True,
+        )
+        names: List[str] = []
+        for entity in all_entities:
+            if entity.name not in names:
+                names.append(entity.name)
+            if len(names) >= max_entities:
+                break
+        return names
+
     def _resolve_pronouns(self, query: str) -> str:
         result = query
         for pronoun, entity_type in _PRONOUN_MAP.items():
@@ -324,7 +411,53 @@ class ConversationContextResolver:
                 else:
                     replacement = entity.name
                 result = pattern.sub(replacement, result, count=1)
+
+        # Resolve topic-continuity references: "what about that?" / "anything else?"
+        if re.search(r"\b(?:anything\s+else|what\s+else|more\s+(?:about|on)\s+(?:this|that))\b", result, re.I):
+            recent = self._get_recent_entities(max_entities=1)
+            if recent:
+                result = f"{result} [Topic continuation about: {recent[0]}]"
+
         return result
+
+    def _resolve_anaphoric_refs(self, query: str) -> str:
+        """Resolve 'the same candidate', 'another document', 'a different person' etc."""
+        match = _ANAPHORIC_REF_RE.search(query)
+        if not match:
+            return query
+        ref_noun = match.group(1).lower()
+        full_phrase = match.group(0).lower()
+        entity_type = "document" if ref_noun in {"document", "file", "resume", "invoice", "report"} else "person"
+
+        if "same" in full_phrase:
+            # "the same candidate" → most recent entity of that type
+            entity = self.register.get_most_recent(entity_type)
+            if entity:
+                return query[:match.start()] + entity.name + query[match.end():]
+        elif "another" in full_phrase or "different" in full_phrase or "other" in full_phrase:
+            # "another candidate" → second-most-recent entity of that type
+            entities = self.register.get_by_type(entity_type)
+            if len(entities) >= 2:
+                # get_by_type returns sorted by last_seen desc, so [1] is second-most-recent
+                name = entities[1].name
+                return query[:match.start()] + name + query[match.end():]
+        elif "next" in full_phrase:
+            # "the next candidate" → entity after the most recent by first_seen order
+            entities = sorted(self.register.get_by_type(entity_type), key=lambda e: e.first_seen_turn)
+            most_recent = self.register.get_most_recent(entity_type)
+            if most_recent and entities:
+                idx = next((i for i, e in enumerate(entities) if e.name == most_recent.name), -1)
+                if idx >= 0 and idx + 1 < len(entities):
+                    return query[:match.start()] + entities[idx + 1].name + query[match.end():]
+        elif "previous" in full_phrase:
+            # "the previous candidate" → entity before the most recent
+            entities = sorted(self.register.get_by_type(entity_type), key=lambda e: e.first_seen_turn)
+            most_recent = self.register.get_most_recent(entity_type)
+            if most_recent and entities:
+                idx = next((i for i, e in enumerate(entities) if e.name == most_recent.name), -1)
+                if idx > 0:
+                    return query[:match.start()] + entities[idx - 1].name + query[match.end():]
+        return query
 
     def _resolve_ordinals(self, query: str) -> str:
         match = _ORDINAL_RE.search(query)
@@ -358,12 +491,20 @@ class ConversationContextResolver:
 # Helper: person alias generation
 # ---------------------------------------------------------------------------
 
+_TITLE_STRIP_RE = re.compile(
+    r"^(?:Dr\.?|Mr\.?|Mrs\.?|Ms\.?|Prof\.?|Sir|Rev\.?)\s+", re.I,
+)
+
 def _person_aliases(name: str) -> Set[str]:
     aliases = {name.lower()}
     parts = name.split()
     if len(parts) >= 2:
-        aliases.add(parts[0].lower())
-        aliases.add(parts[-1].lower())
+        aliases.add(parts[0].lower())   # first name
+        aliases.add(parts[-1].lower())  # last name
+    # Also add title-stripped version: "Dr. John Smith" → "John Smith"
+    stripped = _TITLE_STRIP_RE.sub("", name).strip()
+    if stripped != name and len(stripped) > 2:
+        aliases.add(stripped.lower())
     return aliases
 
 
@@ -410,9 +551,24 @@ class ConversationState:
         documents = self.extractor.extract_documents(user_message)
         topics = self.extractor.extract_topics(user_message)
 
-        # Also extract from assistant response (first 500 chars)
-        persons += self.extractor.extract_persons(assistant_response[:500])
-        documents += self.extractor.extract_documents(assistant_response[:500])
+        # Also extract from assistant response (first 800 chars for better coverage)
+        persons += self.extractor.extract_persons(assistant_response[:800])
+        documents += self.extractor.extract_documents(assistant_response[:800])
+
+        # Extract bold-formatted names from assistant responses: **John Smith**
+        bold_names = re.findall(r"\*\*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\*\*", assistant_response[:800])
+        for bn in bold_names:
+            if bn.lower() not in _STOP_NAMES and len(bn.split()) <= 4:
+                persons.append(bn)
+
+        # Extract names from table rows: | John Smith | ... |
+        table_names = re.findall(
+            r"\|\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\s*\|",
+            assistant_response[:1200],
+        )
+        for tn in table_names:
+            if tn.lower() not in _STOP_NAMES and len(tn.split()) <= 4:
+                persons.append(tn)
 
         entity_names = []
         for name in dict.fromkeys(persons):
@@ -427,7 +583,7 @@ class ConversationState:
 
         enriched = EnrichedTurn(
             user_message=user_message,
-            assistant_response=assistant_response[:300],
+            assistant_response=assistant_response[:600],
             timestamp=time.time(), turn_number=self._turn_counter,
             entities_mentioned=entity_names, resolved_query=resolved_query,
         )
@@ -448,12 +604,33 @@ class ConversationState:
             return ""
         parts = []
         if persons:
-            parts.append(f"Mentioned persons: {', '.join(e.name for e in persons[:5])}")
+            # Sort by salience (recency + frequency)
+            scored = sorted(persons, key=lambda e: self._entity_salience(e), reverse=True)
+            parts.append(f"Mentioned persons: {', '.join(e.name for e in scored[:5])}")
         if docs:
             parts.append(f"Referenced documents: {', '.join(e.name for e in docs[:5])}")
         if self.current_topic:
             parts.append(f"Current topic: {self.current_topic}")
+        # Add topic continuity hint
+        topic_group = self._get_topic_group()
+        if topic_group and topic_group != self.current_topic:
+            parts.append(f"Topic area: {topic_group}")
         return "; ".join(parts)
+
+    def _entity_salience(self, entity: TrackedEntity) -> float:
+        """Score entity salience: combines recency and frequency.
+
+        Recent + frequent entities are more salient (likely the focus of conversation).
+        """
+        recency = 1.0 / max(1, self._turn_counter - entity.last_seen_turn + 1)
+        frequency = min(entity.mention_count / 5.0, 1.0)  # Cap at 5 mentions
+        return 0.6 * recency + 0.4 * frequency
+
+    def _get_topic_group(self) -> Optional[str]:
+        """Infer the broader topic group from current topic."""
+        if not self.current_topic:
+            return None
+        return _TOPIC_GROUPS.get(self.current_topic.lower())
 
     def clear(self, namespace: str, user_id: str):
         self.entity_register = EntityRegister()
@@ -470,7 +647,10 @@ class ConversationState:
                 pass
 
     def _load_state(self, namespace: str, user_id: str):
-        if not self.redis or self.entity_register.entities:
+        if not self.redis:
+            return
+        # Only load from Redis if we haven't already loaded in this session
+        if getattr(self, "_state_loaded", False):
             return
         try:
             cached = self.redis.get(self._state_key(namespace, user_id))
@@ -480,6 +660,7 @@ class ConversationState:
                 self.resolver = ConversationContextResolver(self.entity_register, self.enriched_turns)
                 self._turn_counter = data.get("turn_counter", 0)
                 self.current_topic = data.get("current_topic")
+            self._state_loaded = True
         except Exception:
             pass
 

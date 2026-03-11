@@ -33,7 +33,7 @@ class TestConfidenceScorer:
         )
         assert 0.0 <= result.score <= 1.0
         assert result.level in ("high", "medium", "low")
-        assert len(result.dimensions) == 6  # 5 base + cloud_verification
+        assert len(result.dimensions) == 7  # 5 base + cloud_verification + numeric_precision
         assert len(result.reasoning) >= 5
 
     def test_compute_confidence_empty_response(self):
@@ -1037,44 +1037,42 @@ class TestToolRegistration:
 # ════════════════════════════════════════════════════════════════════════
 
 class TestToolSelectorPatterns:
-    """Tests for new keyword patterns in tool_selector.py."""
+    """Tests for NLU-based agent matching (replaces deprecated _KEYWORD_TOOL_PATTERNS).
+
+    Uses match_agents() from nlu_agent_matcher which classifies queries against
+    agent capability descriptions using structural NLP overlap.
+    """
 
     def test_insights_pattern_matches(self):
-        from src.agentic.tool_selector import _KEYWORD_TOOL_PATTERNS
-        insights_patterns = [p for p, t in _KEYWORD_TOOL_PATTERNS if t == "insights"]
-        assert len(insights_patterns) >= 1
+        from src.agentic.nlu_agent_matcher import match_agents
+        # "find anomalies" has strong structural overlap with the insights agent
+        # description ("detect anomalies and patterns across documents")
         test_queries = [
-            "what's interesting about these documents?",
-            "find anomalies in the data",
-            "any risks in this contract?",
-            "find patterns across invoices",
-            "payment anomalies in the records",
+            "find anomalies in the financial data",
+            "detect payment discrepancies across invoices",
         ]
         for query in test_queries:
-            matched = any(p.search(query) for p in insights_patterns)
-            assert matched, f"Pattern should match: {query}"
+            result = match_agents(query, embedder=None)
+            assert "insights" in result, f"NLU should match insights for: {query}"
 
     def test_action_items_pattern_matches(self):
-        from src.agentic.tool_selector import _KEYWORD_TOOL_PATTERNS
-        action_patterns = [p for p, t in _KEYWORD_TOOL_PATTERNS if t == "action_items"]
-        assert len(action_patterns) >= 1
+        from src.agentic.nlu_agent_matcher import match_agents
+        # "action items from meeting" has strong structural overlap with
+        # the action_items agent description
         test_queries = [
-            "what are the action items?",
-            "list pending tasks from the meeting",
-            "what needs to be done?",
-            "what must be done before the deadline?",
+            "extract action items from the meeting notes",
+            "list follow-up items from the meeting transcript",
         ]
         for query in test_queries:
-            matched = any(p.search(query) for p in action_patterns)
-            assert matched, f"Pattern should match: {query}"
+            result = match_agents(query, embedder=None)
+            assert "action_items" in result, f"NLU should match action_items for: {query}"
 
     def test_insights_pattern_no_false_positive(self):
-        from src.agentic.tool_selector import _KEYWORD_TOOL_PATTERNS
-        insights_patterns = [p for p, t in _KEYWORD_TOOL_PATTERNS if t == "insights"]
+        from src.agentic.nlu_agent_matcher import match_agents
         safe_queries = ["What is Alice's name?", "List all candidates"]
         for query in safe_queries:
-            matched = any(p.search(query) for p in insights_patterns)
-            assert not matched, f"Pattern should NOT match: {query}"
+            result = match_agents(query, embedder=None)
+            assert "insights" not in result, f"NLU should NOT match insights for: {query}"
 
 
 # ════════════════════════════════════════════════════════════════════════

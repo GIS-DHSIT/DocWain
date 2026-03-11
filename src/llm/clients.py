@@ -91,14 +91,15 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation."""
 
     # HTTP-level timeout for Ollama requests.  When a pipeline-level timeout
-    # fires (e.g. 30s in _generate()), future.cancel() does NOT kill the HTTP
-    # connection — the zombie request keeps running until Ollama finishes.
-    # This limits how long a zombie can block the Ollama queue.
-    # Must be >= LLM_EXTRACT_TIMEOUT_S (30s) to avoid premature cancellation.
-    _OLLAMA_HTTP_TIMEOUT_S = 45.0
+    # fires, future.cancel() does NOT kill the HTTP connection — the zombie
+    # request keeps running until Ollama finishes.
+    # Must be >= LLM_EXTRACT_TIMEOUT_S (90s) to avoid premature cancellation.
+    # Qwen3 generates ~2048 tokens (1K thinking + 1K content) at ~45tok/s = 45s
+    # + prompt processing overhead, so 100s gives comfortable margin.
+    _OLLAMA_HTTP_TIMEOUT_S = 100.0
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "gpt-oss:latest")
+        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "qwen3:14b")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         self.backend = "ollama"
@@ -135,28 +136,36 @@ class OllamaClient:
             "top_p": getattr(Config.LLM, "TOP_P", 0.85),
             "top_k": 40,
             "repeat_penalty": 1.1,
-            "num_ctx": 4096,
-            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 1024),
+            "num_ctx": 8192,
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 4096),
         }
         if options:
             generation_options.update({k: v for k, v in options.items() if v is not None})
 
-        # Build extra kwargs for thinking mode
-        extra_kwargs: Dict[str, Any] = {}
-        if thinking:
-            extra_kwargs["think"] = True
+        # Explicitly set think=False to avoid thinking token overhead.
+        # qwen3:14b thinking tokens consume from num_predict budget.
+        extra_kwargs: Dict[str, Any] = {"think": thinking}
 
         last_response: Dict[str, Any] = {}
         for attempt in range(1, max_retries + 1):
             try:
                 _gen_fn = self._client.generate if self._client else ollama.generate
-                response = _gen_fn(
-                    model=self.model_name,
-                    prompt=prompt,
-                    options=generation_options,
-                    keep_alive="24h",
-                    **extra_kwargs,
-                )
+                try:
+                    response = _gen_fn(
+                        model=self.model_name,
+                        prompt=prompt,
+                        options=generation_options,
+                        keep_alive="24h",
+                        **extra_kwargs,
+                    )
+                except TypeError:
+                    # Older ollama client doesn't support 'think' param
+                    response = _gen_fn(
+                        model=self.model_name,
+                        prompt=prompt,
+                        options=generation_options,
+                        keep_alive="24h",
+                    )
                 last_response = response or {}
                 text = (last_response.get("response") or "").strip()
                 reasoning = ""
@@ -179,6 +188,38 @@ class OllamaClient:
                     meta["reasoning"] = reasoning
                 return text, meta
             except Exception as exc:
+                exc_msg = str(exc).lower()
+                is_loading = "loading model" in exc_msg or "llm server loading model" in exc_msg
+                if is_loading and attempt == max_retries:
+                    # Model is loading into GPU — wait and give it one extra retry
+                    logger.warning(
+                        "Ollama model loading detected on attempt %d/%d; waiting 15s for model load",
+                        attempt, max_retries,
+                    )
+                    time.sleep(15)
+                    try:
+                        _gen_fn = self._client.generate if self._client else ollama.generate
+                        response = _gen_fn(
+                            model=self.model_name,
+                            prompt=prompt,
+                            options=generation_options,
+                            keep_alive="24h",
+                            **extra_kwargs,
+                        )
+                        last_response = response or {}
+                        text = (last_response.get("response") or "").strip()
+                        reasoning = ""
+                        if thinking and "<think>" in text:
+                            reasoning, text = _split_thinking(text)
+                        meta = dict(last_response)
+                        if reasoning:
+                            meta["reasoning"] = reasoning
+                        logger.info("Ollama model-loading retry succeeded")
+                        return text, meta
+                    except Exception as retry_exc:
+                        logger.warning("Ollama model-loading retry also failed: %s", retry_exc)
+                        # Fall through to normal failure path
+
                 logger.warning("Ollama attempt %d/%d failed: %s", attempt, max_retries, exc)
                 if attempt < max_retries:
                     time.sleep(backoff * attempt)
@@ -207,6 +248,101 @@ class OllamaClient:
             return "I don't have enough information in the documents to answer that."
         return text
 
+    def chat_with_metadata(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        options: Optional[Dict[str, Any]] = None,
+        max_retries: int = 1,
+        backoff: float = 0.5,
+        thinking: bool = False,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Chat-based generation with proper system/user/assistant role separation.
+
+        Uses ``ollama.chat(messages=...)`` instead of ``ollama.generate(prompt=...)``.
+        This gives the model proper role context, improving instruction following
+        and evidence separation.
+        """
+        import ollama
+        Config = _get_config()
+        request_started = time.time()
+
+        generation_options = {
+            "temperature": getattr(Config.LLM, "TEMPERATURE", 0.2),
+            "top_p": getattr(Config.LLM, "TOP_P", 0.85),
+            "top_k": 40,
+            "repeat_penalty": 1.1,
+            "num_ctx": 8192,
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 4096),
+        }
+        if options:
+            generation_options.update({k: v for k, v in options.items() if v is not None})
+
+        # Explicitly set think=False to avoid thinking token overhead.
+        extra_kwargs: Dict[str, Any] = {"think": thinking}
+
+        last_response: Dict[str, Any] = {}
+        for attempt in range(1, max_retries + 1):
+            try:
+                _chat_fn = self._client.chat if self._client else ollama.chat
+                try:
+                    response = _chat_fn(
+                        model=self.model_name,
+                        messages=messages,
+                        options=generation_options,
+                        keep_alive="24h",
+                        **extra_kwargs,
+                    )
+                except TypeError:
+                    response = _chat_fn(
+                        model=self.model_name,
+                        messages=messages,
+                        options=generation_options,
+                        keep_alive="24h",
+                    )
+                last_response = response or {}
+                # Chat API returns message.content instead of response
+                msg = last_response.get("message") or {}
+                text = (msg.get("content") or "").strip()
+                reasoning = ""
+                if thinking and "<think>" in text:
+                    reasoning, text = _split_thinking(text)
+
+                # Qwen3 thinking fallback: even with think=False, the model
+                # generates thinking tokens that consume num_predict budget.
+                # When content is empty but thinking has substance, log the
+                # issue but return empty — raw thinking text is ungrounded
+                # internal reasoning that can hallucinate.  The pipeline's
+                # emergency chunk summary will handle the empty response.
+                if not text:
+                    thinking_text = (msg.get("thinking") or "").strip()
+                    if thinking_text and len(thinking_text) > 100:
+                        logger.warning(
+                            "Content empty but thinking has %d chars — returning empty "
+                            "(thinking text is ungrounded, pipeline will use fallback)",
+                            len(thinking_text),
+                        )
+
+                meta = dict(last_response)
+                if reasoning:
+                    meta["reasoning"] = reasoning
+                return text, meta
+
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                if "model" in exc_str and ("loading" in exc_str or "not found" in exc_str):
+                    if attempt <= max_retries:
+                        logger.info("Ollama chat model loading, waiting 15s (attempt %d/%d)", attempt, max_retries)
+                        time.sleep(15)
+                        continue
+                logger.warning("Ollama chat attempt %d/%d failed: %s", attempt, max_retries, exc)
+                if attempt < max_retries:
+                    time.sleep(backoff * attempt)
+                else:
+                    raise
+
+        return "", last_response
+
     def generate_with_tools(
         self,
         prompt: str,
@@ -223,7 +359,7 @@ class OllamaClient:
         generation_options = {
             "temperature": getattr(Config.LLM, "TEMPERATURE", 0.2),
             "num_ctx": 4096,
-            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 1024),
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 2048),
         }
         if options:
             generation_options.update({k: v for k, v in options.items() if v is not None})
@@ -259,7 +395,7 @@ class OllamaClient:
             "top_k": 40,
             "repeat_penalty": 1.1,
             "num_ctx": 4096,
-            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 1024),
+            "num_predict": getattr(Config.LLM, "MAX_TOKENS", 2048),
         }
         if options:
             generation_options.update({k: v for k, v in options.items() if v is not None})
@@ -850,7 +986,55 @@ class OpenAIClient:
                     time.sleep(backoff * attempt)
                 else:
                     raise
-        return "", {}
+        return "", {"backend": self.backend, "error": "max_retries_exceeded"}
+
+    def chat_with_metadata(
+        self,
+        messages: list,
+        *,
+        options: Optional[Dict[str, Any]] = None,
+        max_retries: int = 2,
+        backoff: float = 1.0,
+        **kwargs,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Chat-style API — accepts list of {role, content} messages."""
+        if self.in_cooldown():
+            raise RateLimitCooldownError("Azure OpenAI circuit breaker open")
+        if not self.endpoint or not self.api_key:
+            raise ValueError("Azure OpenAI endpoint/key not configured")
+
+        url = f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions?api-version={self.api_version}"
+        payload = {
+            "messages": messages,
+            "temperature": (options or {}).get("temperature", 0.3),
+            "max_tokens": (options or {}).get("num_predict", 2048),
+        }
+        data = json.dumps(payload).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "api-key": self.api_key,
+        }
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                req = request.Request(url, data=data, headers=headers, method="POST")
+                with request.urlopen(req, timeout=90) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+                choice = (body.get("choices") or [{}])[0]
+                text = (choice.get("message", {}).get("content") or "").strip()
+                self._circuit_failures = 0
+                return text, {"response": text, "model": self.deployment, "backend": self.backend, "raw": body}
+            except Exception as exc:
+                logger.warning("Azure OpenAI chat attempt %d/%d failed: %s", attempt, max_retries, exc)
+                self._circuit_failures += 1
+                if self._circuit_failures >= self._circuit_threshold:
+                    self._circuit_open_until = time.time() + self._circuit_cooldown
+                    logger.warning("Azure OpenAI circuit breaker opened for %ds", self._circuit_cooldown)
+                if attempt < max_retries:
+                    time.sleep(backoff * attempt)
+                else:
+                    raise
+        return "", {"backend": self.backend, "error": "max_retries_exceeded"}
 
     def warm_up(self):
         pass  # No warm-up needed for cloud client
@@ -931,7 +1115,7 @@ class ClaudeClient:
                     time.sleep(backoff * attempt)
                 else:
                     raise
-        return "", {}
+        return "", {"backend": "claude", "error": "max_retries_exceeded"}
 
     def warm_up(self):
         pass  # No warm-up needed for cloud client

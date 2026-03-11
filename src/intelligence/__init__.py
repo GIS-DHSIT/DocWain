@@ -32,6 +32,8 @@ from src.intelligence.integration import (
     KnowledgeGraphBuilder,
     process_document_intelligence,
 )
+from src.intelligence.task_spec import TaskSpec
+from src.intelligence.query_understanding import understand_query
 
 __all__ = [
     # Document Intelligence
@@ -52,4 +54,7 @@ __all__ = [
     "IntelligenceResult",
     "KnowledgeGraphBuilder",
     "process_document_intelligence",
+    # Query Understanding
+    "TaskSpec",
+    "understand_query",
 ]

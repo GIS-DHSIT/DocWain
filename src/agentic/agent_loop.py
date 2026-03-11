@@ -163,7 +163,7 @@ class AgentLoop:
         """Ask the LLM to produce a reasoning step.
 
         Uses lfm2.5-thinking (fast, 731MB) when available for MoE routing,
-        falls back to gpt-oss (the base model) if unavailable.
+        falls back to DocWain-Agent (the base model) if unavailable.
         """
         client = self._thinking if self._thinking is not None else self._llm
         try:

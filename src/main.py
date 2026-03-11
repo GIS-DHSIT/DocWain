@@ -264,6 +264,7 @@ class AnswerPayload(BaseModel):
     grounded: bool = False
     context_found: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    media: Optional[List[Dict[str, Any]]] = None  # charts/images as {type, title, data}
     ok: bool = True
 
 
@@ -985,6 +986,10 @@ def ask_question_api(
             return AskResponse(answer=answer_payload, current_session_id=persisted_session_id, debug={})
 
     # ── Agent dispatch: explicit agent_name routes directly to domain agent ──
+    # NOTE: Auto-detection is handled by _try_domain_agent() inside the RAG
+    # pipeline, which has domain context from retrieval.  Pre-pipeline detection
+    # here caused false positives (e.g. factual queries routed to customer_service)
+    # and added 45s+ delay from agent LLM timeouts before falling back to RAG.
     _agent_name = getattr(request, "agent_name", None)
     if _agent_name:
         try:
@@ -1017,7 +1022,7 @@ def ask_question_api(
 
                 _agent_result = _agent.execute(_task, _agent_ctx)
                 if _agent_result.success and _agent_result.output:
-                    _agent_answer = {
+                    _agent_answer: Dict[str, Any] = {
                         "response": _agent_result.output,
                         "sources": _agent_result.sources,
                         "grounded": True,
@@ -1028,6 +1033,10 @@ def ask_question_api(
                             "agent_handled": True,
                         },
                     }
+                    # Propagate media (charts/images) from agent
+                    if (_agent_result.structured_data
+                            and isinstance(_agent_result.structured_data.get("media"), list)):
+                        _agent_answer["media"] = _agent_result.structured_data["media"]
                     normalized = normalize_answer(_agent_answer)
                     persisted_session_id = _persist_chat_turn(
                         user_id=request.user_id,
@@ -1334,6 +1343,55 @@ def finetune_status(job_id: str):
     return status.dict()
 
 
+@api_router.post("/finetune/intelligence", tags=["Finetuning"])
+async def finetune_intelligence(
+    max_iterations: int = 5,
+    target_score: int = 80,
+):
+    """Fine-tune DocWain-Agent-v2 for intelligent query understanding.
+
+    Runs the full pipeline: generate data → train → evaluate → iterate.
+    This is a long-running operation (2-3 hrs per iteration on T4).
+    """
+    import threading
+    from src.finetune.docwain_finetune import run_finetune_pipeline, FinetuneResult
+
+    # Run in background thread to avoid blocking the API
+    result_holder: Dict[str, Any] = {"status": "running", "result": None}
+
+    def _run():
+        try:
+            result = run_finetune_pipeline(
+                max_iterations=max_iterations,
+                target_score=target_score,
+            )
+            result_holder["status"] = "completed" if result.success else "failed"
+            result_holder["result"] = {
+                "success": result.success,
+                "model_name": result.model_name,
+                "iterations_run": result.iterations_run,
+                "final_score": result.final_score,
+                "eval_details": {
+                    k: v for k, v in result.eval_details.items()
+                    if k != "per_example"  # omit verbose per-example data
+                },
+                "error": result.error,
+            }
+        except Exception as exc:
+            result_holder["status"] = "error"
+            result_holder["result"] = {"error": str(exc)}
+
+    thread = threading.Thread(target=_run, daemon=True, name="finetune-intelligence")
+    thread.start()
+
+    return {
+        "message": "Intelligence fine-tuning started",
+        "max_iterations": max_iterations,
+        "target_score": target_score,
+        "note": "This runs in the background. Check /api/admin/taskspec-model/status for results.",
+    }
+
+
 def _collect_available_models() -> List[ModelInfo]:
     models: Dict[str, ModelInfo] = {}
     try:
@@ -1355,6 +1413,10 @@ def _collect_available_models() -> List[ModelInfo]:
     def _display_name(name: str) -> str:
         normalized = name.lower()
         if normalized == "gpt-oss" or normalized.startswith("gpt-oss:"):
+            return "DocWain-Agent"
+        if normalized == "docwain-agent" or normalized.startswith("docwain-agent:"):
+            return "DocWain-Agent"
+        if normalized.startswith("qwen3:"):
             return "DocWain-Agent"
         return name
 
@@ -1443,6 +1505,17 @@ def delete_document_embeddings_api(
 
         if result["status"] == "success":
             logging.info(f"[API] Successfully deleted embeddings for document {doc_id}")
+
+            # Invalidate cached point counts so queries reflect deletion
+            try:
+                from src.api.dw_newron import _COLLECTION_COUNT_CACHE
+                from src.api.vector_store import build_collection_name as _bcn
+                _cname = _bcn(subscription_id)
+                _COLLECTION_COUNT_CACHE.pop(f"{_cname}:{profile_id}", None)
+                _COLLECTION_COUNT_CACHE.pop(_cname, None)
+            except Exception:
+                pass
+
             return {
                 "status": "success",
                 "document_id": doc_id,

@@ -33,11 +33,11 @@ class TestAgentRole:
         assert AgentRole.DEFAULT == "default"
 
     def test_default_models_assigned(self):
-        # All roles route to gpt-oss to avoid model swap contention on T4 16GB
-        assert "gpt-oss" in _DEFAULT_ROLE_MODELS[AgentRole.CLASSIFIER]
-        assert "gpt-oss" in _DEFAULT_ROLE_MODELS[AgentRole.EXTRACTOR]
-        assert "gpt-oss" in _DEFAULT_ROLE_MODELS[AgentRole.GENERATOR]
-        assert "gpt-oss" in _DEFAULT_ROLE_MODELS[AgentRole.VERIFIER]
+        # All roles route to DocWain-Agent to avoid model swap contention on T4 16GB
+        assert "DocWain-Agent" in _DEFAULT_ROLE_MODELS[AgentRole.CLASSIFIER]
+        assert "DocWain-Agent" in _DEFAULT_ROLE_MODELS[AgentRole.EXTRACTOR]
+        assert "DocWain-Agent" in _DEFAULT_ROLE_MODELS[AgentRole.GENERATOR]
+        assert "DocWain-Agent" in _DEFAULT_ROLE_MODELS[AgentRole.VERIFIER]
 
 
 # ---------------------------------------------------------------------------
@@ -61,8 +61,8 @@ class TestMultiAgentGateway:
     def test_init_custom_models(self):
         gw = MultiAgentGateway(role_models={AgentRole.CLASSIFIER: "custom:latest"})
         assert gw.get_role_model(AgentRole.CLASSIFIER) == "custom:latest"
-        # Others should still be defaults (all gpt-oss to avoid model swap)
-        assert "gpt-oss" in gw.get_role_model(AgentRole.EXTRACTOR)
+        # Others should still be defaults (all DocWain-Agent to avoid model swap)
+        assert "DocWain-Agent" in gw.get_role_model(AgentRole.EXTRACTOR)
 
     def test_list_roles(self):
         gw = MultiAgentGateway()
@@ -380,11 +380,11 @@ class TestConfigMultiAgent:
     def test_config_model_defaults(self):
         from src.api.config import Config
         ma = Config.MultiAgent
-        # All multi-agent roles default to gpt-oss to prevent GPU eviction on T4
-        assert "gpt-oss" in ma.CLASSIFIER_MODEL
-        assert "gpt-oss" in ma.EXTRACTOR_MODEL
-        assert "gpt-oss" in ma.GENERATOR_MODEL
-        assert "gpt-oss" in ma.VERIFIER_MODEL
+        # All multi-agent roles default to DocWain-Agent to prevent GPU eviction on T4
+        assert "DocWain-Agent" in ma.CLASSIFIER_MODEL
+        assert "DocWain-Agent" in ma.EXTRACTOR_MODEL
+        assert "DocWain-Agent" in ma.GENERATOR_MODEL
+        assert "DocWain-Agent" in ma.VERIFIER_MODEL
 
 
 # ---------------------------------------------------------------------------

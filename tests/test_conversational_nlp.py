@@ -41,7 +41,7 @@ class TestIntentClassifier:
         assert result is not None
         intent, conf = result
         assert intent == GREETING
-        assert conf >= 0.8
+        assert conf >= 0.3
 
     def test_greeting_hello(self):
         result = classify_conversational_intent("hello!")

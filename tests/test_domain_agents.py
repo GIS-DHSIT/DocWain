@@ -1,6 +1,6 @@
 """Comprehensive tests for all domain agents.
 
-Tests agent registration, capability listing, task detection (ML-first with fallback),
+Tests agent registration, capability listing, task detection (NLU-first with fallback),
 agent execution, and the agentic API router.
 """
 import pytest
@@ -12,23 +12,24 @@ from unittest.mock import patch, MagicMock
 # ---------------------------------------------------------------------------
 
 class TestAgentRegistry:
-    def test_list_available_agents_returns_all_12(self):
+    def test_list_available_agents_returns_all_14(self):
         from src.agentic.domain_agents import list_available_agents
         agents = list_available_agents()
-        assert len(agents) == 12
+        assert len(agents) == 14
 
     def test_all_expected_domains_present(self):
         from src.agentic.domain_agents import list_available_agents
         agents = list_available_agents()
         expected = {"hr", "medical", "legal", "invoice", "content", "translation",
-                    "education", "image", "web", "analytics", "screening", "cloud"}
+                    "education", "image", "web", "analytics", "screening", "cloud",
+                    "customer_service", "analytics_viz"}
         assert set(agents.keys()) == expected
 
     def test_total_capabilities_count(self):
         from src.agentic.domain_agents import list_available_agents
         agents = list_available_agents()
         total = sum(len(caps) for caps in agents.values())
-        assert total >= 50  # 51 capabilities across 11 agents
+        assert total >= 61  # 61 capabilities across 14 agents
 
     def test_get_domain_agent_valid(self):
         from src.agentic.domain_agents import get_domain_agent
@@ -546,29 +547,45 @@ class TestAgenticRouter:
 
 
 # ---------------------------------------------------------------------------
-# ML-first detection tests
+# NLU-based detection tests
 # ---------------------------------------------------------------------------
 
-class TestMLFirstDetection:
-    def test_keyword_fallback_works_without_ml(self):
-        """When ML classifier is unavailable, keyword fallback should still work."""
+class TestNLUDetection:
+    def test_nlu_classification_with_domain_hint(self):
+        """NLU classification resolves translation tasks when domain is hinted."""
         from src.agentic.domain_agents import detect_agent_task
-        # This should work via keyword fallback since ML may not be initialized
-        r = detect_agent_task("translate this to Spanish")
+        # With a domain hint, domain-filtered NLU scoring finds the best
+        # match even for queries that might be ambiguous without a hint.
+        r = detect_agent_task("translate this document to french", domain="translation")
         assert r is not None
         assert r["domain"] == "translation"
+        assert r["task_type"] == "translate_text"
 
     def test_explicit_domain_takes_priority(self):
-        """When domain is explicitly provided, ML is skipped."""
+        """When domain is explicitly provided, domain-filtered classification
+        resolves ambiguous queries correctly."""
         from src.agentic.domain_agents import detect_agent_task
         r = detect_agent_task("find anomalies", domain="analytics")
         assert r is not None
         assert r["domain"] == "analytics"
         assert r["task_type"] == "detect_anomalies"
 
-    def test_resolve_task_type_direct(self):
-        from src.agentic.domain_agents import _resolve_task_type
-        assert _resolve_task_type("translate this to french", "translation") == "translate_text"
-        assert _resolve_task_type("create a quiz", "education") == "generate_quiz"
-        assert _resolve_task_type("find anomalies", "analytics") == "detect_anomalies"
-        assert _resolve_task_type("hello world", "hr") is None
+    def test_classify_domain_task_direct(self):
+        """classify_domain_task resolves domain:task_type via NLU scoring."""
+        from src.nlp.nlu_engine import classify_domain_task
+        # With domain hint, domain-filtered scoring finds the best match
+        r = classify_domain_task("translate this to french", domain="translation")
+        assert r is not None
+        assert r["task_type"] == "translate_text"
+
+        r = classify_domain_task("create a quiz", domain="education")
+        assert r is not None
+        assert r["task_type"] == "generate_quiz"
+
+        r = classify_domain_task("find anomalies", domain="analytics")
+        assert r is not None
+        assert r["task_type"] == "detect_anomalies"
+
+        # No task detected for a generic, non-task query even with domain
+        r = classify_domain_task("what is the weather today", domain="hr")
+        assert r is None

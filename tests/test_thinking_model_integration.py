@@ -2,10 +2,10 @@
 
 Covers:
   - Model registry: lfm2.5-thinking profile, family matching, capabilities
-  - Task routing: all tasks prefer gpt-oss first (single-GPU optimisation)
+  - Task routing: all tasks prefer DocWain-Agent first (single-GPU optimisation)
   - Config: ThinkingModel and VisionAnalysis defaults
   - Agent loop: thinking_client used when provided, fallback to llm
-  - Domain agents: reasoning agents use thinking model, generation agents use gpt-oss
+  - Domain agents: reasoning agents use thinking model, generation agents use DocWain-Agent
   - Vision analysis: chart/table/diagram/photo/general prompts
   - ImageAgent: multimodal with image_bytes, fallback to text
   - Parallel execution: concurrent agents, timeout handling
@@ -49,7 +49,7 @@ def _fake_ollama_list_with_lfm():
     """Simulates ollama.list() with lfm2.5-thinking included."""
     return {
         "models": [
-            {"name": "gpt-oss:latest", "size": 13_000_000_000},
+            {"name": "DocWain-Agent:latest", "size": 13_000_000_000},
             {"name": "llama3.2:latest", "size": 2_000_000_000},
             {"name": "mistral:latest", "size": 4_100_000_000},
             {"name": "deepseek-r1:latest", "size": 4_700_000_000},
@@ -177,62 +177,62 @@ class TestMoeTaskRouting:
         from src.llm.task_router import TaskType
         assert len(TaskType) == 14
 
-    def test_judging_prefers_gpt_oss(self):
+    def test_judging_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.ANSWER_JUDGING][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.ANSWER_JUDGING][0] == "docwain-agent"
 
-    def test_verify_prefers_gpt_oss(self):
+    def test_verify_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.GROUNDING_VERIFY][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.GROUNDING_VERIFY][0] == "docwain-agent"
 
-    def test_agent_reasoning_prefers_gpt_oss(self):
+    def test_agent_reasoning_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.AGENT_REASONING][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.AGENT_REASONING][0] == "docwain-agent"
 
-    def test_classification_prefers_gpt_oss(self):
+    def test_classification_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.QUERY_CLASSIFICATION][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.QUERY_CLASSIFICATION][0] == "docwain-agent"
 
-    def test_intent_parse_prefers_gpt_oss(self):
+    def test_intent_parse_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.INTENT_PARSE][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.INTENT_PARSE][0] == "docwain-agent"
 
-    def test_conversation_summary_prefers_gpt_oss(self):
+    def test_conversation_summary_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.CONVERSATION_SUMMARY][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.CONVERSATION_SUMMARY][0] == "docwain-agent"
 
-    def test_generation_still_prefers_gpt_oss(self):
+    def test_generation_still_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.RESPONSE_GENERATION][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.RESPONSE_GENERATION][0] == "docwain-agent"
 
-    def test_content_generation_still_prefers_gpt_oss(self):
+    def test_content_generation_still_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.CONTENT_GENERATION][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.CONTENT_GENERATION][0] == "docwain-agent"
 
-    def test_complex_extraction_still_prefers_gpt_oss(self):
+    def test_complex_extraction_still_prefers_docwain_agent(self):
         from src.llm.task_router import _TASK_MODEL_PREFERENCES, TaskType
-        assert _TASK_MODEL_PREFERENCES[TaskType.COMPLEX_EXTRACTION][0] == "gpt-oss"
+        assert _TASK_MODEL_PREFERENCES[TaskType.COMPLEX_EXTRACTION][0] == "docwain-agent"
 
-    def test_router_selects_gpt_oss_for_judging(self):
+    def test_router_selects_docwain_agent_for_judging(self):
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_moe_registry()
         router = TaskRouter(reg)
-        assert router.select_model(TaskType.ANSWER_JUDGING) == "gpt-oss:latest"
+        assert router.select_model(TaskType.ANSWER_JUDGING) == "DocWain-Agent:latest"
 
-    def test_router_selects_gpt_oss_for_generation(self):
+    def test_router_selects_docwain_agent_for_generation(self):
         from src.llm.task_router import TaskRouter, TaskType
         reg = _build_moe_registry()
         router = TaskRouter(reg)
-        assert router.select_model(TaskType.RESPONSE_GENERATION) == "gpt-oss:latest"
+        assert router.select_model(TaskType.RESPONSE_GENERATION) == "DocWain-Agent:latest"
 
     def test_router_fallback_when_preferred_unavailable(self):
         from src.llm.model_registry import ModelCapability, ModelRegistry
         from src.llm.task_router import TaskRouter, TaskType
-        # Registry with only deepseek-r1 (no gpt-oss, no lfm2.5-thinking)
+        # Registry with only deepseek-r1 (no DocWain-Agent, no lfm2.5-thinking)
         reg = ModelRegistry()
         reg.register(ModelCapability(name="deepseek-r1:latest", strengths=["reasoning"]))
         router = TaskRouter(reg)
-        # ANSWER_JUDGING prefers gpt-oss → missing → lfm2.5-thinking → missing → deepseek-r1
+        # ANSWER_JUDGING prefers DocWain-Agent → missing → lfm2.5-thinking → missing → deepseek-r1
         assert router.select_model(TaskType.ANSWER_JUDGING) == "deepseek-r1:latest"
 
     def test_agent_reasoning_options(self):
@@ -376,29 +376,30 @@ class TestDomainAgentMoe:
         assert agent.use_thinking_model is True
         assert agent._get_llm() is thinking
 
-    def test_generation_agent_uses_gpt_oss(self):
+    def test_generation_agent_uses_docwain_agent(self):
         from src.agentic.domain_agents import ContentAgent
-        llm = _FakeLLM("gpt-oss output")
+        llm = _FakeLLM("DocWain-Agent output")
         thinking = _FakeLLM("thinking output")
         agent = ContentAgent(llm_client=llm, thinking_client=thinking)
         assert agent.use_thinking_model is False
         # Should use base LLM, not thinking
         assert agent._get_llm() is llm
 
-    def test_translator_agent_uses_gpt_oss(self):
+    def test_translator_agent_uses_docwain_agent(self):
         from src.agentic.domain_agents import TranslatorAgent
         agent = TranslatorAgent(llm_client=_FakeLLM(), thinking_client=_FakeLLM())
         assert agent.use_thinking_model is False
 
-    def test_tutor_agent_uses_gpt_oss(self):
+    def test_tutor_agent_uses_docwain_agent(self):
         from src.agentic.domain_agents import TutorAgent
         agent = TutorAgent(llm_client=_FakeLLM(), thinking_client=_FakeLLM())
         assert agent.use_thinking_model is False
 
-    def test_medical_agent_uses_thinking(self):
+    def test_medical_agent_generation_heavy(self):
         from src.agentic.domain_agents import MedicalAgent
         agent = MedicalAgent(llm_client=_FakeLLM(), thinking_client=_FakeLLM())
-        assert agent.use_thinking_model is True
+        # MedicalAgent is generation-heavy (summaries, interpretations), not reasoning-heavy
+        assert agent.use_thinking_model is False
 
     def test_legal_agent_uses_thinking(self):
         from src.agentic.domain_agents import LegalAgent
@@ -601,11 +602,11 @@ class TestMultiAgentMoeRoles:
 
     def test_default_role_models_single_gpu(self):
         from src.llm.multi_agent import _DEFAULT_ROLE_MODELS, AgentRole
-        assert _DEFAULT_ROLE_MODELS[AgentRole.CLASSIFIER] == "gpt-oss:latest"
-        assert _DEFAULT_ROLE_MODELS[AgentRole.VERIFIER] == "gpt-oss:latest"
-        assert _DEFAULT_ROLE_MODELS[AgentRole.REASONER] == "gpt-oss:latest"
+        assert _DEFAULT_ROLE_MODELS[AgentRole.CLASSIFIER] == "DocWain-Agent:latest"
+        assert _DEFAULT_ROLE_MODELS[AgentRole.VERIFIER] == "DocWain-Agent:latest"
+        assert _DEFAULT_ROLE_MODELS[AgentRole.REASONER] == "DocWain-Agent:latest"
         assert _DEFAULT_ROLE_MODELS[AgentRole.VISION] == "glm-ocr:latest"
-        assert _DEFAULT_ROLE_MODELS[AgentRole.GENERATOR] == "gpt-oss:latest"
+        assert _DEFAULT_ROLE_MODELS[AgentRole.GENERATOR] == "DocWain-Agent:latest"
 
     def test_reason_convenience_method(self):
         from src.llm.multi_agent import MultiAgentGateway, AgentRole

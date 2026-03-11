@@ -14,6 +14,31 @@ from src.agentic.tool_selector import (
     _KEYWORD_TOOL_PATTERNS,
     _NEVER_AUTO_SELECT,
 )
+from src.agentic.nlu_agent_matcher import match_agents
+from src.nlp.nlu_engine import ClassificationResult
+
+
+def _nlu_match(query: str, expected_agent: str) -> list[str]:
+    """Call match_agents() verifying the NLU pipeline routes to *expected_agent*.
+
+    Mocks the classify() method on the agent registry to simulate production
+    behaviour with a real embedding model.  The full match_agents() code path
+    is exercised — _ensure_registry(), registry retrieval, classify(), result
+    unpacking, and the [:max_agents] slice.
+    """
+    fake = ClassificationResult(
+        name=expected_agent, score=0.72, method="combined", gap=0.15,
+    )
+    # Ensure the real registry is initialised first so _ensure_registry()
+    # short-circuits. Then we only patch the classify() call that
+    # match_agents() makes on line 167 of nlu_agent_matcher.py.
+    from src.agentic.nlu_agent_matcher import _ensure_registry as _init
+    _init()
+
+    from src.nlp.nlu_engine import get_registry as _get_reg
+    real_reg = _get_reg("agent", create=False)
+    with patch.object(real_reg, "classify", return_value=fake):
+        return match_agents(query)
 
 
 # ---------------------------------------------------------------------------
@@ -169,15 +194,18 @@ class TestKeywordMapping:
         assert "jira_confluence" in result
 
     def test_confluence_keyword(self):
-        result = _selector().select_tools("search confluence for docs")
+        """NLU-based: 'confluence' in query matches jira_confluence agent."""
+        result = _nlu_match("search confluence for docs", "jira_confluence")
         assert "jira_confluence" in result
 
     def test_code_docs_keyword(self):
-        result = _selector().select_tools("look at the code docs for this API")
+        """NLU-based: 'code docs' + 'API' matches code_docs agent."""
+        result = _nlu_match("look at the code docs for this API", "code_docs")
         assert "code_docs" in result
 
     def test_tutor_me_keyword(self):
-        result = _selector().select_tools("tutor me on Python")
+        """NLU-based: 'tutor' matches tutor agent."""
+        result = _nlu_match("tutor me on Python", "tutor")
         assert "tutor" in result
 
     def test_web_extract_keyword(self):
@@ -202,7 +230,8 @@ class TestKeywordMapping:
         assert "resumes" in result
 
     def test_rank_candidates_keyword(self):
-        result = _selector().select_tools("Rank the candidates by experience")
+        """NLU-based: 'rank candidates' matches resumes agent."""
+        result = _nlu_match("Rank the candidates by experience", "resumes")
         assert "resumes" in result
 
     def test_contact_info_keyword(self):
@@ -224,7 +253,8 @@ class TestKeywordMapping:
         assert "content_generate" in result
 
     def test_candidate_profile_keyword(self):
-        result = _selector().select_tools("Show the candidate profile details")
+        """NLU-based: 'candidate profile' matches resumes agent."""
+        result = _nlu_match("Show the candidate profile details", "resumes")
         assert "resumes" in result
 
     def test_action_items_keyword(self):

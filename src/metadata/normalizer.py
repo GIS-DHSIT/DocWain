@@ -21,6 +21,7 @@ ALLOWED_CHUNK_KINDS = {
     "fact",
     "entity_fact",
     "diagram",
+    "doc_context",
 }
 
 

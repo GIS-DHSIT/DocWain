@@ -91,19 +91,29 @@ def _extract_skills(text: str) -> List[str]:
 
 
 def _extract_amounts(text: str) -> List[str]:
-    """Extract monetary amounts from text."""
+    """Extract monetary amounts from text (currencies, percentages, large numbers with suffixes)."""
     amounts = re.findall(
-        r"(?:[$€£¥₹])\s?[\d,]+(?:\.\d{2})?|\b[\d,]+(?:\.\d{2})?\s?(?:USD|EUR|GBP|INR)\b",
+        r"(?:[$€£¥₹])\s?[\d,]+(?:\.\d{1,2})?(?:\s?[kKmMbB])?"    # $5,000 or $150K
+        r"|\b[\d,]+(?:\.\d{1,2})?\s?(?:USD|EUR|GBP|INR|AED)\b"     # 5000 USD
+        r"|\b[\d,]+(?:\.\d{1,2})?\s?%"                              # 15.5%
+        r"|\b[\d,]+(?:\.\d{1,2})?\s?(?:per\s+(?:month|year|annum|hour|day))\b",  # 5000 per month
         text, re.I,
     )
     return list(dict.fromkeys(amounts))
 
 
 def _extract_dates(text: str) -> List[str]:
-    """Extract dates from text."""
+    """Extract dates from text (numeric, month-name, quarter, and year-only)."""
     dates = re.findall(
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b|"
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b",
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|"                          # 12/31/2024, 2024-01-15
+        r"\b\d{4}[/-]\d{1,2}[/-]\d{1,2}\b|"                             # ISO dates
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"[a-z]*\.?\s+\d{1,2},?\s+\d{4}\b|"                             # March 15, 2024
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"[a-z]*\.?\s+\d{4}\b|"                                          # March 2024
+        r"\b[QqFf][1-4]\s+\d{4}\b|"                                      # Q1 2024, FY 2023
+        r"\b\d{4}\s*[-–]\s*\d{4}\b|"                                     # 2020-2024 (year range)
+        r"\b(?:present|current)\b",                                       # "present" in date ranges
         text, re.I,
     )
     return list(dict.fromkeys(dates))
@@ -113,13 +123,15 @@ def _extract_organizations(text: str) -> List[str]:
     """Extract organization names from text."""
     orgs: List[str] = []
     patterns = [
-        re.compile(r"(?:company|employer|organization|firm|agency)\s*:\s*(.+?)(?:\n|$)", re.I),
-        re.compile(r"(?:at|with|for)\s+([A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+){0,3})\b"),
+        re.compile(r"(?:company|employer|organization|firm|agency|hospital|university|institute)\s*:\s*(.+?)(?:\n|$)", re.I),
+        re.compile(r"(?:at|with|for)\s+([A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+){0,4})\b"),
+        # Match "Org Inc.", "Org Corp.", "Org Ltd." patterns
+        re.compile(r"\b([A-Z][A-Za-z&]+(?:\s+[A-Z][A-Za-z&]+){0,3}\s+(?:Inc|Corp|Ltd|LLC|LLP|Pvt|Pte|GmbH|AG)\.?)\b"),
     ]
     for pat in patterns:
         for m in pat.finditer(text):
             org = m.group(1).strip()
-            if 2 < len(org) < 60:
+            if 2 < len(org) < 80:
                 orgs.append(org)
     return list(dict.fromkeys(orgs))[:10]
 

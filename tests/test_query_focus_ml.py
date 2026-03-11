@@ -347,11 +347,11 @@ class TestGracefulDegradation:
         chunk = _make_chunk("Python and Java skills", section_kind="skills_technical", score=0.5)
 
         score = _raw_chunk_score(chunk, focus)
-        # Without embedding: 0.4 * kw + 0.3 * sect + 0.3 * reranker
+        # Without embedding: 0.35 * kw + 0.25 * sect + 0.40 * reranker
         kw = 1.0  # both keywords match
         sect = 1.0  # exact section match
         reranker = 0.5
-        expected = 0.4 * kw + 0.3 * sect + 0.3 * reranker
+        expected = 0.35 * kw + 0.25 * sect + 0.40 * reranker
         assert score == pytest.approx(expected, abs=0.01)
 
 

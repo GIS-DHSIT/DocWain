@@ -2,7 +2,7 @@
 """Test script to verify document extraction works with ResumeProfile objects."""
 
 import sys
-sys.path.insert(0, '/home/muthu/PycharmProjects/DocWain')
+sys.path.insert(0, '/')
 
 from src.screening.resume.models import ResumeProfile, ExperienceItem, EducationItem, CertificationItem
 from src.rag_v3.document_extraction import extract_hr_from_complete_document

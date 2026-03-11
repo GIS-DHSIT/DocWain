@@ -8,12 +8,16 @@ No imports from other ``src/`` modules — all context is passed as arguments.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # A. Intent constants
@@ -46,233 +50,174 @@ NON_RETRIEVAL_INTENTS = frozenset({
 # B. Intent classifier
 # ---------------------------------------------------------------------------
 
-# Help-meta override — "how do I compare/rank/etc." is USAGE_HELP, not a doc query.
-_HELP_META_OVERRIDE = re.compile(
-    r"\bhow\s+(?:do\s+i|can\s+i|to)\s+(?:compare|rank|summarize|summarise|extract|"
-    r"list|find|screen|generate|upload|add|import)\b",
-    re.I,
-)
-
-# Capability-meta override — common "what else can you do/help with?" variants.
-_CAPABILITY_META_OVERRIDE = re.compile(
-    r"\b(?:"
-    r"what\s+(?:else\s+|all\s+)?can\s+(?:you|docwain)\s+(?:do|help\s+with)|"
-    r"show\s+me\s+what\s+(?:you|docwain)\s+can\s+do|"
-    r"how\s+can\s+(?:you|docwain)\s+help(?:\s+me)?"
-    r")\b",
-    re.I,
-)
-
-# Document discovery patterns — matched BEFORE doc query overrides.
-_DOCUMENT_DISCOVERY_PATTERNS = [
-    re.compile(r"\bwhat\s+can\s+i\s+(?:do|perform|ask)\s+with\s+(?:these|my|the)\s+documents?\b", re.I),
-    re.compile(r"\bwhat\s+(?:documents?|files?)\s+do\s+i\s+have\b", re.I),
-    re.compile(r"\bshow\s+(?:me\s+)?my\s+documents?\b", re.I),
-    re.compile(r"\bwhat\s+can\s+i\s+ask\s+(?:about|you)?\b", re.I),
-    re.compile(r"\bwhat\s+(?:is|are)\s+(?:available|uploaded|in\s+my\s+profile)\b", re.I),
-    re.compile(r"\blist\s+(?:my\s+)?(?:uploaded\s+)?documents?\b", re.I),
-    # "what types/kinds of documents do I have" — inventory, not capability
-    re.compile(r"\bwhat\s+(?:types?|kinds?)\s+of\s+(?:documents?|files?)\s+(?:do\s+i\s+have|are\s+(?:there|in\s+my))\b", re.I),
-    # "how many documents" — document count question
-    re.compile(r"\bhow\s+many\s+(?:documents?|files?|resumes?|invoices?)\b", re.I),
-]
-
-# Document-query override patterns — if these match, it's NOT conversational.
-_DOC_QUERY_OVERRIDES = [
-    re.compile(r"\bwho\s+is\s+[A-Z]", re.IGNORECASE),
-    re.compile(r"\bwhat\s+is\s+the\s+total\b", re.IGNORECASE),
-    re.compile(r"\btell\s+me\s+about\s+(?:the|this|his|her|their)\b", re.IGNORECASE),
-    re.compile(r"\b(?:summarize|summarise|extract|compare|rank|list|find|analyze|analyse)\b", re.IGNORECASE),
-    re.compile(r"\b(?:invoice|resume|contract|document|report|certificate|medication)\b", re.IGNORECASE),
-]
-
-# Greeting prefix pattern to strip before re-classifying.
-_GREETING_PREFIX_RE = re.compile(
-    r"^(?:hi|hello|hey|hiya|howdy|yo|sup|hii|good\s+(?:morning|afternoon|evening|day))"
-    r"[,!.\s]+",
-    re.IGNORECASE,
-)
-
-_INTENT_PATTERNS: Dict[str, List[re.Pattern]] = {
-    GREETING: [
-        re.compile(r"^(?:hi|hello|hey|hiya|howdy|yo|sup|hii|namaste|hola|bonjour|aloha|salutations)[\s!.,]*$", re.I),
-        re.compile(r"^good\s+(?:morning|afternoon|evening|day)[\s!.,]*$", re.I),
-        re.compile(r"^(?:what'?s\s+up|how\s+do\s+you\s+do)[\s!?,]*$", re.I),
-        re.compile(r"^(?:nice\s+to\s+meet\s+you|greetings)[\s!.,]*$", re.I),
-        re.compile(r"^(?:hi|hello|hey)\s+(?:there|team|docwain|assistant|bot|buddy|friend)[\s!.,]*$", re.I),
-    ],
-    FAREWELL: [
-        re.compile(r"^(?:bye|goodbye|good\s*bye|see\s+you|see\s+ya|farewell|ciao|cheerio|adieu)[\s!.,]*$", re.I),
-        re.compile(r"^(?:ta\s*ta|tata|catch\s+you\s+later|later|peace\s+out|au\s+revoir|sayonara)[\s!.,]*$", re.I),
-        re.compile(r"^(?:take\s+care|until\s+next\s+time|signing\s+off|gotta\s+go|gtg|ttyl)[\s!.,]*$", re.I),
-        re.compile(r"^(?:good\s*night|have\s+a\s+(?:good|great|nice)\s+day)[\s!.,]*$", re.I),
-        re.compile(r"^(?:that'?s\s+all|i'?m\s+done|end\s+chat|quit|exit|close|finish|stop|terminate)[\s!.,]*$", re.I),
-        re.compile(r"^(?:see\s+you\s+(?:soon|around|later)|talk\s+to\s+you\s+later|hasta\s+la\s+vista)[\s!.,]*$", re.I),
-    ],
-    THANKS: [
-        re.compile(r"^(?:thanks|thank\s+you|thanks?\s+a\s+lot|thx|ty|tysm|much\s+appreciated)[\s!.,]*$", re.I),
-        re.compile(r"^(?:thank\s+you\s+(?:so\s+much|very\s+much)|appreciate\s+it)[\s!.,]*$", re.I),
-        re.compile(r"^(?:thanks\s+for\s+(?:your|the)\s+help|cheers)[\s!.,]*$", re.I),
-    ],
-    PRAISE: [
-        re.compile(r"^(?:awesome|great\s+job|well\s+done|excellent|perfect|amazing|brilliant|fantastic)[\s!.,]*$", re.I),
-        re.compile(r"^(?:good\s+answer|great\s+answer|very\s+good|nice|impressive|superb|outstanding)[\s!.,]*$", re.I),
-        re.compile(r"^(?:love\s+it|nailed\s+it|spot\s+on|exactly\s+(?:right|what\s+i\s+needed))[\s!.,]*$", re.I),
-    ],
-    NEGATIVE_MILD: [
-        re.compile(r"(?:not\s+quite|could\s+be\s+better|not\s+exactly|not\s+what\s+i\s+(?:meant|wanted|asked))", re.I),
-        re.compile(r"(?:try\s+again|can\s+you\s+redo|not\s+(?:great|ideal)|a\s+bit\s+off|close\s+but)", re.I),
-        re.compile(r"(?:incomplete|partially?\s+(?:right|correct)|needs?\s+(?:work|improvement))", re.I),
-    ],
-    NEGATIVE_STRONG: [
-        re.compile(r"(?:terrible|useless|awful|horrible|worst|garbage|trash|pathetic|dreadful)", re.I),
-        re.compile(r"(?:completely\s+wrong|totally\s+wrong|absolutely\s+wrong|100%\s+wrong)", re.I),
-        re.compile(r"(?:bad\s+(?:answer|response)|wrong\s+(?:answer|response)|not\s+(?:right|correct|accurate))", re.I),
-        re.compile(r"(?:this\s+is\s+(?:bad|wrong|not\s+(?:right|correct|accurate|helpful)))", re.I),
-        re.compile(r"(?:doesn'?t\s+make\s+sense|does\s+not\s+make\s+sense|poor\s+(?:answer|response))", re.I),
-    ],
-    IDENTITY: [
-        re.compile(r"\bwho\s+are\s+you\b", re.I),
-        re.compile(r"\bwhat\s+are\s+you\b", re.I),
-        re.compile(r"\bwhat\s+is\s+docwain\b", re.I),
-        re.compile(r"\btell\s+me\s+about\s+(?:yourself|docwain)\b", re.I),
-        re.compile(r"\bintroduce\s+yourself\b", re.I),
-        re.compile(r"\bwhat'?s\s+your\s+name\b", re.I),
-        re.compile(r"\bare\s+you\s+(?:a\s+(?:bot|ai|robot)|human)\b", re.I),
-    ],
-    CAPABILITY: [
-        re.compile(r"\bwhat\s+can\s+you\s+do\b", re.I),
-        re.compile(r"\bwhat\s+else\s+can\s+you\s+do\b", re.I),
-        re.compile(r"\bwhat\s+all\s+can\s+(?:you|docwain)\s+do\b", re.I),
-        re.compile(r"\bwhat\s+(?:are\s+your|do\s+you\s+have)\s+(?:features|capabilities)\b", re.I),
-        re.compile(r"\blist\s+(?:your\s+)?features\b", re.I),
-        re.compile(r"\blist\s+(?:your\s+)?capabilities\b", re.I),
-        re.compile(r"\bwhat\s+(?:do\s+you|can\s+you)\s+(?:help\s+with|support)\b", re.I),
-        re.compile(r"\bwhat\s+else\s+can\s+you\s+help\s+with\b", re.I),
-        re.compile(r"\bhow\s+can\s+(?:you|docwain)\s+help(?:\s+me)?\b", re.I),
-        re.compile(r"\bwhat\s+can\s+i\s+do\s+with\s+docwain\b", re.I),
-        re.compile(r"\bwhat\s+can\s+docwain\s+do\b", re.I),
-        re.compile(r"\bshow\s+me\s+what\s+you\s+can\s+do\b", re.I),
-        re.compile(r"\bwhat\s+(?:types?|kinds?)\s+of\s+(?:documents?|files?)\s+(?:can|do)\s+you\b", re.I),
-    ],
-    HOW_IT_WORKS: [
-        re.compile(r"\bhow\s+do\s+you\s+work\b", re.I),
-        re.compile(r"\bhow\s+does\s+(?:docwain|this|it)\s+work\b", re.I),
-        re.compile(r"\bhow\s+accurate\s+(?:are\s+you|is\s+(?:docwain|this|it))\b", re.I),
-        re.compile(r"\bwhat\s+(?:technology|tech|model|ai)\s+do\s+you\s+use\b", re.I),
-        re.compile(r"\bhow\s+do\s+you\s+(?:retrieve|find|search|process)\b", re.I),
-        re.compile(r"\bexplain\s+(?:how\s+you\s+work|your\s+process)\b", re.I),
-    ],
-    PRIVACY: [
-        re.compile(r"\b(?:is\s+)?my\s+data\s+(?:safe|secure|private|protected)\b", re.I),
-        re.compile(r"\bwho\s+can\s+(?:see|access|view)\s+my\b", re.I),
-        re.compile(r"\bprivacy\b", re.I),
-        re.compile(r"\bdata\s+(?:security|protection|privacy|handling)\b", re.I),
-        re.compile(r"\bdo\s+you\s+(?:store|keep|share|sell)\s+(?:my\s+)?data\b", re.I),
-        re.compile(r"\b(?:gdpr|compliance|data\s+retention)\b", re.I),
-    ],
-    LIMITATIONS: [
-        re.compile(r"\bwhat\s+can'?t\s+you\s+do\b", re.I),
-        re.compile(r"\bwhat\s+(?:are\s+your|do\s+you\s+have)\s+limitations?\b", re.I),
-        re.compile(r"\bcan\s+you\s+(?:browse|search)\s+(?:the\s+)?(?:internet|web)\b", re.I),
-        re.compile(r"\bdo\s+you\s+(?:have\s+)?(?:access\s+to\s+)?(?:the\s+)?internet\b", re.I),
-        re.compile(r"\bwhat\s+(?:don'?t|do\s+not)\s+you\s+(?:support|handle)\b", re.I),
-    ],
-    USAGE_HELP: [
-        re.compile(r"\bhow\s+(?:do\s+i|can\s+i|to)\s+(?:start|begin|use)\b", re.I),
-        re.compile(r"\bshow\s+(?:me\s+)?(?:examples?|a\s+demo)\b", re.I),
-        re.compile(r"\bhelp\s+me\s+(?:get\s+started|begin)\b", re.I),
-        re.compile(r"\bgetting\s+started\b", re.I),
-        re.compile(r"\bwhat\s+(?:should|can)\s+i\s+(?:ask|try|do)\s+(?:first|next)?\b", re.I),
-        re.compile(r"\bquick\s+(?:start|guide|tutorial)\b", re.I),
-        # Upload queries
-        re.compile(r"\bhow\s+(?:do\s+i|can\s+i|to)\s+(?:upload|add)\s+(?:a\s+)?(?:document|file)\b", re.I),
-        # File type queries
-        re.compile(r"\bwhat\s+(?:file|document)?\s*(?:formats?|types?)\s+(?:are\s+)?supported\b", re.I),
-        re.compile(r"\bcan\s+i\s+upload\s+(?:images?|pdf|excel|word|csv|pptx?)\b", re.I),
-        # Domain example queries
-        re.compile(r"\b(?:resume|invoice|legal|medical|contract)\s+(?:examples?|help)\b", re.I),
-        re.compile(r"\bshow\s+(?:me\s+)?(?:resume|invoice|legal|medical)\s+(?:examples?|queries)\b", re.I),
-        # Screening queries
-        re.compile(r"\bscreening\s+(?:help|guide)\b", re.I),
-        re.compile(r"\bhow\s+(?:does|do)\s+screening\s+work\b", re.I),
-        # Content generation
-        re.compile(r"\b(?:content\s+generation|generate\s+content)\s+(?:help|guide)\b", re.I),
-        # Advanced features
-        re.compile(r"\badvanced\s+(?:features?|capabilities?)\b", re.I),
-        re.compile(r"\bfine.?tun(?:e|ing)\s+(?:help|guide)\b", re.I),
-        # Generic help/guide/tutorial/walkthrough
-        re.compile(r"^(?:help|guide|tutorial|walkthrough)[\s!?.]*$", re.I),
-        re.compile(r"\bexample\s+(?:queries|questions)\b", re.I),
-        re.compile(r"\bsample\s+(?:queries|questions)\b", re.I),
-    ],
-    SMALL_TALK: [
-        re.compile(r"^(?:how\s+are\s+you|how'?s\s+it\s+going|what'?s\s+up|how\s+do\s+you\s+do)[\s!?,]*$", re.I),
-        re.compile(r"^(?:how'?s\s+your\s+day|how\s+have\s+you\s+been|you\s+good)[\s!?,]*$", re.I),
-        re.compile(r"^(?:what'?s\s+new|anything\s+new|what'?s\s+happening)[\s!?,]*$", re.I),
-    ],
-    CLARIFICATION: [
-        re.compile(r"\b(?:repeat|say)\s+that\s+(?:again|please)\b", re.I),
-        re.compile(r"\bexplain\s+(?:that\s+)?again\b", re.I),
-        re.compile(r"\bi\s+(?:didn'?t|did\s+not)\s+(?:understand|get\s+(?:that|it))\b", re.I),
-        re.compile(r"\bcan\s+you\s+(?:clarify|rephrase|elaborate)\b", re.I),
-        re.compile(r"\bwhat\s+(?:do\s+you\s+mean|did\s+you\s+mean)\b", re.I),
-        re.compile(r"\bcould\s+you\s+(?:be\s+more\s+)?(?:specific|clear|explicit)\b", re.I),
-    ],
-}
-
 
 def classify_conversational_intent(
     text: str,
     turn_count: int = 0,
 ) -> Optional[Tuple[str, float]]:
-    """Classify *text* into a conversational intent.
+    """Classify *text* into a conversational intent using NLU understanding.
 
-    Returns ``(intent, confidence)`` or ``None`` when the message should
-    proceed to document retrieval.
+    Uses contrastive embedding classification against document-query and
+    conversational prototypes.  Returns ``(intent, confidence)`` when the
+    message is conversational, or ``None`` when it should proceed to
+    document retrieval.
     """
     text = (text or "").strip()
     if not text:
         return None
 
-    # Document discovery — "what can I do with these documents?" etc.
-    for pat in _DOCUMENT_DISCOVERY_PATTERNS:
-        if pat.search(text):
-            return (DOCUMENT_DISCOVERY, 0.92)
+    try:
+        from src.nlp.nlu_engine import classify_query_routing
 
-    # Help-meta override — "how do I compare?" is usage help, not a doc query.
-    if _HELP_META_OVERRIDE.search(text):
-        return (USAGE_HELP, 0.90)
+        routing, intent, score = classify_query_routing(text)
 
-    # Capability-meta override — "what else can you do?" is conversational.
-    if _CAPABILITY_META_OVERRIDE.search(text):
-        return (CAPABILITY, 0.92)
+        # If the holistic classifier sees GREETING but the message is longer,
+        # strip the greeting prefix (via spaCy INTJ detection) and
+        # re-classify the substantive part.
+        if routing == "conversational" and intent == GREETING:
+            stripped = _strip_greeting_prefix(text)
+            if stripped and stripped != text and len(stripped.split()) > 2:
+                sub_routing, sub_intent, sub_score = classify_query_routing(stripped)
+                if sub_routing == "document":
+                    return None
+                routing, intent, score = sub_routing, sub_intent, sub_score
 
-    # Document query override — these are NOT conversational.
-    for pat in _DOC_QUERY_OVERRIDES:
-        if pat.search(text):
+        if routing == "document":
             return None
 
-    # Try direct match on every intent.
-    for intent, patterns in _INTENT_PATTERNS.items():
-        for pat in patterns:
-            if pat.search(text):
-                conf = 0.95 if pat.pattern.startswith("^") else 0.85
-                # Upgrade GREETING → GREETING_RETURN when conversation ongoing.
-                if intent == GREETING and turn_count > 0:
-                    return (GREETING_RETURN, conf)
-                return (intent, conf)
+        # Confidence threshold gate: borderline classifications (score < 0.65)
+        # should default to document retrieval.  Many document queries with
+        # conversational phrasing ("Can you show me...", "I'd like to know...")
+        # get low-confidence conversational scores — route these to RAG.
+        # Exempt clearly conversational intents (praise, capability questions, etc.)
+        _CONV_CONFIDENCE_THRESHOLD = 0.65
+        _CLEARLY_CONVERSATIONAL = frozenset({
+            GREETING, GREETING_RETURN, FAREWELL, THANKS, IDENTITY,
+            PRAISE, NEGATIVE_MILD, NEGATIVE_STRONG, CAPABILITY,
+            HOW_IT_WORKS, LIMITATIONS, SMALL_TALK,
+            # NOTE: PRIVACY and USAGE_HELP removed — queries about "email",
+            # "phone", "skills" were being misrouted to PRIVACY/USAGE_HELP
+            # because embedding similarity to these prototypes bypassed the
+            # 0.65 confidence gate. Now they must meet the threshold.
+            # CLARIFICATION also removed (see prior note).
+        })
+        if score < _CONV_CONFIDENCE_THRESHOLD and intent not in _CLEARLY_CONVERSATIONAL:
+            return None
 
-    # Combo handling: strip greeting prefix and re-classify remainder.
-    m = _GREETING_PREFIX_RE.match(text)
-    if m:
-        remainder = text[m.end():].strip()
-        if remainder:
-            sub = classify_conversational_intent(remainder, turn_count)
-            if sub is not None:
-                return sub
+        # Adjust greeting for returning users
+        if intent == GREETING and turn_count > 0:
+            return (GREETING_RETURN, score)
+        return (intent, score)
+    except Exception:
+        # Fallback: regex pattern matching when NLU is unavailable
+        return _fallback_intent_patterns(text, turn_count)
+
+
+# ── Regex fallback for when NLU engine is unavailable ──────────────────
+
+_GREETING_RE = re.compile(
+    r"^(hi|hello|hey|good\s+(morning|afternoon|evening)|howdy|greetings)\b", re.IGNORECASE
+)
+_FAREWELL_RE = re.compile(
+    r"\b(bye|goodbye|see\s+you|take\s+care|farewell|until\s+(next|later))\b", re.IGNORECASE
+)
+_THANKS_RE = re.compile(r"\b(thank|thanks|appreciate|grateful)\b", re.IGNORECASE)
+_IDENTITY_RE = re.compile(r"\b(who\s+are\s+you|what\s+are\s+you|your\s+name)\b", re.IGNORECASE)
+_CAPABILITY_RE = re.compile(
+    r"\b(what\s+can\s+you\s+do|your\s+capabilit|help\s+me\s+with|what\s+do\s+you\s+do)\b",
+    re.IGNORECASE,
+)
+_HELP_RE = re.compile(r"\b(how\s+do\s+i|how\s+to\s+use|usage|tutorial|guide)\b", re.IGNORECASE)
+
+
+def _fallback_intent_patterns(text: str, turn_count: int) -> Optional[Tuple[str, float]]:
+    """Regex-based intent detection as fallback when NLU is unavailable.
+
+    Returns (intent, confidence) or None if text looks like a document query.
+    """
+    lowered = text.lower().strip()
+    # Short messages are more likely conversational
+    is_short = len(lowered.split()) <= 4
+
+    if _GREETING_RE.match(lowered):
+        if is_short:
+            intent = GREETING_RETURN if turn_count > 0 else GREETING
+            return (intent, 0.80)
+        return None  # Long message starting with greeting → probably a document query
+
+    if _FAREWELL_RE.search(lowered) and is_short:
+        return (FAREWELL, 0.80)
+
+    if _THANKS_RE.search(lowered) and is_short:
+        return (THANKS, 0.75)
+
+    if _IDENTITY_RE.search(lowered):
+        return (IDENTITY, 0.85)
+
+    if _CAPABILITY_RE.search(lowered):
+        return (CAPABILITY, 0.85)
+
+    if _HELP_RE.search(lowered) and is_short:
+        return (USAGE_HELP, 0.70)
 
     return None
+
+
+def _try_conversational_nlu(text: str) -> Optional[Tuple[str, float]]:
+    """NLU-based conversational classification (embedding + spaCy)."""
+    try:
+        from src.nlp.nlu_engine import classify_conversational
+        return classify_conversational(text)
+    except Exception:
+        return None
+
+
+def _is_document_query(text: str) -> bool:
+    """Determine whether *text* is a document query using NLU classification.
+
+    Uses contrastive embedding similarity against document-query prototypes
+    vs conversational prototypes.  Kept as a utility for any call site
+    that needs a boolean document-query check.
+    """
+    try:
+        from src.nlp.nlu_engine import classify_document_query
+        return classify_document_query(text)
+    except Exception:
+        return False
+
+
+def _strip_greeting_prefix(text: str) -> str:
+    """Strip greeting prefix using spaCy part-of-speech tagging.
+
+    Detects interjection (INTJ) tokens at the start of *text* and strips
+    them along with following punctuation and whitespace.
+    """
+    try:
+        from src.nlp.nlu_engine import _get_nlp
+
+        nlp = _get_nlp()
+        if nlp is None:
+            return text
+        doc = nlp(text)
+        strip_to = 0
+        for token in doc:
+            if token.is_space:
+                continue
+            if token.pos_ == "INTJ":
+                strip_to = token.idx + len(token.text_with_ws)
+                for next_token in doc[token.i + 1 :]:
+                    if next_token.is_punct or next_token.is_space:
+                        strip_to = next_token.idx + len(next_token.text_with_ws)
+                    else:
+                        break
+                break
+            else:
+                break
+        if 0 < strip_to < len(text):
+            return text[strip_to:].strip()
+    except Exception:
+        pass
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -304,14 +249,26 @@ def _time_of_day(hour: Optional[int] = None) -> str:
     return "night"
 
 
+_DOC_SUMMARY_CACHE: Dict[str, Tuple[float, int, List[str], Dict[str, int]]] = {}
+_DOC_SUMMARY_TTL = 30  # seconds — short enough to reflect deletions quickly
+
+
 def _mongodb_doc_summary(subscription_id: str, profile_id: str):
-    """Fetch document names and domains from MongoDB (authoritative source)."""
+    """Fetch document names and domains from MongoDB (authoritative source).
+
+    Uses a 30-second TTL cache to avoid creating a new connection per request.
+    """
+    cache_key = f"{subscription_id}:{profile_id}"
+    cached = _DOC_SUMMARY_CACHE.get(cache_key)
+    if cached:
+        ts, cnt, names, doms = cached
+        if (time.time() - ts) < _DOC_SUMMARY_TTL:
+            return cnt, names, doms
+
     try:
+        from src.api.dataHandler import db
         from src.api.config import Config
-        import pymongo
-        client = pymongo.MongoClient(Config.MongoDB.URI, serverSelectionTimeoutMS=3000)
-        db = client[Config.MongoDB.DB]
-        cursor = db.documents.find(
+        cursor = db[Config.MongoDB.DOCUMENTS].find(
             {"subscription_id": subscription_id, "profile_id": profile_id,
              "status": {"$nin": ["DELETED"]}},
             {"name": 1, "doc_domain": 1},
@@ -322,6 +279,7 @@ def _mongodb_doc_summary(subscription_id: str, profile_id: str):
         domain_counts: Dict[str, int] = {}
         for dom in domains_list:
             domain_counts[dom] = domain_counts.get(dom, 0) + 1
+        _DOC_SUMMARY_CACHE[cache_key] = (time.time(), len(docs), names, domain_counts)
         return len(docs), names, domain_counts
     except Exception:
         return 0, [], {}
@@ -343,22 +301,26 @@ def collect_context(
     doc_names = [n for n in doc_names if n]
     dominant = catalog.get("dominant_domains") or {}
 
-    # Fallback: if catalog is incomplete but profile has data, query MongoDB
+    # Use MongoDB as authoritative source when catalog seems stale.
+    # The cached _mongodb_doc_summary (30s TTL) keeps this cheap.
     doc_count = len(docs)
-    if doc_count == 0 and collection_point_count > 0 and subscription_id and profile_id:
-        mongo_count, mongo_names, mongo_domains = _mongodb_doc_summary(subscription_id, profile_id)
-        if mongo_count > 0:
-            doc_count = mongo_count
-            doc_names = mongo_names[:5]
-            dominant = mongo_domains
-    elif doc_count > 0 and collection_point_count > 0 and subscription_id and profile_id:
-        # Catalog exists but may be stale — check if MongoDB has more docs
-        mongo_count, mongo_names, mongo_domains = _mongodb_doc_summary(subscription_id, profile_id)
-        if mongo_count > doc_count:
-            doc_count = mongo_count
-            doc_names = mongo_names[:5]
-            if mongo_domains:
+    if subscription_id and profile_id:
+        if doc_count == 0 and collection_point_count > 0:
+            # Catalog empty but Qdrant has data — check MongoDB
+            mongo_count, mongo_names, mongo_domains = _mongodb_doc_summary(subscription_id, profile_id)
+            if mongo_count > 0:
+                doc_count = mongo_count
+                doc_names = mongo_names[:5]
                 dominant = mongo_domains
+        elif doc_count > 0:
+            # Catalog exists — verify against MongoDB (handles deletions too)
+            mongo_count, mongo_names, mongo_domains = _mongodb_doc_summary(subscription_id, profile_id)
+            if mongo_count != doc_count:
+                doc_count = mongo_count
+                if mongo_names:
+                    doc_names = mongo_names[:5]
+                if mongo_domains:
+                    dominant = mongo_domains
 
     if isinstance(dominant, dict):
         domains = sorted(dominant.keys(), key=lambda k: dominant[k], reverse=True)
@@ -892,6 +854,61 @@ def _domain_suggestion(ctx: ConversationalContext, seed: int) -> str:
     return ""
 
 
+_CONVERSATIONAL_SYSTEM_PROMPT = (
+    "You are DocWain, a friendly and professional document intelligence assistant. "
+    "You help users analyze, search, and extract insights from their uploaded documents. "
+    "Keep responses warm, concise (2-3 sentences), and helpful. "
+    "Mention document-related capabilities naturally when appropriate. "
+    "Never use bullet points or markdown formatting in conversational responses. "
+    "Do NOT start with 'I' — vary your sentence openings."
+)
+
+# Intents eligible for LLM-generated conversational responses
+# Disabled: LLM conversational responses cause model-swap latency (60-200s)
+# when Ollama has a different model loaded.  Template fragments are sufficient.
+_LLM_CONVERSATIONAL_INTENTS: set = set()  # was {GREETING, GREETING_RETURN, FAREWELL, THANKS, PRAISE}
+
+
+def _llm_conversational_response(
+    intent: str,
+    context: ConversationalContext,
+    user_text: str,
+) -> Optional[str]:
+    """Generate a conversational response using the LLM.
+
+    Returns None if LLM is unavailable or takes too long (>3s).
+    """
+    try:
+        from src.llm.clients import OllamaClient
+        import asyncio
+
+        client = OllamaClient()
+        ctx_info = (
+            f"User has {context.document_count} document(s) loaded"
+            + (f" covering {_format_domains(context.dominant_domains)}" if context.dominant_domains else "")
+            + f". Time of day: {context.time_of_day}."
+        )
+        user_msg = f"[Context: {ctx_info}]\n[Intent: {intent}]\nUser says: {user_text or intent.lower()}"
+
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                client.chat_with_metadata,
+                messages=[
+                    {"role": "system", "content": _CONVERSATIONAL_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                thinking=False,
+                options={"num_predict": 150, "num_ctx": 2048},
+            )
+            text, _meta = future.result(timeout=3.0)
+        if text and len(text.strip()) > 20:
+            return text.strip()
+    except Exception as exc:
+        logger.debug("LLM conversational response failed: %s", exc)
+    return None
+
+
 def compose_response(
     intent: str,
     context: ConversationalContext,
@@ -911,7 +928,19 @@ def compose_response(
         except Exception:
             pass  # Fall through to generic fragment-based response.
 
-    pools = _FRAGMENT_POOLS.get(intent) or _FRAGMENT_POOLS[GREETING]
+    # LLM-generated conversational responses for social intents
+    if intent in _LLM_CONVERSATIONAL_INTENTS and user_text:
+        llm_response = _llm_conversational_response(intent, context, user_text)
+        if llm_response:
+            return llm_response
+
+    pools = _FRAGMENT_POOLS.get(intent)
+    if pools is None:
+        # Try case-insensitive lookup before falling back to GREETING
+        pools = _FRAGMENT_POOLS.get(intent.upper()) if intent else None
+        if pools is None:
+            logger.warning("Unknown conversational intent '%s', falling back to GREETING", intent)
+            pools = _FRAGMENT_POOLS[GREETING]
     seed = _make_seed(intent, user_key)
 
     opener = _pick(_filter_fragments(pools.get("opener", []), context), seed)
