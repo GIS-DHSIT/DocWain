@@ -1,0 +1,65 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Preferences",
+      "weight": "Bolder",
+      "size": "Medium"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Choose your preferred model and persona for this chat.",
+      "wrap": true,
+      "spacing": "Small"
+    },
+    {
+      "type": "TextBlock",
+      "text": "Model",
+      "weight": "Bolder",
+      "spacing": "Medium"
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "model",
+      "value": "{current_model}",
+      "choices": [
+        { "title": "Llama 3.2 (Default)", "value": "llama3.2" },
+        { "title": "GPT-4o", "value": "gpt-4o" },
+        { "title": "Mistral", "value": "mistral" },
+        { "title": "Gemini 2.5 Flash", "value": "gemini-2.5-flash" }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "Persona",
+      "weight": "Bolder",
+      "spacing": "Medium"
+    },
+    {
+      "type": "Input.ChoiceSet",
+      "id": "persona",
+      "value": "{current_persona}",
+      "choices": [
+        { "title": "Document Assistant", "value": "Document Assistant" },
+        { "title": "Analyst", "value": "Analyst" },
+        { "title": "Summarizer", "value": "Summarizer" },
+        { "title": "Legal Reviewer", "value": "Legal Reviewer" }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.Submit",
+      "title": "Save preferences",
+      "data": { "action": "set_preferences" }
+    },
+    {
+      "type": "Action.Submit",
+      "title": "Back to tools",
+      "data": { "action": "show_tools" }
+    }
+  ]
+}

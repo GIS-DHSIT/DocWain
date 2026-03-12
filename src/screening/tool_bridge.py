@@ -5,18 +5,16 @@ and gateway can invoke screening tools the same way as regular tools.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional
 
 from src.tools.base import register_tool
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_engine():
     from src.screening.engine import ScreeningEngine
     return ScreeningEngine()
-
 
 @register_tool("screen_pii")
 def screen_pii_tool(payload: Dict[str, Any], *, correlation_id: Optional[str] = None) -> Dict[str, Any]:
@@ -28,7 +26,6 @@ def screen_pii_tool(payload: Dict[str, Any], *, correlation_id: Optional[str] = 
     result_dict = engine.evaluate(text=text, doc_type=(payload.get("options") or {}).get("doc_type"))
     return {"result": result_dict, "sources": [], "grounded": True}
 
-
 @register_tool("screen_ai_authorship")
 def screen_ai_authorship_tool(payload: Dict[str, Any], *, correlation_id: Optional[str] = None) -> Dict[str, Any]:
     """Detect AI-generated content."""
@@ -38,7 +35,6 @@ def screen_ai_authorship_tool(payload: Dict[str, Any], *, correlation_id: Option
     engine = _get_engine()
     result_dict = engine.evaluate(text=text, doc_type=(payload.get("options") or {}).get("doc_type"))
     return {"result": result_dict, "sources": [], "grounded": True}
-
 
 @register_tool("screen_resume")
 def screen_resume_tool(payload: Dict[str, Any], *, correlation_id: Optional[str] = None) -> Dict[str, Any]:
@@ -60,7 +56,6 @@ def screen_resume_tool(payload: Dict[str, Any], *, correlation_id: Optional[str]
     elif hasattr(result, "dict"):
         result = result.dict()
     return {"result": result, "sources": [], "grounded": True}
-
 
 @register_tool("screen_readability")
 def screen_readability_tool(payload: Dict[str, Any], *, correlation_id: Optional[str] = None) -> Dict[str, Any]:

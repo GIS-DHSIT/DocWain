@@ -1,5 +1,5 @@
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import pickle
 from pathlib import Path
@@ -8,11 +8,10 @@ from typing import Any, Dict
 from src.api.blob_store import BlobStore, BlobConfigurationError, blob_storage_configured
 from src.storage.blob_persistence import load_pickle as load_blob_pickle
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DEFAULT_DIR = "document-content"
 _BLOB_UNCONFIGURED_LOGGED = False
-
 
 def _sanitize_document_id(document_id: str) -> str:
     text = str(document_id).strip()
@@ -21,14 +20,12 @@ def _sanitize_document_id(document_id: str) -> str:
             text = text.replace(sep, "_")
     return text
 
-
 def get_document_content_dir() -> Path:
     raw = os.getenv("DOCUMENT_CONTENT_DIR", _DEFAULT_DIR)
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = Path.cwd() / path
     return path
-
 
 def ensure_document_content_dir() -> Path:
     path = get_document_content_dir()
@@ -39,11 +36,9 @@ def ensure_document_content_dir() -> Path:
         raise
     return path
 
-
 def build_pickle_path(document_id: str) -> Path:
     safe_id = _sanitize_document_id(document_id)
     return ensure_document_content_dir() / f"{safe_id}.pkl"
-
 
 def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any]:
     global _BLOB_UNCONFIGURED_LOGGED
@@ -76,7 +71,6 @@ def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
 
-
 def load_extracted_pickle(document_id: str) -> Any:
     if blob_storage_configured():
         store = BlobStore()
@@ -91,7 +85,6 @@ def load_extracted_pickle(document_id: str) -> Any:
         raise ValueError(f"Extracted content not found for document_id={document_id}")
     with open(path, "rb") as handle:
         return pickle.load(handle)
-
 
 def delete_extracted_pickle(document_id: str) -> bool:
     if blob_storage_configured():

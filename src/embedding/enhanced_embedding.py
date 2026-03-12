@@ -12,14 +12,13 @@ Key improvements:
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from collections import defaultdict
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class EnhancedChunk:
@@ -59,7 +58,6 @@ class EnhancedChunk:
             self.content_hash = hashlib.sha256(
                 self.canonical_text.encode("utf-8")
             ).hexdigest()[:16]
-
 
 class EnhancedEmbeddingBuilder:
     """
@@ -480,7 +478,6 @@ class EnhancedEmbeddingBuilder:
 
         return min(1.0, max(0.0, score))
 
-
 def build_enhanced_payload(
     chunk: EnhancedChunk,
     base_payload: Dict[str, Any],
@@ -522,11 +519,9 @@ def build_enhanced_payload(
 
     return payload
 
-
 def get_embedding_builder(domain: str = "generic") -> EnhancedEmbeddingBuilder:
     """Get an embedding builder for the specified domain."""
     return EnhancedEmbeddingBuilder(domain=domain)
-
 
 __all__ = [
     "EnhancedChunk",

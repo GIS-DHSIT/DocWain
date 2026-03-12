@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Iterable, Optional
 
 from src.api.config import Config
 from src.kg.neo4j_store import Neo4jStore
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class KGUpdater:
     def __init__(self, *, enabled: Optional[bool] = None, redis_client: Optional[Any] = None) -> None:
@@ -198,6 +197,5 @@ class KGUpdater:
             "entities": len(entity_rows),
             "mentions": len(mention_rows),
         }
-
 
 __all__ = ["KGUpdater"]

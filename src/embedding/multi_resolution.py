@@ -7,16 +7,14 @@ section vectors so no information is lost.
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _stable_id(prefix: str, *parts: str) -> str:
     raw = "|".join(str(p) for p in parts)
     return f"{prefix}_{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
-
 
 def build_doc_vector_text(
     *,
@@ -47,7 +45,6 @@ def build_doc_vector_text(
         parts.append(f"Topics: {', '.join(str(t) for t in intent_tags[:10])}")
     return "\n".join(parts) if parts else ""
 
-
 def build_section_vector_text(
     *,
     section_title: str,
@@ -67,7 +64,6 @@ def build_section_vector_text(
         unique = list(dict.fromkeys(rescued_fragments))
         parts.append(f"Details: {', '.join(unique)}")
     return "\n".join(parts) if parts else ""
-
 
 def build_multi_resolution_extras(
     *,
@@ -205,7 +201,6 @@ def build_multi_resolution_extras(
         )
 
     return extras
-
 
 __all__ = [
     "build_doc_vector_text",

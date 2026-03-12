@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
@@ -13,16 +13,14 @@ from src.tools.common.grounding import build_source_record
 from src.tools.common.safety import LEGAL_DISCLAIMER, add_disclaimer
 from src.tools.common.text_extract import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/lawhere", tags=["Tools-LawHere"])
-
 
 class LawHereRequest(BaseModel):
     text: str = Field(..., description="Legal text to analyze")
     query: Optional[str] = Field(default=None, description="User query for focused analysis")
     profile_type: Optional[str] = Field(default=None, description="Legal profile or domain")
-
 
 # ── JSON Schema for LLM extraction ─────────────────────────────────
 
@@ -42,7 +40,6 @@ _JSON_SCHEMA = """{
 }"""
 
 _EXPECTED_FIELDS = ["parties", "obligations", "risks", "summary"]
-
 
 # ── Jurisdiction detection ────────────────────────────────────────────
 
@@ -67,7 +64,6 @@ _JURISDICTION_CONTEXT: Dict[str, str] = {
     "AU": "Australian legal system (federal + state). Key frameworks: Corporations Act, ACL, Fair Work Act. Court hierarchy: Magistrates -> Federal/State -> High Court.",
 }
 
-
 def _detect_legal_jurisdiction(text: str) -> Optional[str]:
     """Detect the legal jurisdiction from document text using regex patterns."""
     if not text:
@@ -83,7 +79,6 @@ def _detect_legal_jurisdiction(text: str) -> Optional[str]:
         return None
     return max(scores, key=scores.get)
 
-
 # ── LLM extraction ─────────────────────────────────────────────────
 
 def _llm_extract(text: str, query: str = "", jurisdiction: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -97,7 +92,6 @@ def _llm_extract(text: str, query: str = "", jurisdiction: Optional[str] = None)
     except Exception as exc:
         logger.debug("Legal LLM extraction failed: %s", exc)
         return None
-
 
 def _normalize_llm_result(raw: Dict[str, Any], profile_type: Optional[str] = None) -> Dict[str, Any]:
     """Normalize LLM output into the expected legal result shape."""
@@ -147,13 +141,11 @@ def _normalize_llm_result(raw: Dict[str, Any], profile_type: Optional[str] = Non
         "profile_type": profile_type,
     }
 
-
 # ── Regex fallback ──────────────────────────────────────────────────
 
 def _extract_clauses(text: str) -> List[str]:
     matches = re.findall(r"(shall|must|will)\s+[^\.]+", text, flags=re.IGNORECASE)
     return [m.strip() for m in matches[:6]]
-
 
 def _regex_analyze(text: str, profile_type: Optional[str] = None) -> Dict[str, Any]:
     cleaned = sanitize_text(text, max_chars=4000)
@@ -177,7 +169,6 @@ def _regex_analyze(text: str, profile_type: Optional[str] = None) -> Dict[str, A
         "obligations": clauses[:10],
         "profile_type": profile_type,
     }
-
 
 # ── Unified analysis ───────────────────────────────────────────────
 
@@ -242,7 +233,6 @@ def _analyze(request: LawHereRequest) -> Dict[str, Any]:
         result["rendered"] = "\n\n".join(rendered_parts)
     return result
 
-
 def _ensure_domain_enabled() -> None:
     if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
         raise ToolError(
@@ -250,7 +240,6 @@ def _ensure_domain_enabled() -> None:
             code="deprecated",
             status_code=410,
         )
-
 
 @register_tool("lawhere")
 async def lawhere_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
@@ -263,7 +252,6 @@ async def lawhere_handler(payload: Dict[str, Any], correlation_id: Optional[str]
     result = _analyze(req)
     sources = [build_source_record("tool", correlation_id or "lawhere", title="lawhere")]
     return {"result": result, "sources": sources, "grounded": True, "context_found": True, "warnings": [LEGAL_DISCLAIMER]}
-
 
 @router.post("/analyze")
 async def analyze(request: LawHereRequest, x_correlation_id: str | None = Header(None)):

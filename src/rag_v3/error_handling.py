@@ -13,16 +13,17 @@ from __future__ import annotations
 
 import functools
 import logging
+
+from src.utils.logging_utils import get_logger
 import time
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Type, TypeVar, Union
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 T = TypeVar("T")
-
 
 class ErrorCategory(Enum):
     """Categories of errors that can occur in the RAG pipeline."""
@@ -55,7 +56,6 @@ class ErrorCategory(Enum):
 
     # Unknown
     UNKNOWN = "unknown"
-
 
 @dataclass
 class RAGError:
@@ -194,14 +194,12 @@ class RAGError:
 
         return ErrorCategory.UNKNOWN
 
-
 class RAGException(Exception):
     """Exception wrapper for RAGError."""
 
     def __init__(self, error: RAGError):
         self.error = error
         super().__init__(error.message)
-
 
 def with_error_handling(
     category: ErrorCategory = ErrorCategory.UNKNOWN,
@@ -256,7 +254,6 @@ def with_error_handling(
         return wrapper
     return decorator
 
-
 def with_retry(
     max_attempts: int = 3,
     backoff_factor: float = 0.5,
@@ -304,7 +301,6 @@ def with_retry(
         return wrapper
     return decorator
 
-
 # Pre-defined fallback responses for common scenarios
 FALLBACK_RESPONSES: Dict[ErrorCategory, str] = {
     ErrorCategory.NO_RESULTS: (
@@ -334,7 +330,6 @@ FALLBACK_RESPONSES: Dict[ErrorCategory, str] = {
         "parts or try again."
     ),
 }
-
 
 def get_fallback_response(
     category: ErrorCategory,
@@ -366,7 +361,6 @@ def get_fallback_response(
             )
 
     return base_response
-
 
 __all__ = [
     "ErrorCategory",

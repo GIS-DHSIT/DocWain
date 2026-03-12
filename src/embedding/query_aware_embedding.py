@@ -7,13 +7,12 @@ how users will query the document, improving retrieval accuracy.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # Common query patterns by domain
 QUERY_PATTERNS = {
@@ -64,7 +63,6 @@ QUERY_PATTERNS = {
     ],
 }
 
-
 @dataclass
 class QueryAwareChunk:
     """A chunk with query-pattern augmented embeddings."""
@@ -80,7 +78,6 @@ class QueryAwareChunk:
 
     # Metadata
     anticipated_queries: List[str]
-
 
 class QueryAwareEmbedder:
     """
@@ -242,7 +239,6 @@ class QueryAwareEmbedder:
 
         return "content"
 
-
 def create_multi_view_embeddings(
     text: str,
     section_type: str,
@@ -298,7 +294,6 @@ def create_multi_view_embeddings(
         "primary_text": primary_text,
         "query_texts": query_texts,
     }
-
 
 __all__ = [
     "QueryAwareChunk",

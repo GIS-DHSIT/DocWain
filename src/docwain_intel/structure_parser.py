@@ -7,7 +7,7 @@ knowledge. A heading is a heading whether it says 'Work Experience' or
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from .models import (
@@ -15,16 +15,14 @@ from .models import (
     Section, Table, UnitType,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MAX_UNIT_CHARS = 2000
 MIN_UNIT_CHARS = 30
 
-
 def _unit_id(document_id: str, index: int, text: str) -> str:
     raw = f"{document_id}|{index}|{text[:64]}"
     return f"su_{hashlib.sha1(raw.encode()).hexdigest()[:12]}"
-
 
 def _build_section_map(sections: List[Section]) -> Dict[str, List[str]]:
     mapping: Dict[str, List[str]] = {}
@@ -33,14 +31,12 @@ def _build_section_map(sections: List[Section]) -> Dict[str, List[str]]:
             mapping[block_id] = section.section_path
     return mapping
 
-
 def _collect_ordered_blocks(doc: ExtractedDocumentJSON) -> List[Block]:
     blocks: List[Block] = []
     for page in sorted(doc.pages, key=lambda p: p.page_number):
         sorted_blocks = sorted(page.blocks, key=lambda b: b.reading_order or 0)
         blocks.extend(sorted_blocks)
     return blocks
-
 
 def _split_text_at_sentence_boundary(text: str, max_chars: int) -> List[str]:
     if len(text) <= max_chars:
@@ -58,7 +54,6 @@ def _split_text_at_sentence_boundary(text: str, max_chars: int) -> List[str]:
     if current.strip():
         chunks.append(current.strip())
     return chunks if chunks else [text]
-
 
 def parse_structure(
     doc: ExtractedDocumentJSON,
@@ -201,6 +196,5 @@ def parse_structure(
         document_id=document_id, units=units,
         unit_count=len(units), total_chars=total_chars,
     )
-
 
 __all__ = ["parse_structure"]

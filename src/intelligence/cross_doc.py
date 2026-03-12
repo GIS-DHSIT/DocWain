@@ -9,11 +9,11 @@ Runs as a post-ingestion step (non-blocking) to:
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Version/amendment patterns ──
 _VERSION_RE = re.compile(
@@ -29,7 +29,6 @@ _FILENAME_STEM_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _normalize_filename_stem(name: str) -> str:
     """Extract a canonical stem from a filename for version chain matching."""
     if not name:
@@ -37,7 +36,6 @@ def _normalize_filename_stem(name: str) -> str:
     stem = re.sub(r"\.[^.]+$", "", name)  # strip extension
     m = _FILENAME_STEM_RE.match(stem)
     return (m.group(1).strip().lower() if m else stem.strip().lower())
-
 
 def detect_version_chain(
     doc_name: str,
@@ -72,7 +70,6 @@ def detect_version_chain(
 
     return matches
 
-
 def compute_entity_overlap(
     doc_entities: List[str],
     other_doc_entities: Dict[str, List[str]],
@@ -101,7 +98,6 @@ def compute_entity_overlap(
             results.append((other_id, jaccard, sorted(intersection)))
 
     return results
-
 
 def run_cross_document_intelligence(
     *,
@@ -282,7 +278,6 @@ def run_cross_document_intelligence(
         logger.debug("cross_doc: intelligence failed for %s: %s", document_id, exc)
 
     return result
-
 
 __all__ = [
     "detect_version_chain",

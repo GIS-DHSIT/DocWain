@@ -1,6 +1,6 @@
 import hashlib
 import io
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -21,17 +21,15 @@ except Exception:  # noqa: BLE001
 from src.api.config import Config
 from src.api.pipeline_models import ChunkCandidate, ExtractedDocument, Figure, Section, Table
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 try:
     import easyocr
 except Exception:  # noqa: BLE001
     easyocr = None
 
-
 _OCR_RETRY_THRESHOLD = 70.0
 _DIGIT_MASK_RE = re.compile(r"\d+")
-
 
 def _smart_decode(raw: bytes) -> str:
     """Decode bytes to str with intelligent encoding detection.
@@ -73,7 +71,6 @@ def _smart_decode(raw: bytes) -> str:
         return raw.decode('latin-1', errors='replace')
 _COPYRIGHT_RE = re.compile(r"(?:copyright|©|\(c\))\s*\d{4}", re.IGNORECASE)
 _CONFIDENTIAL_RE = re.compile(r"\b(?:confidential|proprietary|internal use only|do not distribute)\b", re.IGNORECASE)
-
 
 class DocumentExtractor:
     """Layout-aware document extractor with selective OCR and structured output."""

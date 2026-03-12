@@ -12,22 +12,20 @@ in environments where those packages are not installed.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = ["deep_analyze", "extract_typed_relationships", "DeepAnalysisResult", "EntityMention"]
-
 
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class EntityMention:
@@ -45,7 +43,6 @@ class EntityMention:
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
-
 @dataclass
 class DeepAnalysisResult:
     """Aggregate result of deep document analysis."""
@@ -61,18 +58,15 @@ class DeepAnalysisResult:
     domain_signals: Dict[str, float] = field(default_factory=dict)
     section_roles: Dict[str, str] = field(default_factory=dict)
 
-
 # ---------------------------------------------------------------------------
 # Helper: generic dict / object accessor
 # ---------------------------------------------------------------------------
-
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     """Access attribute or dict key -- supports both objects and dicts."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
 
 # ---------------------------------------------------------------------------
 # Structured-format regex patterns (allowed per design principles)
@@ -102,7 +96,6 @@ _ID_RE = re.compile(
     r"|\b\d{3}[-]\d{2}[-]\d{4}\b",  # SSN-like or generic ID
 )
 
-
 # ---------------------------------------------------------------------------
 # spaCy label mapping
 # ---------------------------------------------------------------------------
@@ -125,13 +118,11 @@ _SPACY_LABEL_MAP: Dict[str, str] = {
     "LANGUAGE": "SKILL",
 }
 
-
 # ---------------------------------------------------------------------------
 # Lazy spaCy loading
 # ---------------------------------------------------------------------------
 
 _NLP_INSTANCE = None
-
 
 def _get_spacy_nlp() -> Any:
     """Return a spaCy Language instance, or None if unavailable."""
@@ -156,11 +147,9 @@ def _get_spacy_nlp() -> Any:
         logger.warning("spaCy not installed. Entity extraction will use regex-only fallback.")
         return None
 
-
 # ---------------------------------------------------------------------------
 # Entity extraction
 # ---------------------------------------------------------------------------
-
 
 def _extract_entities_spacy(
     text: str,
@@ -212,7 +201,6 @@ def _extract_entities_spacy(
             )
         )
     return entities
-
 
 def _extract_entities_regex(
     text: str,
@@ -267,7 +255,6 @@ def _extract_entities_regex(
 
     return entities
 
-
 def _normalize_entity(text: str, ent_type: str) -> str:
     """Normalize an entity value based on its type."""
     if ent_type == "DATE":
@@ -280,7 +267,6 @@ def _normalize_entity(text: str, ent_type: str) -> str:
         return text.strip()
     return text.strip()
 
-
 def _deduplicate_entities(entities: List[EntityMention]) -> List[EntityMention]:
     """Remove duplicate entities by (normalized, type) keeping highest confidence."""
     seen: Dict[Tuple[str, str], EntityMention] = {}
@@ -289,7 +275,6 @@ def _deduplicate_entities(entities: List[EntityMention]) -> List[EntityMention]:
         if key not in seen or ent.confidence > seen[key].confidence:
             seen[key] = ent
     return list(seen.values())
-
 
 # ---------------------------------------------------------------------------
 # Temporal extraction
@@ -344,7 +329,6 @@ _RELATIVE_PERIOD_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _try_parse_date_iso(text: str) -> Optional[str]:
     """Attempt to parse *text* into an ISO date string. Returns None on failure."""
     try:
@@ -354,7 +338,6 @@ def _try_parse_date_iso(text: str) -> Optional[str]:
         return dt.date().isoformat()
     except Exception:  # noqa: BLE001
         return None
-
 
 def _llm_extract_temporal_spans(text: str, existing_spans: List[Dict]) -> List[Dict]:
     """When regex found DATE entities but no ranges, use LLM to extract date ranges.
@@ -407,7 +390,6 @@ def _llm_extract_temporal_spans(text: str, existing_spans: List[Dict]) -> List[D
         return []
     except Exception:
         return []
-
 
 def _extract_temporal_spans(
     text: str,
@@ -512,11 +494,9 @@ def _extract_temporal_spans(
 
     return spans, chronological
 
-
 # ---------------------------------------------------------------------------
 # Quality grading
 # ---------------------------------------------------------------------------
-
 
 def _score_text_quality(text: str) -> float:
     """Score text quality 0-20: encoding errors, avg word length, readability."""
@@ -551,7 +531,6 @@ def _score_text_quality(text: str) -> float:
         2,
     )
 
-
 def _score_structural_completeness(sections: List[Dict], text: str) -> float:
     """Score structural completeness 0-20: section count, headings, hierarchy."""
     section_count = len(sections)
@@ -572,7 +551,6 @@ def _score_structural_completeness(sections: List[Dict], text: str) -> float:
     hierarchy_score = min(1.0, unique_len_buckets / 3.0)
 
     return round(20.0 * (0.40 * count_score + 0.35 * heading_score + 0.25 * hierarchy_score), 2)
-
 
 def _score_content_density(text: str, sections: List[Dict], page_count: Optional[int]) -> float:
     """Score content density 0-20: words per page, entity density, information richness."""
@@ -596,7 +574,6 @@ def _score_content_density(text: str, sections: List[Dict], page_count: Optional
 
     return round(20.0 * (0.35 * wpp_score + 0.30 * ent_density_score + 0.35 * richness), 2)
 
-
 def _score_metadata_richness(entities: List[EntityMention]) -> float:
     """Score metadata richness 0-20: dates, names, identifiers present."""
     type_counts: Dict[str, int] = Counter(e.type for e in entities)
@@ -608,7 +585,6 @@ def _score_metadata_richness(entities: List[EntityMention]) -> float:
     has_amounts = min(1.0, type_counts.get("AMOUNT", 0) / 2.0)
 
     return round(20.0 * (0.25 * has_dates + 0.25 * has_names + 0.20 * has_orgs + 0.15 * has_ids + 0.15 * has_amounts), 2)
-
 
 def _score_consistency(entities: List[EntityMention], sections: List[Dict]) -> float:
     """Score consistency 0-20: no contradictions, uniform formatting."""
@@ -640,7 +616,6 @@ def _score_consistency(entities: List[EntityMention], sections: List[Dict]) -> f
 
     return round(20.0 * (0.50 * name_consistency + 0.50 * length_consistency), 2)
 
-
 def _grade_from_score(score: float) -> str:
     """Map a 0-100 quality score to a letter grade."""
     if score >= 90:
@@ -653,11 +628,9 @@ def _grade_from_score(score: float) -> str:
         return "D"
     return "F"
 
-
 # ---------------------------------------------------------------------------
 # Complexity scoring
 # ---------------------------------------------------------------------------
-
 
 def _compute_complexity(
     entities: List[EntityMention],
@@ -700,7 +673,6 @@ def _compute_complexity(
     )
 
     return round(min(1.0, max(0.0, complexity)), 4)
-
 
 # ---------------------------------------------------------------------------
 # Domain signal detection (keyword overlap, no regex)
@@ -745,7 +717,6 @@ _DOMAIN_KEYWORDS: Dict[str, List[str]] = {
     ],
 }
 
-
 def _detect_domain_signals(text: str) -> Dict[str, float]:
     """Score each domain based on keyword overlap with the document text."""
     if not text:
@@ -769,11 +740,9 @@ def _detect_domain_signals(text: str) -> Dict[str, float]:
 
     return signals
 
-
 # ---------------------------------------------------------------------------
 # Section role detection
 # ---------------------------------------------------------------------------
-
 
 def _detect_section_roles(sections: List[Dict]) -> Dict[str, str]:
     """Assign a semantic role to each section based on title and content heuristics."""
@@ -811,11 +780,9 @@ def _detect_section_roles(sections: List[Dict]) -> Dict[str, str]:
 
     return roles
 
-
 # ---------------------------------------------------------------------------
 # Relationship extraction (co-occurrence)
 # ---------------------------------------------------------------------------
-
 
 def _extract_relationships(
     entities: List[EntityMention],
@@ -863,7 +830,6 @@ def _extract_relationships(
 
     return relationships
 
-
 # ---------------------------------------------------------------------------
 # Typed relationship extraction (sentence-level, keyword matching)
 # ---------------------------------------------------------------------------
@@ -883,7 +849,6 @@ _OWES_TO_VERBS = re.compile(
     r"\b(?:ow(?:es|ed|ing)?|due|pay(?:s|ing)?|paid|invoic(?:es|ed|ing)?|bill(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
-
 
 def extract_typed_relationships(
     entities: List[EntityMention],
@@ -995,11 +960,9 @@ def extract_typed_relationships(
 
     return typed_rels
 
-
 # ---------------------------------------------------------------------------
 # Text extraction from document objects
 # ---------------------------------------------------------------------------
-
 
 def _extract_full_text(extracted: Any) -> str:
     """Extract the full text from an extracted document object or dict."""
@@ -1017,7 +980,6 @@ def _extract_full_text(extracted: Any) -> str:
         return "\n\n".join(parts)
 
     return ""
-
 
 def _extract_sections_list(extracted: Any) -> List[Dict]:
     """Extract sections as a list of dicts with title, text, page info."""
@@ -1043,7 +1005,6 @@ def _extract_sections_list(extracted: Any) -> List[Dict]:
 
     return result
 
-
 def _get_page_count(extracted: Any) -> Optional[int]:
     """Try to determine the page count from the extracted document."""
     try:
@@ -1056,11 +1017,9 @@ def _get_page_count(extracted: Any) -> Optional[int]:
         pass
     return None
 
-
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
-
 
 def deep_analyze(
     extracted: Any,
@@ -1099,7 +1058,6 @@ def deep_analyze(
         return DeepAnalysisResult(
             domain_signals={d: 0.0 for d in _DOMAIN_KEYWORDS},
         )
-
 
 def _deep_analyze_impl(
     extracted: Any,

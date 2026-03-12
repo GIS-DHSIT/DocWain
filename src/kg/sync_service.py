@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -8,8 +8,7 @@ from src.api.vector_store import build_qdrant_filter
 from src.kg.qdrant_reader import QdrantChunk, QdrantKGReader
 from src.kg.neo4j_store import Neo4jStore
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class KGSyncStats:
@@ -19,7 +18,6 @@ class KGSyncStats:
     entities_seen: int = 0
     mentions_created: int = 0
     last_qdrant_offset: Optional[Any] = None
-
 
 class KGSyncService:
     def __init__(

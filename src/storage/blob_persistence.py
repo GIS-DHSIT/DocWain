@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import random
 import time
@@ -21,13 +21,12 @@ from azure.storage.blob import BlobLeaseClient, ContentSettings
 
 from src.storage.azure_blob_client import get_document_container_client, normalize_blob_name
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _LATEST_POINTER_NAME = "latest.json"
 _LATEST_METADATA_KEY = "docwain_latest_run_id"
 _DEFAULT_LEASE_SECONDS = 30
 _DEFAULT_RETRY_SECONDS = 5
-
 
 @dataclass(frozen=True)
 class BlobWriteResult:
@@ -54,7 +53,6 @@ class BlobWriteResult:
         payload.setdefault("path", payload["blob_name"])
         return payload
 
-
 def _document_id_from_blob_name(blob_name: str) -> str:
     base = blob_name.split("/")[-1]
     if base.endswith(".pickle"):
@@ -63,14 +61,11 @@ def _document_id_from_blob_name(blob_name: str) -> str:
         base = base[: -len(".pkl")]
     return base
 
-
 def _pointer_blob_name(document_id: str) -> str:
     return f"{document_id}/{_LATEST_POINTER_NAME}"
 
-
 def _versioned_blob_name(document_id: str, run_id: str) -> str:
     return f"{document_id}/{run_id}.pkl"
-
 
 def _ensure_blob_exists(blob_client) -> None:
     try:
@@ -82,7 +77,6 @@ def _ensure_blob_exists(blob_client) -> None:
         blob_client.upload_blob(b"", overwrite=False)
     except ResourceExistsError:
         return
-
 
 def _acquire_lease(blob_client, lease_duration: int) -> Optional[str]:
     try:
@@ -96,7 +90,6 @@ def _acquire_lease(blob_client, lease_duration: int) -> Optional[str]:
         if str(getattr(exc, "error_code", "")).lower() in {"leasealreadypresent", "leasealreadyacquired"}:
             return None
         raise
-
 
 def _release_lease_with_retry(
     blob_client, lease_id: str, document_id: Optional[str], blob_name: str, *, max_attempts: int = 3
@@ -124,7 +117,6 @@ def _release_lease_with_retry(
                     max_attempts, document_id, blob_name, lease_id, exc,
                 )
 
-
 def _log_lease_state(blob_name: str, document_id: Optional[str], props: Any, *, attempt: int, outcome: str) -> None:
     lease = getattr(props, "lease", None)
     lease_status = getattr(lease, "status", None)
@@ -139,7 +131,6 @@ def _log_lease_state(blob_name: str, document_id: Optional[str], props: Any, *, 
         outcome,
     )
 
-
 def _upload_pointer_blob(container_client, pointer_blob: str, payload: Dict[str, Any]) -> None:
     blob_client = container_client.get_blob_client(pointer_blob)
     blob_client.upload_blob(
@@ -147,7 +138,6 @@ def _upload_pointer_blob(container_client, pointer_blob: str, payload: Dict[str,
         overwrite=True,
         content_settings=ContentSettings(content_type="application/json"),
     )
-
 
 def _write_versioned_blob(
     *,
@@ -200,7 +190,6 @@ def _write_versioned_blob(
         etag=etag,
         leased=True,
     )
-
 
 def load_pickle(blob_name: str) -> Optional[bytes]:
     container_client = get_document_container_client()
@@ -265,7 +254,6 @@ def load_pickle(blob_name: str) -> Optional[bytes]:
             )
             time.sleep(delay)
             versioned_client = container_client.get_blob_client(versioned_blob)
-
 
 def save_pickle_atomic(
     blob_name: str,
@@ -377,6 +365,5 @@ def save_pickle_atomic(
         etag=etag,
         leased=bool(lease_id),
     ).to_dict()
-
 
 __all__ = ["load_pickle", "save_pickle_atomic", "BlobWriteResult"]

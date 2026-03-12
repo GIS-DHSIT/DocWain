@@ -7,13 +7,12 @@ and intelligent chunk merging/splitting for optimal retrieval.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class ChunkQualityMetrics:
@@ -30,7 +29,6 @@ class ChunkQualityMetrics:
     quality_grade: str  # A, B, C, D, F
     issues: List[str]  # List of quality issues detected
 
-
 @dataclass(frozen=True)
 class SemanticCohesionScore:
     """Semantic cohesion between chunks."""
@@ -41,7 +39,6 @@ class SemanticCohesionScore:
     topic_continuity: float  # 0-1, whether topics continue
     should_merge: bool
     merge_score: float  # 0-1, confidence in merge recommendation
-
 
 class SemanticChunkQualityEvaluator:
     """Evaluates and scores chunk quality with semantic coherence metrics."""
@@ -409,7 +406,6 @@ class SemanticChunkQualityEvaluator:
         union = len(keywords_a | keywords_b)
 
         return intersection / union if union > 0 else 0.0
-
 
 __all__ = [
     "SemanticChunkQualityEvaluator",

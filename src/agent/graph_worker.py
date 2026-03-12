@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -6,8 +6,7 @@ from src.api.config import Config
 from src.kg.neo4j_store import Neo4jStore
 from src.kg.retrieval import GraphAugmenter, GraphHints
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class GraphWorkerResult:
@@ -15,7 +14,6 @@ class GraphWorkerResult:
     candidate_persons: List[Dict[str, Any]] = field(default_factory=list)
     candidate_doc_ids: List[str] = field(default_factory=list)
     constraints: List[str] = field(default_factory=list)
-
 
 class GraphWorker:
     def __init__(self, augmenter: GraphAugmenter, neo4j_store: Neo4jStore) -> None:
@@ -159,6 +157,5 @@ class GraphWorker:
             seen.add(key)
             unique.append(person)
         return unique
-
 
 __all__ = ["GraphWorker", "GraphWorkerResult"]

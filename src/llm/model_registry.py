@@ -6,12 +6,12 @@ select the optimal model for each LLM task type.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Hardcoded model knowledge base
@@ -106,7 +106,6 @@ _REQUIREMENT_STRENGTHS: Dict[str, List[str]] = {
     "tool_calling": ["tool_calling", "instruction_following"],
 }
 
-
 @dataclass
 class ModelCapability:
     """Describes the capabilities of a single local model."""
@@ -121,7 +120,6 @@ class ModelCapability:
     supports_tool_calling: bool = False
     context_window: int = 4096
     available: bool = True
-
 
 def _match_family(model_name: str) -> Optional[str]:
     """Strip tag suffixes and match against known model families."""
@@ -139,7 +137,6 @@ def _match_family(model_name: str) -> Optional[str]:
             return family
     return None
 
-
 def _speed_tier_from_size(size_bytes: int) -> str:
     """Derive speed tier from model file size."""
     gb = size_bytes / (1024 ** 3)
@@ -148,7 +145,6 @@ def _speed_tier_from_size(size_bytes: int) -> str:
     if gb <= 8.0:
         return "medium"
     return "heavy"
-
 
 class ModelRegistry:
     """Auto-discovers available Ollama models and catalogs their capabilities."""
@@ -250,7 +246,6 @@ class ModelRegistry:
             return best.name
         return ranked[0].name  # fallback to first available
 
-
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
@@ -258,11 +253,9 @@ class ModelRegistry:
 _REGISTRY: Optional[ModelRegistry] = None
 _REGISTRY_LOCK = threading.Lock()
 
-
 def get_model_registry() -> Optional[ModelRegistry]:
     """Return the singleton ModelRegistry (may be None if not initialized)."""
     return _REGISTRY
-
 
 def set_model_registry(registry: ModelRegistry) -> None:
     """Set the singleton ModelRegistry."""

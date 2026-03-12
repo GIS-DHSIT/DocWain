@@ -6,18 +6,17 @@ matches what was produced by the ingestion pipeline.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
 from .models import ExtractionResult, StructuredDocument
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _PROVENANCE_SAMPLE_SIZE = 3
 _PROVENANCE_KEYWORD_OVERLAP_THRESHOLD = 0.4
-
 
 class IntegrityReport(BaseModel):
     """Result of a post-ingestion integrity audit."""
@@ -37,11 +36,9 @@ class IntegrityReport(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
 
-
 def _keyword_set(text: str) -> set[str]:
     """Extract lowercased non-trivial keywords from text."""
     return {w.lower().strip(".,;:!?\"'()[]") for w in text.split() if len(w) > 2}
-
 
 def _check_provenance(
     doc: StructuredDocument,
@@ -73,7 +70,6 @@ def _check_provenance(
             return False
 
     return True
-
 
 def run_integrity_audit(
     doc: StructuredDocument,

@@ -22,15 +22,14 @@ Usage:
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ── Data structures ───────────────────────────────────────────────────────
 
@@ -43,7 +42,6 @@ class CategoryEntry:
     target_nouns: List[str] = field(default_factory=list)
     _embedding: Optional[Any] = field(default=None, repr=False)
 
-
 @dataclass
 class ClassificationResult:
     """Result of classifying a query against a registry."""
@@ -51,7 +49,6 @@ class ClassificationResult:
     score: float
     method: str  # "embedding", "nlu_structural", or "combined"
     gap: float = 0.0  # Score gap above second-best
-
 
 @dataclass
 class QuerySemantics:
@@ -62,12 +59,10 @@ class QuerySemantics:
     raw_text: str
     _embedding: Optional[Any] = field(default=None, repr=False)
 
-
 # ── Shared NLP singletons ─────────────────────────────────────────────────
 
 _nlp_model = None
 _nlp_lock = threading.Lock()
-
 
 def _get_nlp():
     """Get spaCy NLP model (singleton, thread-safe)."""
@@ -84,10 +79,8 @@ def _get_nlp():
         except Exception:
             return None
 
-
 _embedder_instance = None
 _embedder_lock = threading.Lock()
-
 
 def get_embedder() -> Any:
     """Get the sentence-transformer embedder (singleton).
@@ -125,7 +118,6 @@ def get_embedder() -> Any:
         except Exception:
             pass
     return None
-
 
 # ── Query parsing ─────────────────────────────────────────────────────────
 
@@ -179,7 +171,6 @@ def parse_query(query: str) -> QuerySemantics:
         context_words=context,
         raw_text=query,
     )
-
 
 # ── Classification Registry ──────────────────────────────────────────────
 
@@ -321,7 +312,6 @@ class ClassificationRegistry:
             gap=score_gap,
         )
 
-
 # ── NLU scoring functions ────────────────────────────────────────────────
 
 def _extract_features(entry: CategoryEntry) -> None:
@@ -341,7 +331,6 @@ def _extract_features(entry: CategoryEntry) -> None:
         })
     except Exception:
         pass
-
 
 def _compute_nlu_score(query_sem: QuerySemantics, entry: CategoryEntry) -> float:
     """Compute NLU structural overlap between parsed query and category entry.
@@ -372,7 +361,6 @@ def _compute_nlu_score(query_sem: QuerySemantics, entry: CategoryEntry) -> float
 
     return 0.4 * action_overlap + 0.4 * target_overlap + 0.2 * context_overlap
 
-
 def _embedding_score(query: str, entry: CategoryEntry, embedder: Any) -> float:
     """Compute embedding cosine similarity between query and entry description."""
     try:
@@ -385,7 +373,6 @@ def _embedding_score(query: str, entry: CategoryEntry, embedder: Any) -> float:
     except Exception:
         return 0.0
 
-
 def _embedding_score_vec(query_vec: Any, entry: CategoryEntry, embedder: Any) -> float:
     """Compute cosine similarity using pre-computed query vector."""
     try:
@@ -396,12 +383,10 @@ def _embedding_score_vec(query_vec: Any, entry: CategoryEntry, embedder: Any) ->
     except Exception:
         return 0.0
 
-
 # ── Global registry management ───────────────────────────────────────────
 
 _registries: Dict[str, ClassificationRegistry] = {}
 _registries_lock = threading.Lock()
-
 
 def get_registry(
     name: str,
@@ -432,7 +417,6 @@ def get_registry(
         _registries[name] = reg
         return reg
 
-
 def classify(
     query: str,
     registry_name: str,
@@ -454,14 +438,12 @@ def classify(
 
     return reg.classify(query, embedder=embedder)
 
-
 # ── Pre-built registries ─────────────────────────────────────────────────
 # These are initialized lazily on first access. Each registry contains
 # natural language descriptions — NO hardcoded patterns or keywords.
 
 _registries_initialized: Dict[str, bool] = {}
 _init_lock = threading.Lock()
-
 
 def _ensure_registry(name: str) -> ClassificationRegistry:
     """Ensure a pre-built registry is initialized."""
@@ -489,7 +471,6 @@ def _ensure_registry(name: str) -> ClassificationRegistry:
         except Exception:
             pass  # embedder not available yet, will encode lazily
         return reg
-
 
 def _init_intent_registry() -> None:
     """Initialize the query intent classification registry."""
@@ -543,7 +524,6 @@ def _init_intent_registry() -> None:
             "compose a document, build a report, prepare content, produce output"
         ),
     })
-
 
 def _init_conversational_registry() -> None:
     """Initialize the conversational intent classification registry."""
@@ -625,7 +605,6 @@ def _init_conversational_registry() -> None:
         ),
     })
 
-
 def _init_scope_registry() -> None:
     """Initialize the query scope classification registry."""
     reg = get_registry("scope", threshold=0.38, gap=0.06)
@@ -642,7 +621,6 @@ def _init_scope_registry() -> None:
             "single document details"
         ),
     })
-
 
 def _init_domain_task_registry() -> None:
     """Initialize the domain task classification registry."""
@@ -964,7 +942,6 @@ def _init_domain_task_registry() -> None:
         ),
     })
 
-
 def _init_content_type_registry() -> None:
     """Initialize the content type detection registry."""
     reg = get_registry("content_type", threshold=0.36, gap=0.05)
@@ -1080,7 +1057,6 @@ def _init_content_type_registry() -> None:
         ),
     })
 
-
 def _init_document_query_registry() -> None:
     """Initialize document-query prototypes for contrastive NLU routing.
 
@@ -1138,12 +1114,10 @@ def _init_document_query_registry() -> None:
         ),
     })
 
-
 # ── Sub-intent classification (replaces keyword sets in extract.py) ──────
 
 # Registry for query sub-intents: contact, product/item, totals, fit/rank
 _subintent_registry_initialized = False
-
 
 def _init_subintent_registry() -> None:
     """Register sub-intent prototypes for fine-grained extraction intent detection."""
@@ -1173,7 +1147,6 @@ def _init_subintent_registry() -> None:
     })
     _subintent_registry_initialized = True
 
-
 # Registry initializer map
 _REGISTRY_INITIALIZERS = {
     "intent": _init_intent_registry,
@@ -1184,7 +1157,6 @@ _REGISTRY_INITIALIZERS = {
     "document_query": _init_document_query_registry,
     "subintent": _init_subintent_registry,
 }
-
 
 # ── Convenience API ──────────────────────────────────────────────────────
 
@@ -1292,7 +1264,6 @@ def classify_intent(query: str, *, intent_hint: str | None = None) -> str:
     result = reg.classify(query, embedder=get_embedder())
     return result.name if result else "factual"
 
-
 def classify_conversational(
     text: str,
 ) -> Optional[Tuple[str, float]]:
@@ -1308,9 +1279,7 @@ def classify_conversational(
         return None
     return (result.name, result.score)
 
-
 # ── Contrastive NLU routing ──────────────────────────────────────────────
-
 
 def _score_entry_with_vec(
     query_sem: QuerySemantics,
@@ -1343,7 +1312,6 @@ def _score_entry_with_vec(
     if embedder is not None and query_vec is not None:
         return emb_weight * emb_score + nlu_weight * nlu_score
     return nlu_score
-
 
 def classify_query_routing(text: str) -> Tuple[str, str, float]:
     """Holistic NLU routing: classify a query as document or conversational.
@@ -1536,7 +1504,6 @@ def classify_query_routing(text: str) -> Tuple[str, str, float]:
 
     return ("document", doc_best_name, doc_best)
 
-
 def classify_document_query(text: str) -> bool:
     """Convenience wrapper: returns True if the text is a document query.
 
@@ -1545,7 +1512,6 @@ def classify_document_query(text: str) -> bool:
     """
     routing, _, _ = classify_query_routing(text)
     return routing == "document"
-
 
 def classify_scope(query: str) -> Optional[str]:
     """Classify query scope as 'all_profile' or 'targeted' or None."""
@@ -1598,9 +1564,7 @@ def classify_scope(query: str) -> Optional[str]:
     result = reg.classify(query, embedder=get_embedder())
     return result.name if result else None
 
-
 _DOMAIN_FILTERED_MIN_THRESHOLD = 0.40
-
 
 def _domain_filtered_classify(
     query: str,
@@ -1637,7 +1601,6 @@ def _domain_filtered_classify(
         return {"domain": parts[0], "task_type": parts[1]}
     return None
 
-
 def classify_query_subintent(query: str) -> Optional[str]:
     """Classify a query into a sub-intent category using NLU.
 
@@ -1653,7 +1616,6 @@ def classify_query_subintent(query: str) -> Optional[str]:
     if result is not None:
         return result.name
     return None
-
 
 def is_contact_query(query: str) -> bool:
     """Determine if a query is asking for contact information using NLU.
@@ -1677,7 +1639,6 @@ def is_contact_query(query: str) -> bool:
     # Secondary: embedding-based sub-intent classification
     subintent = classify_query_subintent(query)
     return subintent == "contact"
-
 
 def classify_domain_task(
     query: str,

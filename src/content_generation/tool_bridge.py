@@ -6,7 +6,7 @@ Exposes content generation through the unified gateway via:
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional
 
 from src.tools.base import register_tool
@@ -20,8 +20,7 @@ from .registry import (
     list_domains,
 )
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_chunks_from_payload(payload: Dict[str, Any]) -> list:
     """Extract chunks from tool payload, supporting multiple sources."""
@@ -59,7 +58,6 @@ def _get_chunks_from_payload(payload: Dict[str, Any]) -> list:
 
     return []
 
-
 def _get_llm_client() -> Optional[Any]:
     """Lazy-load LLM client."""
     try:
@@ -72,7 +70,6 @@ def _get_llm_client() -> Optional[Any]:
     except Exception:  # noqa: BLE001
         pass
     return None
-
 
 @register_tool("content_generate")
 async def content_generate_handler(
@@ -132,7 +129,6 @@ async def content_generate_handler(
         "context_found": result.get("context_found", False),
         "warnings": result.get("warnings", []),
     }
-
 
 @register_tool("content_types")
 async def content_types_handler(

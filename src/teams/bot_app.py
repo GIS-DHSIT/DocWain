@@ -31,7 +31,7 @@ from src.teams.state import TeamsStateStore
 from src.teams.tools import TeamsToolRouter, _card_activity
 from src.utils.logging_utils import get_correlation_id, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MICROSOFT_APP_ID = Config.Teams.BOT_APP_ID or os.getenv("MICROSOFT_APP_ID")
 MICROSOFT_APP_PASSWORD = (
@@ -78,7 +78,6 @@ state_store = TeamsStateStore()
 chat_service = TeamsChatService()
 tool_router = TeamsToolRouter(chat_service, state_store)
 
-
 def _as_activity(payload: Dict[str, Any]):
     """Deserialize a dict into a Bot Framework Activity."""
     if not _BOTBUILDER_AVAILABLE or Activity is None:
@@ -87,7 +86,6 @@ def _as_activity(payload: Dict[str, Any]):
         return Activity().deserialize(payload)
     except Exception:  # noqa: BLE001
         return Activity(type=ActivityTypes.message, text=payload.get("text") or "")
-
 
 def _log_startup_credentials():
     app_id = MICROSOFT_APP_ID or ""
@@ -108,9 +106,7 @@ def _log_startup_credentials():
         _BOTBUILDER_AVAILABLE,
     )
 
-
 _log_startup_credentials()
-
 
 def _build_screening_card(filenames, screening_results):
     """Build a screening summary card from screening results."""
@@ -150,7 +146,6 @@ def _build_screening_card(filenames, screening_results):
         findings_text=findings_text,
         tools_summary=tools_summary,
     )
-
 
 def _build_di_report_card(ingestion, log) -> Optional[Dict[str, Any]]:
     """Build a Document Intelligence report card from ingestion results."""
@@ -218,7 +213,6 @@ def _build_di_report_card(ingestion, log) -> Optional[Dict[str, Any]]:
         metadata_text=metadata_text,
         **action_data,
     )
-
 
 class DocWainTeamsBot(TeamsActivityHandler):
     """Teams ActivityHandler that supports text, attachments, and Adaptive Card tool actions."""
@@ -581,7 +575,6 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 log,
             )
 
-
 async def handle_bot_error(turn_context, error: Exception):  # type: ignore[func-returns-value]
     """Single-attempt error handler with trusted service URL."""
     if MicrosoftAppCredentials is not None:
@@ -591,7 +584,6 @@ async def handle_bot_error(turn_context, error: Exception):  # type: ignore[func
         await turn_context.send_activity("Sorry, something went wrong processing your request.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to send error activity: %s", exc)
-
 
 # Configure adapter error handling
 if bot_adapter and _BOTBUILDER_AVAILABLE:

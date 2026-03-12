@@ -1,5 +1,5 @@
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -10,7 +10,7 @@ from qdrant_client.http.models import Filter
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TEXT_FIELD_CANDIDATES = [
     "text",
@@ -21,7 +21,6 @@ TEXT_FIELD_CANDIDATES = [
     "document_text",
     "raw_text",
 ]
-
 
 @dataclass(frozen=True)
 class QdrantChunk:
@@ -44,19 +43,16 @@ class QdrantChunk:
     subscription_id: Optional[str]
     profile_id: Optional[str]
 
-
 @dataclass(frozen=True)
 class QdrantBatch:
     points: List[QdrantChunk]
     next_offset: Optional[Any]
-
 
 def _get_first(payload: Dict[str, Any], keys: Iterable[str]) -> Any:
     for key in keys:
         if key in payload and payload[key] is not None:
             return payload[key]
     return None
-
 
 def _coerce_int(value: Any) -> Optional[int]:
     if value is None:
@@ -65,7 +61,6 @@ def _coerce_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
-
 
 def _normalize_payload(point_id: Any, payload: Dict[str, Any]) -> Optional[QdrantChunk]:
     if payload is None:
@@ -116,7 +111,6 @@ def _normalize_payload(point_id: Any, payload: Dict[str, Any]) -> Optional[Qdran
         subscription_id=_get_first(payload, ["subscription_id", "subscriptionId"]),
         profile_id=_get_first(payload, ["profile_id", "profileId"]),
     )
-
 
 class QdrantKGReader:
     def __init__(self, collection_name: str, client: Optional[QdrantClient] = None):

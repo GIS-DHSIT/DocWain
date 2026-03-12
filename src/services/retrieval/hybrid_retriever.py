@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import re
 import time
@@ -20,8 +20,7 @@ try:
 except Exception:  # noqa: BLE001
     BM25Okapi = None
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class HybridRetrieverConfig:
@@ -31,7 +30,6 @@ class HybridRetrieverConfig:
     score_threshold: Optional[float] = None
     metadata_boost: float = 0.12
     strict_filter_boost: float = 0.2
-
 
 @dataclass
 class RetrievalCandidate:
@@ -44,7 +42,6 @@ class RetrievalCandidate:
     source: Optional[str] = None
     method: str = "dense"
     boosts: Dict[str, float] = field(default_factory=dict)
-
 
 class HybridRetriever:
     """Dense-first retrieval with lexical and metadata-aware re-scoring."""

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header
@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from src.tools.base import ToolError, generate_correlation_id, register_tool, standard_response
 from src.tools.common.grounding import build_source_record
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/translator", tags=["Tools-Translator"])
 
@@ -21,12 +21,10 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # noqa: BLE001
     _argos_translate = None  # type: ignore
 
-
 class TranslateRequest(BaseModel):
     text: str = Field(..., min_length=1)
     target_lang: str = Field(..., description="Target language code")
     source_lang: Optional[str] = Field(default=None, description="Optional source language code")
-
 
 # ── Language code mapping ──────────────────────────────────────────
 
@@ -43,7 +41,6 @@ _LANG_CODE_MAP = {
 }
 
 _KNOWN_LANGUAGES = frozenset(_LANG_CODE_MAP.keys()) | {"english"}
-
 
 def _spacy_extract_translation_intent(query: str):
     """Use spaCy to detect translation intent and extract target language.
@@ -106,7 +103,6 @@ def _spacy_extract_translation_intent(query: str):
         pass
     return None, None
 
-
 # ── LLM translation ────────────────────────────────────────────────
 
 def _llm_detect_language(text: str) -> Optional[str]:
@@ -137,7 +133,6 @@ def _llm_detect_language(text: str) -> Optional[str]:
     except Exception:
         return None
 
-
 def _llm_detect_target_language(query: str) -> Optional[str]:
     """Use LLM to detect the target translation language from a query."""
     try:
@@ -166,7 +161,6 @@ def _llm_detect_target_language(query: str) -> Optional[str]:
     except Exception:
         return None
 
-
 def _llm_translate(text: str, source_lang: Optional[str], target_lang: str) -> Optional[Dict[str, Any]]:
     """LLM-powered translation with domain terminology preservation."""
     try:
@@ -185,7 +179,6 @@ def _llm_translate(text: str, source_lang: Optional[str], target_lang: str) -> O
     except Exception as exc:
         logger.debug("LLM translation failed: %s", exc)
         return None
-
 
 # ── Argos translation ───────────────────────────────────────────────
 
@@ -206,13 +199,11 @@ def _argos_translate_text(text: str, source: Optional[str], target: str) -> str:
         logger.warning("Argos translation failed: %s", exc)
         raise ToolError("Translation failed", code="translation_failed") from exc
 
-
 # ── Deterministic fallback ──────────────────────────────────────────
 
 def _fallback_translate(text: str, target: str) -> str:
     """Deterministic offline fallback to keep endpoint responsive."""
     return f"[{target}] {text}"
-
 
 # ── Smart request parsing ─────────────────────────────────────────
 
@@ -247,7 +238,6 @@ def _parse_translation_request(payload: Dict[str, Any]) -> TranslateRequest:
     target_lang = _llm_detect_target_language(query) or "en"
     text = source_text or query
     return TranslateRequest(text=text, target_lang=target_lang, source_lang=inp.get("source_lang"))
-
 
 # ── Unified translation ────────────────────────────────────────────
 
@@ -337,7 +327,6 @@ def _translate_text(request: TranslateRequest) -> Dict[str, Any]:
         ),
     }
 
-
 @register_tool("translator")
 async def translator_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     req = _parse_translation_request(payload)
@@ -350,7 +339,6 @@ async def translator_handler(payload: Dict[str, Any], correlation_id: Optional[s
         "grounded": True,
         "warnings": result.get("warnings", []),
     }
-
 
 @router.post("/translate")
 async def translate(request: TranslateRequest, x_correlation_id: str | None = Header(None)):

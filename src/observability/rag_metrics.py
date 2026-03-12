@@ -23,12 +23,13 @@ Usage:
 from __future__ import annotations
 
 import logging
+
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class RAGPipelineMetrics:
@@ -118,7 +119,6 @@ class RAGPipelineMetrics:
             "is_successful": self.is_successful,
         }
 
-
 class StageTimer:
     """
     Context manager for timing pipeline stages.
@@ -175,7 +175,6 @@ class StageTimer:
                 extra={"correlation_id": self.metrics.correlation_id},
             )
 
-
 def log_pipeline_summary(
     metrics: RAGPipelineMetrics,
     level: int = logging.INFO,
@@ -215,7 +214,6 @@ def log_pipeline_summary(
         },
     )
 
-
 def create_metrics(
     correlation_id: str = "",
     query: str = "",
@@ -234,7 +232,6 @@ def create_metrics(
         correlation_id=correlation_id,
         query=query,
     )
-
 
 __all__ = [
     "RAGPipelineMetrics",

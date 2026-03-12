@@ -11,14 +11,13 @@ Duck-types the same interface as LLMGateway so existing code works unchanged.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class AgentRole(str, Enum):
     CLASSIFIER = "classifier"
@@ -28,7 +27,6 @@ class AgentRole(str, Enum):
     REASONER = "reasoner"
     VISION = "vision"
     DEFAULT = "default"
-
 
 # Default model assignments per role — MoE routing
 # CRITICAL: On a single T4 16GB GPU, Ollama can only keep ONE large model loaded.
@@ -45,7 +43,6 @@ _DEFAULT_ROLE_MODELS: Dict[str, str] = {
     AgentRole.VISION: "glm-ocr:latest",                # Vision/OCR sub-agent
     AgentRole.DEFAULT: "DocWain-Agent:latest",               # Default — no model swap
 }
-
 
 class _RoleStats:
     """Thread-safe per-role call statistics."""
@@ -74,7 +71,6 @@ class _RoleStats:
                 "errors": self.errors,
                 "avg_latency_ms": round(avg, 1),
             }
-
 
 class MultiAgentGateway:
     """Routes LLM calls to role-specific Ollama models.
@@ -293,7 +289,6 @@ class MultiAgentGateway:
         """No-op — models are loaded on demand."""
         pass
 
-
 class TaskAwareGateway(MultiAgentGateway):
     """Extends MultiAgentGateway with task-type-aware model routing.
 
@@ -446,7 +441,6 @@ class TaskAwareGateway(MultiAgentGateway):
         base["task_routing"] = self.get_task_stats()
         base["model_clients"] = list(self._model_clients.keys())
         return base
-
 
 def create_multi_agent_gateway(
     fallback_gateway: Any = None,

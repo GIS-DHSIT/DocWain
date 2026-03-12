@@ -11,16 +11,15 @@ Adding a new agent requires ONLY registering its capability description.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Global registry of agent capabilities — uses NLU engine's ClassificationRegistry
 _registry_initialized = False
 _init_lock = threading.Lock()
-
 
 def _ensure_registry() -> None:
     """Ensure the agent capability registry is initialized."""
@@ -137,14 +136,12 @@ def _ensure_registry() -> None:
         _registry_initialized = True
         logger.debug("Agent capability registry initialized with %d agents", len(reg.entries))
 
-
 def register_agent(name: str, description: str) -> None:
     """Register an agent with its natural language capability description."""
     _ensure_registry()
     from src.nlp.nlu_engine import get_registry
     reg = get_registry("agent")
     reg.register(name, description)
-
 
 def _keyword_fast_path(query: str) -> Optional[str]:
     """Detect agent from unambiguous keyword signals in the query.
@@ -250,7 +247,6 @@ def _keyword_fast_path(query: str) -> Optional[str]:
         return "web_extract"
 
     return None
-
 
 def match_agents(
     query: str,

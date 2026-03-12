@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -10,8 +10,7 @@ from src.kg.kg_store import KGStore
 
 from .models import EvidenceChunk, EvidenceQuality, Plan
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class RepairLoop:
     def __init__(self, redis_client: Optional[Any] = None, kg_store: Optional[KGStore] = None) -> None:
@@ -170,7 +169,6 @@ class RepairLoop:
             "section_ids": list(dict.fromkeys(section_ids)),
         }
 
-
 def _score_evidence(evidence: List[EvidenceChunk], plan: Plan) -> EvidenceQuality:
     if not evidence:
         return EvidenceQuality(quality="LOW", reasons=["no_evidence"], stats={"documents": 0, "coverage": 0.0})
@@ -206,7 +204,6 @@ def _score_evidence(evidence: List[EvidenceChunk], plan: Plan) -> EvidenceQualit
         },
     )
 
-
 def _entity_coverage(evidence: List[EvidenceChunk], hints: Iterable[str]) -> float:
     hints_list = [h for h in hints if h]
     if not hints_list:
@@ -220,7 +217,6 @@ def _entity_coverage(evidence: List[EvidenceChunk], hints: Iterable[str]) -> flo
                 break
     return found / max(len(hints_list), 1)
 
-
 def _duplicate_ratio(evidence: List[EvidenceChunk]) -> float:
     if not evidence:
         return 0.0
@@ -233,7 +229,6 @@ def _duplicate_ratio(evidence: List[EvidenceChunk]) -> float:
             seen.add(chunk.snippet_sha)
     return dup / max(len(evidence), 1)
 
-
 def _merge_evidence(current: List[EvidenceChunk], new_items: List[EvidenceChunk]) -> List[EvidenceChunk]:
     merged = list(current)
     seen = {chunk.snippet_sha for chunk in merged}
@@ -244,13 +239,11 @@ def _merge_evidence(current: List[EvidenceChunk], new_items: List[EvidenceChunk]
         merged.append(item)
     return merged
 
-
 def _next_rewrite(rewrites: List[str], iteration: int) -> Optional[str]:
     if not rewrites:
         return None
     idx = min(iteration + 1, len(rewrites) - 1)
     return rewrites[idx]
-
 
 def _safe_retrieve(
     retriever: Any,
@@ -291,6 +284,5 @@ def _safe_retrieve(
             exc_info=True,
         )
         return [], str(exc)
-
 
 __all__ = ["RepairLoop"]

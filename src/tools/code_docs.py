@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import zipfile
 from typing import Any, Dict, List, Optional
@@ -13,19 +13,16 @@ from src.tools.base import ToolError, generate_correlation_id, register_tool, st
 from src.tools.common.grounding import build_source_record
 from src.tools.common.io_limits import ALLOWED_ARCHIVES, MAX_BINARY_BYTES, enforce_limit
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/code", tags=["Tools-Code"])
-
 
 class CodeFile(BaseModel):
     path: str
     content: str
 
-
 class CodeDocsRequest(BaseModel):
     files: List[CodeFile] = Field(default_factory=list, description="Inline code files")
-
 
 def _extract_zip(upload: UploadFile) -> List[CodeFile]:
     if upload.content_type not in ALLOWED_ARCHIVES:
@@ -46,7 +43,6 @@ def _extract_zip(upload: UploadFile) -> List[CodeFile]:
             files.append(CodeFile(path=name, content=text))
     return files
 
-
 def _summarize_file(code_file: CodeFile) -> Dict[str, Any]:
     lines = code_file.content.splitlines()
     functions = len(re.findall(r"def\s+\w+\(", code_file.content))
@@ -57,7 +53,6 @@ def _summarize_file(code_file: CodeFile) -> Dict[str, Any]:
         "functions": functions,
         "classes": classes,
     }
-
 
 def _generate_docs(files: List[CodeFile]) -> Dict[str, Any]:
     summaries = [_summarize_file(f) for f in files]
@@ -78,14 +73,12 @@ def _generate_docs(files: List[CodeFile]) -> Dict[str, Any]:
         "total_lines": total_lines,
     }
 
-
 @register_tool("code_docs")
 async def code_docs_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     req = CodeDocsRequest(**(payload.get("input") or {}))
     docs = _generate_docs(req.files)
     sources = [build_source_record("tool", correlation_id or "code_docs", title="code_docs")]
     return {"result": docs, "sources": sources, "grounded": True, "context_found": bool(req.files)}
-
 
 @router.post("/docs")
 async def docs(

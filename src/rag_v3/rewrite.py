@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 import time
@@ -10,7 +10,7 @@ from typing import Optional, Tuple
 
 from .types import LLMBudget
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 REWRITE_TIMEOUT_MS = 5000
 REWRITE_MAX_TOKENS = 96
@@ -18,7 +18,6 @@ REWRITE_CACHE_TTL_SEC = 24 * 60 * 60
 
 # Shared semaphore to avoid rewrite and extract competing for the same GPU
 _ollama_semaphore: Optional[threading.Semaphore] = None
-
 
 def _get_ollama_semaphore() -> threading.Semaphore:
     global _ollama_semaphore
@@ -66,7 +65,6 @@ _STOPWORDS = {
     "its",
 }
 
-
 _DOMAIN_REWRITE_HINTS: dict[str, str] = {
     "medical": "For medical queries, preserve clinical terms (diagnoses, medications, dosages, lab values). ",
     "hr": "For HR/resume queries, preserve job titles, skill names, and company names. ",
@@ -95,7 +93,6 @@ _DOMAIN_DETECT_TAX_RE = re.compile(
     r"\b(?:tax\s+return|taxable\s+income|w-?2|1099|schedule\s+c|irs|deduction|withholding)\b", re.I
 )
 
-
 def _detect_domain_guidance(query: str) -> str:
     """Detect domain from query text and return appropriate rewrite guidance."""
     lowered = query.lower()
@@ -112,7 +109,6 @@ def _detect_domain_guidance(query: str) -> str:
     if _DOMAIN_DETECT_TAX_RE.search(lowered):
         return _DOMAIN_REWRITE_HINTS["tax"]
     return ""
-
 
 def rewrite_query(
     *,
@@ -213,7 +209,6 @@ def rewrite_query(
     _cache(redis_client, cache_key, normalized)
     return normalized
 
-
 # Conversational filler phrases to strip in smart fallback
 _FILLER_PATTERNS = [
     re.compile(r"^(?:can\s+you\s+)?(?:please\s+)?tell\s+me\s+", re.I),
@@ -242,7 +237,6 @@ _INTENT_WORDS = frozenset({
 
 # Pattern to detect quoted strings that should be preserved
 _QUOTED_RE = re.compile(r'"[^"]+"|\'[^\']+\'')
-
 
 def _smart_timeout_fallback(query: str) -> str:
     """Produce a smarter fallback than raw normalized query when rewrite times out.
@@ -296,14 +290,12 @@ def _smart_timeout_fallback(query: str) -> str:
 
     return result
 
-
 def _normalize(text: str) -> str:
     if not text:
         return ""
     cleaned = text.replace("\n", " ").replace("\t", " ").strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned
-
 
 _IMPLICIT_COMPARISON_RE = re.compile(
     r"\b(?:versus|vs\.?|compared?\s+to|differ(?:ence|ent)|better|worse|"
@@ -314,7 +306,6 @@ _CONJUNCTION_CLAUSE_RE = re.compile(
     r"\b(?:and\s+also|and\s+then|as\s+well\s+as|in\s+addition)\b",
     re.IGNORECASE,
 )
-
 
 def _should_rewrite(text: str) -> bool:
     if not text:
@@ -363,7 +354,6 @@ def _should_rewrite(text: str) -> bool:
 
     return (ambiguous or long_query or has_multi_clause or has_implicit_comparison
             or has_parenthetical or has_negation or has_conditional or has_relative_temporal)
-
 
 def _is_safe_rewrite(*, original: str, rewritten: str) -> bool:
     if not rewritten or rewritten == original:
@@ -414,12 +404,10 @@ def _is_safe_rewrite(*, original: str, rewritten: str) -> bool:
 
     return True
 
-
 def _cache_key(subscription_id: str, profile_id: Optional[str], query: str) -> str:
     seed = f"{subscription_id}:{profile_id or ''}:{query}".encode("utf-8")
     digest = hashlib.sha1(seed).hexdigest()
     return f"ragv3:rewrite:{digest}"
-
 
 def _cache(redis_client: Optional[object], key: str, value: str) -> None:
     if redis_client is None:
@@ -431,7 +419,6 @@ def _cache(redis_client: Optional[object], key: str, value: str) -> None:
             redis_client.set(key, value)
         except Exception:
             return
-
 
 def _generate_with_timeout(
     llm_client: object,

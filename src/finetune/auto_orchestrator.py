@@ -14,10 +14,9 @@ from src.finetune.qdrant_discovery import list_collections, list_profile_ids
 from src.finetune.unsloth_trainer import get_finetune_manager
 from src.utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _AUTO_ORCHESTRATOR = None
-
 
 def get_auto_orchestrator():
     global _AUTO_ORCHESTRATOR
@@ -25,14 +24,12 @@ def get_auto_orchestrator():
         _AUTO_ORCHESTRATOR = AutoFinetuneOrchestrator()
     return _AUTO_ORCHESTRATOR
 
-
 @dataclass
 class AutoFinetunePolicy:
     min_points: int = getattr(Config.Finetune, "AUTO_MIN_POINTS", 40)
     min_records: int = getattr(Config.Finetune, "AUTO_MIN_RECORDS", 20)
     max_profiles_per_run: int = getattr(Config.Finetune, "AUTO_MAX_PROFILES_PER_RUN", 10)
     interval_hours: float = getattr(Config.Finetune, "AUTO_INTERVAL_HOURS", 6)
-
 
 class AutoFinetuneOrchestrator:
     def __init__(self, client: Optional[QdrantClient] = None, policy: Optional[AutoFinetunePolicy] = None):

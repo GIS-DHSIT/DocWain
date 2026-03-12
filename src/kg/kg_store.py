@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.api.config import Config
 from src.kg.neo4j_store import Neo4jStore
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class EvidencePointer:
@@ -19,13 +18,11 @@ class EvidencePointer:
     snippet: str
     snippet_sha: str
 
-
 @dataclass
 class KGEntity:
     entity_norm: str
     entity_type: str
     surface_forms: List[str]
-
 
 class InMemoryKGStore:
     def __init__(self) -> None:
@@ -123,7 +120,6 @@ class InMemoryKGStore:
                     if len(results) >= limit:
                         return results
         return results
-
 
 class KGStore:
     def __init__(self, neo4j_store: Optional[Neo4jStore] = None) -> None:
@@ -421,18 +417,13 @@ class KGStore:
             return results
         return self.memory_store.find_sections_for_entities(subscription_id, profile_id, entity_norms, limit=limit)
 
-
-
 def _entity_key(subscription_id: str, profile_id: str, entity_norm: str, entity_type: str) -> str:
     return f"{subscription_id}:{profile_id}:{entity_type}:{entity_norm}"
-
 
 def _section_key(subscription_id: str, profile_id: str, section_id: str) -> str:
     return f"{subscription_id}:{profile_id}:{section_id}"
 
-
 def _doc_key(subscription_id: str, profile_id: str, document_id: str) -> str:
     return f"{subscription_id}:{profile_id}:{document_id}"
-
 
 __all__ = ["KGStore", "EvidencePointer"]

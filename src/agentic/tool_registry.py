@@ -7,13 +7,12 @@ Wraps the existing ``ToolRegistry`` from ``src/tools/base.py`` to provide:
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class ToolSchema:
@@ -21,7 +20,6 @@ class ToolSchema:
     name: str
     description: str
     parameters: Dict[str, Any] = field(default_factory=dict)
-
 
 @dataclass
 class ToolResult:
@@ -31,7 +29,6 @@ class ToolResult:
     output: Any = None
     error: Optional[str] = None
     elapsed_ms: float = 0.0
-
 
 class AgentToolRegistry:
     """Registry of tools available to the agentic reasoning loop.
@@ -127,6 +124,5 @@ class AgentToolRegistry:
         except Exception as exc:
             logger.warning("Could not import existing ToolRegistry: %s", exc)
         return registry
-
 
 __all__ = ["AgentToolRegistry", "ToolSchema", "ToolResult"]

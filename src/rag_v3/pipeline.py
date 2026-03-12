@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 import uuid
@@ -50,11 +50,9 @@ from .types import (
     PolicySchema,
 )
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 NO_CHUNKS_MESSAGE = "Not enough information in the documents to answer that."
-
 
 # ── Query simplification for retry ───────────────────────────────────
 
@@ -66,7 +64,6 @@ _QUERY_FILLER_WORDS = frozenset({
     "all", "each", "every", "any",
 })
 
-
 def _simplify_query_for_retry(query: str) -> str:
     """Strip filler words to extract core content terms for a broader search.
 
@@ -77,7 +74,6 @@ def _simplify_query_for_retry(query: str) -> str:
     if len(core) < 2:
         return ""  # Too aggressive — nothing left
     return " ".join(core)
-
 
 # Semantic expansions for common query terms — helps retrieval when exact
 # terms don't match document vocabulary
@@ -108,7 +104,6 @@ _SEMANTIC_EXPANSIONS = {
     "agreement": "agreement contract terms conditions provisions",
 }
 
-
 def _expand_query_for_retry(query: str) -> str:
     """Expand query terms with synonyms for broader retrieval.
 
@@ -121,7 +116,6 @@ def _expand_query_for_retry(query: str) -> str:
             expanded = expanded.replace(term, expansion, 1)
             break  # Only expand one term to avoid query bloat
     return expanded if expanded != query else ""
-
 
 def _no_results_message(
     query: str = "",
@@ -213,7 +207,6 @@ def _no_results_message(
         )
     return "\n".join(parts)
 
-
 # ── Smart Query Scope Inference ──────────────────────────────────────────────
 
 @dataclass
@@ -221,7 +214,6 @@ class QueryScope:
     mode: str  # "all_profile", "specific_document", "targeted"
     document_id: Optional[str] = None
     entity_hint: Optional[str] = None
-
 
 _DOCUMENT_ID_PATTERN = r"document_id\s*[:=]\s*([A-Za-z0-9_-]+)"
 
@@ -253,7 +245,6 @@ def _nlu_scope_is_all_profile(query: str, intent_hint: str = "") -> bool:
         return scope == "all_profile"
     except Exception:  # noqa: BLE001
         return False
-
 
 # Multi-word phrases that are document types, NOT person/entity names.
 # These slip through spaCy's single-word stopword filter but should never
@@ -292,7 +283,6 @@ _ENTITY_HINT_STOP_PHRASES = frozenset({
     "proper format", "same response", "the same",
 })
 
-
 def _try_nlp_entity(query: str) -> Optional[str]:
     """Extract entity from query using spaCy NLP (helper for scope inference)."""
     try:
@@ -306,7 +296,6 @@ def _try_nlp_entity(query: str) -> Optional[str]:
     except Exception:  # noqa: BLE001
         pass
     return None
-
 
 def _infer_query_scope(
     query: str,
@@ -403,11 +392,9 @@ def _infer_query_scope(
     # targeted mode, found no entity match, and returned "not mentioned."
     return QueryScope(mode="all_profile")
 
-
 def _is_llm_response(extraction: Any) -> bool:
     """Check if extraction produced an LLMResponseSchema (skip render step)."""
     return isinstance(getattr(extraction, "schema", None), LLMResponseSchema)
-
 
 # ── Domain-specific post-processing for LLM responses ────────────────────
 _DOMAIN_DISCLAIMERS = {
@@ -417,7 +404,6 @@ _DOMAIN_DISCLAIMERS = {
 
 # Consolidated LLM preamble pattern — imported from sanitize to avoid drift
 from .sanitize import _LLM_PREAMBLE_RE  # noqa: E402
-
 
 _FILLER_PHRASES_RE = re.compile(
     r"(?:^|\n)\s*(?:"
@@ -433,7 +419,6 @@ _FILLER_PHRASES_RE = re.compile(
     r")\s*",
     re.IGNORECASE,
 )
-
 
 def _deduplicate_output_lines(text: str) -> str:
     """Remove near-duplicate lines/bullets from LLM output.
@@ -495,7 +480,6 @@ def _deduplicate_output_lines(text: str) -> str:
 
     return "\n".join(result)
 
-
 # Pattern to extract "entity + numeric value" claims for contradiction detection
 _NUMERIC_CLAIM_RE = re.compile(
     r"(?:\*\*)?([A-Z][a-zA-Z\s]{1,30}?)(?:\*\*)?\s*"   # Entity name (possibly bold)
@@ -503,7 +487,6 @@ _NUMERIC_CLAIM_RE = re.compile(
     r"(?:\*\*)?(\$?[\d,]+\.?\d*%?)\s*(years?|months?|days?|hours?)?(?:\*\*)?",  # Value
     re.IGNORECASE,
 )
-
 
 def _detect_self_contradictions(text: str) -> list[str]:
     """Detect when the same entity has conflicting numeric values in the response.
@@ -565,7 +548,6 @@ def _detect_self_contradictions(text: str) -> list[str]:
 
     return contradictions
 
-
 def _remove_repetitive_patterns(text: str) -> str:
     """Remove repetitive sentence patterns that indicate LLM generation loops.
 
@@ -610,7 +592,6 @@ def _remove_repetitive_patterns(text: str) -> str:
 
     return "\n".join(result_lines)
 
-
 def _repair_markdown_artifacts(text: str) -> str:
     """Fix common markdown artifacts from LLM output.
 
@@ -633,7 +614,6 @@ def _repair_markdown_artifacts(text: str) -> str:
             line = line + "**"
         repaired.append(line)
     return "\n".join(repaired)
-
 
 def _post_process_llm_response(text: str, domain: str, intent: str) -> str:
     """Clean up raw LLM output for readability and accuracy.
@@ -747,7 +727,6 @@ def _post_process_llm_response(text: str, domain: str, intent: str) -> str:
 
     return processed
 
-
 def _trim_trailing_incomplete(text: str) -> str:
     """Remove a trailing incomplete sentence caused by LLM token truncation.
 
@@ -774,7 +753,6 @@ def _trim_trailing_incomplete(text: str) -> str:
     if len(last) < 80 and len(lines) > 1:
         return "\n".join(lines[:-1])
     return text
-
 
 def _has_valid_deterministic_extraction(schema: Any) -> bool:
     """Check if schema has valid deterministic data that doesn't need evidence_spans."""
@@ -814,7 +792,6 @@ def _has_valid_deterministic_extraction(schema: Any) -> bool:
         )
     return False
 
-
 # ── Agent-to-Domain mapping ────────────────────────────────────────────────
 # When /ask receives tools=["resume-analysis"], the pipeline uses this to
 # set an authoritative domain_hint that overrides query/chunk-based inference.
@@ -835,7 +812,6 @@ _AGENT_DOMAIN_MAP: Dict[str, str] = {
 }
 _TOOL_DOMAIN_MAP = _AGENT_DOMAIN_MAP  # backward-compat alias
 
-
 def _resolve_domain_from_agents(tools: Optional[List[str]]) -> Optional[str]:
     """Map agent names to an authoritative domain hint.
 
@@ -849,9 +825,7 @@ def _resolve_domain_from_agents(tools: Optional[List[str]]) -> Optional[str]:
             return domain
     return None
 
-
 _resolve_domain_from_tools = _resolve_domain_from_agents  # backward-compat alias
-
 
 # ── Document-agnostic agents ──────────────────────────────────────────────
 # Agents that produce results from the query itself, not from document chunks.
@@ -859,7 +833,6 @@ _resolve_domain_from_tools = _resolve_domain_from_agents  # backward-compat alia
 # when Qdrant returns zero results.
 _DOC_AGNOSTIC_AGENTS = frozenset({"web_search", "email_drafting", "creator", "tutor"})
 _DOC_AGNOSTIC_TOOLS = _DOC_AGNOSTIC_AGENTS  # backward-compat alias
-
 
 # ── Domain Agent Dispatch ─────────────────────────────────────────────────
 # Detects queries that require specialized agent reasoning (e.g. "generate
@@ -967,11 +940,9 @@ def _try_domain_agent(
         answer["media"] = media
     return answer
 
-
 def _time_remaining(pipeline_start: float, deadline_s: float) -> float:
     """Return seconds remaining before pipeline deadline.  Negative = overdue."""
     return deadline_s - (time.time() - pipeline_start)
-
 
 # ── Chunk Translation ─────────────────────────────────────────────────────
 
@@ -990,7 +961,6 @@ def _detect_target_language(query: str) -> Optional[str]:
         return _llm_detect_target_language(query)
     except Exception:
         return None
-
 
 def _is_non_english(text: str) -> bool:
     """Quick heuristic to detect if text is likely non-English.
@@ -1022,7 +992,6 @@ def _is_non_english(text: str) -> bool:
     words = set(text_lower.split())
     marker_count = len(words & _NON_EN_MARKERS)
     return marker_count >= 3
-
 
 def _translate_chunks(
     chunks: List[Chunk],
@@ -1104,12 +1073,10 @@ def _translate_chunks(
 
     return chunks
 
-
 # ── Agent Dispatch ─────────────────────────────────────────────────────────
 
 _TOOL_DISPATCH_TIMEOUT_S = 10.0
 _MAX_TOOL_CONTEXT_CHUNKS = 10
-
 
 def _dispatch_agents(
     tool_names: List[str],
@@ -1299,9 +1266,7 @@ def _dispatch_agents(
 
     return result_chunks
 
-
 _dispatch_tools = _dispatch_agents  # backward-compat alias
-
 
 def _bold_values_in_line(line: str) -> str:
     """Bold values in key-value lines for consistent formatting.
@@ -1325,7 +1290,6 @@ def _bold_values_in_line(line: str) -> str:
     if line.lstrip().startswith('-') and re.search(r'\$[\d,]+\.?\d*|\b\d{2,}%?\b', line):
         line = re.sub(r'(\$[\d,]+\.?\d*)', r'**\1**', line, count=1)
     return line
-
 
 def _emergency_chunk_summary(chunks: List[Chunk], query: str) -> str:
     """Generate a factual summary from raw chunks when renderers return empty.
@@ -1459,7 +1423,6 @@ def _emergency_chunk_summary(chunks: List[Chunk], query: str) -> str:
         return f"Based on available information:\n{first_text}"
     return ""
 
-
 _EMERGENCY_STOP_WORDS = frozenset({
     "the", "and", "for", "are", "was", "were", "with", "this", "that",
     "from", "what", "who", "how", "which", "tell", "show", "give",
@@ -1467,7 +1430,6 @@ _EMERGENCY_STOP_WORDS = frozenset({
     "would", "could", "should", "its", "you", "your", "they", "them",
     "not", "but", "all", "any", "each", "more", "some", "than",
 })
-
 
 def _normalize_llm_formatting(text: str) -> str:
     """Ensure LLM output has proper formatting for markdown-aware UIs.
@@ -1498,7 +1460,6 @@ def _normalize_llm_formatting(text: str) -> str:
     text = re.sub(r"([^\n])\n(#{1,4} )", r"\1\n\n\2", text)
 
     return text.strip()
-
 
 def _fix_incomplete_structures(text: str) -> str:
     """Fix common LLM output truncation artifacts.
@@ -1539,7 +1500,6 @@ def _fix_incomplete_structures(text: str) -> str:
         text += "*"
 
     return text
-
 
 def _extract_render_judge(
     *,
@@ -1824,7 +1784,6 @@ def _extract_render_judge(
 
     return sanitized, verdict
 
-
 def _load_document_data_for_extraction(
     chunks: List[Any], query: str, correlation_id: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
@@ -1906,11 +1865,9 @@ def _load_document_data_for_extraction(
 
     return document_data
 
-
 _CONTACT_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 _CONTACT_PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-()]{7,15})")
 _CONTACT_LINKEDIN_RE = re.compile(r"linkedin\.com/in/[\w-]+", re.IGNORECASE)
-
 
 def _augment_chunks_with_contact_info(
     chunks: List[Any],
@@ -2004,7 +1961,6 @@ def _augment_chunks_with_contact_info(
     )
     return [synthetic] + list(chunks)
 
-
 _INSUFFICIENT_PHRASES = (
     "do not contain", "does not contain", "no information",
     "none of the", "sorry, but", "no relevant information",
@@ -2014,7 +1970,6 @@ _INSUFFICIENT_PHRASES = (
     "not covered in", "not available in",
     "does not mention", "do not mention",
 )
-
 
 def _web_search_fallback(
     answer_text: str,
@@ -2064,7 +2019,6 @@ def _web_search_fallback(
     except Exception as exc:
         logger.debug("Web search post-hoc fallback failed: %s", exc)
     return None
-
 
 def _run_all_profile_analysis(
     *,
@@ -2591,7 +2545,6 @@ def _run_all_profile_analysis(
         llm_client=llm_client,
     )
 
-
 def run(
     *,
     query: str,
@@ -3068,7 +3021,6 @@ def run(
             reranked = deduplicate_by_content(reranked)
             reranked = filter_chunks_by_focus(reranked, focus, min_keep=4, top_k=8)
             clear_chunk_embed_cache()
-
 
             # Entity-hint filtering for targeted queries in profile scan path
             # Soft fallback: if entity filter returns empty, keep all chunks
@@ -4190,7 +4142,6 @@ def run(
         llm_client=llm_client,
     )
 
-
 def run_docwain_rag_v3(
     *,
     query: str,
@@ -4234,7 +4185,6 @@ def run_docwain_rag_v3(
         conversation_context=conversation_context,
     )
 
-
 def _retry_render(extraction: Any, correlation_id: Optional[str], query: str = "") -> str:
     try:
         return render(domain=extraction.domain, intent=extraction.intent, schema=extraction.schema, strict=True, query=query)
@@ -4245,7 +4195,6 @@ def _retry_render(extraction: Any, correlation_id: Optional[str], query: str = "
             extra={"stage": "render_retry", "correlation_id": correlation_id},
         )
         return ""
-
 
 def _collect_retrieved_metadata(chunks: List[Chunk]) -> Dict[str, List[str]]:
     doc_types = set()
@@ -4272,7 +4221,6 @@ def _collect_retrieved_metadata(chunks: List[Chunk]) -> Dict[str, List[str]]:
         "document_ids": sorted(document_ids),
         "document_names": sorted(document_names),
     }
-
 
 def _log_extraction_diagnostics(
     *,
@@ -4317,7 +4265,6 @@ def _log_extraction_diagnostics(
             },
         )
 
-
 def _maybe_log_hr_schema(extraction: Any, correlation_id: Optional[str]) -> None:
     if not Config.RagV3.DEBUG_SCHEMA:
         return
@@ -4332,7 +4279,6 @@ def _maybe_log_hr_schema(extraction: Any, correlation_id: Optional[str]) -> None
         payload,
         extra={"stage": "extract_hr_schema", "correlation_id": correlation_id},
     )
-
 
 def _hr_field_coverage(schema: HRSchema) -> Dict[str, Dict[str, int]]:
     fields = {
@@ -4355,7 +4301,6 @@ def _hr_field_coverage(schema: HRSchema) -> Dict[str, Dict[str, int]]:
             else:
                 coverage[key]["missing"] += 1
     return coverage
-
 
 def _redact_hr_schema(schema: HRSchema) -> Dict[str, Any]:
     data = schema.model_dump()
@@ -4383,7 +4328,6 @@ def _redact_hr_schema(schema: HRSchema) -> Dict[str, Any]:
         cand["evidence_spans"] = []
     return data
 
-
 def _redact_text(text: Any) -> str:
     if text is None:
         return ""
@@ -4392,7 +4336,6 @@ def _redact_text(text: Any) -> str:
     cleaned = re.sub(r"\\+?\\d[\\d\\-\\s().]{6,}\\d", "[phone]", cleaned)
     cleaned = re.sub(r"\\b[A-Fa-f0-9]{8,}\\b", "[id]", cleaned)
     return cleaned
-
 
 def _truncate(text: str, limit: int) -> str:
     """Boundary-aware truncation — cuts at sentence/paragraph end, not mid-word.
@@ -4428,7 +4371,6 @@ def _truncate(text: str, limit: int) -> str:
     # Fallback: hard cut at limit
     return candidate.rstrip() + "…"
 
-
 def _chunk_document_id(chunk: Chunk) -> Optional[str]:
     meta = chunk.meta or {}
     for key in ("document_id", "doc_id", "docId"):
@@ -4436,7 +4378,6 @@ def _chunk_document_id(chunk: Chunk) -> Optional[str]:
         if value:
             return str(value)
     return None
-
 
 # Tech abbreviation dictionary — maps stack acronyms to individual component terms
 _TECH_ACRONYM_EXPANSIONS: Dict[str, List[str]] = {
@@ -4458,10 +4399,8 @@ _TECH_TERMS = frozenset({
     "jamstack", "graphql", "typescript", "golang", "spark", "hadoop",
 })
 
-
 def _is_tech_term(hint: str) -> bool:
     return hint.lower().strip() in _TECH_TERMS
-
 
 def _expand_tech_hint(hint: str) -> List[str]:
     """Return expanded search terms for a tech abbreviation."""
@@ -4470,7 +4409,6 @@ def _expand_tech_hint(hint: str) -> List[str]:
     if lower in _TECH_ACRONYM_EXPANSIONS:
         terms.extend(_TECH_ACRONYM_EXPANSIONS[lower])
     return terms
-
 
 def _resolve_entity_to_doc_ids(
     entity_hint: str,
@@ -4538,7 +4476,6 @@ def _resolve_entity_to_doc_ids(
             matching_doc_ids.add(str(doc_id))
 
     return list(matching_doc_ids)
-
 
 def _filter_chunks_by_entity_hint(
     chunks: List[Chunk],
@@ -4637,7 +4574,6 @@ def _filter_chunks_by_entity_hint(
         return filtered
     return []
 
-
 def _build_generic_schema_from_chunks(chunks: List[Chunk]) -> GenericSchema:
     items: List[FieldValue] = []
     for chunk in chunks or []:
@@ -4655,7 +4591,6 @@ def _build_generic_schema_from_chunks(chunks: List[Chunk]) -> GenericSchema:
         return GenericSchema(facts=FieldValuesField(items=None, missing_reason=MISSING_REASON))
     return GenericSchema(facts=FieldValuesField(items=items))
 
-
 def _collect_sources(chunks: List[Chunk]) -> List[Dict[str, Any]]:
     sources: List[Dict[str, Any]] = []
     seen = set()
@@ -4669,7 +4604,6 @@ def _collect_sources(chunks: List[Chunk]) -> List[Dict[str, Any]]:
         seen.add(key)
         sources.append({"file_name": doc, "page": page, "snippet": snippet})
     return sources
-
 
 def _synthesize_cross_document(
     schemas: List[Any],
@@ -4774,7 +4708,6 @@ def _synthesize_cross_document(
 
     return " ".join(parts)
 
-
 def _llm_synthesize(
     rendered_text: str,
     query: str,
@@ -4863,7 +4796,6 @@ def _llm_synthesize(
 
     return None
 
-
 def _should_use_thinking(
     query: str,
     intent_parse: Any,
@@ -4906,7 +4838,6 @@ def _should_use_thinking(
         return True
 
     return False
-
 
 def _build_answer(
     response_text: str,
@@ -5222,7 +5153,6 @@ def _build_answer(
 
     return result
 
-
 def _snippet(text: str, limit: int = 160) -> str:
     if not text:
         return ""
@@ -5230,7 +5160,6 @@ def _snippet(text: str, limit: int = 160) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[:limit].rstrip()
-
 
 def _log_stage(stage: str, start_time: float, correlation_id: Optional[str]) -> None:
     elapsed_ms = (time.time() - start_time) * 1000
@@ -5240,7 +5169,6 @@ def _log_stage(stage: str, start_time: float, correlation_id: Optional[str]) -> 
         elapsed_ms,
         extra={"stage": stage, "correlation_id": correlation_id, "latency_ms": elapsed_ms},
     )
-
 
 def _infer_intent_type(query: str, intent_parse: Optional[IntentParse] = None) -> str:
     if intent_parse:
@@ -5267,7 +5195,6 @@ def _infer_intent_type(query: str, intent_parse: Optional[IntentParse] = None) -
         return "extract"
     return "answer"
 
-
 def _start_intent_parse(
     *,
     query: str,
@@ -5281,7 +5208,6 @@ def _start_intent_parse(
     executor.shutdown(wait=False)
     return future
 
-
 def _resolve_intent_future(future: Optional[concurrent.futures.Future]) -> Optional[IntentParse]:
     if future is None:
         return None
@@ -5289,7 +5215,6 @@ def _resolve_intent_future(future: Optional[concurrent.futures.Future]) -> Optio
         return future.result(timeout=0.5)
     except Exception:
         return None
-
 
 def _infer_scope_document_id(query: str, explicit_document_id: Optional[str]) -> Optional[str]:
     if explicit_document_id:
@@ -5307,14 +5232,12 @@ def _infer_scope_document_id(query: str, explicit_document_id: Optional[str]) ->
             return match.group(1)
     return None
 
-
 def _needs_full_scan_generic(schema: Any) -> bool:
     """Check if generic extraction result is too sparse and needs more chunks."""
     if not isinstance(schema, GenericSchema):
         return False
     facts = (schema.facts.items if schema.facts else None) or []
     return len(facts) < 3
-
 
 def _needs_full_scan_hr(schema: HRSchema, intent: str) -> bool:
     candidates = (schema.candidates.items if schema.candidates else None) or []
@@ -5334,7 +5257,6 @@ def _needs_full_scan_hr(schema: HRSchema, intent: str) -> bool:
             missing += 1
     return missing >= max(1, len(candidates) // 2)
 
-
 def _needs_full_scan_invoice(schema: InvoiceSchema, intent: str) -> bool:
     _ = intent
     items = (schema.items.items if schema.items else None) or []
@@ -5344,12 +5266,10 @@ def _needs_full_scan_invoice(schema: InvoiceSchema, intent: str) -> bool:
     missing_groups = sum(1 for group in (items, totals, parties, terms) if not group)
     return missing_groups >= 2
 
-
 def _needs_full_scan_legal(schema: LegalSchema, intent: str) -> bool:
     _ = intent
     clauses = (schema.clauses.items if schema.clauses else None) or []
     return not clauses
-
 
 def _needs_profile_scan(chunks: List[Chunk]) -> bool:
     if not chunks:
@@ -5359,7 +5279,6 @@ def _needs_profile_scan(chunks: List[Chunk]) -> bool:
         return True
     top_score = max((c.score for c in chunks), default=0.0)
     return top_score < 0.2
-
 
 def _profile_point_counts(
     subscription_id: str,
@@ -5406,11 +5325,9 @@ def _profile_point_counts(
     )
     return count, total
 
-
 def _should_unconditional_profile_scan(profile_count: int, threshold: int = 80) -> bool:
     # profile_count == 0 means the Qdrant filter matched nothing — still trigger
     # the scan so the retrieve fallback (unscoped scroll) has a chance to recover.
     return profile_count <= threshold
-
 
 __all__ = ["run_docwain_rag_v3", "run"]

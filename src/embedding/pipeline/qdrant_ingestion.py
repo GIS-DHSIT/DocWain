@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Iterable, List, Optional
 
 import ollama
@@ -12,12 +12,11 @@ from src.api.vector_store import QdrantVectorStore, build_collection_name, compu
 from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
 from src.utils.payload_utils import get_canonical_text, token_count
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DOC_TYPE_MAP = {
     "report_table_heavy": "resume",
 }
-
 
 def _stringify(value: Any) -> Optional[str]:
     if value is None:
@@ -25,14 +24,12 @@ def _stringify(value: Any) -> Optional[str]:
     text = str(value).strip()
     return text or None
 
-
 def _first_present(*values: Any) -> Optional[str]:
     for value in values:
         text = _stringify(value)
         if text:
             return text
     return None
-
 
 def _merge_texts(raw_data: Dict[str, Any]) -> str:
     candidates = [
@@ -54,18 +51,15 @@ def _merge_texts(raw_data: Dict[str, Any]) -> str:
         seen.add(text)
     return "\n\n".join(merged).strip()
 
-
 def _map_doc_type(raw_doc_type: Optional[str]) -> Optional[str]:
     if not raw_doc_type:
         return None
     return _DOC_TYPE_MAP.get(raw_doc_type, raw_doc_type)
 
-
 def extract_skills_stub(content: str) -> List[str]:
     """Placeholder for future skill extraction; returns empty list for now."""
     _ = content
     return []
-
 
 def transform_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize messy payloads into a retrieval-ready schema."""
@@ -169,7 +163,6 @@ def transform_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     return {k: v for k, v in payload.items() if v is not None}
 
-
 def _ollama_embed(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
     model_name = model or getattr(Config.Model, "OLLAMA_EMBEDDING_MODEL", "bge-m3")
     vectors: List[List[float]] = []
@@ -185,7 +178,6 @@ def _ollama_embed(texts: List[str], model: Optional[str] = None) -> List[List[fl
             raise ValueError("Ollama embeddings response missing embedding vector")
         vectors.append([float(x) for x in embedding])
     return vectors
-
 
 def ingest_payloads(
     raw_payloads: Iterable[Dict[str, Any]],
@@ -256,6 +248,5 @@ def ingest_payloads(
         results[collection_name] = saved
 
     return results
-
 
 __all__ = ["transform_payload", "ingest_payloads"]

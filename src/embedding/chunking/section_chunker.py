@@ -7,7 +7,7 @@ and only cuts at safe boundaries (paragraph, sentence, bullet, or table row).
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -16,7 +16,7 @@ from src.api.config import Config
 from src.api.pipeline_models import ChunkCandidate, ExtractedDocument, Section, Table
 from src.embedding.chunking.sentence_splitter import join_sentences, split_into_sentences
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _HEADING_RE = re.compile(
     r"^(?:chapter\b|section\b|appendix\b|\d+(?:\.\d+)+|\d+\.|[ivxlcdm]+\.)\s+.+",
@@ -27,7 +27,6 @@ _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[\.)])\s+")
 _TABLE_ROW_RE = re.compile(r"\|.*\|.*|(?:\S+\s{2,}){2,}\S+")
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", re.IGNORECASE)
 _BOILERPLATE_RE = re.compile(r"^\s*(confidential|draft|internal use only)\s*$", re.IGNORECASE)
-
 
 def _safe_text(item: Any) -> str:
     """Extract text from a list item that might be a string, dict, or object.
@@ -48,7 +47,6 @@ def _safe_text(item: Any) -> str:
             return val
     return ""
 
-
 def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if value is None:
@@ -56,7 +54,6 @@ def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return int(value)
     except Exception:  # noqa: BLE001
         return default
-
 
 def _coalesce_whitespace(text: str) -> str:
     # Preserve bullets and line-based tables by working line-wise.
@@ -74,7 +71,6 @@ def _coalesce_whitespace(text: str) -> str:
         cleaned_lines.append(line)
     return "\n".join(cleaned_lines).strip()
 
-
 def normalize_text(text: str) -> str:
     """Normalize extracted text without damaging structure."""
     if not text:
@@ -86,7 +82,6 @@ def normalize_text(text: str) -> str:
     text = _coalesce_whitespace(text)
     text = _strip_boilerplate_lines(text)
     return text
-
 
 def _strip_boilerplate_lines(text: str) -> str:
     lines = [ln for ln in text.splitlines()]
@@ -105,7 +100,6 @@ def _strip_boilerplate_lines(text: str) -> str:
         filtered.append(line)
     return "\n".join(filtered).strip()
 
-
 def _is_heading_line(line: str) -> bool:
     clean = (line or "").strip()
     if not clean:
@@ -115,7 +109,6 @@ def _is_heading_line(line: str) -> bool:
     if len(clean.split()) <= 10 and _ALL_CAPS_RE.match(clean):
         return True
     return False
-
 
 def _infer_sections_from_text(text: str, *, fallback_title: str) -> List[Section]:
     """Infer sections using heading-like lines when explicit sections are missing."""
@@ -176,14 +169,12 @@ def _infer_sections_from_text(text: str, *, fallback_title: str) -> List[Section
 
     return sections
 
-
 @dataclass
 class Block:
     text: str
     block_type: str
     page_start: Optional[int]
     page_end: Optional[int]
-
 
 @dataclass
 class Chunk:
@@ -196,7 +187,6 @@ class Chunk:
     doc_internal_id: str
     source_filename: str
     sentence_complete: bool
-
 
 class SectionChunker:
     """Chunk extracted documents along section and sentence boundaries."""

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import re
 from typing import Any, List, Sequence
 
 from .types import Chunk
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Minimum rerank score threshold - chunks below this are considered irrelevant
 MIN_RERANK_SCORE = 0.20  # Raised from 0.15: reduces low-relevance noise in context
@@ -22,7 +22,6 @@ _DOMAIN_MIN_SCORES = {
     "hr": 0.25,
     "policy": 0.25,
 }
-
 
 def get_domain_min_score(domain_hint: str | None = None) -> float:
     """Return domain-adaptive minimum rerank score."""
@@ -38,7 +37,6 @@ try:
     _RERANK_TIMEOUT_S = getattr(getattr(_Cfg, "Reranker", None), "TIMEOUT_S", 20.0)
 except Exception:
     _RERANK_TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "20.0"))
-
 
 def _tag_rerank_confidence(chunks: List[Chunk], min_score: float) -> None:
     """Tag chunks with rerank confidence signal.
@@ -58,7 +56,6 @@ def _tag_rerank_confidence(chunks: List[Chunk], min_score: float) -> None:
             if isinstance(meta, dict):
                 meta["rerank_low_confidence"] = True
 
-
 def _infer_domain_from_chunks(chunks: List[Chunk]) -> str | None:
     """Infer dominant domain from chunk metadata."""
     from collections import Counter
@@ -77,7 +74,6 @@ def _infer_domain_from_chunks(chunks: List[Chunk]) -> str | None:
         if count >= max(2, sampled * 0.3):
             return best
     return None
-
 
 def rerank_chunks(
     *,
@@ -162,7 +158,6 @@ def rerank_chunks(
     _tag_rerank_confidence(_result, min_score)
     return _result
 
-
 def rerank(
     *,
     query: str,
@@ -183,9 +178,7 @@ def rerank(
         entity_hints=entity_hints,
     )
 
-
 _ENTITY_BOOST = 0.10  # Score boost for chunks containing conversation entities
-
 
 def _apply_entity_boost(chunks: List[Chunk], entity_hints: List[str]) -> None:
     """Boost scores of chunks that mention known entities (persons, orgs from conversation).
@@ -227,7 +220,6 @@ def _apply_entity_boost(chunks: List[Chunk], entity_hints: List[str]) -> None:
                 chunk.score = min(1.0, chunk.score * (1.0 + boost * 5))
             else:
                 chunk.score = min(1.0, chunk.score + boost)
-
 
 def _try_cross_encoder(
     encoder: Any,
@@ -340,8 +332,6 @@ def _try_cross_encoder(
             extra={"stage": "rerank", "correlation_id": correlation_id},
         )
         return None
-
-
 
 def _normalize_scores(scores: Any, expected: int) -> List[float]:
     if scores is None:

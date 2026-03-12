@@ -1,6 +1,8 @@
 import hashlib
 import json
 import logging
+
+from src.utils.logging_utils import get_logger
 import datetime as dt
 import os
 import re
@@ -129,14 +131,12 @@ from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details or {}}}
-
 
 def _get_dw_newron():
     """
@@ -146,7 +146,6 @@ def _get_dw_newron():
     """
     from src.api import dw_newron  # local import to defer heavy deps
     return dw_newron
-
 
 app = FastAPI(title="DocWain API", lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
@@ -170,13 +169,11 @@ api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
 api_router.include_router(tools_router, tags=["Agents"])
 
-
 @api_router.get("/agents/capabilities", tags=["Agents"])
 def list_available_agents_with_capabilities():
     """List all available agents with their intelligence profiles and capabilities."""
     from src.tools.intelligence import list_agents_with_capabilities
     return list_agents_with_capabilities()
-
 
 @api_router.get("/tools", tags=["Agents"], deprecated=True)
 def list_available_tools():
@@ -187,11 +184,9 @@ def list_available_tools():
     """
     return list_available_agents_with_capabilities()
 
-
 api_router.include_router(agents_router, tags=["Agents"])
 if _EXTRACTION_ROUTER_AVAILABLE and extraction_router:
     api_router.include_router(extraction_router, tags=["Extraction Pipeline"])
-
 
 class FeedbackRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -202,9 +197,7 @@ class FeedbackRequest(BaseModel):
 
 session_state_store = SessionStateStore()
 
-
 ## Startup checks migrated to lifespan handler in src/api/app_lifespan.py
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -214,7 +207,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
     return JSONResponse(status_code=exc.status_code, content=payload)
 
-
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled error for %s %s", request.method, request.url, exc_info=True)
@@ -222,7 +214,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content=_error("internal_error", "Unexpected error occurred", {"reason": str(exc)}),
     )
-
 
 class QuestionRequest(BaseModel):
     query: constr(min_length=1)
@@ -257,7 +248,6 @@ class QuestionRequest(BaseModel):
     agent_name: Optional[str] = Field(default=None, description="Domain agent to invoke (e.g. 'hr', 'medical', 'legal', 'content')")
     agent_task: Optional[str] = Field(default=None, description="Specific agent task (e.g. 'generate_interview_questions')")
 
-
 class AnswerPayload(BaseModel):
     response: Any
     sources: List[Any] = Field(default_factory=list)
@@ -267,17 +257,14 @@ class AnswerPayload(BaseModel):
     media: Optional[List[Dict[str, Any]]] = None  # charts/images as {type, title, data}
     ok: bool = True
 
-
 class AskResponse(BaseModel):
     answer: AnswerPayload
     current_session_id: Optional[str]
     debug: Dict[str, Any] = Field(default_factory=dict)
 
-
 class AskLiteResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]] = Field(default_factory=list)
-
 
 def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
     """
@@ -291,7 +278,6 @@ def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
     if request.new_session:
         return str(uuid.uuid4())
     return None
-
 
 def _latest_profile_from_catalog(cache: RedisIntelCache, subscription_id: str) -> Optional[str]:
     prefix = f"{cache.prefix}:catalog:{subscription_id}:"
@@ -312,7 +298,6 @@ def _latest_profile_from_catalog(cache: RedisIntelCache, subscription_id: str) -
             best_ts = ts
             best_profile = str(profile_id)
     return best_profile
-
 
 def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Optional[str]) -> Tuple[Optional[str], str]:
     explicit = (request.profile_id or "").strip()
@@ -346,7 +331,6 @@ def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Option
 
     return None, "missing"
 
-
 def _history_response_text(value: Any) -> str:
     """Extract plain-text assistant response from stored history payloads."""
     if isinstance(value, dict):
@@ -359,7 +343,6 @@ def _history_response_text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     return str(value or "").strip()
-
 
 def _hydrate_runtime_session_context(
     *,
@@ -441,7 +424,6 @@ def _hydrate_runtime_session_context(
             restored,
         )
 
-
 def _persist_chat_turn(
     *,
     user_id: str,
@@ -466,11 +448,9 @@ def _persist_chat_turn(
         logger.debug("Chat history persistence skipped: %s", exc)
         return session_id
 
-
 def _normalize_answer(answer):
     """Backward-compatible wrapper around the shared normalizer."""
     return normalize_answer(answer)
-
 
 def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
     if not value:
@@ -478,7 +458,6 @@ def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "…"
-
 
 def _minimize_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     minimal: List[Dict[str, Any]] = []
@@ -496,7 +475,6 @@ def _minimize_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             minimal.append(entry)
     return minimal
 
-
 def _resolve_output_root(path_str: str) -> Path:
     """Resolve user-provided output_dir to an absolute path within APP_HOME when relative."""
     root = Path(path_str)
@@ -504,12 +482,10 @@ def _resolve_output_root(path_str: str) -> Path:
         root = Path(Config.Path.APP_HOME) / root
     return root
 
-
 def _training_runs_dir(output_dir: str) -> Path:
     run_dir = _resolve_output_root(output_dir) / "training_runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
-
 
 def _load_training_run_records(run_dir: Path) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
@@ -523,7 +499,6 @@ def _load_training_run_records(run_dir: Path) -> List[Dict[str, Any]]:
             logger.warning("Unable to read training run record %s: %s", path, exc)
     return records
 
-
 def _persist_training_run_record(run_dir: Path, record: Dict[str, Any]) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / f"{record['training_run_id']}.json"
@@ -532,7 +507,6 @@ def _persist_training_run_record(run_dir: Path, record: Dict[str, Any]) -> Path:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to persist training run record %s: %s", path, exc)
     return path
-
 
 def _collection_config_hash(request: CollectionOnlyFinetuneRequest) -> str:
     """
@@ -559,7 +533,6 @@ def _collection_config_hash(request: CollectionOnlyFinetuneRequest) -> str:
     encoded = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
-
 def _map_status(status: Optional[str]) -> str:
     if status == "completed":
         return "succeeded"
@@ -568,7 +541,6 @@ def _map_status(status: Optional[str]) -> str:
     if status == "running":
         return "running"
     return "scheduled"
-
 
 def _derive_overall_status(record: Dict[str, Any]) -> str:
     profiles = record.get("profiles") or []
@@ -584,7 +556,6 @@ def _derive_overall_status(record: Dict[str, Any]) -> str:
     if statuses.issubset({"scheduled", "queued", "running"}):
         return "in_progress"
     return "partial"
-
 
 def _refresh_training_run_record(record: Dict[str, Any], manager) -> bool:
     """Refresh per-profile statuses from the finetune manager when possible."""
@@ -626,7 +597,6 @@ def _refresh_training_run_record(record: Dict[str, Any], manager) -> bool:
         updated = True
     return updated
 
-
 def _find_successful_training_run(
         run_dir: Path,
         collection_name: str,
@@ -652,7 +622,6 @@ def _find_successful_training_run(
         ):
             return record
     return None
-
 
 def _build_training_summary(
         record: Dict[str, Any],
@@ -685,7 +654,6 @@ def _build_training_summary(
         "failures": failures,
     }
 
-
 def _is_botframework_jwt(auth_header: str) -> bool:
     """Determine if the Authorization header contains a Bot Framework JWT."""
     if not auth_header:
@@ -694,7 +662,6 @@ def _is_botframework_jwt(auth_header: str) -> bool:
         return False
     token = auth_header[7:].strip()
     return token.count(".") == 2
-
 
 def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> Dict[str, Any] | None:
     """Construct a minimal Teams-like activity from a plain text payload."""
@@ -718,7 +685,6 @@ def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> D
         "conversation": {"id": convo_id},
         "from": {"id": user_id},
     }
-
 
 async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None, bytes]:
     """
@@ -760,7 +726,6 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
         return None, raw_body
 
     return activity, raw_body
-
 
 @api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
@@ -903,7 +868,6 @@ async def handle_teams_messages(request: Request):
     except teams_adapter.TeamsAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_error("unauthorized", str(exc)))
 
-
 def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool]):
     """
     Resolve session + mode and build a shared RequestContext for both streaming and JSON responses.
@@ -931,7 +895,6 @@ def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool
         enable_internet=bool(getattr(request, "enable_internet", False)),
     )
     return session_id, session_state, mode, ctx
-
 
 @api_router.post("/ask", tags=["Default"], response_model=AskResponse)
 def ask_question_api(
@@ -1088,7 +1051,6 @@ def ask_question_api(
         debug=result.debug or {},
     )
 
-
 @api_router.post("/askStream", tags=["Default"], deprecated=True)
 def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
     """
@@ -1096,7 +1058,6 @@ def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool]
     """
     object.__setattr__(request, "stream", True)
     return ask_question_api(request, agent_mode=agent_mode, stream=True)
-
 
 @api_router.post("/extract/{doc_id}", tags=["Default"])
 def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
@@ -1113,12 +1074,10 @@ def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
         logging.error(f"Single extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Single document extraction failed")
 
-
 @api_router.post("/train/{doc_id}", tags=["Default"], deprecated=True)
 def trigger_single_training(doc_id: str, subscription_id: str = "default"):
     """Deprecated alias for /extract/{doc_id}. Performs extraction only."""
     return trigger_single_extraction(doc_id=doc_id, subscription_id=subscription_id)
-
 
 @api_router.get("/extract", tags=["Default"])
 def trigger_extraction(subscription_id: str = "default"):
@@ -1132,12 +1091,10 @@ def trigger_extraction(subscription_id: str = "default"):
         logging.error(f"Extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Extraction process failed")
 
-
 @api_router.get("/train", tags=["Default"], deprecated=True)
 def trigger_training(subscription_id: str = "default"):
     """Deprecated alias for /extract. Performs extraction only."""
     return trigger_extraction(subscription_id=subscription_id)
-
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])
 def finetune_single_profile(request: FinetuneRequest):
@@ -1333,7 +1290,6 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
 
     return _build_training_summary(run_record, total_profiles_discovered=len(discovered_profiles))
 
-
 @api_router.get("/finetune/status/{job_id}", tags=["Finetuning"])
 def finetune_status(job_id: str):
     manager = get_finetune_manager()
@@ -1341,7 +1297,6 @@ def finetune_status(job_id: str):
     if not status:
         raise HTTPException(status_code=404, detail="Job not found")
     return status.dict()
-
 
 @api_router.post("/finetune/intelligence", tags=["Finetuning"])
 async def finetune_intelligence(
@@ -1390,7 +1345,6 @@ async def finetune_intelligence(
         "target_score": target_score,
         "note": "This runs in the background. Check /api/admin/taskspec-model/status for results.",
     }
-
 
 def _collect_available_models() -> List[ModelInfo]:
     models: Dict[str, ModelInfo] = {}
@@ -1448,11 +1402,9 @@ def _collect_available_models() -> List[ModelInfo]:
     models.setdefault("gemini-2.5-flash", ModelInfo(model="gemini-2.5-flash", source="gemini", backend="gemini"))
     return list(models.values())
 
-
 @api_router.get("/models", tags=["Default"], response_model=ModelsResponse)
 def list_available_models():
     return ModelsResponse(models=_collect_available_models())
-
 
 @api_router.delete("/document/{doc_id}/embeddings", tags=["Default"])
 def delete_document_embeddings_api(
@@ -1548,7 +1500,6 @@ def delete_document_embeddings_api(
             detail=f"Failed to delete embeddings: {str(e)}"
         )
 
-
 @api_router.get("/metrics", tags=["Default"])
 def get_metrics(
     days: int = Query(..., gt=0),
@@ -1640,7 +1591,6 @@ def get_metrics(
         logging.error(f"Failed to retrieve metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
 
-
 @api_router.post("/feedback/positive", tags=["Default"])
 def record_positive_feedback(request: FeedbackRequest):
     """Capture positive user feedback for evaluation and fine-tuning."""
@@ -1669,7 +1619,6 @@ def record_positive_feedback(request: FeedbackRequest):
     except Exception as _fb_exc:
         logging.warning("Feedback MongoDB write failed: %s", _fb_exc)
     return {"status": "ok", "feedback": "positive"}
-
 
 @api_router.post("/feedback/negative", tags=["Default"])
 def record_negative_feedback(request: FeedbackRequest):
@@ -1759,7 +1708,6 @@ def get_sessions_api(user_id: str, subscription_id: str = "default"):
         logging.error(f"Failed to retrieve sessions: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
 
-
 @api_router.get("/session/{user_id}/{session_id}", tags=["Default"])
 def get_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to get a specific session's messages."""
@@ -1773,7 +1721,6 @@ def get_session_api(user_id: str, session_id: str, subscription_id: str = "defau
         logging.error(f"Failed to retrieve session: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve session")
 
-
 @api_router.delete("/chat-history/{user_id}", tags=["Default"])
 def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to delete all chat history for a user."""
@@ -1783,7 +1730,6 @@ def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
     except Exception as e:
         logging.error(f"Failed to delete chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete chat history")
-
 
 @api_router.delete("/session/{user_id}/{session_id}", tags=["Default"])
 def delete_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
@@ -1817,7 +1763,6 @@ def get_pii_info(doc_id: str, subscription_id: str = "default"):
 class PIISettingUpdate(BaseModel):
     pii_enabled: bool
 
-
 @api_router.get("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def get_pii_setting(subscription_id: str):
     """
@@ -1833,7 +1778,6 @@ def get_pii_setting(subscription_id: str):
     except Exception as e:
         logging.error(f"Failed to get PII setting: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve PII setting")
-
 
 @api_router.put("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
@@ -1890,7 +1834,6 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
         logging.error(f"Failed to update PII setting: {e}")
         raise HTTPException(status_code=500, detail="Failed to update PII setting")
 
-
 @api_router.post("/subscription/{subscription_id}/reprocess-documents", tags=["Subscriptions"])
 def reprocess_documents_with_new_pii_setting(subscription_id: str):
     """
@@ -1932,13 +1875,11 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
         logging.error(f"Failed to reprocess documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to reprocess documents")
 
-
 app.include_router(api_router)
 app.include_router(knowledge_graph_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

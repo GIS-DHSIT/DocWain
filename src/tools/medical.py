@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
@@ -13,20 +13,17 @@ from src.tools.common.grounding import build_source_record
 from src.tools.common.safety import add_disclaimer, collect_warnings
 from src.tools.common.text_extract import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/medical", tags=["Tools-Medical"])
-
 
 class MedicalSummaryRequest(BaseModel):
     text: str = Field(..., description="Medical note text")
     redact: bool = Field(default=False, description="Redact detected identifiers")
 
-
 class MedicalImageRequest(BaseModel):
     image_reference: Optional[str] = Field(default=None, description="URL or identifier of the image")
     notes: Optional[str] = None
-
 
 # ── JSON Schema for LLM extraction ─────────────────────────────────
 
@@ -43,7 +40,6 @@ _JSON_SCHEMA = """{
 
 _EXPECTED_FIELDS = ["diagnoses", "medications", "clinical_summary"]
 
-
 # ── LLM extraction ─────────────────────────────────────────────────
 
 def _llm_extract(text: str, query: str = "") -> Optional[Dict[str, Any]]:
@@ -55,7 +51,6 @@ def _llm_extract(text: str, query: str = "") -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.debug("Medical LLM extraction failed: %s", exc)
         return None
-
 
 def _normalize_llm_result(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize LLM output into the expected medical result shape."""
@@ -91,7 +86,6 @@ def _normalize_llm_result(raw: Dict[str, Any]) -> Dict[str, Any]:
         "patient_info": patient_info,
     }
 
-
 # ── Regex fallback ──────────────────────────────────────────────────
 
 def _extract_entities(text: str) -> List[Dict[str, Any]]:
@@ -101,13 +95,11 @@ def _extract_entities(text: str) -> List[Dict[str, Any]]:
         entities.append({"type": "medication", "value": med, "dosage": dosage})
     return entities
 
-
 def _regex_summarize_medical(text: str) -> Dict[str, Any]:
     cleaned = sanitize_text(text, max_chars=3200)
     summary = cleaned[:400] if cleaned else "No content provided."
     entities = _extract_entities(cleaned)
     return {"summary": summary, "entities": entities}
-
 
 # ── Unified extraction ──────────────────────────────────────────────
 
@@ -163,7 +155,6 @@ def _summarize_medical(text: str, redact: bool, query: str = "") -> Dict[str, An
     result["rendered"] = rendered
 
     return result
-
 
 def _render_medical_result(result: Dict[str, Any], query: str = "") -> str:
     """Render structured medical data into readable markdown."""
@@ -266,7 +257,6 @@ def _render_medical_result(result: Dict[str, Any], query: str = "") -> str:
 
     return "\n\n".join(sections) if sections else summary or ""
 
-
 def _search_nice_guidance(term: str) -> List[Dict[str, str]]:
     """Search NICE (nice.org.uk) guidance for a clinical term."""
     try:
@@ -286,7 +276,6 @@ def _search_nice_guidance(term: str) -> List[Dict[str, str]]:
     except Exception as exc:
         logger.debug("NICE lookup failed for %s: %s", term, exc)
         return []
-
 
 def _enrich_with_nice(result: Dict[str, Any]) -> Dict[str, Any]:
     """Enrich medical result with NICE guidance references."""
@@ -322,7 +311,6 @@ def _enrich_with_nice(result: Dict[str, Any]) -> Dict[str, Any]:
     result["nice_references"] = nice_references
     return result
 
-
 def _ensure_domain_enabled() -> None:
     if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
         raise ToolError(
@@ -330,7 +318,6 @@ def _ensure_domain_enabled() -> None:
             code="deprecated",
             status_code=410,
         )
-
 
 @register_tool("medical")
 async def medical_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
@@ -346,7 +333,6 @@ async def medical_handler(payload: Dict[str, Any], correlation_id: Optional[str]
         "context_found": True,
         "warnings": collect_warnings("medical"),
     }
-
 
 @router.post("/summarize")
 async def summarize(request: MedicalSummaryRequest, x_correlation_id: str | None = Header(None)):
@@ -367,7 +353,6 @@ async def summarize(request: MedicalSummaryRequest, x_correlation_id: str | None
         warnings=collect_warnings("medical"),
         correlation_id=cid,
     )
-
 
 @router.post("/image-analyze")
 async def image_analyze(request: MedicalImageRequest, x_correlation_id: str | None = Header(None)):

@@ -15,12 +15,12 @@ to lower tiers when a provider is unavailable.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "IntelligenceRouter",
@@ -48,7 +48,6 @@ _MEDIUM_INTENTS = frozenset({"summary", "comparison"})
 
 # Intents that are inherently simple regardless of score
 _SIMPLE_INTENTS = frozenset({"factual", "extraction", "classification"})
-
 
 class ComplexityScorer:
     """Scores query complexity on a 0-to-1 scale.
@@ -127,11 +126,9 @@ class ComplexityScorer:
 
         return s
 
-
 # ---------------------------------------------------------------------------
 # Intelligence router
 # ---------------------------------------------------------------------------
-
 
 class IntelligenceRouter:
     """Three-tier fallback chain with complexity-based routing.
@@ -279,7 +276,6 @@ class IntelligenceRouter:
             "client_model": getattr(client, "model_name", "unknown"),
         }
 
-
 # ---------------------------------------------------------------------------
 # Singleton accessor
 # ---------------------------------------------------------------------------
@@ -287,11 +283,9 @@ class IntelligenceRouter:
 _ROUTER: Optional[IntelligenceRouter] = None
 _ROUTER_LOCK = threading.Lock()
 
-
 def get_intelligence_router() -> Optional[IntelligenceRouter]:
     """Return the global ``IntelligenceRouter`` instance, or ``None``."""
     return _ROUTER
-
 
 def set_intelligence_router(router: IntelligenceRouter) -> None:
     """Install *router* as the global ``IntelligenceRouter`` singleton."""

@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 import enum
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _spacy_lock = threading.Lock()
 _spacy_nlp = None
@@ -18,7 +18,6 @@ _spacy_nlp = None
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 _MAX_QUERY_LENGTH = 10_000
-
 
 def _get_spacy():
     """Load spaCy model (lazy singleton, thread-safe). Prefers en_core_web_lg."""
@@ -37,13 +36,11 @@ def _get_spacy():
             _spacy_nlp = spacy.load("en_core_web_sm")
     return _spacy_nlp
 
-
 class QueryRoute(str, enum.Enum):
     GRAPH_DIRECT = "GRAPH_DIRECT"
     HYBRID_SEARCH = "HYBRID_SEARCH"
     FULL_SEARCH = "FULL_SEARCH"
     LLM_GENERATION = "LLM_GENERATION"
-
 
 class QueryAnalysis(BaseModel):
     query: str
@@ -56,7 +53,6 @@ class QueryAnalysis(BaseModel):
     has_numeric_constraint: bool = False
     reasoning_required: bool = False
     confidence: float = 0.5
-
 
 # Lemmas that signal broad scope / summarization (imperative verbs).
 _BROAD_SCOPE_LEMMAS = frozenset({
@@ -100,7 +96,6 @@ _SPECIFIC_FIELD_TOKENS = frozenset({
     "revenue", "profit", "age", "dob", "ssn", "id",
 })
 
-
 def _extract_entities(doc) -> List[str]:
     """Extract named entities from spaCy doc, deduped."""
     seen = set()
@@ -116,7 +111,6 @@ def _extract_entities(doc) -> List[str]:
             entities.append(text)
     return entities
 
-
 def _has_possessive(doc) -> bool:
     """Check if the query contains a possessive structure (X's Y)."""
     for token in doc:
@@ -125,7 +119,6 @@ def _has_possessive(doc) -> bool:
         if token.tag_ == "POS":
             return True
     return False
-
 
 def _detect_comparison(doc) -> bool:
     """Detect comparison intent using dependency parse and lemmas."""
@@ -140,7 +133,6 @@ def _detect_comparison(doc) -> bool:
             if token.dep_ == "cc" and token.lemma_.lower() in ("and", "or", "versus", "vs"):
                 return True
     return False
-
 
 def _detect_aggregation(doc) -> bool:
     """Detect aggregation queries using dependency parse."""
@@ -159,7 +151,6 @@ def _detect_aggregation(doc) -> bool:
                 if nxt.lemma_.lower() in ("many", "much"):
                     return True
     return False
-
 
 def _detect_reasoning(doc) -> bool:
     """Detect if query requires reasoning / LLM generation."""
@@ -189,7 +180,6 @@ def _detect_reasoning(doc) -> bool:
             return True
     return False
 
-
 def _detect_broad_scope(doc) -> bool:
     """Detect broad scope queries (summarize, overview, etc.)."""
     lemmas = {t.lemma_.lower() for t in doc}
@@ -203,7 +193,6 @@ def _detect_broad_scope(doc) -> bool:
         return True
     return False
 
-
 def _detect_numeric_constraint(doc) -> bool:
     """Detect numeric constraints using NER and token features."""
     for ent in doc.ents:
@@ -215,7 +204,6 @@ def _detect_numeric_constraint(doc) -> bool:
         if token.text.startswith("$") or token.text.endswith("%"):
             return True
     return False
-
 
 def _detect_conversational(doc) -> bool:
     """Detect conversational / greeting queries."""
@@ -234,7 +222,6 @@ def _detect_conversational(doc) -> bool:
             if tok.pos_ not in ("NOUN", "PROPN", "VERB"):
                 return True
     return False
-
 
 def _compute_specificity(
     doc,
@@ -278,7 +265,6 @@ def _compute_specificity(
 
     return max(0.0, min(1.0, score))
 
-
 def _sanitize_query(query: str) -> str:
     """Strip, remove control characters, and truncate query."""
     query = query.strip()
@@ -286,7 +272,6 @@ def _sanitize_query(query: str) -> str:
     if len(query) > _MAX_QUERY_LENGTH:
         query = query[:_MAX_QUERY_LENGTH]
     return query
-
 
 def route_query(query: str) -> QueryAnalysis:
     """Classify a query and determine the optimal retrieval route."""

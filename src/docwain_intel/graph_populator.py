@@ -2,15 +2,14 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 from collections import Counter
 from typing import List
 
 from .graph_adapter import CypherGraphAdapter, GraphEdge, GraphNode
 from .models import ExtractionResult, StructuredDocument
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def populate_graph(
     *,

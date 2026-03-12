@@ -13,17 +13,16 @@ Usage:
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _MAX_METRICS_BUFFER = 2000
-
 
 @dataclass
 class QueryMetrics:
@@ -40,21 +39,17 @@ class QueryMetrics:
     domain: str = "unknown"
     timestamp: float = field(default_factory=time.time)
 
-
 _BUFFER: deque = deque(maxlen=_MAX_METRICS_BUFFER)
 _LOCK = threading.Lock()
-
 
 def record_query_metrics(metrics: QueryMetrics) -> None:
     with _LOCK:
         _BUFFER.append(metrics)
 
-
 def get_recent_metrics(hours: int = 24) -> List[QueryMetrics]:
     cutoff = time.time() - (hours * 3600)
     with _LOCK:
         return [m for m in _BUFFER if m.timestamp >= cutoff]
-
 
 def get_quality_summary(hours: int = 24) -> Dict[str, Any]:
     """Aggregate quality stats over the last N hours."""
@@ -102,6 +97,5 @@ def get_quality_summary(hours: int = 24) -> Dict[str, Any]:
         "llm_backends": backends,
         "scope_modes": scopes,
     }
-
 
 __all__ = ["QueryMetrics", "record_query_metrics", "get_quality_summary", "get_recent_metrics"]

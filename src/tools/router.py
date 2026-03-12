@@ -6,7 +6,7 @@ for backward compatibility and delegates to the agent registry.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header
@@ -34,10 +34,9 @@ from src.tools import (  # noqa: F401
     web_extract,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/tools", tags=["Agents"])
-
 
 class ToolRunRequest(BaseModel):
     tool_name: str = Field(default="", description="Registered tool/agent name to execute (deprecated, use agent_name)")
@@ -49,10 +48,8 @@ class ToolRunRequest(BaseModel):
     profile_id: Optional[str] = None
     user_id: Optional[str] = None
 
-
 # Alias: callers may use AgentRunRequest as the canonical name
 AgentRunRequest = ToolRunRequest
-
 
 @router.post("/run")
 async def run_tool(request: ToolRunRequest, x_correlation_id: str | None = Header(None)):
@@ -90,7 +87,6 @@ async def run_tool(request: ToolRunRequest, x_correlation_id: str | None = Heade
             correlation_id=correlation_id,
         )
         return JSONResponse(status_code=exc.status_code, content=error_response)
-
 
 # Alias for import convenience
 tools_router = router

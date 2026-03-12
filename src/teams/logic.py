@@ -1,5 +1,5 @@
 import concurrent.futures
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -14,12 +14,10 @@ try:
 except Exception:  # noqa: BLE001
     dw_newron = None
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class TeamsChatError(Exception):
     """Raised when Teams chat handling cannot complete."""
-
 
 @dataclass
 class TeamsChatContext:
@@ -32,7 +30,6 @@ class TeamsChatContext:
     model_name: str
     persona: str
 
-
 @dataclass
 class TeamsAnswerResult:
     """Answer payload paired with the scope that produced it."""
@@ -42,7 +39,6 @@ class TeamsAnswerResult:
     profile_id: str
     fallback_used: bool = False
     internet_mode: bool = False
-
 
 class TeamsChatService:
     """

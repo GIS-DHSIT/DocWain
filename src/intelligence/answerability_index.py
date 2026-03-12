@@ -8,10 +8,10 @@ documents that cannot answer the query).
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "_QUERY_TYPE_TAXONOMY",
@@ -440,16 +440,13 @@ _UNIVERSAL_QUERY_TYPES: frozenset[str] = frozenset(
     {"specific_fact", "document_summary"}
 )
 
-
 def _normalise(text: str) -> str:
     """Lowercase and strip extra whitespace."""
     return " ".join(text.lower().split())
 
-
 def _keywords_present_in_text(keywords: list[str], text_lower: str) -> bool:
     """Return True if at least one keyword phrase appears in *text_lower*."""
     return any(kw in text_lower for kw in keywords)
-
 
 def _infer_from_full_text(full_text: str) -> list[str]:
     """Scan full_text for taxonomy keyword hits; return matched query types."""
@@ -460,7 +457,6 @@ def _infer_from_full_text(full_text: str) -> list[str]:
         if _keywords_present_in_text(normalised_kws, text_lower):
             matched.append(query_type)
     return matched
-
 
 def _infer_from_sections(schema_result: dict[str, Any]) -> list[str]:
     """
@@ -498,7 +494,6 @@ def _infer_from_sections(schema_result: dict[str, Any]) -> list[str]:
 
     return matched
 
-
 def _infer_from_entities(entities: list[dict[str, Any]] | list[str]) -> list[str]:
     """
     Map entity types/labels found in *entities* to answerable query types.
@@ -521,11 +516,9 @@ def _infer_from_entities(entities: list[dict[str, Any]] | list[str]) -> list[str
             matched.extend(_ENTITY_TYPE_SIGNALS[label])
     return matched
 
-
 def _normalise_doc_type(doc_type: str) -> str:
     """Normalise a doc_type string for lookup in _DOC_TYPE_BASELINE."""
     return _normalise(doc_type).replace(" ", "_").replace("-", "_")
-
 
 def _compute_confidence(
     baseline_count: int,
@@ -554,11 +547,9 @@ def _compute_confidence(
 
     return round(min(score, 1.0), 3)
 
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 
 def build_answerability_index(
     doc_type: str,
@@ -682,7 +673,6 @@ def build_answerability_index(
     )
     return result
 
-
 def classify_query_type(query: str) -> list[str]:
     """
     Classify a user query string into one or more query types from the taxonomy.
@@ -725,7 +715,6 @@ def classify_query_type(query: str) -> list[str]:
         matched,
     )
     return matched
-
 
 def filter_by_answerability(
     query_types: list[str],

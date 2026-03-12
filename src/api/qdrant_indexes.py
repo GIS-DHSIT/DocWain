@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 REQUIRED_PAYLOAD_INDEX_FIELDS: List[str] = [
     "subscription_id",
@@ -28,10 +28,8 @@ _INDEX_CACHE_TTL_SEC = 300
 
 _MISSING_INDEX_RE = re.compile(r'Index required but not found for "([^"]+)"')
 
-
 def _coerce_str(value: Any) -> str:
     return str(value) if value is not None else ""
-
 
 def _cache_get(collection_name: str) -> Optional[List[str]]:
     cached = _INDEX_CACHE.get(collection_name)
@@ -42,10 +40,8 @@ def _cache_get(collection_name: str) -> Optional[List[str]]:
         return None
     return list(fields)
 
-
 def _cache_set(collection_name: str, fields: List[str]) -> None:
     _INDEX_CACHE[collection_name] = (time.time(), list(fields))
-
 
 def list_payload_indexes(
     client: QdrantClient,
@@ -65,7 +61,6 @@ def list_payload_indexes(
         fields = sorted(payload_schema.keys())
     _cache_set(collection_name, fields)
     return fields
-
 
 def ensure_payload_indexes(
     client: QdrantClient,
@@ -117,7 +112,6 @@ def ensure_payload_indexes(
         "failures": failures,
     }
 
-
 def parse_missing_index_error(detail: Any) -> Optional[str]:
     if not detail:
         return None
@@ -126,7 +120,6 @@ def parse_missing_index_error(detail: Any) -> Optional[str]:
     if not match:
         return None
     return match.group(1).strip() if match.group(1) else None
-
 
 def autoheal_missing_index(
     client: QdrantClient,
@@ -143,7 +136,6 @@ def autoheal_missing_index(
     except Exception as exc:  # noqa: BLE001
         logger.error("Auto-heal failed for payload index %s in %s: %s", field, collection_name, exc)
         return None
-
 
 __all__ = [
     "REQUIRED_PAYLOAD_INDEX_FIELDS",

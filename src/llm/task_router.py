@@ -7,7 +7,7 @@ task so the gateway can route transparently.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 from contextlib import contextmanager
@@ -16,8 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from src.llm.model_registry import ModelRegistry, _match_family
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Task type taxonomy
@@ -38,7 +37,6 @@ class TaskType(str, Enum):
     COMPLEX_EXTRACTION = "complex_extraction"
     AGENT_REASONING = "agent_reasoning"
     GENERAL = "general"
-
 
 # ---------------------------------------------------------------------------
 # Ordered preference lists (first available wins)
@@ -87,25 +85,20 @@ _TASK_OPTIONS: Dict[TaskType, Dict[str, Any]] = {
     TaskType.GENERAL:               {"temperature": 0.3,  "num_predict": 2048, "num_ctx": 4096},
 }
 
-
 # ---------------------------------------------------------------------------
 # Thread-local task context
 # ---------------------------------------------------------------------------
 
 _task_context = threading.local()
 
-
 def set_current_task(task: TaskType) -> None:
     _task_context.task = task
-
 
 def get_current_task() -> Optional[TaskType]:
     return getattr(_task_context, "task", None)
 
-
 def clear_current_task() -> None:
     _task_context.task = None
-
 
 @contextmanager
 def task_scope(task: TaskType):
@@ -120,7 +113,6 @@ def task_scope(task: TaskType):
             set_current_task(prev)
         else:
             clear_current_task()
-
 
 # ---------------------------------------------------------------------------
 # TaskRouter

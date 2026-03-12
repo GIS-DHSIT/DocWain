@@ -16,7 +16,7 @@ structured knowledge, enabling more accurate and intelligent responses.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 from collections import Counter, defaultdict
@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Tunables ──────────────────────────────────────────────────────────
 _CLUSTER_SIMILARITY_THRESHOLD = 0.72  # cosine sim to merge into same cluster
@@ -78,7 +78,6 @@ _STOP = frozenset({
     "could", "should", "these", "those", "between", "through", "during",
 })
 
-
 # ── Data classes ──────────────────────────────────────────────────────
 
 @dataclass
@@ -89,7 +88,6 @@ class TopicCluster:
     representative_terms: List[str]
     avg_score: float = 0.0
 
-
 @dataclass
 class EntitySalience:
     """An entity with its relevance score to the query."""
@@ -99,14 +97,12 @@ class EntitySalience:
     mentions: int
     source_documents: List[str]
 
-
 @dataclass
 class QueryAlignment:
     """How well a chunk aligns with the query."""
     chunk_index: int
     alignment_score: float  # 0.0 - 1.0
     matching_aspects: List[str]
-
 
 @dataclass
 class DocumentRelationship:
@@ -116,7 +112,6 @@ class DocumentRelationship:
     relationship_type: str  # "similar_topic", "shared_entities", "complementary"
     strength: float
 
-
 @dataclass
 class StructuredFact:
     """A key-value fact extracted from document content."""
@@ -124,7 +119,6 @@ class StructuredFact:
     value: str
     source_doc: str
     confidence: float
-
 
 @dataclass
 class TemporalSpan:
@@ -134,7 +128,6 @@ class TemporalSpan:
     source_doc: str
     sort_key: int = 0  # numeric key for ordering (e.g., YYYYMMDD)
 
-
 @dataclass
 class CausalLink:
     """A cause-effect relationship detected in content."""
@@ -142,7 +135,6 @@ class CausalLink:
     effect: str
     source_doc: str
     marker: str  # the causal marker word that triggered detection
-
 
 @dataclass
 class ContextUnderstanding:
@@ -343,13 +335,11 @@ class ContextUnderstanding:
             "relationship_count": len(self.document_relationships),
         }
 
-
 # ── Core analysis functions ───────────────────────────────────────────
 
 def _get_chunk_text(chunk: Any) -> str:
     """Extract text from a chunk object."""
     return (getattr(chunk, "text", "") or "").strip()
-
 
 def _get_chunk_doc_name(chunk: Any) -> str:
     """Extract document name from a chunk object."""
@@ -362,7 +352,6 @@ def _get_chunk_doc_name(chunk: Any) -> str:
         or "Document"
     )
 
-
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Compute cosine similarity between two vectors."""
     norm_a = np.linalg.norm(a)
@@ -371,14 +360,12 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
 
-
 def _extract_key_terms(text: str, top_k: int = 8) -> List[str]:
     """Extract top-k key terms from text using TF scoring."""
     words = re.findall(r"[a-zA-Z]{3,}", text.lower())
     words = [w for w in words if w not in _STOP and len(w) > 2]
     counts = Counter(words)
     return [w for w, _ in counts.most_common(top_k)]
-
 
 def _detect_multi_hop(query: str) -> bool:
     """Detect if query requires multi-hop reasoning across evidence segments."""
@@ -389,7 +376,6 @@ def _detect_multi_hop(query: str) -> bool:
     if query.count("?") >= 2:
         return True
     return False
-
 
 def _build_entity_aliases(entities: List["EntitySalience"]) -> Dict[str, List[str]]:
     """Build alias map from detected entities.
@@ -439,7 +425,6 @@ def _build_entity_aliases(entities: List["EntitySalience"]) -> Dict[str, List[st
 
     return alias_map
 
-
 def _extract_entities_from_text(text: str) -> List[Tuple[str, str]]:
     """Extract named entities from text using pattern matching.
 
@@ -465,7 +450,6 @@ def _extract_entities_from_text(text: str) -> List[Tuple[str, str]]:
         entities.append((match.group(), "date"))
 
     return entities
-
 
 # ── Temporal & causal extraction ──────────────────────────────────────
 
@@ -503,7 +487,6 @@ _REVERSE_CAUSAL_MARKERS = frozenset({
     "contributing to", "following", "in response to", "since",
 })
 
-
 def _parse_sort_key(date_text: str) -> int:
     """Convert date text to a numeric sort key (YYYYMMDD approx)."""
     # Try YYYY-MM-DD or YYYY/MM/DD
@@ -537,7 +520,6 @@ def _parse_sort_key(date_text: str) -> int:
     if m:
         return int(m.group(1)) * 10000
     return 0
-
 
 def _extract_temporal_spans(text: str, doc_name: str) -> List[TemporalSpan]:
     """Extract temporal references with surrounding context."""
@@ -578,7 +560,6 @@ def _extract_temporal_spans(text: str, doc_name: str) -> List[TemporalSpan]:
 
     return spans
 
-
 def _extract_causal_links(text: str, doc_name: str) -> List[CausalLink]:
     """Extract cause-effect relationships from text using causal markers."""
     links: List[CausalLink] = []
@@ -611,14 +592,12 @@ def _extract_causal_links(text: str, doc_name: str) -> List[CausalLink]:
 
     return links[:5]  # Cap per document
 
-
 _BULLET_KV_RE = re.compile(
     r"^\s*[-•*]\s+(.{3,40})\s*[:–—]\s+(.{2,})", re.MULTILINE
 )
 _TABLE_CELL_RE = re.compile(
     r"\|\s*(.{2,30})\s*\|\s*(.{2,}?)\s*\|", re.MULTILINE
 )
-
 
 def _extract_structured_facts(text: str, doc_name: str) -> List[StructuredFact]:
     """Extract key-value facts from text using multiple pattern heuristics.
@@ -657,7 +636,6 @@ def _extract_structured_facts(text: str, doc_name: str) -> List[StructuredFact]:
         _add_fact(match.group(1), match.group(2), 0.70)
 
     return facts
-
 
 # ── Semantic clustering ───────────────────────────────────────────────
 
@@ -738,7 +716,6 @@ def _cluster_chunks(
     clusters.sort(key=lambda c: c.avg_score, reverse=True)
     return clusters
 
-
 # ── Query-evidence alignment ─────────────────────────────────────────
 
 def _compute_query_alignment(
@@ -798,7 +775,6 @@ def _compute_query_alignment(
     alignments.sort(key=lambda a: a.alignment_score, reverse=True)
     return alignments
 
-
 # ── Entity salience ───────────────────────────────────────────────────
 
 def _compute_entity_salience(
@@ -857,7 +833,6 @@ def _compute_entity_salience(
     results.sort(key=lambda e: e.salience, reverse=True)
     return results[:_MAX_CONTEXT_ENTITIES]
 
-
 # ── Cross-document relationships ──────────────────────────────────────
 
 def _compute_document_relationships(
@@ -913,7 +888,6 @@ def _compute_document_relationships(
     relationships.sort(key=lambda r: r.strength, reverse=True)
     return relationships[:10]
 
-
 # ── Content summary ───────────────────────────────────────────────────
 
 def _build_content_summary(
@@ -966,11 +940,9 @@ def _build_content_summary(
 
     return " ".join(parts)
 
-
 # ── Main entry point ──────────────────────────────────────────────────
 
 _MAX_CHUNKS_FOR_UNDERSTANDING = 12  # Increased from 6: bge-large on CPU handles 12 chunks in ~8s
-
 
 def _safe_encode(embedder: Any, texts: List[str]) -> Optional[np.ndarray]:
     """Encode texts with GPU OOM fallback to CPU."""
@@ -991,7 +963,6 @@ def _safe_encode(embedder: Any, texts: List[str]) -> Optional[np.ndarray]:
             except Exception:
                 pass
         return None
-
 
 def understand_context(
     *,
@@ -1201,7 +1172,6 @@ def understand_context(
     except Exception as exc:
         logger.warning("Context understanding failed: %s", exc)
         return None
-
 
 def understand_context_for_prompt(
     *,

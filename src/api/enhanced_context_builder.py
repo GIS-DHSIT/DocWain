@@ -5,7 +5,7 @@ Replaces context building logic in dw_newron.py
 
 import re
 import time
-import logging
+from src.utils.logging_utils import get_logger
 from typing import List, Dict, Any, Tuple, Optional
 from collections import defaultdict
 
@@ -15,8 +15,7 @@ from src.api.config import Config
 from src.prompting.prompt_builder import inject_persona_prompt
 from src.embedding.pipeline.chunk_integrity import is_valid_chunk_text
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class IntelligentContextBuilder:
     """
@@ -616,7 +615,6 @@ class IntelligentContextBuilder:
             return f"{name}, p. {page}"
         return f"{name}"
 
-
 class AnswerGenerator:
     """
     Generates accurate answers with proper citations.
@@ -816,7 +814,6 @@ Answer:"""
             'verification': verification_status,
             'verified': verification_status['overall_verified']
         }
-
 
 # Integration function to replace existing answer_question logic
 def generate_accurate_answer(

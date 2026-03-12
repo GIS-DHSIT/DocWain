@@ -1,18 +1,17 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "by",
     "is", "are", "was", "were", "be", "been", "it", "this", "that", "as", "at",
 }
-
 
 @dataclass
 class VerificationReport:
@@ -24,7 +23,6 @@ class VerificationReport:
     coverage_score: float
     numeric_support_rate: float
     overall_grounded: bool
-
 
 class EvidencePlanner:
     """Internal reasoning layer to map claims to evidence without exposing chain-of-thought."""
@@ -72,7 +70,6 @@ Return format:
         if not match:
             return {}
         return json.loads(match.group(0))
-
 
 class AnswerVerifier:
     """Verify citations and claim support against sources."""
@@ -212,7 +209,6 @@ class AnswerVerifier:
         intersection = set(sentence_tokens) & set(source_tokens)
         return len(intersection) / max(len(set(sentence_tokens)), 1)
 
-
 class ConfidenceScorer:
     """Compute a holistic confidence score from retrieval and verification signals."""
 
@@ -267,7 +263,6 @@ class ConfidenceScorer:
             return 0.0
         unique = len({str(src.get("source_name")) for src in sources if src.get("source_name")})
         return min(1.0, unique / max(1, len(sources)))
-
 
 def _tokenize(text: str) -> List[str]:
     tokens = re.findall(r"[a-z0-9]+", (text or "").lower())

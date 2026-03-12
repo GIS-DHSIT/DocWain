@@ -6,15 +6,14 @@ structured JSON that serves as the source-of-truth for all downstream operations
 """
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Dict, Any, List, Optional
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
 from src.embedding.document_classifier import DocumentType, DocumentClassification, get_document_classifier
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class ExtractedSection:
@@ -31,7 +30,6 @@ class ExtractedSection:
     def __post_init__(self):
         if self.key_items is None:
             self.key_items = []
-
 
 @dataclass
 class StructuredDocument:
@@ -59,7 +57,6 @@ class StructuredDocument:
     # Source references for traceability
     extraction_version: str = "1.0"
     extraction_pipeline: str = "structured_extraction_v1"
-
 
 class StructuredExtractionEngine:
     """Extract documents into structured JSON format."""
@@ -484,10 +481,8 @@ class StructuredExtractionEngine:
 
         return notes
 
-
 # Singleton instance
 _extraction_engine = None
-
 
 def get_extraction_engine() -> StructuredExtractionEngine:
     """Get or create extraction engine singleton."""
@@ -495,7 +490,6 @@ def get_extraction_engine() -> StructuredExtractionEngine:
     if _extraction_engine is None:
         _extraction_engine = StructuredExtractionEngine()
     return _extraction_engine
-
 
 # Required imports
 import re

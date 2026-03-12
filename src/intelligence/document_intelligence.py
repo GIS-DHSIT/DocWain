@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import mimetypes
 import re
 from dataclasses import dataclass, field
@@ -22,8 +22,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class DocumentDomain(Enum):
     """Supported document domains for specialized processing."""
@@ -36,7 +35,6 @@ class DocumentDomain(Enum):
     TECHNICAL = "technical"
     SCANNED = "scanned"
     GENERIC = "generic"
-
 
 @dataclass
 class DocumentMetadata:
@@ -89,7 +87,6 @@ class DocumentMetadata:
             "extraction_timestamp": self.extraction_timestamp,
         }
 
-
 @dataclass
 class ExtractedEntity:
     """A single extracted entity with metadata."""
@@ -100,7 +97,6 @@ class ExtractedEntity:
     start_pos: Optional[int] = None
     end_pos: Optional[int] = None
     context: Optional[str] = None  # Surrounding text for evidence
-
 
 @dataclass
 class ExtractedEntities:
@@ -150,7 +146,6 @@ class ExtractedEntities:
         terms.extend(self.keywords)
         return list(set(terms))
 
-
 @dataclass
 class DocumentSection:
     """A structured section within a document."""
@@ -179,7 +174,6 @@ class DocumentSection:
             "entities": self.entities.to_dict() if self.entities else None,
             "metadata": self.metadata,
         }
-
 
 @dataclass
 class StructuredDocument:
@@ -232,7 +226,6 @@ class StructuredDocument:
             f"{s.heading}\n{s.content}" if s.heading else s.content
             for s in self.sections if s.content
         )
-
 
 class DocumentIntelligence:
     """
@@ -775,7 +768,6 @@ class DocumentIntelligence:
         ]
 
         return sum(bool(x) for x in ocr_indicators) >= 2
-
 
 __all__ = [
     "DocumentIntelligence",

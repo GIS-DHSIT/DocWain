@@ -8,7 +8,7 @@ No imports from other ``src/`` modules — all context is passed as arguments.
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 import time
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # A. Intent constants
@@ -49,7 +49,6 @@ NON_RETRIEVAL_INTENTS = frozenset({
 # ---------------------------------------------------------------------------
 # B. Intent classifier
 # ---------------------------------------------------------------------------
-
 
 def classify_conversational_intent(
     text: str,
@@ -112,7 +111,6 @@ def classify_conversational_intent(
         # Fallback: regex pattern matching when NLU is unavailable
         return _fallback_intent_patterns(text, turn_count)
 
-
 # ── Regex fallback for when NLU engine is unavailable ──────────────────
 
 _GREETING_RE = re.compile(
@@ -128,7 +126,6 @@ _CAPABILITY_RE = re.compile(
     re.IGNORECASE,
 )
 _HELP_RE = re.compile(r"\b(how\s+do\s+i|how\s+to\s+use|usage|tutorial|guide)\b", re.IGNORECASE)
-
 
 def _fallback_intent_patterns(text: str, turn_count: int) -> Optional[Tuple[str, float]]:
     """Regex-based intent detection as fallback when NLU is unavailable.
@@ -162,7 +159,6 @@ def _fallback_intent_patterns(text: str, turn_count: int) -> Optional[Tuple[str,
 
     return None
 
-
 def _try_conversational_nlu(text: str) -> Optional[Tuple[str, float]]:
     """NLU-based conversational classification (embedding + spaCy)."""
     try:
@@ -170,7 +166,6 @@ def _try_conversational_nlu(text: str) -> Optional[Tuple[str, float]]:
         return classify_conversational(text)
     except Exception:
         return None
-
 
 def _is_document_query(text: str) -> bool:
     """Determine whether *text* is a document query using NLU classification.
@@ -184,7 +179,6 @@ def _is_document_query(text: str) -> bool:
         return classify_document_query(text)
     except Exception:
         return False
-
 
 def _strip_greeting_prefix(text: str) -> str:
     """Strip greeting prefix using spaCy part-of-speech tagging.
@@ -219,7 +213,6 @@ def _strip_greeting_prefix(text: str) -> str:
         pass
     return text
 
-
 # ---------------------------------------------------------------------------
 # C. Context collector
 # ---------------------------------------------------------------------------
@@ -236,7 +229,6 @@ class ConversationalContext:
     time_of_day: str = "day"
     total_points: int = 0
 
-
 def _time_of_day(hour: Optional[int] = None) -> str:
     if hour is None:
         hour = datetime.now().hour
@@ -248,10 +240,8 @@ def _time_of_day(hour: Optional[int] = None) -> str:
         return "evening"
     return "night"
 
-
 _DOC_SUMMARY_CACHE: Dict[str, Tuple[float, int, List[str], Dict[str, int]]] = {}
 _DOC_SUMMARY_TTL = 30  # seconds — short enough to reflect deletions quickly
-
 
 def _mongodb_doc_summary(subscription_id: str, profile_id: str):
     """Fetch document names and domains from MongoDB (authoritative source).
@@ -283,7 +273,6 @@ def _mongodb_doc_summary(subscription_id: str, profile_id: str):
         return len(docs), names, domain_counts
     except Exception:
         return 0, [], {}
-
 
 def collect_context(
     *,
@@ -341,7 +330,6 @@ def collect_context(
         total_points=collection_point_count,
     )
 
-
 # ---------------------------------------------------------------------------
 # D. Fragment pools
 # ---------------------------------------------------------------------------
@@ -354,10 +342,8 @@ class ResponseFragment:
     requires_returning: bool = False
     requires_first: bool = False
 
-
 def _frag(text: str, **kw: bool) -> ResponseFragment:
     return ResponseFragment(text=text, **kw)
-
 
 _FRAGMENT_POOLS: Dict[str, Dict[str, List[ResponseFragment]]] = {
     # -- GREETING --
@@ -782,7 +768,6 @@ _DOMAIN_SUGGESTIONS: Dict[str, List[str]] = {
     ],
 }
 
-
 # ---------------------------------------------------------------------------
 # E. Response composer
 # ---------------------------------------------------------------------------
@@ -805,19 +790,16 @@ def _filter_fragments(
         result.append(f)
     return result or fragments  # Fallback to all if nothing passes.
 
-
 def _make_seed(intent: str, user_key: str, extra: int = 0) -> int:
     """Deterministic-per-minute seed for weighted random selection."""
     minute = datetime.now().strftime("%Y%m%d%H%M")
     raw = f"{intent}:{user_key}:{minute}:{extra}"
     return int(hashlib.md5(raw.encode()).hexdigest(), 16)
 
-
 def _pick(fragments: List[ResponseFragment], seed: int) -> ResponseFragment:
     if not fragments:
         return _frag("")
     return fragments[seed % len(fragments)]
-
 
 def _format_domains(domains: List[str]) -> str:
     if not domains:
@@ -825,7 +807,6 @@ def _format_domains(domains: List[str]) -> str:
     if len(domains) == 1:
         return domains[0]
     return ", ".join(domains[:-1]) + " and " + domains[-1]
-
 
 def _inject_vars(text: str, ctx: ConversationalContext) -> str:
     """Replace placeholders with context values. Missing vars become empty."""
@@ -842,7 +823,6 @@ def _inject_vars(text: str, ctx: ConversationalContext) -> str:
 
     return text.format_map(_Default(mapping))
 
-
 def _domain_suggestion(ctx: ConversationalContext, seed: int) -> str:
     """Return a domain-specific suggestion ~30% of the time."""
     if seed % 10 >= 3:  # ~70% chance of skipping
@@ -852,7 +832,6 @@ def _domain_suggestion(ctx: ConversationalContext, seed: int) -> str:
         if suggestions:
             return suggestions[seed % len(suggestions)]
     return ""
-
 
 _CONVERSATIONAL_SYSTEM_PROMPT = (
     "You are DocWain, a friendly and professional document intelligence assistant. "
@@ -867,7 +846,6 @@ _CONVERSATIONAL_SYSTEM_PROMPT = (
 # Disabled: LLM conversational responses cause model-swap latency (60-200s)
 # when Ollama has a different model loaded.  Template fragments are sufficient.
 _LLM_CONVERSATIONAL_INTENTS: set = set()  # was {GREETING, GREETING_RETURN, FAREWELL, THANKS, PRAISE}
-
 
 def _llm_conversational_response(
     intent: str,
@@ -907,7 +885,6 @@ def _llm_conversational_response(
     except Exception as exc:
         logger.debug("LLM conversational response failed: %s", exc)
     return None
-
 
 def compose_response(
     intent: str,
@@ -988,14 +965,12 @@ def compose_response(
     _deduplicator.record(user_key, text_hash)
     return text
 
-
 # ---------------------------------------------------------------------------
 # F. Anti-repetition
 # ---------------------------------------------------------------------------
 
 def _hash_text(text: str) -> int:
     return int(hashlib.md5(text.encode()).hexdigest()[:12], 16)
-
 
 class ResponseDeduplicator:
     """Module-level ring buffer of recent response hashes per user key."""
@@ -1027,9 +1002,7 @@ class ResponseDeduplicator:
             if len(ring) > self._MAX_PER_KEY:
                 ring.pop(0)
 
-
 _deduplicator = ResponseDeduplicator()
-
 
 # ---------------------------------------------------------------------------
 # G. Public API
@@ -1041,7 +1014,6 @@ class ConversationalResponse:
     intent: str
     confidence: float
     is_conversational: bool = True
-
 
 def generate_conversational_response(
     user_text: str,
@@ -1091,7 +1063,6 @@ def generate_conversational_response(
         intent=intent,
         confidence=confidence,
     )
-
 
 __all__ = [
     "NON_RETRIEVAL_INTENTS",

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Optional
 
 from src.observability.metrics import metrics_store
 from src.router.schema import RouterDecision
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ROUTER_PROMPT = """
 You are a routing engine for DocWain. Return ONLY valid JSON matching this schema:
@@ -52,7 +52,6 @@ Rules:
 Return JSON only. Do not add commentary.
 """.strip()
 
-
 def _build_prompt(query: str, subscription_id: str, profile_id: str, profile_name: str) -> str:
     return (
         f"{ROUTER_PROMPT}\n\n"
@@ -61,7 +60,6 @@ def _build_prompt(query: str, subscription_id: str, profile_id: str, profile_nam
         f"profile_name: {profile_name}\n"
         f"user_query: {query}"
     )
-
 
 def route_with_ollama(
     *,
@@ -87,6 +85,5 @@ def route_with_ollama(
         metrics_store().increment("ollama_router_fail_count")
         logger.debug("Ollama router failed: %s", exc)
         return None
-
 
 __all__ = ["route_with_ollama", "ROUTER_PROMPT"]

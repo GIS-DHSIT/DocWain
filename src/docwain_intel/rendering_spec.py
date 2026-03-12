@@ -6,7 +6,7 @@ axes of analysis (data shape, query geometry, structural inference).
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from collections import Counter
 from typing import Dict, List, Optional, Set
 
@@ -15,8 +15,7 @@ from pydantic import BaseModel, Field
 from .evidence_organizer import OrganizedEvidence, EvidenceGroup
 from .query_analyzer import QueryGeometry
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Output model
@@ -33,7 +32,6 @@ class RenderingSpec(BaseModel):
     max_items: Optional[int] = None
     include_provenance: bool = True
     include_gaps: bool = False
-
 
 # ---------------------------------------------------------------------------
 # Axis 1 — Data Shape Analysis
@@ -80,7 +78,6 @@ class _DataShape:
             self.total_facts == 0 and self.total_chunks > 0
         )
 
-
 def _extract_field_names(group: EvidenceGroup) -> Set[str]:
     """Extract the set of field/predicate names from an entity group's facts."""
     names: Set[str] = set()
@@ -89,7 +86,6 @@ def _extract_field_names(group: EvidenceGroup) -> Set[str]:
         if pred:
             names.add(str(pred).strip().lower())
     return names
-
 
 # ---------------------------------------------------------------------------
 # Axis 2 — Query Geometry helpers
@@ -105,7 +101,6 @@ def _detail_from_granularity(granularity: float) -> str:
         return "standard"
     return "comprehensive"
 
-
 def _grouping_from_geometry(geometry: QueryGeometry) -> str:
     """Derive an initial grouping strategy from query geometry."""
     if geometry.temporal_ordering:
@@ -115,7 +110,6 @@ def _grouping_from_geometry(geometry: QueryGeometry) -> str:
     if geometry.focus_type == "attribute_centric":
         return "by_attribute"
     return "flat"
-
 
 # ---------------------------------------------------------------------------
 # Axis 3 — Structural Inference (combines data shape + geometry)
@@ -159,7 +153,6 @@ def _infer_layout(geometry: QueryGeometry, shape: _DataShape) -> str:
     # Fallback: narrative.
     return "narrative"
 
-
 # ---------------------------------------------------------------------------
 # Field ordering
 # ---------------------------------------------------------------------------
@@ -186,7 +179,6 @@ def _derive_field_ordering(
             seen.add(field)
 
     return ordering
-
 
 # ---------------------------------------------------------------------------
 # Main entry point

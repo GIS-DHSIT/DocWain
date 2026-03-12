@@ -9,14 +9,13 @@ This module provides intelligent response formatting that:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class QueryIntent(Enum):
     """Classification of user query intent."""
@@ -30,7 +29,6 @@ class QueryIntent(Enum):
     VALIDATE = "validate"           # User wants to verify information
     SEARCH = "search"               # User is searching for something
     UNKNOWN = "unknown"
-
 
 # Intent detection patterns
 INTENT_PATTERNS: Dict[QueryIntent, List[str]] = {
@@ -68,7 +66,6 @@ INTENT_PATTERNS: Dict[QueryIntent, List[str]] = {
         r"\bwhere\s+can\s+i\s+find\b", r"\blocate\b",
     ],
 }
-
 
 # Acknowledgement templates by intent
 ACKNOWLEDGEMENT_TEMPLATES: Dict[QueryIntent, List[str]] = {
@@ -113,7 +110,6 @@ ACKNOWLEDGEMENT_TEMPLATES: Dict[QueryIntent, List[str]] = {
     ],
 }
 
-
 @dataclass
 class FormattedResponse:
     """A formatted response with acknowledgement and content."""
@@ -147,7 +143,6 @@ class FormattedResponse:
             "sources": self.sources,
             "metadata": self.metadata,
         }
-
 
 class ResponseFormatter:
     """
@@ -408,7 +403,6 @@ class ResponseFormatter:
             metadata={"no_results": True},
         )
 
-
 def format_acknowledged_response(
     query: str,
     content: str,
@@ -430,7 +424,6 @@ def format_acknowledged_response(
     formatter = ResponseFormatter()
     response = formatter.format_response(query, content, sources, confidence)
     return response.to_string()
-
 
 __all__ = [
     "QueryIntent",

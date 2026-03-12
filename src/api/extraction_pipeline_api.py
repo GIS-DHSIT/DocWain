@@ -4,7 +4,7 @@ POST /api/extraction/extract -- extracts content, entities, temporal spans,
 domain assignment, quality grading, and optionally stores to configured databases.
 """
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -12,10 +12,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 extraction_router = APIRouter(prefix="/extraction", tags=["Extraction Pipeline"])
-
 
 class ExtractionPipelineResponse(BaseModel):
     """Response from the standalone extraction pipeline."""
@@ -38,7 +37,6 @@ class ExtractionPipelineResponse(BaseModel):
     extraction_time_ms: float = 0.0
     stored: bool = False
     storage_targets: List[str] = Field(default_factory=list)
-
 
 @extraction_router.post("/extract", response_model=ExtractionPipelineResponse)
 async def extract_document_endpoint(

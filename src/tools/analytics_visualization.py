@@ -8,18 +8,17 @@ from __future__ import annotations
 import base64
 import io
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Lazy matplotlib import (avoid import-time side effects)
 # ---------------------------------------------------------------------------
 
 _MPL_BACKEND_SET = False
-
 
 def _ensure_mpl():
     """Set matplotlib to non-interactive backend (once)."""
@@ -28,7 +27,6 @@ def _ensure_mpl():
         import matplotlib
         matplotlib.use("Agg")
         _MPL_BACKEND_SET = True
-
 
 # ---------------------------------------------------------------------------
 # Data extraction (LLM-based)
@@ -75,7 +73,6 @@ def extract_chart_data(
     # Fallback: regex extraction of number-label pairs
     return _regex_extract(text)
 
-
 def _parse_json_array(text: str) -> List[Dict[str, Any]]:
     """Extract and parse a JSON array from LLM output."""
     # Find JSON array in the response
@@ -99,7 +96,6 @@ def _parse_json_array(text: str) -> List[Dict[str, Any]]:
     except json.JSONDecodeError:
         return []
 
-
 def _regex_extract(text: str) -> List[Dict[str, Any]]:
     """Simple regex fallback to find label-number pairs in text."""
     results: List[Dict[str, Any]] = []
@@ -109,7 +105,6 @@ def _regex_extract(text: str) -> List[Dict[str, Any]]:
         value = float(m.group(2))
         results.append({"label": label, "value": value})
     return results[:20]
-
 
 # ---------------------------------------------------------------------------
 # Chart type selection
@@ -123,7 +118,6 @@ _CHART_KEYWORDS = {
     "grouped_bar": {"compare", "comparison", "versus", "vs", "side by side", "grouped"},
     "bar": {"bar", "count", "total", "amount", "chart", "graph"},
 }
-
 
 def select_chart_type(query: str, data: List[Dict[str, Any]]) -> str:
     """Select the best chart type based on query keywords and data shape."""
@@ -142,7 +136,6 @@ def select_chart_type(query: str, data: List[Dict[str, Any]]) -> str:
     # Default
     return "bar"
 
-
 # ---------------------------------------------------------------------------
 # Chart generation functions
 # ---------------------------------------------------------------------------
@@ -157,7 +150,6 @@ def _fig_to_base64(fig) -> str:
     import matplotlib.pyplot as plt
     plt.close(fig)
     return b64
-
 
 def generate_bar_chart(
     labels: List[str],
@@ -191,7 +183,6 @@ def generate_bar_chart(
     fig.tight_layout()
     return _fig_to_base64(fig)
 
-
 def generate_pie_chart(
     labels: List[str],
     values: List[float],
@@ -219,7 +210,6 @@ def generate_pie_chart(
     fig.tight_layout()
     return _fig_to_base64(fig)
 
-
 def generate_line_chart(
     labels: List[str],
     values: List[float],
@@ -244,7 +234,6 @@ def generate_line_chart(
     ax.grid(alpha=0.3)
     fig.tight_layout()
     return _fig_to_base64(fig)
-
 
 def generate_grouped_bar_chart(
     data: List[Dict[str, Any]],
@@ -299,7 +288,6 @@ def generate_grouped_bar_chart(
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     return _fig_to_base64(fig)
-
 
 def generate_histogram(
     values: List[float],

@@ -8,13 +8,13 @@ Each step runs through a simplified pipeline call.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Multi-step detection patterns ─────────────────────────────────────────
 
@@ -58,7 +58,6 @@ _CONDITIONAL_SPLIT = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-
 @dataclass
 class QueryStep:
     """A single step in a multi-step query plan."""
@@ -81,7 +80,6 @@ class QueryStep:
             d["result"] = self.result[:200]
         return d
 
-
 @dataclass
 class QueryPlan:
     """A plan for executing a multi-step query."""
@@ -98,7 +96,6 @@ class QueryPlan:
             "synthesis_strategy": self.synthesis_strategy,
             "is_multi_step": self.is_multi_step,
         }
-
 
 def _classify_step_intent(query: str) -> str:
     """Classify the intent of a single query step."""
@@ -118,7 +115,6 @@ def _classify_step_intent(query: str) -> str:
             return intent
     return "retrieve"
 
-
 def is_multi_step_query(query: str) -> bool:
     """Check if a query requires multi-step decomposition."""
     if not query or len(query) < 20:
@@ -128,13 +124,11 @@ def is_multi_step_query(query: str) -> bool:
             return True
     return False
 
-
 def _decompose_conjunction(query: str) -> List[str]:
     """Split a query at conjunction boundaries into sub-queries."""
     parts = _CONJUNCTION_SPLIT.split(query)
     cleaned = [p.strip().strip(",;.") for p in parts if p and len(p.strip()) > 10]
     return cleaned if len(cleaned) > 1 else [query]
-
 
 def _decompose_conditional(query: str) -> Optional[tuple[str, str]]:
     """Decompose a conditional query into condition + question."""
@@ -145,7 +139,6 @@ def _decompose_conditional(query: str) -> Optional[tuple[str, str]]:
         if len(condition) > 5 and len(question) > 5:
             return (condition, question)
     return None
-
 
 def decompose_query(query: str, max_steps: int = 3) -> QueryPlan:
     """
@@ -212,7 +205,6 @@ def decompose_query(query: str, max_steps: int = 3) -> QueryPlan:
         is_multi_step=False,
     )
 
-
 def _llm_decompose(
     query: str, llm_client: Any, timeout: float = 5.0, max_steps: int = 3
 ) -> Optional[List[str]]:
@@ -247,7 +239,6 @@ def _llm_decompose(
         logger.debug("LLM decomposition failed: %s", exc)
         return None
 
-
 def _call_llm(llm_client: Any, prompt: str) -> str:
     """Call LLM client."""
     if hasattr(llm_client, "generate"):
@@ -256,7 +247,6 @@ def _call_llm(llm_client: Any, prompt: str) -> str:
             return result[0] if result[0] else ""
         return result or ""
     return ""
-
 
 def execute_plan(
     plan: QueryPlan,
@@ -286,7 +276,6 @@ def execute_plan(
             step_results.append({"response": "", "sources": [], "context_found": False})
 
     return _synthesize_results(plan, step_results)
-
 
 def _synthesize_results(
     plan: QueryPlan, step_results: List[Dict[str, Any]]

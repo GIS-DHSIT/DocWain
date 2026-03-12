@@ -7,7 +7,7 @@ adaptive thresholds, and quality evaluation for efficient and accurate responses
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from src.embedding.cache_manager import EmbeddingCacheManager
@@ -15,8 +15,7 @@ from src.embedding.reranker import RetrievalReranker, RerankingConfig
 from src.embedding.threshold_tuner import AdaptiveThresholdTuner, ThresholdConfig
 from src.embedding.quality_evaluator import SemanticChunkQualityEvaluator
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class EnhancedEmbeddingOrchestrator:
     """
@@ -298,7 +297,6 @@ class EnhancedEmbeddingOrchestrator:
             profile_id,
         )
         return cleared
-
 
 __all__ = ["EnhancedEmbeddingOrchestrator"]
 

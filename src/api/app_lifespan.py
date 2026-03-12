@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -14,8 +14,7 @@ from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, ensure_payload
 from src.api.rag_state import AppState, activate_singleton_guard, register_instance_ids, set_app_state
 from src.llm.gateway import create_llm_gateway, set_llm_gateway
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _bootstrap_qdrant_indexes(qdrant_client) -> Dict[str, Dict[str, object]]:
     index_status: Dict[str, Dict[str, object]] = {}
@@ -40,7 +39,6 @@ def _bootstrap_qdrant_indexes(qdrant_client) -> Dict[str, Dict[str, object]]:
             index_status[name] = {"status": "unhealthy", "error": str(exc)}
 
     return index_status
-
 
 def initialize_app_state(app: FastAPI) -> AppState:
     default_model = os.getenv("DOCWAIN_DEFAULT_MODEL", "DocWain-Agent")
@@ -253,7 +251,6 @@ def initialize_app_state(app: FastAPI) -> AppState:
     logger.info("AppState initialized with model=%s", default_model)
     return state
 
-
 def _precreate_subscription_collections(qdrant_client) -> None:
     """Pre-create Qdrant collections for active subscriptions to avoid 404s on first document."""
     try:
@@ -286,7 +283,6 @@ def _precreate_subscription_collections(qdrant_client) -> None:
             logger.info("Pre-created %d Qdrant collections for active subscriptions", created)
     except Exception as exc:
         logger.debug("Subscription collection pre-creation skipped: %s", exc)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -493,6 +489,5 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
     logger.info("DocWain API shutting down")
-
 
 __all__ = ["initialize_app_state", "lifespan"]

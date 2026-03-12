@@ -6,14 +6,13 @@ fuses results via Reciprocal Rank Fusion (RRF).
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from .query_decomposer import DecomposedQuery, SubQuery
 from .types import Chunk
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Reciprocal Rank Fusion
@@ -58,7 +57,6 @@ def rrf_fuse(
 
     results.sort(key=lambda c: c.score, reverse=True)
     return results[:top_n]
-
 
 # ---------------------------------------------------------------------------
 # Sub-query dispatch
@@ -174,7 +172,6 @@ def _dispatch_subquery(
             extra={"correlation_id": correlation_id},
         )
         return []
-
 
 # ---------------------------------------------------------------------------
 # Orchestrator entry-point

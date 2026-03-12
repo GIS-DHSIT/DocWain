@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import re
 from typing import Iterable, List, Sequence
 
 from sklearn.feature_extraction.text import HashingVectorizer
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class LocalCrossEncoder:
     """Lightweight cross-encoder scoring without HuggingFace dependencies."""

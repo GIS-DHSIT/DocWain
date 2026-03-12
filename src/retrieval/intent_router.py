@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from src.intent.llm_intent import parse_intent
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _INTENT_CACHE: Dict[str, Dict[str, Any]] = {}
 _INTENT_CACHE_MAX = 512
@@ -32,7 +32,6 @@ _DOC_TYPE_KEYWORDS = {
     "statement": ["statement", "balance"],
 }
 
-
 @dataclass(frozen=True)
 class IntentResult:
     intent: str
@@ -41,10 +40,8 @@ class IntentResult:
     need_tables: bool
     source: str
 
-
 def _cache_key(query: str) -> str:
     return hashlib.sha256(query.encode("utf-8")).hexdigest()
-
 
 def _heuristic_intent(query: str) -> IntentResult:
     lowered = query.lower()
@@ -68,7 +65,6 @@ def _heuristic_intent(query: str) -> IntentResult:
     need_tables = bool(re.search(r"\b(table|line item|rows)\b", lowered))
     return IntentResult(intent=intent, target_doc_types=target_types, constraints={}, need_tables=need_tables, source="heuristic")
 
-
 def _ollama_intent(query: str, model_name: Optional[str], llm_client: Optional[Any] = None) -> Optional[IntentResult]:
     if not model_name and llm_client is None:
         return None
@@ -90,7 +86,6 @@ def _ollama_intent(query: str, model_name: Optional[str], llm_client: Optional[A
     except Exception as exc:  # noqa: BLE001
         logger.debug("Ollama intent analysis failed: %s", exc)
         return None
-
 
 def analyze_intent(
     query: str,
@@ -129,6 +124,5 @@ def analyze_intent(
         "source": result.source,
     }
     return result
-
 
 __all__ = ["IntentResult", "analyze_intent"]

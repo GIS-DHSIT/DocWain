@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import random
 import re
@@ -19,8 +19,7 @@ from typing import Any, Dict, Generator, List, Optional, Tuple
 from urllib import request
 from urllib.error import HTTPError, URLError
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ── Lazy imports from dw_newron to avoid circular deps ─────────────
 
@@ -28,36 +27,29 @@ def _get_metrics_store():
     from src.api.dw_newron import get_metrics_store
     return get_metrics_store()
 
-
 def _resolve_model_alias(name):
     from src.api.dw_newron import _resolve_model_alias
     return _resolve_model_alias(name)
-
 
 def _configure_gemini():
     from src.api.dw_newron import configure_gemini
     return configure_gemini()
 
-
 def _generate_text_gemini(**kwargs):
     from src.api.dw_newron import generate_text
     return generate_text(**kwargs)
-
 
 def _get_redis_client():
     from src.api.dw_newron import get_redis_client
     return get_redis_client()
 
-
 def _get_config():
     from src.api.config import Config
     return Config
 
-
 # ── Thinking mode helpers ──────────────────────────────────────────
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-
 
 def _split_thinking(text: str) -> Tuple[str, str]:
     """Extract <think>...</think> block from response, returning (reasoning, cleaned_text)."""
@@ -68,12 +60,10 @@ def _split_thinking(text: str) -> Tuple[str, str]:
     cleaned = _THINK_RE.sub("", text).strip()
     return reasoning, cleaned
 
-
 # ── Default client singleton ───────────────────────────────────────
 
 _default_client = None
 _default_client_lock = threading.Lock()
-
 
 def get_default_client():
     """Return (or create) a singleton OllamaClient with the default model."""
@@ -83,7 +73,6 @@ def get_default_client():
             if _default_client is None:
                 _default_client = OllamaClient()
     return _default_client
-
 
 # ── OllamaClient ───────────────────────────────────────────────────
 
@@ -421,7 +410,6 @@ class OllamaClient:
         except Exception as exc:
             logger.warning("Ollama warm-up failed (continuing): %s", exc)
 
-
 # ── RateLimitCooldownError ─────────────────────────────────────────
 
 class RateLimitCooldownError(RuntimeError):
@@ -429,7 +417,6 @@ class RateLimitCooldownError(RuntimeError):
         super().__init__(message)
         self.code = 429
         self.retry_after = retry_after
-
 
 # ── GeminiClient ───────────────────────────────────────────────────
 
@@ -693,7 +680,6 @@ class GeminiClient:
         except Exception as exc:
             logger.warning("Gemini warm-up failed (continuing): %s", exc)
 
-
 # ── OpenAICompatibleClient ─────────────────────────────────────────
 
 class OpenAICompatibleClient:
@@ -794,7 +780,6 @@ class OpenAICompatibleClient:
         text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
         return text, {"response": text, "model": self.model_name, "backend": "vllm"}
 
-
 # ── _LLMClientWrapper (semaphore-based concurrency control) ────────
 
 class LLMClientWrapper:
@@ -817,7 +802,6 @@ class LLMClientWrapper:
                 return self._client.generate_with_metadata(*args, **kwargs)
             text = self._client.generate(*args, **kwargs)
             return text, {"response": text}
-
 
 # ── ResilientLLMClient ─────────────────────────────────────────────
 
@@ -909,7 +893,6 @@ class ResilientLLMClient:
                     warm_fb()
                 except Exception:
                     pass
-
 
 # ── OpenAIClient (Azure OpenAI / GPT-4o) ──────────────────────────
 
@@ -1038,7 +1021,6 @@ class OpenAIClient:
 
     def warm_up(self):
         pass  # No warm-up needed for cloud client
-
 
 # ── ClaudeClient (Anthropic Claude) ───────────────────────────────
 

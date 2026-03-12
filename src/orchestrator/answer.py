@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.observability.metrics import metrics_store
 from src.orchestrator.citations import format_citation
 from src.prompting.persona import DOCWAIN_META_RESPONSE, get_docwain_persona
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ALWAYS_HELPFUL_PROMPT = """
 You are DocWain, a document-wise AI assistant. Your knowledge comes ONLY from the documents provided via retrieval context.
@@ -127,7 +127,6 @@ EXAMPLE_OUTPUTS = {
     ),
 }
 
-
 def _build_evidence_block(chunks: List[Dict[str, Any]]) -> str:
     parts = []
     meta_keys = ("document_category", "detected_language", "language_confidence", "category_confidence")
@@ -146,7 +145,6 @@ def _build_evidence_block(chunks: List[Dict[str, Any]]) -> str:
         parts.append("\n".join(block_parts))
     return "\n\n".join(parts)
 
-
 def _detect_exact_match(query: str, chunks: List[Dict[str, Any]]) -> bool:
     query_terms = [term for term in (query or "").lower().split() if len(term) > 2]
     if not query_terms:
@@ -156,7 +154,6 @@ def _detect_exact_match(query: str, chunks: List[Dict[str, Any]]) -> bool:
         if any(term in text for term in query_terms):
             return True
     return False
-
 
 def _fallback_answer(query: str, chunks: List[Dict[str, Any]]) -> Tuple[str, bool]:
     exact_match = _detect_exact_match(query, chunks)
@@ -176,10 +173,8 @@ def _fallback_answer(query: str, chunks: List[Dict[str, Any]]) -> Tuple[str, boo
     )
     return answer, exact_match
 
-
 def generate_meta_response() -> str:
     return DOCWAIN_META_RESPONSE
-
 
 def generate_answer(
     *,
@@ -219,6 +214,5 @@ def generate_answer(
         metrics_store().increment("answer_generation_fail_count")
         logger.debug("Answer generation failed: %s", exc)
         return _fallback_answer(query, chunks)
-
 
 __all__ = ["generate_answer", "generate_meta_response", "ALWAYS_HELPFUL_PROMPT", "EXAMPLE_OUTPUTS"]

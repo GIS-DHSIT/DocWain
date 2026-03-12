@@ -4,19 +4,17 @@ Aggregates per-document ``document_domain`` values across all documents
 in a profile to compute a single profile-level domain tag.
 """
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_mongo_db():
     """Lazy import to avoid circular imports."""
     from src.api.dataHandler import db
     return db
-
 
 @dataclass
 class ProfileDomainResult:
@@ -26,7 +24,6 @@ class ProfileDomainResult:
     distribution: Dict[str, int] = field(default_factory=dict)
     confidence: float = 0.0
     total_documents: int = 0
-
 
 def compute_profile_domain(
     subscription_id: str,
@@ -106,7 +103,6 @@ def compute_profile_domain(
         logger.warning("Failed to compute profile domain for %s/%s: %s", subscription_id, profile_id, exc)
         return ProfileDomainResult()
 
-
 def _persist_profile_domain(
     subscription_id: str,
     profile_id: str,
@@ -133,7 +129,6 @@ def _persist_profile_domain(
     except Exception as exc:
         logger.debug("Failed to persist profile domain: %s", exc)
 
-
 def refresh_profile_domain_on_document_change(
     subscription_id: str,
     profile_id: str,
@@ -157,7 +152,6 @@ def refresh_profile_domain_on_document_change(
         name=f"profile-domain-{str(profile_id)[:8]}",
     )
     t.start()
-
 
 def get_profile_domain(
     subscription_id: str,

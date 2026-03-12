@@ -1,12 +1,11 @@
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Dict, List, Optional
 
 from qdrant_client import QdrantClient
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _ensure_profile_indexes(client: QdrantClient, collection_name: str) -> None:
     for field in ("profile_id", "profileId"):
@@ -22,12 +21,10 @@ def _ensure_profile_indexes(client: QdrantClient, collection_name: str) -> None:
                 continue
             logger.debug("Ensure payload index %s on %s failed: %s", field, collection_name, exc)
 
-
 def list_collections(client: Optional[QdrantClient] = None) -> List[str]:
     client = client or QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
     resp = client.get_collections()
     return [col.name for col in getattr(resp, "collections", [])]
-
 
 def list_profile_ids(
     collection_name: str,

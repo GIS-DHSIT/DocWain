@@ -1,6 +1,6 @@
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import queue
 import threading
 import time
@@ -11,11 +11,10 @@ from src.api.config import Config
 from src.kg.entity_extractor import EntityExtractor, normalize_entity_name
 from src.kg.neo4j_store import Neo4jStore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_QUEUE_KEY = "kg:ingest:queue"
 DEFAULT_DEAD_KEY = "kg:ingest:dead"
-
 
 @dataclass
 class GraphEntity:
@@ -25,7 +24,6 @@ class GraphEntity:
     normalized_name: str
     subscription_id: str = ""
     profile_id: str = ""
-
 
 @dataclass
 class GraphMention:
@@ -38,7 +36,6 @@ class GraphMention:
     subscription_id: str = ""
     profile_id: str = ""
 
-
 @dataclass
 class GraphField:
     doc_id: str
@@ -50,7 +47,6 @@ class GraphField:
     edge_key: str
     subscription_id: str = ""
     profile_id: str = ""
-
 
 @dataclass
 class GraphIngestPayload:
@@ -103,7 +99,6 @@ class GraphIngestPayload:
             typed_relationships=payload.get("typed_relationships") or [],
             temporal_spans=payload.get("temporal_spans") or [],
         )
-
 
 class GraphIngestQueue:
     def __init__(
@@ -209,16 +204,13 @@ class GraphIngestQueue:
                 except Exception:  # noqa: BLE001
                     logger.error("Failed to requeue KG payload after error")
 
-
 _graph_ingest_queue: Optional[GraphIngestQueue] = None
-
 
 def get_graph_ingest_queue(redis_client: Optional[Any] = None) -> GraphIngestQueue:
     global _graph_ingest_queue
     if _graph_ingest_queue is None:
         _graph_ingest_queue = GraphIngestQueue(redis_client=redis_client)
     return _graph_ingest_queue
-
 
 def _deep_entities_to_graph_entities(deep_entities: list) -> list:
     """Convert deep analysis EntityMention dicts to GraphEntity-compatible dicts.
@@ -242,7 +234,6 @@ def _deep_entities_to_graph_entities(deep_entities: list) -> list:
             "page": ent.get("page"),
         })
     return result
-
 
 def build_graph_payload(
     *,
@@ -405,7 +396,6 @@ def build_graph_payload(
         temporal_spans=[],  # Populated by callers that pass deep_result.temporal_spans
     )
 
-
 def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None:
     if not payload or not payload.document:
         return
@@ -562,7 +552,6 @@ def ingest_graph_payload(store: Neo4jStore, payload: GraphIngestPayload) -> None
                 doc_id_for_tl,
             )
 
-
 def _extract_evidence_span(text: str, name: str, window: int = 48) -> Optional[str]:
     if not text or not name:
         return None
@@ -575,7 +564,6 @@ def _extract_evidence_span(text: str, name: str, window: int = 48) -> Optional[s
     end = min(idx + len(needle) + window, len(text))
     return text[start:end].strip()
 
-
 def _extract_structured_fields(meta: Dict[str, Any]) -> List[tuple[str, Any]]:
     candidates = []
     for key in ("fields", "structured_fields", "extracted_fields"):
@@ -587,7 +575,6 @@ def _extract_structured_fields(meta: Dict[str, Any]) -> List[tuple[str, Any]]:
                 candidates.append((str(field_key), value))
     return candidates
 
-
 def _graph_version(document_id: str, chunk_metadata: Iterable[Dict[str, Any]]) -> str:
     hashes = []
     for meta in chunk_metadata:
@@ -597,14 +584,12 @@ def _graph_version(document_id: str, chunk_metadata: Iterable[Dict[str, Any]]) -
     seed = "|".join(sorted(hashes)) or str(document_id)
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
-
 def _coerce_language(languages: Any) -> Optional[str]:
     if isinstance(languages, list) and languages:
         return str(languages[0])
     if isinstance(languages, str):
         return languages
     return None
-
 
 __all__ = [
     "GraphIngestPayload",

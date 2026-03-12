@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional, Tuple
 
 from src.api.rag_state import AppState
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 SERVICE_UNAVAILABLE_CODES = {
     "RETRIEVAL_INDEX_MISSING",
     "RETRIEVAL_QDRANT_UNAVAILABLE",
     "RETRIEVAL_INDEX_BOOTSTRAP_FAILED",
 }
-
 
 def _extract_error_code(answer: Dict[str, Any]) -> Optional[str]:
     if not isinstance(answer, dict):
@@ -24,7 +23,6 @@ def _extract_error_code(answer: Dict[str, Any]) -> Optional[str]:
     code = err.get("code")
     return str(code) if code else None
 
-
 def _ensure_ok_flag(answer: Dict[str, Any], ok: bool) -> Dict[str, Any]:
     if not isinstance(answer, dict):
         return answer
@@ -33,7 +31,6 @@ def _ensure_ok_flag(answer: Dict[str, Any], ok: bool) -> Dict[str, Any]:
     answer["ok"] = ok
     return answer
 
-
 def attach_instance_ids(answer: Dict[str, Any], state: Optional[AppState]) -> Dict[str, Any]:
     if not isinstance(answer, dict) or not state:
         return answer
@@ -41,7 +38,6 @@ def attach_instance_ids(answer: Dict[str, Any], state: Optional[AppState]) -> Di
     meta.setdefault("instance_ids", state.instance_ids or {})
     answer["metadata"] = meta
     return answer
-
 
 def apply_error_contract(
     answer: Dict[str, Any],
@@ -63,17 +59,14 @@ def apply_error_contract(
     answer = attach_instance_ids(answer, state)
     return answer, code
 
-
 def should_return_503(error_code: Optional[str]) -> bool:
     return bool(error_code and error_code in SERVICE_UNAVAILABLE_CODES)
-
 
 def get_rag_system_from_app(app) -> Any:  # noqa: ANN401
     rag_system = getattr(app.state, "rag_system", None)
     if rag_system is None:
         logger.error("RAG system missing in app.state; request will fall back to lazy init")
     return rag_system
-
 
 __all__ = [
     "apply_error_contract",

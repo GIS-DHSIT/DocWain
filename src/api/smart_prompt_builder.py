@@ -7,7 +7,7 @@ Key Fixes:
 4. Answer verification prompt
 """
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import List, Dict, Any, Optional
 
@@ -15,8 +15,7 @@ from src.utils.payload_utils import get_source_name
 
 from src.prompting.prompt_builder import inject_persona_prompt
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class SmartPromptBuilder:
     """Builds prompts that enforce strict document grounding"""
@@ -251,7 +250,6 @@ Your verification:"""
             redis_client=redis_client,
         )
 
-
 class DocumentMatcher:
     """Helps match queries to relevant documents"""
 
@@ -330,7 +328,6 @@ class DocumentMatcher:
             logger.info(f"No specific document match for terms: {search_terms}")
 
         return matched_docs if matched_docs else None
-
 
 def build_enhanced_answer_with_verification(
         query: str,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Iterable, Optional
 from urllib.parse import quote, unquote, urlparse, urlsplit, urlunsplit
@@ -12,7 +12,7 @@ from azure.storage.blob import BlobServiceClient, ContainerClient, ContentSettin
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _BASE64_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
 
@@ -21,7 +21,6 @@ _CHAT_CONTAINER_CLIENT: Optional[ContainerClient] = None
 _DOCUMENT_CONTAINER_CLIENT: Optional[ContainerClient] = None
 _CONTAINERS_VALIDATED = False
 _STORAGE_CONFIG_VALIDATED = False
-
 
 class BlobDownloadError(RuntimeError):
     error_code = "UnknownError"
@@ -41,29 +40,23 @@ class BlobDownloadError(RuntimeError):
         self.request_id = request_id
         self.original_exc = original_exc
 
-
 class CredentialError(BlobDownloadError):
     error_code = "CredentialError"
-
 
 class NotFoundError(BlobDownloadError):
     error_code = "NotFoundError"
 
-
 class TransientError(BlobDownloadError):
     error_code = "TransientError"
 
-
 class UnknownError(BlobDownloadError):
     error_code = "UnknownError"
-
 
 def _pad_base64(value: str) -> str:
     remainder = len(value) % 4
     if remainder == 0:
         return value
     return value + ("=" * (4 - remainder))
-
 
 def validate_base64_padding(value: str, *, label: str = "AZURE_STORAGE_ACCOUNT_KEY") -> None:
     if not value:
@@ -87,7 +80,6 @@ def validate_base64_padding(value: str, *, label: str = "AZURE_STORAGE_ACCOUNT_K
     except binascii.Error as exc:
         raise CredentialError(f"{label} is not valid base64.") from exc
 
-
 def decode_connection_string_if_base64(raw: str) -> str:
     raw = raw.strip()
     if not raw:
@@ -108,13 +100,11 @@ def decode_connection_string_if_base64(raw: str) -> str:
         return decoded.strip()
     return raw
 
-
 def sanitize_blob_url(url: str) -> str:
     if not url:
         return url
     parts = urlsplit(url)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
-
 
 def normalize_blob_name(file_path: str, *, container_name: Optional[str] = None) -> str:
     blob_name = (file_path or "").strip()
@@ -129,7 +119,6 @@ def normalize_blob_name(file_path: str, *, container_name: Optional[str] = None)
                 return raw_path[len(container_name) + 1 :]
         return raw_path or netloc
     return blob_name
-
 
 def iter_blob_name_candidates(blob_name: str) -> Iterable[str]:
     seen = set()
@@ -156,7 +145,6 @@ def iter_blob_name_candidates(blob_name: str) -> Iterable[str]:
         if next_value:
             yield next_value
 
-
 def _parse_connection_string(raw: str) -> dict:
     parts = {}
     for segment in raw.split(";"):
@@ -168,10 +156,8 @@ def _parse_connection_string(raw: str) -> dict:
         parts[key] = value
     return parts
 
-
 def has_blob_credentials() -> bool:
     return bool(getattr(Config.AzureBlob, "CONNECTION_STRING", "").strip())
-
 
 def _connection_string() -> str:
     try:
@@ -179,7 +165,6 @@ def _connection_string() -> str:
     except Exception as exc:  # noqa: BLE001
         raise CredentialError(str(exc)) from exc
     return getattr(Config.AzureBlob, "CONNECTION_STRING", "").strip()
-
 
 def get_blob_service_client() -> BlobServiceClient:
     global _SERVICE_CLIENT
@@ -202,11 +187,9 @@ def get_blob_service_client() -> BlobServiceClient:
         raise CredentialError("AzureBlob.CONNECTION_STRING is not a valid Azure storage connection string.") from exc
     return _SERVICE_CLIENT
 
-
 def get_container_client(container_name: str) -> ContainerClient:
     service_client = get_blob_service_client()
     return service_client.get_container_client(container_name)
-
 
 def get_chat_container_client() -> ContainerClient:
     global _CHAT_CONTAINER_CLIENT
@@ -218,7 +201,6 @@ def get_chat_container_client() -> ContainerClient:
         _CHAT_CONTAINER_CLIENT = get_blob_service_client().get_container_client(container_name)
     return _CHAT_CONTAINER_CLIENT
 
-
 def get_document_container_client() -> ContainerClient:
     global _DOCUMENT_CONTAINER_CLIENT
     if _DOCUMENT_CONTAINER_CLIENT is None:
@@ -228,7 +210,6 @@ def get_document_container_client() -> ContainerClient:
         logger.info("Document container: %s", container_name)
         _DOCUMENT_CONTAINER_CLIENT = get_blob_service_client().get_container_client(container_name)
     return _DOCUMENT_CONTAINER_CLIENT
-
 
 def validate_containers_once() -> None:
     """Validate configured containers exist, logging once without raising."""
@@ -253,7 +234,6 @@ def validate_containers_once() -> None:
         if not exists:
             logger.warning("Configured container %s not found. Please verify Azure Blob setup.", name)
 
-
 def validate_storage_configured_once() -> bool:
     """Validate blob credentials once and log a single actionable message."""
     global _STORAGE_CONFIG_VALIDATED
@@ -266,7 +246,6 @@ def validate_storage_configured_once() -> bool:
     logger.info("Azure blob storage configured.")
     return True
 
-
 def upload_chat_history(blob_name: str, payload: bytes) -> None:
     container_client = get_chat_container_client()
     blob_client = container_client.get_blob_client(blob_name)
@@ -275,7 +254,6 @@ def upload_chat_history(blob_name: str, payload: bytes) -> None:
         overwrite=True,
         content_settings=ContentSettings(content_type="application/json"),
     )
-
 
 def upload_pickle(
     blob_name: str,
@@ -292,12 +270,10 @@ def upload_pickle(
         content_settings=ContentSettings(content_type="application/octet-stream"),
     )
 
-
 def download_pickle(blob_name: str) -> bytes:
     container_client = get_document_container_client()
     blob_client = container_client.get_blob_client(blob_name)
     return blob_client.download_blob().readall()
-
 
 def _extract_request_id(exc: BaseException) -> Optional[str]:
     response = getattr(exc, "response", None)
@@ -305,7 +281,6 @@ def _extract_request_id(exc: BaseException) -> Optional[str]:
         return None
     headers = getattr(response, "headers", None) or {}
     return headers.get("x-ms-request-id") or headers.get("x-ms-client-request-id")
-
 
 def classify_blob_error(
     exc: BaseException,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from src.api.config import Config
 from .models import compute_config_hash
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 _LEGACY_VETTING_NOTICE_LOGGED = False
 
 DEFAULT_WEIGHTS = {
@@ -68,14 +68,12 @@ DOMAIN_SPECIFIC_TOOLS = {
     "policy_compliance",
 }
 
-
 def _parse_bool(value: str | bool | None, default: bool = False) -> bool:
     if value is None:
         return default
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
 
 def _log_legacy_vetting_notice() -> None:
     global _LEGACY_VETTING_NOTICE_LOGGED
@@ -84,14 +82,12 @@ def _log_legacy_vetting_notice() -> None:
     _LEGACY_VETTING_NOTICE_LOGGED = True
     logger.info("Legacy vetting config not found — proceeding with screening defaults")
 
-
 def log_legacy_vetting_notice_if_missing(path: Optional[str] = None) -> None:
     config_path = Path(path) if path else Path(
         os.getenv("SCREENING_CONFIG_PATH", "") or Path.cwd() / "screening_config.json"
     )
     if not config_path.exists():
         _log_legacy_vetting_notice()
-
 
 @dataclass
 class ScreeningConfig:
