@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from dataclasses import dataclass
@@ -31,7 +31,7 @@ from .types import (
     PolicySchema,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 EXTRACT_TIMEOUT_MS = 15000  # 60s→15s: deterministic LLM fallback should be fast, not retry-length
 
@@ -40,7 +40,6 @@ class ExtractionResult:
     domain: str
     intent: str
     schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema | Any  # includes LLMResponseSchema
-
 
 _INVOICE_HINTS = {
     "invoice",
@@ -65,7 +64,6 @@ def _nlu_subintent(query: str) -> Optional[str]:
     except Exception:
         return None
 
-
 _CONTACT_KEYWORDS = frozenset({
     "contact", "contacts", "email", "emails", "phone", "phones",
     "reach", "linkedin", "number", "address", "mobile",
@@ -82,7 +80,6 @@ def _nlu_is_contact(query: str) -> bool:
         return is_contact_query(query)
     except Exception:
         return False
-
 
 def schema_extract(
     *,
@@ -139,7 +136,6 @@ def schema_extract(
 
     return ExtractionResult(domain=domain, intent=intent, schema=schema)
 
-
 # Content validators: multi-word phrases that MUST appear in chunk text
 # for a metadata domain tag to be trusted.  Single generic words like
 # "total", "policy", "experience" cause massive false positives on
@@ -181,7 +177,6 @@ _DOMAIN_CONTENT_VALIDATORS: Dict[str, tuple] = {
 _DOMAIN_MAP = {"resume": "hr", "invoice": "invoice", "legal": "legal",
                "policy": "policy", "report": "report"}
 
-
 def _ml_query_domain(query: str, intent_parse: Any = None) -> Optional[str]:
     """Detect query domain using trained ML classifier.
 
@@ -220,7 +215,6 @@ def _ml_query_domain(query: str, intent_parse: Any = None) -> Optional[str]:
     except Exception:  # noqa: BLE001
         pass
     return None
-
 
 def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
     """Determine domain from chunk metadata with mandatory content validation.
@@ -283,7 +277,6 @@ def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
         return None
 
     return mapped
-
 
 def _infer_domain_intent(
     query: str,
@@ -457,7 +450,6 @@ def _infer_domain_intent(
     )
     return domain, intent
 
-
 def _looks_like_hr_total(text: str) -> bool:
     if not text:
         return False
@@ -470,7 +462,6 @@ def _looks_like_hr_total(text: str) -> bool:
             "total years of experience",
         )
     )
-
 
 def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[Any], *, query_focus: Optional[Any] = None, embedder: Any = None):
     """Route to domain-specific extractor when domain is known, else generic."""
@@ -485,7 +476,6 @@ def _deterministic_extract(domain: str, intent: str, query: str, chunks: List[An
     if domain == "medical":
         return _extract_medical(chunks, embedder=embedder)
     return _extract_document_intelligence(query, chunks, query_focus=query_focus)
-
 
 def _extract_document_intelligence(query: str, chunks: List[Any], *, query_focus: Optional[Any] = None) -> GenericSchema:
     """Universal document intelligence extraction.
@@ -615,7 +605,6 @@ def _extract_document_intelligence(query: str, chunks: List[Any], *, query_focus
 
     return GenericSchema(facts=_field_values_field(facts))
 
-
 def _overlaps_existing_facts(sentence: str, facts: List[FieldValue]) -> bool:
     """Check if sentence content is already captured by extracted facts."""
     words = set(sentence.lower().split())
@@ -629,7 +618,6 @@ def _overlaps_existing_facts(sentence: str, facts: List[FieldValue]) -> bool:
         if overlap > 0.6:
             return True
     return False
-
 
 def _extract_structured_facts(
     text: str,
@@ -729,7 +717,6 @@ def _extract_structured_facts(
                     evidence_spans=[_span(chunk_id, cleaned)],
                 ))
 
-
 def _score_and_sort_facts(
     facts: List[FieldValue],
     keywords: List[str],
@@ -767,7 +754,6 @@ def _score_and_sort_facts(
 
     return sorted(facts, key=_fact_score, reverse=True)
 
-
 # ---------------------------------------------------------------------------
 # OCR text normalization — cleans up common OCR artifacts before ML classification
 # ---------------------------------------------------------------------------
@@ -776,7 +762,6 @@ _OCR_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _OCR_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
 _OCR_BULLET_ARTIFACT_RE = re.compile(r"^[•·▪■□◦‣⁃]\s*")
 _OCR_SEMICOLON_LABEL_RE = re.compile(r"^([A-Z][A-Za-z\s]{2,30});(\s)")
-
 
 def _normalize_ocr_line(line: str) -> str:
     """Normalize a single OCR-extracted line: strip control chars, collapse whitespace,
@@ -787,7 +772,6 @@ def _normalize_ocr_line(line: str) -> str:
     line = _OCR_SEMICOLON_LABEL_RE.sub(r"\1:\2", line)
     return line.strip()
 
-
 def _is_table_chunk(text: str) -> bool:
     """Detect if text looks like a pipe-delimited or tab-delimited table."""
     lines = text.strip().splitlines()
@@ -796,7 +780,6 @@ def _is_table_chunk(text: str) -> bool:
     pipe_count = sum(1 for l in lines if l.count("|") >= 2)
     tab_count = sum(1 for l in lines if l.count("\t") >= 2)
     return (pipe_count >= 2) or (tab_count >= 2)
-
 
 def _table_to_kv_pairs(text: str) -> List[str]:
     """Convert pipe/tab-delimited table rows into 'label: value' pairs for classification."""
@@ -820,7 +803,6 @@ def _table_to_kv_pairs(text: str) -> List[str]:
             if i < len(headers) and cell:
                 pairs.append(f"{headers[i]}: {cell}")
     return pairs
-
 
 # ---------------------------------------------------------------------------
 # ML-based line classification helper (shared by all domain extractors)
@@ -860,7 +842,6 @@ def _ml_extract_lines(chunks, domain: str, embedder):
 
     classifications = _classify_lines(all_lines, domain, embedder)
     return list(zip(all_lines, line_meta, classifications))
-
 
 def _extract_invoice(chunks: List[Any], embedder: Any = None) -> InvoiceSchema:
     items: List[InvoiceItem] = []
@@ -927,7 +908,6 @@ def _extract_invoice(chunks: List[Any], embedder: Any = None) -> InvoiceSchema:
         terms=_field_values_field(terms),
         invoice_metadata=_field_values_field(invoice_metadata),
     )
-
 
 def _extract_hr(chunks: List[Any]) -> HRSchema:
     """Extract HR data from chunks using intelligent content and metadata analysis."""
@@ -1424,7 +1404,6 @@ def _extract_hr(chunks: List[Any]) -> HRSchema:
 
     return HRSchema(candidates=_candidates_field(candidates))
 
-
 # ============================================================================
 # Candidate Field Sanitization
 # ============================================================================
@@ -1436,7 +1415,6 @@ _METADATA_GARBAGE_RE = re.compile(
     r"ChunkCandidate|Section\(|Table\(|'text':|'title':|'page':)",
     re.IGNORECASE,
 )
-
 
 def _is_metadata_garbage(value: str, max_length: int = 200) -> bool:
     """Check if a string value contains Qdrant/extraction metadata artifacts."""
@@ -1455,7 +1433,6 @@ def _is_metadata_garbage(value: str, max_length: int = 200) -> bool:
     if "='" in value and ("section" in value.lower() or "chunk" in value.lower()):
         return True
     return False
-
 
 def _sanitize_field_value(value: Optional[str], max_length: int = 500) -> Optional[str]:
     """Clean a single string field value."""
@@ -1477,7 +1454,6 @@ def _sanitize_field_value(value: Optional[str], max_length: int = 500) -> Option
     if len(cleaned) > max_length:
         cleaned = cleaned[:max_length].rstrip()
     return cleaned if cleaned else None
-
 
 def _sanitize_field_list(items: Optional[List[str]], max_item_length: int = 100) -> Optional[List[str]]:
     """Clean a list of string items, removing garbage entries."""
@@ -1588,7 +1564,6 @@ def _sanitize_field_list(items: Optional[List[str]], max_item_length: int = 100)
             cleaned.append(item)
     return cleaned if cleaned else None
 
-
 def _sanitize_candidate(cand: Candidate) -> None:
     """Sanitize all fields of a Candidate to remove metadata artifacts."""
     # Clean name — reject names that are actually skill/keyword lists
@@ -1644,7 +1619,6 @@ def _sanitize_candidate(cand: Candidate) -> None:
     cand.education = _sanitize_field_list(cand.education, max_item_length=150)
     cand.achievements = _sanitize_field_list(cand.achievements, max_item_length=150)
 
-
 def _extract_legal(chunks: List[Any], embedder: Any = None) -> LegalSchema:
     """Extract structured legal/contract intelligence from chunks."""
     clauses: List[Clause] = []
@@ -1697,7 +1671,6 @@ def _extract_legal(chunks: List[Any], embedder: Any = None) -> LegalSchema:
         parties=_field_values_field(parties),
         obligations=_field_values_field(obligations),
     )
-
 
 def _extract_medical(chunks: List[Any], embedder: Any = None) -> "MedicalSchema":
     """Extract structured medical intelligence from patient records and clinical documents."""
@@ -1781,7 +1754,6 @@ def _extract_medical(chunks: List[Any], embedder: Any = None) -> "MedicalSchema"
         vitals=_field_values_field(vitals),
     )
 
-
 def _extract_policy(chunks: List[Any], embedder: Any = None) -> "PolicySchema":
     """Extract structured insurance policy intelligence from policy documents."""
     policy_info: List[FieldValue] = []
@@ -1856,7 +1828,6 @@ def _extract_policy(chunks: List[Any], embedder: Any = None) -> "PolicySchema":
         terms=_field_values_field(terms),
     )
 
-
 def _extract_generic(query: str, chunks: List[Any]) -> GenericSchema:
     keywords = _keywords(query)
     facts: List[FieldValue] = []
@@ -1916,7 +1887,6 @@ def _extract_generic(query: str, chunks: List[Any]) -> GenericSchema:
 
     return GenericSchema(facts=_field_values_field(facts))
 
-
 def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema | MedicalSchema | PolicySchema) -> bool:
     if isinstance(schema, InvoiceSchema):
         return not (
@@ -1958,7 +1928,6 @@ def _schema_is_empty(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSch
     if isinstance(schema, MultiEntitySchema):
         return not (schema.entities or [])
     return True
-
 
 def _schema_completeness(schema) -> float:
     """Return weighted ratio of populated fields (0.0=empty, 1.0=full).
@@ -2026,7 +1995,6 @@ def _schema_completeness(schema) -> float:
 
     return sum(w for present, w in weighted if present)
 
-
 def _merge_schemas(deterministic, llm_result):
     """Merge LLM result into deterministic schema — deterministic values take priority.
 
@@ -2083,7 +2051,6 @@ def _merge_schemas(deterministic, llm_result):
 
     return deterministic
 
-
 def _llm_extract(
     domain: str,
     intent: str,
@@ -2128,7 +2095,6 @@ def _llm_extract(
         return GenericSchema.model_validate(cleaned)
     except Exception:
         return None
-
 
 def _build_llm_prompt(
     domain: str,
@@ -2188,7 +2154,6 @@ def _build_llm_prompt(
         + "\n\nReturn JSON with format: {\"schema\": { ... }}"
     )
 
-
 def _generate_extract_response(
     llm_client: Any,
     prompt: str,
@@ -2237,14 +2202,12 @@ def _generate_extract_response(
         )
         return "", {}
 
-
 def _is_empty_or_truncated(raw: Any, meta: dict) -> bool:
     text = str(raw or "").strip()
     if not text:
         return True
     done_reason = str(meta.get("done_reason") or "").lower()
     return done_reason in {"length", "error"}
-
 
 def _sanitize_schema_payload(domain: str, payload: Any, chunks: List[Any]) -> Any:
     chunk_ids = {str(getattr(c, "id", "")) for c in chunks}
@@ -2314,7 +2277,6 @@ def _sanitize_schema_payload(domain: str, payload: Any, chunks: List[Any]) -> An
     facts = _clean_list(payload.get("facts") or [], ["label", "value"])
     return {"facts": _field_values_field(facts).model_dump()}
 
-
 def _extract_json(raw: Any) -> dict:
     if not raw:
         return {}
@@ -2332,12 +2294,10 @@ def _extract_json(raw: Any) -> dict:
             return {}
     return {}
 
-
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # Phone pattern - require at least 7 digits total and avoid year ranges
 _PHONE_RE = re.compile(r"(?:\+\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4,}")
 _LINKEDIN_RE = re.compile(r"(?:https?://)?(?:www\.)?linkedin\.com/[A-Za-z0-9._/?=&-]+", re.IGNORECASE)
-
 
 def _clean_extraction_text(text: str) -> str:
     """
@@ -2463,7 +2423,6 @@ def _clean_extraction_text(text: str) -> str:
 
     return text.strip()
 
-
 def _extract_full_text_content(text: str) -> str:
     """
     Extract the actual document content from Qdrant payload.
@@ -2534,7 +2493,6 @@ def _extract_full_text_content(text: str) -> str:
 
     return _clean_extraction_text(text)
 
-
 # Section header patterns used for boundary detection in full-document chunks
 _SECTION_HEADER_MAP = {
     "summary_objective": [
@@ -2584,7 +2542,6 @@ _SECTION_HEADER_MAP = {
 _ALL_SECTION_HEADERS = []
 for _headers in _SECTION_HEADER_MAP.values():
     _ALL_SECTION_HEADERS.extend(_headers)
-
 
 def _extract_section_from_text(full_text: str, section_kind: str) -> str:
     """
@@ -2645,7 +2602,6 @@ def _extract_section_from_text(full_text: str, section_kind: str) -> str:
 
     return extracted if extracted else full_text
 
-
 def _text_has_multiple_sections(text: str) -> bool:
     """Check if text contains multiple recognized resume section headers."""
     if not text or len(text) < 300:
@@ -2658,7 +2614,6 @@ def _text_has_multiple_sections(text: str) -> bool:
                 found += 1
                 break  # Count one per section type
     return found >= 3  # Need at least 3 different section types
-
 
 def _split_document_into_sections(text: str) -> List[Tuple[str, str]]:
     """
@@ -2746,7 +2701,6 @@ def _split_document_into_sections(text: str) -> List[Tuple[str, str]]:
 
     return result
 
-
 def _extract_contact_fields(line: str) -> Dict[str, List[str]]:
     if not line:
         return {}
@@ -2765,7 +2719,6 @@ def _extract_contact_fields(line: str) -> Dict[str, List[str]]:
         "linkedins": [l for l in linkedins if l],
     }
 
-
 def _clean_contact_value(value: str, preserve_parens: bool = False) -> str:
     if preserve_parens:
         cleaned = value.strip().strip(".,;:[]{}<>")
@@ -2773,7 +2726,6 @@ def _clean_contact_value(value: str, preserve_parens: bool = False) -> str:
         cleaned = value.strip().strip(".,;:()[]{}<>")
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned
-
 
 def _is_valid_phone(phone: str) -> bool:
     """Validate that a string is actually a phone number, not a year range."""
@@ -2789,7 +2741,6 @@ def _is_valid_phone(phone: str) -> bool:
     if re.match(r"^\d{4}$", phone):
         return False
     return True
-
 
 def _extract_contact_fields_comprehensive(text: str) -> Dict[str, List[str]]:
     """Extract contact fields from multi-line text more comprehensively."""
@@ -2890,7 +2841,6 @@ def _extract_contact_fields_comprehensive(text: str) -> Dict[str, List[str]]:
         "names": names[:1] if names else [],  # Return only first potential name
     }
 
-
 # Known invoice/document field labels — when found inline, split before them
 # to create separate "label: value" lines for the ML classifier
 _INVOICE_LABEL_RE = re.compile(
@@ -2907,7 +2857,6 @@ _INVOICE_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _split_lines(text: str) -> List[str]:
     lines = [line for line in text.splitlines() if line.strip()]
     # For long single lines (OCR'd invoices), try splitting at label boundaries
@@ -2920,14 +2869,12 @@ def _split_lines(text: str) -> List[str]:
             result.append(line)
     return result
 
-
 def _split_sentences(text: str) -> List[str]:
     if not text:
         return []
     # Split on sentence endings AND newlines (common document boundary)
     parts = re.split(r"(?<=[.!?])\s+|\n+", text)
     return [p.strip() for p in parts if p.strip()]
-
 
 def _keywords(query: str) -> List[str]:
     tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
@@ -2944,11 +2891,9 @@ def _keywords(query: str) -> List[str]:
             bigrams.append(f"{tokens[i]} {tokens[i + 1]}")
     return singles + bigrams
 
-
 def _span(chunk_id: str, snippet: str) -> EvidenceSpan:
     cleaned = " ".join(snippet.split())
     return EvidenceSpan(chunk_id=str(chunk_id), snippet=cleaned[:120])
-
 
 _FIELD_EQUIVALENCE = {
     # Invoice totals
@@ -3001,7 +2946,6 @@ _FIELD_EQUIVALENCE = {
     "rx": "medications",
 }
 
-
 def _normalize_key(text: str) -> str:
     normalized = re.sub(r"\W+", " ", text.lower()).strip()
     # For label:value patterns, canonicalize the label
@@ -3014,14 +2958,12 @@ def _normalize_key(text: str) -> str:
             return f"{canonical} {raw_value}" if raw_value else canonical
     return normalized
 
-
 def _is_bullet_item(line: str) -> bool:
     if not line.startswith("-") and not line.startswith("•"):
         return False
     has_price = bool(re.search(r"[$€£]\s*\d", line))
     has_qty = bool(re.search(r"\bqty\b|\bquantity\b|\b\d+\s*x\b", line, re.IGNORECASE))
     return has_price or has_qty
-
 
 def _extract_years_experience(text: str) -> Optional[str]:
     """Extract years of experience — explicit mention first, then calculate from date ranges."""
@@ -3108,7 +3050,6 @@ def _extract_years_experience(text: str) -> Optional[str]:
 
     return None
 
-
 def _infer_section_kind_from_content(text: str, section_title: str) -> str:
     """Infer section kind from actual chunk content when metadata is generic.
 
@@ -3118,7 +3059,6 @@ def _infer_section_kind_from_content(text: str, section_title: str) -> str:
     from src.embedding.pipeline.content_classifier import classify_section_kind
 
     return classify_section_kind(text, section_title)
-
 
 def _normalize_intent_hint(value: Optional[str]) -> Optional[str]:
     if not value:
@@ -3131,7 +3071,6 @@ def _normalize_intent_hint(value: Optional[str]) -> Optional[str]:
     if normalized in {"qa", "answer", "facts", "factual"}:
         return "factual"
     return None
-
 
 def _split_list(text: str) -> List[str]:
     cleaned = re.sub(r"(?i)^(technical skills|functional skills|key skills|skills)\s*[:\-]\s*", "", text).strip()
@@ -3147,7 +3086,6 @@ def _split_list(text: str) -> List[str]:
         if item:
             items.append(item)
     return items
-
 
 def _parse_sections(text: str) -> Dict[str, List[str]]:
     sections: Dict[str, List[str]] = {
@@ -3176,7 +3114,6 @@ def _parse_sections(text: str) -> Dict[str, List[str]]:
             sections[current].append(cleaned)
     return sections
 
-
 def _section_heading(line: str) -> Optional[str]:
     lower = line.lower().strip()
     if re.match(r"^(technical skills|technical skill|technologies|tech stack)\b", lower):
@@ -3190,7 +3127,6 @@ def _section_heading(line: str) -> Optional[str]:
     if re.match(r"^(education|academic|academics|qualification|qualifications)\b", lower):
         return "education"
     return None
-
 
 def _looks_like_heading_break(line: str) -> bool:
     lower = line.lower().strip()
@@ -3209,7 +3145,6 @@ def _looks_like_heading_break(line: str) -> bool:
             "languages",
         )
     )
-
 
 def _flatten_skill_block(lines: List[str]) -> List[str]:
     items: List[str] = []
@@ -3278,7 +3213,6 @@ def _flatten_skill_block(lines: List[str]) -> List[str]:
         items.extend(_split_list(cleaned))
     return items
 
-
 def _parse_education_block(lines: List[str]) -> List[str]:
     entries: List[str] = []
     # Headers to skip
@@ -3300,7 +3234,6 @@ def _parse_education_block(lines: List[str]) -> List[str]:
             entries.append(cleaned)
     return entries
 
-
 def _is_degree_line(line: str) -> bool:
     lower = line.lower()
     return bool(
@@ -3310,14 +3243,12 @@ def _is_degree_line(line: str) -> bool:
         )
     )
 
-
 def _append_span(cand: Candidate, chunk_id: str, line: str, span_seen: set[str]) -> None:
     snippet = " ".join(line.split())[:120]
     if not snippet or snippet in span_seen:
         return
     span_seen.add(snippet)
     cand.evidence_spans.append(EvidenceSpan(chunk_id=str(chunk_id), snippet=snippet))
-
 
 def _merge_list(current: Optional[List[str]], new_items: List[str]) -> List[str]:
     merged = list(current or [])
@@ -3330,11 +3261,9 @@ def _merge_list(current: Optional[List[str]], new_items: List[str]) -> List[str]
         merged.append(item)
     return merged
 
-
 def _looks_like_education(text: str) -> bool:
     lower = text.lower()
     return any(token in lower for token in ("bachelor", "master", "phd", "university", "college", "b.tech", "btech", "mba"))
-
 
 def _infer_source_type(doc_name: str) -> Optional[str]:
     lowered = (doc_name or "").lower()
@@ -3350,7 +3279,6 @@ def _infer_source_type(doc_name: str) -> Optional[str]:
         return "Legal document"
     return None
 
-
 def _extract_name_guess(text: str, doc_name: str) -> Optional[str]:
     filename_guess = _name_from_filename(doc_name)
     if filename_guess:
@@ -3363,7 +3291,6 @@ def _extract_name_guess(text: str, doc_name: str) -> Optional[str]:
         if _looks_like_name(candidate):
             return candidate
     return None
-
 
 def _looks_like_name(value: str) -> bool:
     if not value:
@@ -3462,7 +3389,6 @@ def _looks_like_name(value: str) -> bool:
         return (token[:1].isupper() or (token[:1].isalpha() and not token[:1].islower())) and len(token) >= 3
     return all(p[:1].isupper() or (p[:1].isalpha() and not p[:1].islower()) for p in parts)
 
-
 def _smart_title_case(text: str) -> str:
     """Title-case long ALL CAPS words, keep short abbreviations (PK, MM) uppercase."""
     parts = text.split()
@@ -3473,7 +3399,6 @@ def _smart_title_case(text: str) -> str:
         else:
             result.append(p)
     return " ".join(result)
-
 
 def _name_from_filename(doc_name: str) -> Optional[str]:
     if not doc_name:
@@ -3537,7 +3462,6 @@ def _name_from_filename(doc_name: str) -> Optional[str]:
         return capitalized
 
     return None
-
 
 # ============================================================================
 # Fallback Extraction Functions - Used when section-based extraction fails
@@ -3609,7 +3533,6 @@ def _extract_name_from_text(text: str) -> Optional[str]:
                         return line
 
     return None
-
 
 def _extract_skills_from_text(text: str, skill_type: str = "technical") -> List[str]:
     """Extract skills directly from text content."""
@@ -3762,7 +3685,6 @@ def _extract_skills_from_text(text: str, skill_type: str = "technical") -> List[
 
     return unique_skills[:20]  # Return top 20 skills
 
-
 def _extract_education_from_text(text: str) -> List[str]:
     """Extract education entries from text using aggressive pattern matching."""
     education = []
@@ -3820,7 +3742,6 @@ def _extract_education_from_text(text: str) -> List[str]:
 
     return unique_edu[:5]
 
-
 _CONTACT_INFO_RE = re.compile(
     r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b'  # phone numbers
     r'|\S+@\S+\.\S+'                        # emails
@@ -3828,17 +3749,14 @@ _CONTACT_INFO_RE = re.compile(
     r'|\b\d{5,}\b',                          # long numbers (zip, ID)
 )
 
-
 def _clean_extracted_item(item: str) -> str:
     """Strip phone numbers, emails, URLs from an extracted cert/skill string."""
     item = _CONTACT_INFO_RE.sub('', item)
     return re.sub(r'\s+', ' ', item).strip()
 
-
 def _is_contact_line(line: str) -> bool:
     """Return True if the line is primarily contact information (phone, email, address)."""
     return bool(re.search(r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b|\S+@\S+\.\S+', line))
-
 
 def _extract_certifications_from_text(text: str) -> List[str]:
     """Extract certifications from text with broad pattern matching."""
@@ -3897,30 +3815,25 @@ def _extract_certifications_from_text(text: str) -> List[str]:
 
     return unique_certs[:10]
 
-
 def _items_field(items: List[InvoiceItem]) -> InvoiceItemsField:
     if items:
         return InvoiceItemsField(items=items, missing_reason=None)
     return InvoiceItemsField(items=None, missing_reason=MISSING_REASON)
-
 
 def _field_values_field(items: List[FieldValue]) -> FieldValuesField:
     if items:
         return FieldValuesField(items=items, missing_reason=None)
     return FieldValuesField(items=None, missing_reason=MISSING_REASON)
 
-
 def _candidates_field(items: List[Candidate]) -> CandidateField:
     if items:
         return CandidateField(items=items, missing_reason=None)
     return CandidateField(items=None, missing_reason=MISSING_REASON)
 
-
 def _clauses_field(items: List[Clause]) -> ClauseField:
     if items:
         return ClauseField(items=items, missing_reason=None)
     return ClauseField(items=None, missing_reason=MISSING_REASON)
-
 
 def _detect_multi_entity_collision(
     domain: str,
@@ -3947,7 +3860,6 @@ def _detect_multi_entity_collision(
     if scope_document_id:
         return False
     return len(doc_ids) > 1
-
 
 def _build_multi_entity_schema(
     domain: str,
@@ -3994,7 +3906,6 @@ def _build_multi_entity_schema(
 
     return MultiEntitySchema(entities=entities or None, missing_reason=None if entities else MISSING_REASON)
 
-
 def _chunk_document_id(chunk: Any) -> Optional[str]:
     meta = getattr(chunk, "meta", None) or getattr(chunk, "metadata", None) or {}
     for key in ("document_id", "doc_id", "docId"):
@@ -4002,7 +3913,6 @@ def _chunk_document_id(chunk: Any) -> Optional[str]:
         if value:
             return str(value)
     return None
-
 
 def extract_schema(
     domain: Optional[str],
@@ -4498,7 +4408,6 @@ def extract_schema(
             extra={"stage": "extract", "correlation_id": correlation_id},
         )
     return deterministic_result
-
 
 def _convert_document_data_to_candidate(data: Dict[str, Any]) -> Candidate:
     """Convert document extraction result to Candidate model."""

@@ -5,7 +5,7 @@ The hooks are designed to be called from embedding_service.py and documents_api.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 from typing import Any, Dict, List, Optional
@@ -15,7 +15,7 @@ from .intel_pipeline import process_document, ProcessingResult
 from .query_router import route_query, QueryAnalysis, QueryRoute
 from .response_assembler import assemble_response, AssembledResponse
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Feature flag — set DOCWAIN_INTEL_PIPELINE=1 to enable
 INTEL_PIPELINE_ENABLED = os.getenv("DOCWAIN_INTEL_PIPELINE", "0") == "1"
@@ -26,7 +26,6 @@ INTEL_PIPELINE_ENABLED = os.getenv("DOCWAIN_INTEL_PIPELINE", "0") == "1"
 
 _engine_lock = threading.Lock()
 _engine_instance = None
-
 
 def get_intelligence_engine():
     """Return the singleton IntelligenceEngine, or None if disabled.
@@ -47,7 +46,6 @@ def get_intelligence_engine():
         from .intelligence import IntelligenceEngine
         _engine_instance = IntelligenceEngine()
         return _engine_instance
-
 
 def run_intel_pipeline_hook(
     *,
@@ -85,7 +83,6 @@ def run_intel_pipeline_hook(
     except Exception as exc:
         logger.error("Intel pipeline hook failed for doc=%s: %s", document_id, exc, exc_info=True)
         return None
-
 
 def route_and_assemble(
     *,

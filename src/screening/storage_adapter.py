@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -13,15 +13,13 @@ from src.api.pipeline_models import ExtractedDocument
 from src.api.dataHandler import db, get_qdrant_client
 from src.api.vector_store import build_collection_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_document_collection():
     try:
         return db[Config.MongoDB.DOCUMENTS]
     except Exception:  # noqa: BLE001
         return None
-
 
 def _get_document_record(doc_id: str) -> Dict[str, Any]:
     collection = _get_document_collection()
@@ -52,7 +50,6 @@ def _get_document_record(doc_id: str) -> Dict[str, Any]:
             continue
 
     raise ValueError(f"Document not found for doc_id={doc_id}")
-
 
 def _extract_text_from_record(record: Dict[str, Any]) -> List[str]:
     texts: List[str] = []
@@ -95,7 +92,6 @@ def _extract_text_from_record(record: Dict[str, Any]) -> List[str]:
 
     return texts
 
-
 def _extract_text_from_extracted(extracted: Any) -> List[str]:
     texts: List[str] = []
     if isinstance(extracted, ExtractedDocument):
@@ -137,7 +133,6 @@ def _extract_text_from_extracted(extracted: Any) -> List[str]:
                 texts.append(" ".join(str(item) for item in value if item))
     return texts
 
-
 def get_extracted_document(document_id: str) -> ExtractedDocument:
     extracted = load_extracted_pickle(document_id)
     if isinstance(extracted, ExtractedDocument):
@@ -147,7 +142,6 @@ def get_extracted_document(document_id: str) -> ExtractedDocument:
             if isinstance(value, ExtractedDocument):
                 return value
     raise ValueError(f"Extracted content is not an ExtractedDocument for document_id={document_id}")
-
 
 def _fetch_chunks_from_qdrant(
     doc_id: str,
@@ -222,7 +216,6 @@ def _fetch_chunks_from_qdrant(
             logger.warning("Qdrant scroll failed for doc_id=%s: %s", doc_id, exc)
     return payloads
 
-
 def _combine_payload_texts(payloads: List[Dict[str, Any]]) -> List[str]:
     texts: List[str] = []
     for payload in payloads:
@@ -232,7 +225,6 @@ def _combine_payload_texts(payloads: List[Dict[str, Any]]) -> List[str]:
                 texts.append(value.strip())
                 break
     return texts
-
 
 def get_document_subscription_id(doc_id: str) -> Optional[str]:
     record = _get_document_record(doc_id)
@@ -261,10 +253,8 @@ def get_document_subscription_id(doc_id: str) -> Optional[str]:
             return text
     return None
 
-
 def get_document_metadata(doc_id: str) -> Dict[str, Any]:
     return _get_document_record(doc_id)
-
 
 def get_document_doc_type(doc_id: str) -> Optional[str]:
     record = _get_document_record(doc_id)
@@ -274,13 +264,11 @@ def get_document_doc_type(doc_id: str) -> Optional[str]:
             return value
     return None
 
-
 def extract_text_from_payload(extracted: Any) -> Optional[str]:
     texts = _extract_text_from_extracted(extracted)
     if texts:
         return "\n\n".join(texts)
     return None
-
 
 def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool = True) -> str:
     if extracted is not None:
@@ -398,7 +386,6 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
         return f"[Screening Placeholder] Document ID: {doc_id} - Original content unavailable"
 
     return "\n\n".join(texts)
-
 
 def get_document_bytes(doc_id: str) -> Optional[bytes]:
     record = _get_document_record(doc_id)

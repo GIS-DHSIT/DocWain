@@ -2,19 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Response builder
 # ---------------------------------------------------------------------------
-
 
 def _build_response(
     *,
@@ -45,11 +43,9 @@ def _build_response(
         "metadata": metadata,
     }
 
-
 # ---------------------------------------------------------------------------
 # ScreeningExecutor
 # ---------------------------------------------------------------------------
-
 
 class ScreeningExecutor:
     """Dedicated screening dispatcher for document analysis operations.

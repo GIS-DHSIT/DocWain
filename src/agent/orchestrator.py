@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -22,11 +22,10 @@ from src.prompting.persona import enforce_docwain_identity, get_docwain_persona,
 from src.prompting.response_contract import format_docwain_response
 from src.utils.payload_utils import get_canonical_text, get_document_type, get_source_name
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MAX_CONTEXT_CHARS = 8000
 PER_DOC_CHUNKS = 3
-
 
 @dataclass
 class DocumentContext:
@@ -36,7 +35,6 @@ class DocumentContext:
     language: str
     chunks: List[Dict[str, Any]]
 
-
 @dataclass
 class DocumentSummary:
     doc_name: str
@@ -45,7 +43,6 @@ class DocumentSummary:
     summary: str
     key_points: List[str]
     fields: Dict[str, Any]
-
 
 class AgentOrchestrator:
     @staticmethod
@@ -629,6 +626,5 @@ class AgentOrchestrator:
             new_session=request.new_session,
         )
         return {"answer": answer_payload, "current_session_id": active_session_id, "debug": {}}
-
 
 __all__ = ["AgentOrchestrator"]

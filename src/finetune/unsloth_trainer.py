@@ -2,7 +2,7 @@ import contextlib
 import hashlib
 import inspect
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import os
 import shutil
@@ -23,10 +23,9 @@ from src.ollama_publisher import DEFAULT_PARAMS as OLLAMA_DEFAULT_PARAMS
 from src.ollama_publisher import DEFAULT_SYSTEM_PROMPT, OllamaPublisher
 from transformers import __version__ as transformers_version
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _MANAGER = None
-
 
 def build_training_arguments(request: FinetuneRequest, output_dir: Path, has_eval_dataset: bool):
     """
@@ -103,13 +102,11 @@ def build_training_arguments(request: FinetuneRequest, output_dir: Path, has_eva
     )
     return TrainingArguments(**filtered_args)
 
-
 def get_finetune_manager():
     global _MANAGER
     if _MANAGER is None:
         _MANAGER = UnslothFinetuneManager()
     return _MANAGER
-
 
 class UnslothFinetuneManager:
     """Coordinates Unsloth fine-tune jobs and activates results per profile."""

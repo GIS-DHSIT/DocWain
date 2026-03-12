@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import uuid
 from datetime import datetime, timezone
@@ -12,7 +12,7 @@ from src.api.config import Config
 from src.api.genai_client import generate_text
 from src.storage.azure_blob_client import get_chat_container_client, upload_chat_history
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MAX_SESSIONS = int(os.getenv("CHAT_HISTORY_MAX_SESSIONS", "50"))
 MAX_MESSAGES_PER_SESSION = int(os.getenv("CHAT_HISTORY_MAX_MESSAGES_PER_SESSION", "200"))
@@ -21,10 +21,8 @@ MAX_RESPONSE_CHARS = int(os.getenv("CHAT_HISTORY_MAX_RESPONSE_CHARS", "6000"))
 MAX_SOURCES_PER_MESSAGE = int(os.getenv("CHAT_HISTORY_MAX_SOURCES_PER_MESSAGE", "8"))
 DEFAULT_CONTEXT_MESSAGES = int(os.getenv("CHAT_HISTORY_CONTEXT_MESSAGES", "10"))
 
-
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def _parse_iso_to_epoch(value: Optional[str]) -> float:
     raw = (value or "").strip()
@@ -37,13 +35,11 @@ def _parse_iso_to_epoch(value: Optional[str]) -> float:
     except Exception:
         return 0.0
 
-
 def _trim_text(value: Any, *, max_chars: int) -> str:
     text = str(value or "").strip()
     if len(text) > max_chars:
         return text[:max_chars]
     return text
-
 
 def _response_text(response: Any) -> str:
     if isinstance(response, dict):
@@ -56,7 +52,6 @@ def _response_text(response: Any) -> str:
     if isinstance(response, str):
         return response.strip()
     return str(response or "").strip()
-
 
 def _sanitize_sources(sources: Any) -> List[Dict[str, Any]]:
     if not isinstance(sources, list):
@@ -74,7 +69,6 @@ def _sanitize_sources(sources: Any) -> List[Dict[str, Any]]:
         cleaned.append(item)
     return cleaned
 
-
 def serialize_response(response: Any) -> Any:
     """Serialize responses for storage with bounded size."""
     if isinstance(response, dict):
@@ -86,7 +80,6 @@ def serialize_response(response: Any) -> Any:
     if isinstance(response, str):
         return _trim_text(response, max_chars=MAX_RESPONSE_CHARS)
     return _trim_text(str(response or ""), max_chars=MAX_RESPONSE_CHARS)
-
 
 def _normalize_message(message: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(message, dict):
@@ -103,7 +96,6 @@ def _normalize_message(message: Any) -> Optional[Dict[str, Any]]:
         "response": response,
         "timestamp": timestamp,
     }
-
 
 def _normalize_session(session: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(session, dict):
@@ -139,7 +131,6 @@ def _normalize_session(session: Any) -> Optional[Dict[str, Any]]:
         "messages": normalized_messages,
     }
 
-
 def _normalize_history(history: Any) -> Dict[str, Any]:
     sessions: List[Dict[str, Any]] = []
 
@@ -170,12 +161,10 @@ def _normalize_history(history: Any) -> Dict[str, Any]:
         sessions = sessions[-MAX_SESSIONS:]
     return {"sessions": sessions}
 
-
 def _latest_session(sessions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not sessions:
         return None
     return max(sessions, key=lambda s: _parse_iso_to_epoch(s.get("updated_at")))
-
 
 def get_chat_history(user_id: str) -> Dict[str, Any]:
     """Retrieve normalized chat history with sessions from Azure Blob Storage."""
@@ -192,7 +181,6 @@ def get_chat_history(user_id: str) -> Dict[str, Any]:
         logger.info("[GET_HISTORY] No existing chat history for %s: %s", user_id, exc)
         return {"sessions": []}
 
-
 def save_chat_history(user_id: str, chat_history: Dict[str, Any]) -> None:
     """Save normalized chat history to Azure Blob Storage."""
     try:
@@ -204,7 +192,6 @@ def save_chat_history(user_id: str, chat_history: Dict[str, Any]) -> None:
         logger.info("[SAVE_HISTORY] User=%s sessions=%d", user_id, len(normalized.get("sessions", [])))
     except Exception as exc:
         logger.error("Error saving chat history for %s: %s", user_id, exc)
-
 
 def create_new_session(
     query: Any,
@@ -236,12 +223,10 @@ def create_new_session(
         "messages": [normalized_message],
     }
 
-
 def generate_session_title(first_query: Any) -> str:
     """Generate a session title from the first query."""
     title = _trim_text(first_query, max_chars=50)
     return title or "Chat Session"
-
 
 def _append_message(target_session: Dict[str, Any], new_message: Dict[str, Any]) -> Tuple[int, int]:
     """Append message to a session and return old/new counts."""
@@ -252,7 +237,6 @@ def _append_message(target_session: Dict[str, Any], new_message: Dict[str, Any])
         target_session["messages"] = target_session["messages"][-MAX_MESSAGES_PER_SESSION:]
     target_session["updated_at"] = new_message.get("timestamp") or _now_iso()
     return old_count, len(target_session["messages"])
-
 
 def add_message_to_history(
     user_id: str,
@@ -325,7 +309,6 @@ def add_message_to_history(
     active_session_id = target_session.get("session_id") if target_session else None
     return normalized_history, active_session_id
 
-
 def get_current_session_context(
     user_id: str,
     session_id: Optional[str] = None,
@@ -357,7 +340,6 @@ def get_current_session_context(
         if isinstance(msg, dict)
     ]
 
-
 def delete_chat_history(user_id: str) -> Dict[str, str]:
     """Delete chat history from Azure Blob Storage."""
     try:
@@ -370,7 +352,6 @@ def delete_chat_history(user_id: str) -> Dict[str, str]:
     except Exception as exc:
         logger.error("Error deleting chat history for %s: %s", user_id, exc)
         return {"status": "error", "message": "Error deleting chat history"}
-
 
 def delete_session(user_id: str, session_id: str) -> Dict[str, str]:
     """Delete a specific session from chat history."""
@@ -391,7 +372,6 @@ def delete_session(user_id: str, session_id: str) -> Dict[str, str]:
         logger.error("Error deleting session %s for %s: %s", session_id, user_id, exc)
         return {"status": "error", "message": "Error deleting session"}
 
-
 def get_session_list(user_id: str) -> List[Dict[str, Any]]:
     """Get list of all sessions with metadata (for sidebar display)."""
     history = get_chat_history(user_id)
@@ -408,7 +388,6 @@ def get_session_list(user_id: str) -> List[Dict[str, Any]]:
         for session in ordered
     ]
 
-
 def get_session_by_id(user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
     """Get a specific session's full chat history."""
     history = get_chat_history(user_id)
@@ -417,7 +396,6 @@ def get_session_by_id(user_id: str, session_id: str) -> Optional[Dict[str, Any]]
         if session.get("session_id") == session_id:
             return session
     return None
-
 
 def generate_follow_up_questions(retrieved_text: str, num_questions: int = 3):
     """Generates follow-up questions using Gemini 2.5 Flash based on retrieved content."""

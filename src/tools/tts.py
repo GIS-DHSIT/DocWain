@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import os
 import tempfile
@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from src.tools.base import ToolError, generate_correlation_id, register_tool, standard_response
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/tts", tags=["Tools-TTS"])
 
@@ -26,13 +26,11 @@ try:  # pragma: no cover - optional dependency
 except Exception:  # noqa: BLE001
     pyttsx3 = None  # type: ignore
 
-
 class SpeakRequest(BaseModel):
     text: str = Field(..., min_length=1, description="Text to synthesize")
     voice: Optional[str] = Field(default=None, description="Voice id if supported by backend")
     format: str = Field(default="wav", pattern="^(mp3|wav)$")
     rate: Optional[int] = Field(default=None, ge=80, le=240)
-
 
 def _generate_tone(text: str, *, sample_rate: int = 16000) -> bytes:
     """
@@ -52,7 +50,6 @@ def _generate_tone(text: str, *, sample_rate: int = 16000) -> bytes:
             value = int(32767 * 0.2 * math.sin(2 * math.pi * freq * (i / sample_rate)))
             wav_file.writeframes(value.to_bytes(2, "little", signed=True))
     return buffer.getvalue()
-
 
 def _speak_with_pyttsx3(request: SpeakRequest) -> Tuple[bytes, list[str]]:
     warnings: list[str] = []
@@ -85,7 +82,6 @@ def _speak_with_pyttsx3(request: SpeakRequest) -> Tuple[bytes, list[str]]:
             pass
     return data, warnings
 
-
 def _synthesize(request: SpeakRequest) -> Tuple[bytes, str, list[str]]:
     fmt = request.format or "wav"
     if _PYTTSX3_AVAILABLE and fmt == "wav":
@@ -97,7 +93,6 @@ def _synthesize(request: SpeakRequest) -> Tuple[bytes, str, list[str]]:
     if fmt == "mp3":
         warnings.append("MP3 requested but fallback uses WAV encoding.")
     return audio, "fallback", warnings
-
 
 @register_tool("tts")
 async def tts_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
@@ -117,7 +112,6 @@ async def tts_handler(payload: Dict[str, Any], correlation_id: Optional[str] = N
         "warnings": warnings,
         "audio_bytes": audio_bytes,
     }
-
 
 @router.post("/speak")
 async def speak(request: SpeakRequest, x_correlation_id: str | None = Header(None)):

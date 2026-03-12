@@ -9,14 +9,13 @@ Performs heavy analysis asynchronously via a Redis-backed queue:
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class AnalysisJob:
@@ -26,7 +25,6 @@ class AnalysisJob:
     profile_id: str
     enqueued_at: float
     payload_key: str  # Redis key where extracted doc is stored
-
 
 class BackgroundAnalyzer:
     """Async background enrichment worker using Redis queue."""
@@ -262,18 +260,14 @@ class BackgroundAnalyzer:
     def is_running(self) -> bool:
         return self._running
 
-
 # Singleton
 _ANALYZER: Optional[BackgroundAnalyzer] = None
-
 
 def get_background_analyzer() -> Optional[BackgroundAnalyzer]:
     return _ANALYZER
 
-
 def set_background_analyzer(analyzer: BackgroundAnalyzer) -> None:
     global _ANALYZER
     _ANALYZER = analyzer
-
 
 __all__ = ["BackgroundAnalyzer", "get_background_analyzer", "set_background_analyzer"]

@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 from src.utils.payload_utils import get_canonical_text, token_count
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ALLOWED_CHUNK_KINDS = {
     "section_text",
@@ -24,10 +24,8 @@ ALLOWED_CHUNK_KINDS = {
     "doc_context",
 }
 
-
 class MetadataNormalizationError(ValueError):
     pass
-
 
 @dataclass(frozen=True)
 class NormalizedMetadata:
@@ -60,13 +58,11 @@ class NormalizedMetadata:
             "metadata_warnings": list(self.metadata_warnings or ()),
         }
 
-
 def _stringify(value: Any) -> Optional[str]:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
-
 
 def _intify(value: Any) -> Optional[int]:
     if value is None or value == "":
@@ -75,7 +71,6 @@ def _intify(value: Any) -> Optional[int]:
         return int(value)
     except Exception as exc:  # noqa: BLE001
         raise MetadataNormalizationError(f"Invalid integer value: {value}") from exc
-
 
 def _resolve_field(
     metadata: Dict[str, Any],
@@ -100,7 +95,6 @@ def _resolve_field(
         raise MetadataNormalizationError(f"Conflicting values for {canonical_key}: {distinct}")
     return candidates[0][1]
 
-
 def _resolve_int_field(
     metadata: Dict[str, Any],
     canonical_key: str,
@@ -120,7 +114,6 @@ def _resolve_int_field(
         raise MetadataNormalizationError(f"Conflicting values for {canonical_key}: {distinct_raw}")
     return _intify(candidates[0][1])
 
-
 def _infer_chunk_kind(metadata: Dict[str, Any], *, fallback: str = "section_text") -> str:
     chunk_kind = _stringify(metadata.get("chunk_kind"))
     if chunk_kind:
@@ -134,10 +127,8 @@ def _infer_chunk_kind(metadata: Dict[str, Any], *, fallback: str = "section_text
         return "section_summary"
     return fallback
 
-
 def infer_chunk_kind(metadata: Dict[str, Any], *, fallback: str = "section_text") -> str:
     return _infer_chunk_kind(metadata, fallback=fallback)
-
 
 def normalize_chunk_kind(
     metadata: Dict[str, Any],
@@ -153,7 +144,6 @@ def normalize_chunk_kind(
         logger.warning("Unknown chunk_kind '%s'; falling back to %s", chunk_kind, fallback)
         return fallback
     return chunk_kind
-
 
 def normalize_chunk_metadata(metadata: Dict[str, Any], *, strict: bool = True) -> NormalizedMetadata:
     document_type = _resolve_field(metadata, "document_type", aliases=("type",), required=False)
@@ -200,7 +190,6 @@ def normalize_chunk_metadata(metadata: Dict[str, Any], *, strict: bool = True) -
 
     return normalized
 
-
 def normalize_document_metadata(metadata: Dict[str, Any], *, strict: bool = False) -> NormalizedMetadata:
     document_type = _resolve_field(metadata, "document_type", aliases=("type",), required=False)
     doc_type = _stringify(metadata.get("doc_type"))
@@ -228,7 +217,6 @@ def normalize_document_metadata(metadata: Dict[str, Any], *, strict: bool = Fals
 
     return normalized
 
-
 def normalize_payload_metadata(payload: Dict[str, Any], *, strict: bool = True) -> Dict[str, Any]:
     normalized = normalize_chunk_metadata(payload, strict=strict)
     normalized_dict = normalized.to_dict()
@@ -243,7 +231,6 @@ def normalize_payload_metadata(payload: Dict[str, Any], *, strict: bool = True) 
     if normalized.file_name and _stringify(merged.get("source_file")) in {None, ""}:
         merged["source_file"] = normalized.file_name
     return merged
-
 
 def normalize_chunk_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize ingestion chunk payloads using the canonical metadata normalizer."""
@@ -295,7 +282,6 @@ def normalize_chunk_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     return payload
 
-
 def normalize_ingestion_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize metadata for ingestion/embedding without hard-failing on conflicts."""
     warnings: list[str] = []
@@ -336,7 +322,6 @@ def normalize_ingestion_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
     if doc_type_raw:
         normalized["doc_type"] = doc_type_raw
     return normalized
-
 
 __all__ = [
     "ALLOWED_CHUNK_KINDS",

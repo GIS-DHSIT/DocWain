@@ -1,5 +1,5 @@
 import asyncio
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional
 
 from src.api.config import Config
@@ -7,14 +7,13 @@ from src.teams.cards import build_card
 from src.teams.logic import TeamsChatContext, TeamsChatService
 from src.teams.state import TeamsStateStore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ADAPTIVE_CARD_TYPE = "application/vnd.microsoft.card.adaptive"
 DEFAULT_WEB_URL = getattr(Config.Teams, "WEB_APP_URL", "https://www.docwain.ai")
 
 _MAX_INPUT_LEN = 2000
 _VALID_PRESETS = frozenset({"invoice", "contract", "hr", "medical", "legal", "policy"})
-
 
 def _card_activity(card: Dict[str, Any], text: Optional[str] = None) -> Dict[str, Any]:
     activity: Dict[str, Any] = {
@@ -30,7 +29,6 @@ def _card_activity(card: Dict[str, Any], text: Optional[str] = None) -> Dict[str
         activity["text"] = text
     return activity
 
-
 def _format_sources(sources: Any) -> str:
     items = sources or []
     if not isinstance(items, list):
@@ -44,7 +42,6 @@ def _format_sources(sources: Any) -> str:
         else:
             snippets.append(f"- {name}")
     return "\n".join(snippets)
-
 
 class TeamsToolRouter:
     """Routes Teams Adaptive Card Submit actions to DocWain tools."""

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import re
 from dataclasses import dataclass
@@ -10,8 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.api.config import Config
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class CompanionClassification:
@@ -25,7 +24,6 @@ class CompanionClassification:
             "sentiment": self.sentiment,
             "style_directives": self.style_directives,
         }
-
 
 class CompanionClassifier:
     """Fast, cached intent/sentiment/style classifier for companion responses."""
@@ -266,7 +264,6 @@ class CompanionClassifier:
             "safety",
         ]
         return any(tok in normalized_query for tok in tokens)
-
 
 class CompanionConfig:
     """Placeholder to avoid attribute errors when Config.Companion is absent."""

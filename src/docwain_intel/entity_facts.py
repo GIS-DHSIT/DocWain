@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from .models import Block, Entity, EntityFactBundle, Fact, ExtractedDocumentJSON
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DATE_RE = re.compile(r"\b(?:\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\s+\d{4})\b", re.IGNORECASE)
 _CURRENCY_RE = re.compile(r"\b(?:\$|USD|EUR|GBP)\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b", re.IGNORECASE)
@@ -17,7 +17,6 @@ _ID_RE = re.compile(r"\b[A-Z]{2,5}-?\d{3,}\b")
 _CERT_HINT_RE = re.compile(r"\b(certified|certification|certificate)\b", re.IGNORECASE)
 _SKILL_HINT_RE = re.compile(r"\b(skills?|technologies|tools)\b", re.IGNORECASE)
 _ACRONYM_RE = re.compile(r"\b[A-Z]{2,6}\d?\b")
-
 
 try:  # pragma: no cover - optional dependency
     import spacy
@@ -36,22 +35,18 @@ except Exception:  # noqa: BLE001
     def _load_spacy():  # type: ignore[no-redef]
         return None
 
-
 def _hash_entity(label: str, text: str) -> str:
     raw = f"{label}|{text.lower()}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
-
 def _entity(label: str, text: str, attributes: Optional[Dict[str, Any]] = None) -> Entity:
     return Entity(entity_id=_hash_entity(label, text), label=label, text=text, attributes=attributes or {})
-
 
 def _block_text(block: Block) -> str:
     parts = [block.text or ""]
     if block.key and block.value:
         parts.append(f"{block.key}: {block.value}")
     return " ".join([p for p in parts if p]).strip()
-
 
 def _collect_blocks(document: ExtractedDocumentJSON) -> List[Tuple[Block, List[str]]]:
     block_map: Dict[str, Block] = {}
@@ -68,7 +63,6 @@ def _collect_blocks(document: ExtractedDocumentJSON) -> List[Tuple[Block, List[s
     for block_id, block in block_map.items():
         blocks.append((block, block_section.get(block_id, [])))
     return blocks
-
 
 def _facts_from_block(
     block: Block,
@@ -132,7 +126,6 @@ def _facts_from_block(
 
     return entities, facts
 
-
 def _spacy_entities(text: str) -> List[Entity]:
     nlp = _load_spacy()
     if not nlp:
@@ -151,7 +144,6 @@ def _spacy_entities(text: str) -> List[Entity]:
         result.append(_entity(mapped, ent.text))
     return result
 
-
 def extract_entities_and_facts(document: ExtractedDocumentJSON) -> EntityFactBundle:
     entities: Dict[str, Entity] = {}
     facts: List[Fact] = []
@@ -169,6 +161,5 @@ def extract_entities_and_facts(document: ExtractedDocumentJSON) -> EntityFactBun
         entities.setdefault(ent.entity_id, ent)
 
     return EntityFactBundle(entities=list(entities.values()), facts=facts)
-
 
 __all__ = ["extract_entities_and_facts"]

@@ -20,13 +20,12 @@ layer for higher-order analysis tasks.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Agent result
@@ -53,7 +52,6 @@ class AgentTaskResult:
             "reasoning": self.reasoning,
             "error": self.error,
         }
-
 
 # ---------------------------------------------------------------------------
 # Base domain agent
@@ -145,7 +143,6 @@ class DomainAgent(ABC):
     def can_handle(self, task_type: str) -> bool:
         """Check if this agent can handle the given task type."""
         return task_type in self.get_capabilities()
-
 
 # ---------------------------------------------------------------------------
 # Resume Agent
@@ -310,7 +307,6 @@ class ResumeAgent(DomainAgent):
         output = self._generate(prompt, temperature=0.2)
         return AgentTaskResult(task_type="certification_lookup", success=bool(output), output=output)
 
-
 # ---------------------------------------------------------------------------
 # Medical Agent
 # ---------------------------------------------------------------------------
@@ -467,7 +463,6 @@ class MedicalAgent(DomainAgent):
         output = self._generate(prompt, temperature=0.1)
         return AgentTaskResult(task_type="evidence_based_review", success=bool(output), output=output)
 
-
 # ---------------------------------------------------------------------------
 # Legal Agent
 # ---------------------------------------------------------------------------
@@ -622,7 +617,6 @@ class LegalAgent(DomainAgent):
             structured_data={"country": country},
         )
 
-
 # ---------------------------------------------------------------------------
 # Invoice/Financial Agent
 # ---------------------------------------------------------------------------
@@ -714,7 +708,6 @@ class InvoiceAgent(DomainAgent):
         )
         output = self._generate(prompt, temperature=0.1)
         return AgentTaskResult(task_type="duplicate_detection", success=bool(output), output=output)
-
 
 # ---------------------------------------------------------------------------
 # Content Agent
@@ -867,7 +860,6 @@ class ContentAgent(DomainAgent):
             structured_data={"num_slides": num_slides, "topic": topic},
         )
 
-
 # ---------------------------------------------------------------------------
 # Translator Agent
 # ---------------------------------------------------------------------------
@@ -986,7 +978,6 @@ class TranslatorAgent(DomainAgent):
             task_type="localize_content", success=bool(output), output=output,
             structured_data={"target_region": target_region, "target_language": target_language},
         )
-
 
 # ---------------------------------------------------------------------------
 # Tutor Agent
@@ -1121,7 +1112,6 @@ class TutorAgent(DomainAgent):
             task_type="study_guide", success=bool(output), output=output,
             structured_data={"topic": topic},
         )
-
 
 # ---------------------------------------------------------------------------
 # Image Agent
@@ -1301,7 +1291,6 @@ class ImageAgent(DomainAgent):
             structured_data={"method": "text_based"},
         )
 
-
 # ---------------------------------------------------------------------------
 # Web Agent
 # ---------------------------------------------------------------------------
@@ -1424,7 +1413,6 @@ class WebAgent(DomainAgent):
             task_type="fact_check", success=bool(output), output=output,
             structured_data={"claim": claim[:200]},
         )
-
 
 # ---------------------------------------------------------------------------
 # Insights Agent
@@ -1562,7 +1550,6 @@ class InsightsAgent(DomainAgent):
             task_type="generate_report", success=bool(output), output=output,
             structured_data={"report_type": report_type},
         )
-
 
 # ---------------------------------------------------------------------------
 # Screening Agent
@@ -1721,7 +1708,6 @@ class ScreeningAgent(DomainAgent):
             structured_data={"standards": standards},
         )
 
-
 # ---------------------------------------------------------------------------
 # Cloud Platform Agent
 # ---------------------------------------------------------------------------
@@ -1815,7 +1801,6 @@ class CloudPlatformAgent(DomainAgent):
         )
         output = self._generate(prompt, temperature=0.3, max_tokens=2048)
         return AgentTaskResult(task_type="cross_platform_summary", success=bool(output), output=output)
-
 
 # ---------------------------------------------------------------------------
 # Customer Service Agent
@@ -1959,7 +1944,6 @@ class CustomerServiceAgent(DomainAgent):
         )
         output = self._generate(prompt, temperature=0.2, max_tokens=1024)
         return AgentTaskResult(task_type="faq_search", success=bool(output), output=output)
-
 
 # ---------------------------------------------------------------------------
 # Analytics Visualization Agent
@@ -2255,7 +2239,6 @@ class AnalyticsVisualizationAgent(DomainAgent):
 
         return AgentTaskResult(task_type="compute_statistics", success=bool(analysis), output=analysis)
 
-
 # ---------------------------------------------------------------------------
 # Agent Registry
 # ---------------------------------------------------------------------------
@@ -2299,7 +2282,6 @@ _DOMAIN_AGENTS: Dict[str, type] = {
     "visualization": AnalyticsVisualizationAgent,
 }
 
-
 def get_domain_agent(domain: str, llm_client: Any = None, thinking_client: Any = None) -> Optional[DomainAgent]:
     """Get a domain-specialized agent by domain name.
 
@@ -2310,7 +2292,6 @@ def get_domain_agent(domain: str, llm_client: Any = None, thinking_client: Any =
     if agent_class is None:
         return None
     return agent_class(llm_client=llm_client, thinking_client=thinking_client)
-
 
 def list_available_agents() -> Dict[str, List[str]]:
     """List all available agents and their capabilities."""
@@ -2323,7 +2304,6 @@ def list_available_agents() -> Dict[str, List[str]]:
         agent = agent_class()
         result[domain] = agent.get_capabilities()
     return result
-
 
 def _ml_detect_domain(query: str) -> Optional[str]:
     """Use ML intent classifier to detect domain. Returns domain string or None."""
@@ -2357,10 +2337,8 @@ def _ml_detect_domain(query: str) -> Optional[str]:
     except Exception:
         return None
 
-
 # Task detection now uses NLU engine — see src/nlp/nlu_engine.py domain_task registry.
 # No hardcoded keyword patterns needed.
-
 
 def _customer_service_fast_path(query: str) -> Optional[Dict[str, str]]:
     """Keyword fast-path for customer service tasks.
@@ -2396,7 +2374,6 @@ def _customer_service_fast_path(query: str) -> Optional[Dict[str, str]]:
 
     return None
 
-
 def _keyword_task_fast_path(query: str) -> Optional[Dict[str, str]]:
     """Keyword fast-path for domain tasks where embedding similarity
     between closely related tasks (e.g., anomaly vs duplicate detection)
@@ -2418,7 +2395,6 @@ def _keyword_task_fast_path(query: str) -> Optional[Dict[str, str]]:
         return {"domain": "translation", "task_type": "detect_language"}
 
     return None
-
 
 def detect_agent_task(query: str, domain: str = "") -> Optional[Dict[str, str]]:
     """Detect if a query requires a specialized agent task.
@@ -2459,7 +2435,6 @@ def detect_agent_task(query: str, domain: str = "") -> Optional[Dict[str, str]]:
             pass
 
     return None
-
 
 __all__ = [
     "DomainAgent",

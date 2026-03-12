@@ -1,0 +1,45 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "Image",
+              "url": "https://adaptivecards.io/content/pending.png",
+              "size": "Small",
+              "width": "24px"
+            }
+          ],
+          "verticalContentAlignment": "Center"
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "{status_message}",
+              "wrap": true,
+              "weight": "Bolder"
+            },
+            {
+              "type": "TextBlock",
+              "text": "This may take a moment...",
+              "wrap": true,
+              "isSubtle": true,
+              "size": "Small"
+            }
+          ],
+          "verticalContentAlignment": "Center"
+        }
+      ]
+    }
+  ]
+}

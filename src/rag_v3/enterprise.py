@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, List, Optional, TYPE_CHECKING
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from .query_focus import QueryFocus
 
 from .types import GenericSchema, HRSchema, InvoiceSchema, LegalSchema, MedicalSchema, MISSING_REASON, MultiEntitySchema, PolicySchema
-
 
 NO_ITEMS_MESSAGE = "Invoice pages retrieved don't show itemized products/services—only totals/parties."
 
@@ -24,7 +23,6 @@ _RENDER_GARBAGE_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 _NER_LABEL_RE = re.compile(
     r"\s+(?:person|organization|other|date|location|money|percent|norp|fac|gpe|event|product|work_of_art|law|language):\s*$",
     re.IGNORECASE,
@@ -33,7 +31,6 @@ _NER_INLINE_RE = re.compile(
     r"(?:^|\s+)(?:person|organization|other|date|location|money|percent|norp|fac|gpe|event|product|work_of_art|law|language):\s*",
     re.IGNORECASE,
 )
-
 
 def _sanitize_render_value(value: str, max_length: int = 500) -> str:
     """Final safety net: clean any remaining metadata from a rendered value."""
@@ -53,14 +50,12 @@ def _sanitize_render_value(value: str, max_length: int = 500) -> str:
         cleaned = cleaned[:max_length].rstrip()
     return cleaned.strip()
 
-
 # Contact info pattern — items that are phone numbers, emails, or addresses should be stripped
 _CONTACT_ITEM_RE = re.compile(
     r'^\s*\+?\d[\d\s\-().]{7,}\s*$'     # pure phone number
     r'|^\s*\S+@\S+\.\S+\s*$'             # pure email
     r'|^\s*https?://\S+\s*$'             # pure URL
 )
-
 
 # Intent-aware rendering limits — concise intents get fewer items
 _INTENT_MAX_ITEMS = {
@@ -75,7 +70,6 @@ _INTENT_MAX_ITEMS = {
     "analyze": 20,
     "timeline": 20,
 }
-
 
 def _sanitize_render_list(items: List[str], max_items: int = 20, *, intent: str = "") -> List[str]:
     """Clean a list of rendered items, removing any garbage entries."""
@@ -94,7 +88,6 @@ def _sanitize_render_list(items: List[str], max_items: int = 20, *, intent: str 
         if item and len(item) > 2:
             cleaned.append(item)
     return cleaned[:max_items]
-
 
 def render_enterprise(schema: Any, intent: str, *, domain: str | None = None, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     if isinstance(schema, MultiEntitySchema):
@@ -154,7 +147,6 @@ def render_enterprise(schema: Any, intent: str, *, domain: str | None = None, st
                     break
     return result
 
-
 def _render_generic(schema: GenericSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     """Adaptive renderer — formats based on content structure, not domain label."""
     facts_items = (schema.facts.items if schema.facts else None) or []
@@ -201,7 +193,6 @@ def _render_generic(schema: GenericSchema, intent: str, strict: bool = False, qu
         return rendered
 
     return _render_flat_facts(facts, intent=intent)
-
 
 def _render_grouped_by_document(facts: List[Any]) -> str:
     """Render facts grouped by document_name, then by section."""
@@ -273,7 +264,6 @@ def _render_grouped_by_document(facts: List[Any]) -> str:
 
     return "\n".join(lines).strip()
 
-
 _INTENT_HEADINGS = {
     "contact": "Contact Information:",
     "rank": "Candidate Rankings:",
@@ -282,7 +272,6 @@ _INTENT_HEADINGS = {
     "list": "Listed Items:",
     "facts": None,
 }
-
 
 # Auto-bold significant values in rendered facts (GPT-style emphasis)
 _SIGNIFICANT_VALUE_RE = re.compile(
@@ -295,13 +284,11 @@ _SIGNIFICANT_VALUE_RE = re.compile(
     r"(?!\*\*)"  # not already bolded
 )
 
-
 def _bold_significant_values(text: str) -> str:
     """Bold significant numeric values in fact text (currency, %, large numbers, year ranges)."""
     if not text or (text.startswith("**") and text.endswith("**")):
         return text  # Already fully wrapped in bold formatting, skip
     return _SIGNIFICANT_VALUE_RE.sub(r"**\1**", text)
-
 
 def _render_flat_facts(facts: List[Any], intent: str = "facts") -> str:
     """Render facts without document grouping (single-doc or no doc info).
@@ -390,7 +377,6 @@ def _render_flat_facts(facts: List[Any], intent: str = "facts") -> str:
 
     return "\n".join(lines).strip()
 
-
 def _render_multi(schema: MultiEntitySchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     entities = schema.entities or []
     if not entities:
@@ -477,7 +463,6 @@ def _render_multi(schema: MultiEntitySchema, intent: str, strict: bool = False, 
             lines.append(f"You can ask about a specific person, e.g., \"Tell me about {names[0]}\"")
 
     return "\n".join(lines).strip()
-
 
 def _render_hr(schema: HRSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     candidates = (schema.candidates.items if schema.candidates else None) or []
@@ -694,7 +679,6 @@ def _render_hr(schema: HRSchema, intent: str, strict: bool = False, query: str =
 
     return "\n".join(parts).strip()
 
-
 _RANK_STOP_WORDS = frozenset({
     "the", "and", "or", "for", "a", "an", "is", "are", "was", "were",
     "of", "in", "to", "with", "on", "at", "by", "from", "as", "it",
@@ -733,7 +717,6 @@ for _canonical, _syns in _SKILL_SYNONYMS.items():
         _SYNONYM_REVERSE[_syn] = _canonical
     _SYNONYM_REVERSE[_canonical] = _canonical
 
-
 def _expand_query_keywords(keywords: set[str]) -> set[str]:
     """Expand query keywords with skill synonyms for better matching."""
     expanded = set(keywords)
@@ -745,7 +728,6 @@ def _expand_query_keywords(keywords: set[str]) -> set[str]:
             expanded.add(canonical)
             expanded.update(_SKILL_SYNONYMS.get(canonical, set()))
     return expanded
-
 
 def _rank_candidates(candidates: List[Any], query: str = ""):
     """Rank candidates by a weighted score combining profile strength and query relevance.
@@ -832,14 +814,12 @@ def _rank_candidates(candidates: List[Any], query: str = ""):
     scored.sort(key=lambda item: item[0], reverse=True)
     return [cand for _, cand in scored]
 
-
 def _parse_years(value: str):
     try:
         number = float(value.split()[0])
         return number
     except Exception:
         return None
-
 
 def _format_rank_line(idx: int, cand: Any) -> str:
     name = _sanitize_render_value(cand.name or "", max_length=80) or "Candidate"
@@ -861,7 +841,6 @@ def _format_rank_line(idx: int, cand: Any) -> str:
         detail_parts.append(f"certifications: {certs}")
     detail = "; ".join(detail_parts) if detail_parts else "See document for details"
     return f"{idx}. **{name}** — {detail}"
-
 
 def _format_candidate_detail(cand: Any) -> str:
     name = _sanitize_render_value(cand.name or "", max_length=80) or "Candidate"
@@ -908,11 +887,9 @@ def _format_candidate_detail(cand: Any) -> str:
         lines.append(f"- Source: {source}")
     return "\n".join(lines)
 
-
 def _render_contact_value(value: Any) -> str:
     items = [item for item in (value or []) if item]
     return ", ".join(items) if items else ""
-
 
 def _render_invoice(schema: InvoiceSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     # Detect vendor/seller/supplier query intent for adaptive headings
@@ -1037,7 +1014,6 @@ def _render_invoice(schema: InvoiceSchema, intent: str, strict: bool = False, qu
     # No structured invoice sections could be rendered
     return "No invoice details were found in the provided documents."
 
-
 def _render_totals_parties(schema: InvoiceSchema, prefer_totals: bool = True, query: str = "") -> str:
     parts: List[str] = []
     totals_items = (schema.totals.items if schema.totals else None) or []
@@ -1062,10 +1038,8 @@ def _render_totals_parties(schema: InvoiceSchema, prefer_totals: bool = True, qu
             parts.extend(f"- {item}" for item in terms)
     return "\n".join(parts).strip()
 
-
 def _format_item(text: str) -> str:
     return " ".join(text.split())
-
 
 _MONEY_RE = re.compile(
     r"(?:(?:USD|EUR|GBP|INR|AUD|CAD|JPY|CHF)\s*)?[\$€£₹¥]?\s*"
@@ -1078,7 +1052,6 @@ _CURRENCY_SYMBOLS = {
     "usd": "$", "eur": "€", "gbp": "£", "inr": "₹", "jpy": "¥",
     "$": "$", "€": "€", "£": "£", "₹": "₹", "¥": "¥",
 }
-
 
 def _format_monetary(value: str) -> str:
     """Normalize monetary values to consistent format with currency symbol and 2 decimals."""
@@ -1102,7 +1075,6 @@ def _format_monetary(value: str) -> str:
             pass
     return value
 
-
 def _format_field(label: str | None, value: str) -> str:
     if label:
         # Auto-format monetary fields
@@ -1111,7 +1083,6 @@ def _format_field(label: str | None, value: str) -> str:
             value = _format_monetary(value)
         return f"{label}: {value}"
     return value
-
 
 def _render_legal(schema: LegalSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     clauses_items = (schema.clauses.items if schema.clauses else None) or []
@@ -1227,7 +1198,6 @@ def _render_legal(schema: LegalSchema, intent: str, strict: bool = False, query:
 
     return "\n\n".join(parts).strip()
 
-
 def _render_medical(schema: MedicalSchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     """Render structured medical document intelligence."""
     _SECTION_MAP = {
@@ -1318,7 +1288,6 @@ def _render_medical(schema: MedicalSchema, intent: str, strict: bool = False, qu
         result = f"{overview}\n\n{result}"
 
     return result
-
 
 def _render_policy(schema: PolicySchema, intent: str, strict: bool = False, query: str = "", query_focus: Optional["QueryFocus"] = None) -> str:
     """Render structured insurance policy intelligence."""
@@ -1418,7 +1387,6 @@ def _render_policy(schema: PolicySchema, intent: str, strict: bool = False, quer
 
     return result
 
-
 def _compute_hr_insights(candidates: List[Any]) -> str:
     """Compute statistical insights from multiple HR candidates."""
     if len(candidates) < 2:
@@ -1468,7 +1436,6 @@ def _compute_hr_insights(candidates: List[Any]) -> str:
 
     return " ".join(parts)
 
-
 def _compute_invoice_insights(schema: Any) -> str:
     """Compute statistical insights from invoice data."""
     parts: List[str] = []
@@ -1503,7 +1470,6 @@ def _compute_invoice_insights(schema: Any) -> str:
 
     return " ".join(parts)
 
-
 def _compute_generic_insights(facts: List[Any]) -> str:
     """Compute insights from generic facts across documents."""
     if len(facts) < 3:
@@ -1530,6 +1496,5 @@ def _compute_generic_insights(facts: List[Any]) -> str:
         parts.append(f"Recurring themes: {', '.join(common_themes)}.")
 
     return " ".join(parts)
-
 
 __all__ = ["render_enterprise"]

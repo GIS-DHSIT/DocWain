@@ -11,14 +11,14 @@ confidence-weighted correction priority, and missing-evidence detection.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -137,7 +137,6 @@ _PRIORITY_NUMERIC = 3    # Sentences with numbers — highest risk
 _PRIORITY_ENTITY = 2     # Sentences with named entities
 _PRIORITY_GENERIC = 1    # Generic unsupported sentences
 
-
 # ── Data classes ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -146,7 +145,6 @@ class MissingEvidence:
     text: str
     occurrences_in_evidence: int
     evidence_type: str  # "entity" or "number"
-
 
 @dataclass
 class CorrectionResult:
@@ -169,13 +167,11 @@ class CorrectionResult:
             "missing_evidence_count": len(self.missing_evidence),
         }
 
-
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _tokenize(text: str) -> Set[str]:
     """Extract lowercase tokens from text."""
     return {t.lower() for t in _TOKEN_RE.findall(text) if len(t) > 2}
-
 
 def _expand_with_synonyms(tokens: Set[str]) -> Set[str]:
     """Expand a token set with known synonyms."""
@@ -185,7 +181,6 @@ def _expand_with_synonyms(tokens: Set[str]) -> Set[str]:
         if synonyms:
             expanded.update(synonyms)
     return expanded
-
 
 def _split_sentences(text: str) -> List[str]:
     """Split text into sentences, keeping table rows, list items, and headers intact."""
@@ -216,7 +211,6 @@ def _split_sentences(text: str) -> List[str]:
         sentences.extend(s.strip() for s in parts if s and len(s.strip()) > 5)
     return sentences
 
-
 def _jaccard(a: Set[str], b: Set[str]) -> float:
     """Compute Jaccard similarity between two token sets."""
     if not a or not b:
@@ -225,13 +219,11 @@ def _jaccard(a: Set[str], b: Set[str]) -> float:
     union = a | b
     return len(inter) / max(len(union), 1)
 
-
 def _get_negation_tokens(domain: Optional[str] = None) -> FrozenSet[str]:
     """Get negation tokens, optionally enriched with domain-specific ones."""
     if domain and domain.lower() in _DOMAIN_NEGATION_TOKENS:
         return _NEGATION_TOKENS | _DOMAIN_NEGATION_TOKENS[domain.lower()]
     return _NEGATION_TOKENS
-
 
 def _has_negation_mismatch(
     sentence: str,
@@ -273,13 +265,11 @@ def _has_negation_mismatch(
 
     return False
 
-
 def _asymmetric_containment(response_tokens: Set[str], evidence_tokens: Set[str]) -> float:
     """What fraction of response tokens appear in evidence (asymmetric)."""
     if not response_tokens:
         return 0.0
     return len(response_tokens & evidence_tokens) / len(response_tokens)
-
 
 def _score_sentence(
     sentence: str,
@@ -362,7 +352,6 @@ def _score_sentence(
 
     return score
 
-
 def _classify_sentence_priority(sentence: str) -> int:
     """Classify correction priority for an unsupported sentence.
 
@@ -376,7 +365,6 @@ def _classify_sentence_priority(sentence: str) -> int:
     if has_entities:
         return _PRIORITY_ENTITY
     return _PRIORITY_GENERIC
-
 
 def _detect_missing_evidence(
     response: str,
@@ -456,7 +444,6 @@ def _detect_missing_evidence(
 
     return missing
 
-
 _STRUCTURAL_RE = re.compile(
     r"^\s*(?:"
     r"\*\*|##|###|####"              # Markdown headers/bold
@@ -468,7 +455,6 @@ _STRUCTURAL_RE = re.compile(
     r"|based on|according to|from the" # Attribution intros
     r")"
 )
-
 
 def _is_structural(sentence: str) -> bool:
     """Check if sentence is structural (heading, list intro, attribution) and should be kept."""
@@ -483,7 +469,6 @@ def _is_structural(sentence: str) -> bool:
     if stripped.startswith("|") and stripped.endswith("|"):
         return True
     return False
-
 
 # ── LLM correction helpers ──────────────────────────────────────────────────
 
@@ -515,7 +500,6 @@ def _call_llm_correction(
         logger.debug("LLM correction failed for sentence: %s", exc)
         return None
 
-
 def _call_llm(llm_client: Any, prompt: str) -> str:
     """Call LLM client."""
     if hasattr(llm_client, "generate"):
@@ -524,7 +508,6 @@ def _call_llm(llm_client: Any, prompt: str) -> str:
             return result[0] if result[0] else ""
         return result or ""
     return ""
-
 
 def _call_llm_batch_correction(
     llm_client: Any,
@@ -583,7 +566,6 @@ def _call_llm_batch_correction(
         elif len(text) >= 5:
             corrections[idx] = text
     return corrections
-
 
 # ── Main entry point ────────────────────────────────────────────────────────
 

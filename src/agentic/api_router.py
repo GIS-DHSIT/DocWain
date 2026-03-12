@@ -8,7 +8,7 @@ Agents can be invoked:
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import uuid
 from typing import Any, Dict, List, Optional, Union
 
@@ -16,10 +16,9 @@ from fastapi import APIRouter, Header, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
-
 
 class AgentRequest(BaseModel):
     """Request body for agent execution."""
@@ -30,7 +29,6 @@ class AgentRequest(BaseModel):
     subscription_id: Optional[str] = None
     profile_id: Optional[str] = None
 
-
 class AgentRunRequest(BaseModel):
     """Request body for the generic agent run endpoint."""
     agent_name: str = Field(..., description="Name of the agent to invoke")
@@ -40,7 +38,6 @@ class AgentRunRequest(BaseModel):
     options: Dict[str, Any] = Field(default_factory=dict)
     subscription_id: Optional[str] = None
     profile_id: Optional[str] = None
-
 
 # GET /api/agents — list all agents and their capabilities
 @router.get("")
@@ -60,7 +57,6 @@ def list_agents():
         "total": len(agents),
     }
 
-
 # GET /api/agents/{agent_name} — get specific agent details
 @router.get("/{agent_name}")
 def get_agent_info(agent_name: str):
@@ -78,7 +74,6 @@ def get_agent_info(agent_name: str):
         "capabilities": agent.get_capabilities(),
         "description": f"Specialized agent for {agent.domain} domain tasks",
     }
-
 
 # POST /api/agents/{agent_name}/execute — invoke a specific agent
 @router.post("/{agent_name}/execute")
@@ -157,7 +152,6 @@ def execute_agent(
             },
         )
 
-
 # POST /api/agents/run — generic agent dispatcher (similar to /api/tools/run)
 @router.post("/run")
 def run_agent(
@@ -175,7 +169,6 @@ def run_agent(
     )
     return execute_agent(request.agent_name, agent_request, x_correlation_id)
 
-
 def _get_agent_names() -> List[str]:
     """Get list of available agent names."""
     try:
@@ -183,7 +176,6 @@ def _get_agent_names() -> List[str]:
         return list(list_available_agents().keys())
     except Exception:
         return []
-
 
 def _retrieve_rag_context(query: str, subscription_id: str, profile_id: str) -> Optional[str]:
     """Retrieve document context from RAG for agent use."""
@@ -211,7 +203,6 @@ def _retrieve_rag_context(query: str, subscription_id: str, profile_id: str) -> 
     except Exception as exc:
         logger.debug("RAG context retrieval for agent failed: %s", exc)
     return None
-
 
 # Backward-compat: tools/run shim
 # This can be mounted separately to handle old /api/tools/run requests
@@ -262,6 +253,5 @@ _TOOL_TO_TASK_MAP = {
     "cloud_platform": "manage_cloud_resource",
     "sharepoint": "manage_sharepoint",
 }
-
 
 agents_router = router

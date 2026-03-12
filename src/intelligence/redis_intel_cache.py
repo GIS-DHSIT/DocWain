@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
@@ -9,12 +9,10 @@ from typing import Any, Dict, Iterable, List, Optional
 from src.api.config import Config
 from src.intelligence.redis_schema import RedisSchema
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _now_ts() -> float:
     return float(time.time())
-
 
 def _safe_json_loads(payload: Optional[str]) -> Optional[Dict[str, Any]]:
     if payload is None:
@@ -26,10 +24,8 @@ def _safe_json_loads(payload: Optional[str]) -> Optional[Dict[str, Any]]:
         logger.debug("Redis JSON decode failed: %s", exc)
         return None
 
-
 def _safe_json_dumps(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
-
 
 @dataclass
 class SessionState:
@@ -69,7 +65,6 @@ class SessionState:
             style_prefs=payload.get("style_prefs") or {"verbosity": "medium", "format_bias": "bullets"},
             last_seen_ts=float(payload.get("last_seen_ts") or _now_ts()),
         )
-
 
 class RedisIntelCache:
     """Redis helper for DocWain intelligent-by-default cache (dwx:*)."""
@@ -196,6 +191,5 @@ class RedisIntelCache:
         state.last_seen_ts = _now_ts()
         self.set_session_state(subscription_id, session_id, state)
         return state
-
 
 __all__ = ["RedisIntelCache", "SessionState"]

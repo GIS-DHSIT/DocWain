@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
 from src.orchestrator.response_validator import validate_response_payload
 from src.retrieval.profile_evidence import DocumentEvidence, ProfileEvidenceGraph
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def select_output_schema(intent: str) -> Dict[str, Any]:
     if intent == "extract":
@@ -21,7 +20,6 @@ def select_output_schema(intent: str) -> Dict[str, Any]:
     if intent == "rank":
         return {"schema": "rank", "required_fields": ["schema", "ranking", "documents"]}
     return {"schema": "answer", "required_fields": ["schema", "answer", "documents"]}
-
 
 def generate_structured_answer(
     *,
@@ -60,7 +58,6 @@ def generate_structured_answer(
         logger.debug("Structured answer generation failed: %s", exc)
     return json.dumps(base_payload, indent=2)
 
-
 def build_payload(
     *,
     user_query: str,
@@ -94,7 +91,6 @@ def build_payload(
     payload["answer"] = _summarize_documents(evidence_graph)
     return payload
 
-
 def _document_payload(doc: DocumentEvidence) -> Dict[str, Any]:
     contacts = doc.contacts
     return {
@@ -112,12 +108,10 @@ def _document_payload(doc: DocumentEvidence) -> Dict[str, Any]:
         "tables": _items_or_not_mentioned(doc.tables),
     }
 
-
 def _items_or_not_mentioned(items: List[Any]) -> Any:
     if not items:
         return "Not Mentioned"
     return [_item_payload(item) for item in items]
-
 
 def _item_payload(item: Any) -> Dict[str, Any]:
     return {
@@ -132,7 +126,6 @@ def _item_payload(item: Any) -> Dict[str, Any]:
         "meta": item.meta,
     }
 
-
 def _summarize_documents(graph: ProfileEvidenceGraph) -> str:
     parts: List[str] = []
     for doc in graph.documents.values():
@@ -145,14 +138,12 @@ def _summarize_documents(graph: ProfileEvidenceGraph) -> str:
         )
     return " | ".join(parts) if parts else "Not Mentioned"
 
-
 def _list_items_from_evidence(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
     for doc in graph.documents.values():
         for ident in doc.identifiers:
             items.append({"item": ident.value, "document_id": doc.document_id, "source_name": doc.source_name})
     return items
-
 
 def _compare_documents(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
     comparisons: List[Dict[str, Any]] = []
@@ -169,7 +160,6 @@ def _compare_documents(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
                 }
             )
     return comparisons
-
 
 def _rank_documents(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
     ranked = sorted(
@@ -189,18 +179,15 @@ def _rank_documents(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
         )
     return ranking
 
-
 def _shared_values(doc: DocumentEvidence, other: DocumentEvidence) -> List[str]:
     left = {item.value.lower() for item in doc.identifiers}
     right = {item.value.lower() for item in other.identifiers}
     return sorted(left.intersection(right))
 
-
 def _diff_values(doc: DocumentEvidence, other: DocumentEvidence) -> List[str]:
     left = {item.value.lower() for item in doc.identifiers}
     right = {item.value.lower() for item in other.identifiers}
     return sorted(left.symmetric_difference(right))
-
 
 def _build_prompt(user_query: str, schema_name: str, base_payload: Dict[str, Any]) -> str:
     schema_json = json.dumps(base_payload, indent=2)
@@ -215,11 +202,9 @@ def _build_prompt(user_query: str, schema_name: str, base_payload: Dict[str, Any
         f"{schema_json}\n"
     )
 
-
 def _should_merge(user_query: str) -> bool:
     lowered = (user_query or "").lower()
     return any(keyword in lowered for keyword in ("merge", "combine", "together"))
-
 
 def _merge_documents(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
     entities: List[Dict[str, Any]] = []
@@ -249,7 +234,6 @@ def _merge_documents(graph: ProfileEvidenceGraph) -> List[Dict[str, Any]]:
         merged.append({"group": group, "merge_key": sorted(keys)})
     return merged
 
-
 def _join_keys(doc: DocumentEvidence) -> set[str]:
     keys = set()
     for item in doc.contacts.get("emails", []):
@@ -261,7 +245,6 @@ def _join_keys(doc: DocumentEvidence) -> set[str]:
         if "linkedin.com" in url:
             keys.add(url)
     return keys
-
 
 def _extract_json(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -276,6 +259,5 @@ def _extract_json(text: str) -> Optional[Dict[str, Any]]:
             return json.loads(match.group(0))
         except json.JSONDecodeError:
             return None
-
 
 __all__ = ["select_output_schema", "generate_structured_answer", "build_payload"]

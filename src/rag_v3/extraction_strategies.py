@@ -14,14 +14,13 @@ The ExtractionOrchestrator coordinates these strategies with fallback.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Type
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class ExtractionResult:
@@ -46,7 +45,6 @@ class ExtractionResult:
             errors=merged_errors,
             metadata={**self.metadata, **other.metadata},
         )
-
 
 class ExtractionStrategy(ABC):
     """Base class for extraction strategies."""
@@ -74,7 +72,6 @@ class ExtractionStrategy(ABC):
     ) -> ExtractionResult:
         """Extract the requested field using this strategy."""
         pass
-
 
 class DocumentDataStrategy(ExtractionStrategy):
     """
@@ -168,7 +165,6 @@ class DocumentDataStrategy(ExtractionStrategy):
             strategy_used=self.name,
         )
 
-
 class ChunkBasedStrategy(ExtractionStrategy):
     """
     Extract using regex and heuristics on document chunks.
@@ -258,7 +254,6 @@ class ChunkBasedStrategy(ExtractionStrategy):
             strategy_used=self.name,
         )
 
-
 class LLMExtractionStrategy(ExtractionStrategy):
     """
     Extract using LLM for complex or ambiguous cases.
@@ -338,7 +333,6 @@ Return only the extracted value, or "NOT_FOUND" if the information is not presen
             errors=[f"LLM could not extract '{field_name}'"],
             strategy_used=self.name,
         )
-
 
 class ExtractionOrchestrator:
     """
@@ -449,7 +443,6 @@ class ExtractionOrchestrator:
                 field_name, document_data, chunks, **kwargs
             )
         return results
-
 
 __all__ = [
     "ExtractionResult",

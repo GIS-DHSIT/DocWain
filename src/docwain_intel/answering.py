@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from dataclasses import dataclass
@@ -13,8 +13,7 @@ from src.metadata.normalizer import ALLOWED_CHUNK_KINDS
 from src.services.retrieval.reranker import Reranker, RerankerConfig
 from src.utils.redis_cache import RedisJsonCache, hash_query
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class RoutePlan:
@@ -23,7 +22,6 @@ class RoutePlan:
     requested_fields: List[str]
     retrieval_plan: Dict[str, Any]
     assumption: Optional[str] = None
-
 
 def _route_query(query: str, *, has_document_scope: bool) -> RoutePlan:
     lowered = (query or "").lower()
@@ -59,7 +57,6 @@ def _route_query(query: str, *, has_document_scope: bool) -> RoutePlan:
     }
     return RoutePlan(scope=scope, task=task, requested_fields=requested_fields, retrieval_plan=retrieval_plan)
 
-
 def _field_queries(fields: List[str]) -> Dict[str, str]:
     queries: Dict[str, str] = {}
     for field in fields:
@@ -75,7 +72,6 @@ def _field_queries(fields: List[str]) -> Dict[str, str]:
             queries[field] = field
     return queries
 
-
 def _dedupe_chunks(chunks: List[EvidenceChunk]) -> List[EvidenceChunk]:
     seen = set()
     deduped: List[EvidenceChunk] = []
@@ -87,14 +83,12 @@ def _dedupe_chunks(chunks: List[EvidenceChunk]) -> List[EvidenceChunk]:
         deduped.append(chunk)
     return deduped
 
-
 def _group_by_document(chunks: List[EvidenceChunk]) -> Dict[str, List[EvidenceChunk]]:
     grouped: Dict[str, List[EvidenceChunk]] = {}
     for chunk in chunks:
         doc_id = chunk.document_id or "document"
         grouped.setdefault(doc_id, []).append(chunk)
     return grouped
-
 
 def _extract_field_values(field: str, chunks: List[EvidenceChunk]) -> List[str]:
     values: List[str] = []
@@ -126,7 +120,6 @@ def _extract_field_values(field: str, chunks: List[EvidenceChunk]) -> List[str]:
                 values.append(part)
     return values
 
-
 def _validate_values(values: List[str], chunks: List[EvidenceChunk]) -> List[str]:
     if not values:
         return []
@@ -136,7 +129,6 @@ def _validate_values(values: List[str], chunks: List[EvidenceChunk]) -> List[str
         if value.lower() in evidence_text:
             validated.append(value)
     return validated
-
 
 def _compose_response(
     *,
@@ -166,7 +158,6 @@ def _compose_response(
         lines.append(f"- {file_name}: " + "; ".join(line_parts))
 
     return "\n".join(lines).strip()
-
 
 def run_agentic_rag(
     *,
@@ -267,6 +258,5 @@ def run_agentic_rag(
         "grounded": bool(reranked),
         "metadata": metadata,
     }
-
 
 __all__ = ["run_agentic_rag"]

@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import traceback
 from typing import Any, Dict, Optional
@@ -10,11 +10,10 @@ from bson import ObjectId
 from src.api.config import Config
 from src.api.statuses import STATUS_UNDER_REVIEW
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _PROGRESS_TTL = 3600  # 1 hour
 _PROGRESS_CHANNEL = "dw:training:events"
-
 
 def emit_progress(
     document_id: str,
@@ -46,7 +45,6 @@ def emit_progress(
     except Exception:
         pass  # Best-effort, never block the pipeline
 
-
 def get_training_progress(document_id: str) -> Optional[dict]:
     """Get the latest training progress from Redis (for polling)."""
     try:
@@ -59,9 +57,7 @@ def get_training_progress(document_id: str) -> Optional[dict]:
     except Exception:
         return None
 
-
 _ZOMBIE_TIMEOUT_SECONDS = 1800  # 30 minutes
-
 
 def recover_zombie_documents(timeout_seconds: int = _ZOMBIE_TIMEOUT_SECONDS) -> int:
     """Auto-fail documents stuck in TRAINING_STARTED beyond timeout."""
@@ -94,25 +90,20 @@ def recover_zombie_documents(timeout_seconds: int = _ZOMBIE_TIMEOUT_SECONDS) -> 
             logger.warning("Failed to recover zombie %s", doc_id, exc_info=True)
     return recovered
 
-
 _MISSING = object()
-
 
 def get_documents_collection():
     from src.api.dataHandler import db
     return db[Config.MongoDB.DOCUMENTS]
 
-
 def get_screening_collection():
     from src.api.dataHandler import db
     return db["screening"]
-
 
 def _doc_id_value(document_id: str):
     if ObjectId.is_valid(str(document_id)):
         return ObjectId(str(document_id))
     return str(document_id)
-
 
 def _doc_filter(document_id: str) -> Dict[str, Any]:
     doc_id_str = str(document_id)
@@ -126,7 +117,6 @@ def _doc_filter(document_id: str) -> Dict[str, Any]:
     if ObjectId.is_valid(str(document_id)):
         candidates.insert(0, {"_id": ObjectId(str(document_id))})
     return {"$or": candidates}
-
 
 def init_document_record(
     document_id: str,
@@ -163,7 +153,6 @@ def init_document_record(
         return_document=ReturnDocument.AFTER,
     )
 
-
 def _flatten(prefix: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     flat: Dict[str, Any] = {}
     for key, value in payload.items():
@@ -173,7 +162,6 @@ def _flatten(prefix: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             flat[target] = value
     return flat
-
 
 def update_document_fields(document_id: str, fields: Dict[str, Any]):
     now = time.time()
@@ -216,7 +204,6 @@ def update_document_fields(document_id: str, fields: Dict[str, Any]):
         return_document=ReturnDocument.AFTER,
     )
 
-
 def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
     now = time.time()
     patch_copy = dict(patch)
@@ -249,7 +236,6 @@ def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
         return_document=ReturnDocument.AFTER,
     )
 
-
 def set_error(document_id: str, stage: str, exc: Exception):
     message = str(exc)
     trace = traceback.format_exc()
@@ -263,7 +249,6 @@ def set_error(document_id: str, stage: str, exc: Exception):
             "error": {"message": message, "trace": trace, "code": code},
         },
     )
-
 
 def upsert_screening_report(
     run_id: str,
@@ -296,11 +281,9 @@ def upsert_screening_report(
         upsert=True,
     )
 
-
 def get_document_record(document_id: str) -> Optional[Dict[str, Any]]:
     collection = get_documents_collection()
     return collection.find_one(_doc_filter(document_id))
-
 
 _ERROR_NULL_PATHS = [
     "error",
@@ -311,7 +294,6 @@ _ERROR_NULL_PATHS = [
     "screening.security.error",
     "cleanup.error",
 ]
-
 
 def normalize_error_fields(collection=None) -> Dict[str, Any]:
     """

@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional
 
@@ -6,8 +6,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 from src.utils.payload_utils import get_canonical_text
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_nested(value: Dict[str, Any], path: List[str]) -> Any:
     cur = value
@@ -20,7 +19,6 @@ def _get_nested(value: Dict[str, Any], path: List[str]) -> Any:
             return None
     return cur
 
-
 @dataclass
 class RetrievedChunk:
     profile_id: str
@@ -31,7 +29,6 @@ class RetrievedChunk:
     payload: Dict[str, Any]
     vector: Optional[List[float]]
     point_id: Any
-
 
 class QdrantRetriever:
     def __init__(

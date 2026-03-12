@@ -7,13 +7,12 @@ recall-precision trade-off based on query characteristics and document profiles.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class ThresholdConfig:
@@ -28,7 +27,6 @@ class ThresholdConfig:
     min_results_target: int = 5  # Target minimum results
     coverage_boost_factor: float = 0.85  # Multiply threshold when below min_results
 
-
 @dataclass(frozen=True)
 class ThresholdAdjustment:
     """Result of threshold adjustment."""
@@ -37,7 +35,6 @@ class ThresholdAdjustment:
     adjusted_threshold: float
     adjustment_reason: str
     adjustment_factor: float
-
 
 class AdaptiveThresholdTuner:
     """Dynamically adjusts retrieval thresholds based on query and context."""
@@ -310,7 +307,6 @@ class AdaptiveThresholdTuner:
             "std": statistics.stdev(thresholds) if len(thresholds) > 1 else 0.0,
             "count": len(thresholds),
         }
-
 
 __all__ = ["AdaptiveThresholdTuner", "ThresholdConfig", "ThresholdAdjustment"]
 

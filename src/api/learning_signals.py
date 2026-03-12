@@ -1,12 +1,11 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class LearningSignalStore:
     """Persist lightweight online learning signals for fine-tuning and evaluation."""

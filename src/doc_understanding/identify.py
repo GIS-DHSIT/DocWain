@@ -1,20 +1,18 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     """Access attribute or dict key — supports both objects and dicts."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
 
 DOCUMENT_TAXONOMY = [
     "resume",
@@ -29,7 +27,6 @@ DOCUMENT_TAXONOMY = [
     "other",
 ]
 
-
 @dataclass(frozen=True)
 class DocumentIdentification:
     doc_name: str
@@ -39,7 +36,6 @@ class DocumentIdentification:
     page_count: Optional[int]
     file_format: Optional[str]
     created_date: Optional[str]
-
 
 # Multi-word phrases preferred to avoid single-word false positives (e.g. "total" in resumes)
 _INVOICE_RE = re.compile(r"\b(invoice\s+number|invoice\s+date|bill\s+to|amount\s+due|total\s+due|payment\s+terms|vat|gst|remittance|subtotal|invoice)\b", re.IGNORECASE)
@@ -51,7 +47,6 @@ _BROCHURE_RE = re.compile(r"\b(brochure|catalog|features|overview)\b", re.IGNORE
 _REPORT_RE = re.compile(r"\b(report|analysis|findings|executive summary)\b", re.IGNORECASE)
 _STATEMENT_RE = re.compile(r"\b(statement|account summary|balance forward)\b", re.IGNORECASE)
 _PRESENTATION_RE = re.compile(r"\b(slide|agenda|presentation)\b", re.IGNORECASE)
-
 
 def _guess_from_filename(filename: str) -> Optional[str]:
     lower = (filename or "").lower()
@@ -76,7 +71,6 @@ def _guess_from_filename(filename: str) -> Optional[str]:
     if "ppt" in lower or "presentation" in lower:
         return "presentation"
     return None
-
 
 def _heuristic_classify(text: str, tables: str, filename: str) -> Optional[tuple[str, float]]:
     candidate = _guess_from_filename(filename)
@@ -110,7 +104,6 @@ def _heuristic_classify(text: str, tables: str, filename: str) -> Optional[tuple
     if best_type and best_count >= 1:
         return best_type, best_conf
     return None
-
 
 def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional[str] = None, llm_client=None) -> Optional[tuple[str, float]]:
     prompt = (
@@ -150,7 +143,6 @@ def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional
         logger.debug("LLM document classification failed: %s", exc)
         return None
 
-
 def _extract_page_count(extracted: Any) -> Optional[int]:
     try:
         pages = [_get(sec, "end_page") for sec in (_get(extracted, "sections") or [])]
@@ -160,7 +152,6 @@ def _extract_page_count(extracted: Any) -> Optional[int]:
     except Exception:  # noqa: BLE001
         return None
     return None
-
 
 def classify_document_type(
     text_sample: str,
@@ -182,7 +173,6 @@ def classify_document_type(
         return heuristic
 
     return "other", 0.5
-
 
 def identify_document(
     *,
@@ -226,7 +216,6 @@ def identify_document(
         file_format=file_format,
         created_date=None,
     )
-
 
 __all__ = [
     "DocumentIdentification",

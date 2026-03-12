@@ -8,12 +8,12 @@ improvements that work across resumes, invoices, legal documents, and all other 
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Import universal enhancer for document-agnostic improvements
 try:
@@ -30,7 +30,6 @@ except ImportError:
     UNIVERSAL_ENHANCER_AVAILABLE = False
     logger.warning("Universal enhancer not available, using fallback enhancement")
 
-
 @dataclass
 class EmbeddingEnhancementResult:
     """Result of embedding enhancement process."""
@@ -40,7 +39,6 @@ class EmbeddingEnhancementResult:
     deduplicated_count: int
     average_quality_score: float
     enhancement_stats: Dict[str, Any]
-
 
 def enhance_chunks_for_embedding(
     texts: List[str],
@@ -96,7 +94,6 @@ def enhance_chunks_for_embedding(
         document_metadata=document_metadata,
         domain=domain,
     )
-
 
 def _enhance_with_universal_enhancer(
     texts: List[str],
@@ -219,7 +216,6 @@ def _enhance_with_universal_enhancer(
             document_metadata=document_metadata,
             domain=domain,
         )
-
 
 def _enhance_with_legacy_pipeline(
     texts: List[str],
@@ -345,7 +341,6 @@ def _enhance_with_legacy_pipeline(
             enhancement_stats={"fallback": True, "error": str(e)},
         )
 
-
 def build_optimal_embedding_text(
     text: str,
     section_title: str,
@@ -402,7 +397,6 @@ def build_optimal_embedding_text(
 
     return f"{prefix}{text}".strip()
 
-
 def calculate_chunk_quality(
     text: str,
     section_type: str = "content",
@@ -455,7 +449,6 @@ def calculate_chunk_quality(
 
     return min(1.0, max(0.0, score))
 
-
 def deduplicate_chunks(
     texts: List[str],
     metadata: List[Dict[str, Any]],
@@ -483,7 +476,6 @@ def deduplicate_chunks(
     )
 
     return kept_texts, kept_metadata
-
 
 def deduplicate_chunks_with_info(
     texts: List[str],
@@ -549,7 +541,6 @@ def deduplicate_chunks_with_info(
 
     return kept_texts, kept_metadata, kept_chunks
 
-
 def enrich_query_for_retrieval(query: str) -> Dict[str, Any]:
     """
     Enrich a query for better retrieval matching.
@@ -575,7 +566,6 @@ def enrich_query_for_retrieval(query: str) -> Dict[str, Any]:
         "query_type": "general",
         "expansion_terms": [],
     }
-
 
 def get_enhanced_embedding_text(
     text: str,
@@ -616,7 +606,6 @@ def get_enhanced_embedding_text(
         document_type=document_type,
         domain="generic",
     )
-
 
 def infer_document_domain(
     texts: List[str],
@@ -671,7 +660,6 @@ def infer_document_domain(
         return best_domain
 
     return "generic"
-
 
 __all__ = [
     "EmbeddingEnhancementResult",

@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TEXT_FIELD_CANDIDATES = [
     "canonical_text",
@@ -28,7 +28,6 @@ PROFILE_FIELD_CANDIDATES = [
     "profileID",
 ]
 
-
 def _get_nested(value: Dict[str, Any], path: List[str]) -> Any:
     cur = value
     for key in path:
@@ -40,10 +39,8 @@ def _get_nested(value: Dict[str, Any], path: List[str]) -> Any:
             return None
     return cur
 
-
 def _token_count(text: str) -> int:
     return len((text or "").split())
-
 
 @dataclass
 class FieldStat:
@@ -78,7 +75,6 @@ class FieldStat:
     def avg_tokens(self) -> float:
         return 0.0 if self.non_empty == 0 else self.total_tokens / self.non_empty
 
-
 @dataclass
 class SchemaProbeResult:
     text_field: FieldStat
@@ -103,7 +99,6 @@ class SchemaProbeResult:
             "observed_keys": self.observed_keys,
             "sample_payloads": self.sample_payloads,
         }
-
 
 class SchemaProbe:
     def __init__(
@@ -249,7 +244,6 @@ class SchemaProbe:
         logger.info("Schema probe complete. Text field: %s", ".".join(text_field.path))
         return result
 
-
 def run_probe(
     collection: str,
     run_dir: Path,
@@ -262,6 +256,5 @@ def run_probe(
     client = QdrantClient(url=url, api_key=api_key, timeout=120)
     probe = SchemaProbe(client=client, collection=collection, run_dir=run_dir, sample_size=sample_size)
     return probe.probe()
-
 
 __all__ = ["SchemaProbe", "SchemaProbeResult", "run_probe", "TEXT_FIELD_CANDIDATES", "FieldStat"]

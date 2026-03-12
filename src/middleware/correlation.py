@@ -155,7 +155,7 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
                 request.url.path,
                 response.status_code,
                 duration_ms,
-                extra={"correlation_id": correlation_id},
+                extra={"correlation_id": correlation_id, "duration_ms": duration_ms, "status_code": response.status_code},
             )
 
             return response
@@ -171,7 +171,7 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
                 request.url.path,
                 type(exc).__name__,
                 duration_ms,
-                extra={"correlation_id": correlation_id},
+                extra={"correlation_id": correlation_id, "duration_ms": duration_ms},
                 exc_info=True,
             )
             raise

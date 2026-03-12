@@ -8,7 +8,7 @@ existing entities and regex patterns, and scores completeness.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,7 +21,7 @@ __all__ = [
     "detect_and_extract_schema",
 ]
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Schema version
@@ -42,7 +42,6 @@ class FieldDefinition:
     section_hint: Optional[str] = None  # look inside this section first
     description: str = ""
 
-
 @dataclass
 class SchemaTemplate:
     """Schema definition for one document type."""
@@ -50,7 +49,6 @@ class SchemaTemplate:
     required_sections: List[str]
     optional_sections: List[str]
     fields: List[FieldDefinition]
-
 
 @dataclass
 class SchemaDetectionResult:
@@ -61,7 +59,6 @@ class SchemaDetectionResult:
     missing_sections: List[str]
     extracted_fields: Dict[str, Any]
     schema_version: str
-
 
 # ---------------------------------------------------------------------------
 # Regex helpers (compiled once at import time)
@@ -219,7 +216,6 @@ SECTION_ROLE_MAP: Dict[str, str] = {
     "references": None,
     "glossary": None,
 }
-
 
 # ---------------------------------------------------------------------------
 # Schema templates
@@ -452,7 +448,6 @@ SCHEMA_TEMPLATES: Dict[str, SchemaTemplate] = {
     ),
 }
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -477,7 +472,6 @@ def _map_section_roles(
     missing = [s for s in schema.required_sections if s not in mapped]
     return found, missing
 
-
 def _build_section_text_index(
     sections: List[Dict[str, Any]],
 ) -> Dict[str, str]:
@@ -501,7 +495,6 @@ def _build_section_text_index(
             index[canonical] = index.get(canonical, "") + "\n" + text
 
     return index
-
 
 def _entities_by_label(
     entities: List[Dict[str, Any]],
@@ -528,7 +521,6 @@ def _entities_by_label(
             by_label.setdefault(label, []).append(text)
     return by_label
 
-
 def _first_regex_match(pattern_str: str, text: str, group: int = 1) -> Optional[str]:
     """Return the first capture group from a regex search, or None."""
     try:
@@ -542,7 +534,6 @@ def _first_regex_match(pattern_str: str, text: str, group: int = 1) -> Optional[
         logger.debug("Regex error for pattern %r: %s", pattern_str, exc)
     return None
 
-
 def _all_regex_matches(pattern_str: str, text: str, group: int = 1) -> List[str]:
     """Return all non-overlapping capture-group matches from a regex."""
     results: List[str] = []
@@ -555,7 +546,6 @@ def _all_regex_matches(pattern_str: str, text: str, group: int = 1) -> List[str]
     except re.error as exc:
         logger.debug("Regex error for pattern %r: %s", pattern_str, exc)
     return results
-
 
 def _extract_skills_from_text(text: str) -> List[str]:
     """
@@ -575,7 +565,6 @@ def _extract_skills_from_text(text: str) -> List[str]:
 
     return list(dict.fromkeys(skills))  # deduplicate, preserve order
 
-
 def _extract_experience_entries(sections: List[Dict[str, Any]]) -> List[str]:
     """
     Pull job-title / company pairs from experience sections.
@@ -594,7 +583,6 @@ def _extract_experience_entries(sections: List[Dict[str, Any]]) -> List[str]:
                 entry = f"{m.group(1).strip()} — {m.group(2).strip()}"
                 entries.append(entry)
     return entries
-
 
 # ---------------------------------------------------------------------------
 # Field extraction dispatcher
@@ -671,7 +659,6 @@ def _extract_field(
             return val
 
     return None
-
 
 # ---------------------------------------------------------------------------
 # Public API

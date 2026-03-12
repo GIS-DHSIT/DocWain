@@ -1,9 +1,9 @@
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Iterable, List, Optional
 
 from qdrant_client import QdrantClient
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Default payload paths to inspect for a profile id.
 default_profile_paths = [
@@ -13,7 +13,6 @@ default_profile_paths = [
     "metadata.profile_id",
     "metadata.profileId",
 ]
-
 
 def _get_nested(payload: Dict[str, Any], path: str) -> Optional[Any]:
     """Resolve dotted keys from nested payload dictionaries."""
@@ -29,14 +28,12 @@ def _get_nested(payload: Dict[str, Any], path: str) -> Optional[Any]:
         current = current[part]
     return current
 
-
 def _iter_profile_ids(payload: Dict[str, Any], payload_paths: Iterable[str]) -> Iterable[str]:
     """Yield all matching profile ids from the payload based on configured paths."""
     for path in payload_paths:
         value = _get_nested(payload, path)
         if value:
             yield str(value)
-
 
 def discover_profile_ids_from_collection(
     client: QdrantClient,

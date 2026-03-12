@@ -2,22 +2,20 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from .types import GenericSchema, HRSchema, InvoiceSchema, LegalSchema, LLMBudget, LLMResponseSchema, MultiEntitySchema
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class JudgeResult:
     status: str
     reason: str = ""
     confidence: float = 0.0  # 0.0-1.0 graduated confidence score
-
 
 FALLBACK_STATUS = JudgeResult(status="fail", reason="fallback")
 
@@ -106,11 +104,9 @@ _IMPLICIT_REFERENCES = frozenset({
     "he", "she", "they", "his", "her", "their",
 })
 
-
 def _tokenize(text: str) -> list[str]:
     """Lowercase tokenize, dropping stopwords and very short tokens."""
     return [t for t in _TOKEN_RE.findall(text.lower()) if t not in _STOPWORDS]
-
 
 # ── Numeric normalization helpers ─────────────────────────────────────────
 
@@ -125,7 +121,6 @@ def _normalize_number(num_str: str, suffix: str | None = None) -> float:
         value *= _UNIT_MULTIPLIERS[suffix]
     return value
 
-
 def _extract_all_normalized_numbers(text: str) -> set[float]:
     """Extract all numbers from text, normalizing units (e.g. $50K → 50000)."""
     results: set[float] = set()
@@ -133,7 +128,6 @@ def _extract_all_normalized_numbers(text: str) -> set[float]:
         num_str, suffix = match.group(1), match.group(2)
         results.add(_normalize_number(num_str, suffix))
     return results
-
 
 def _extract_ranges(text: str) -> list[tuple[float, float]]:
     """Extract numeric ranges from text (e.g. '40K-60K' → (40000, 60000))."""
@@ -147,11 +141,9 @@ def _extract_ranges(text: str) -> list[tuple[float, float]]:
             ranges.append((hi, lo))
     return ranges
 
-
 def _number_in_any_range(num: float, ranges: list[tuple[float, float]]) -> bool:
     """Check if a number falls within any of the given ranges."""
     return any(lo <= num <= hi for lo, hi in ranges)
-
 
 def _normalize_percentage(text: str) -> set[float]:
     """Extract percentage values from text, normalizing words and decimals.
@@ -172,7 +164,6 @@ def _normalize_percentage(text: str) -> set[float]:
         if word in lowered:
             results.add(pct)
     return results
-
 
 # ── Entity alias helpers ──────────────────────────────────────────────────
 
@@ -211,11 +202,9 @@ def _build_entity_aliases(entities: set[str]) -> dict[str, set[str]]:
         alias_map[canon] = aliases
     return alias_map
 
-
 def _entity_mentioned_in_text(aliases: set[str], text_lower: str) -> bool:
     """Check if any alias of an entity appears in the given text."""
     return any(alias in text_lower for alias in aliases)
-
 
 def _check_entity_consistency(
     query: str, answer: str, intent: str,
@@ -317,7 +306,6 @@ def _check_entity_consistency(
 
     return None
 
-
 def _check_numeric_fidelity(
     answer: str, evidence_texts: list[str],
 ) -> list[str]:
@@ -412,7 +400,6 @@ def _check_numeric_fidelity(
 
     return hallucinated
 
-
 def _check_table_integrity(answer: str) -> str:
     """Check markdown table integrity — column consistency and completeness.
 
@@ -447,7 +434,6 @@ def _check_table_integrity(answer: str) -> str:
         return f"table_column_mismatch: expected {expected} cols, {len(mismatched)}/{len(col_counts)} rows differ"
 
     return ""
-
 
 def _check_answer_relevance(query: str, answer: str, intent: str = "") -> float:
     """Check if answer addresses the question topic. Returns relevance score 0.0-1.0.
@@ -521,7 +507,6 @@ def _check_answer_relevance(query: str, answer: str, intent: str = "") -> float:
 
     return round(min(1.0, overlap), 4)
 
-
 def _get_relevance_threshold(intent: str) -> float:
     """Return the minimum relevance threshold based on intent type."""
     # Factual/extraction intents need higher overlap — the answer should
@@ -539,7 +524,6 @@ def _get_relevance_threshold(intent: str) -> float:
     if intent in _LOW_THRESHOLD_INTENTS:
         return 0.15
     return 0.25  # default
-
 
 # ── Factual consistency checking ──────────────────────────────────────────
 
@@ -585,7 +569,6 @@ def _check_source_citations(answer: str, evidence_texts: list[str]) -> Optional[
         )
 
     return None
-
 
 def _check_factual_consistency(answer: str, evidence_texts: list[str]) -> Optional[str]:
     """Check if the answer makes claims not supported by evidence.
@@ -638,7 +621,6 @@ def _check_factual_consistency(answer: str, evidence_texts: list[str]) -> Option
 
     return None
 
-
 # ── Completeness checking ─────────────────────────────────────────────────
 
 _COMPLETENESS_TRIGGERS = re.compile(
@@ -647,7 +629,6 @@ _COMPLETENESS_TRIGGERS = re.compile(
 _COUNT_TRIGGER = re.compile(
     r"\b(?:top|first|last|bottom)\s+(\d+)\b", re.IGNORECASE
 )
-
 
 def _check_answer_completeness(
     query: str, answer: str,
@@ -712,7 +693,6 @@ def _check_answer_completeness(
 
     return None
 
-
 def _count_answer_items(answer: str) -> int:
     """Count discrete items in the answer (numbered, bulleted, or table rows)."""
     lines = [ln.strip() for ln in answer.splitlines() if ln.strip()]
@@ -737,7 +717,6 @@ def _count_answer_items(answer: str) -> int:
         return max(table_rows - 1, 1)
 
     return 0
-
 
 def judge_answer(
     *,
@@ -839,7 +818,6 @@ def judge_answer(
         return JudgeResult(status="pass", reason="uncertain_with_content", confidence=0.5)
     return JudgeResult(status="fail", reason="no_usable_content", confidence=0.1)
 
-
 def _compute_judge_confidence(
     answer: str,
     schema: Any,
@@ -921,7 +899,6 @@ def _compute_judge_confidence(
 
     return round(max(0.0, min(1.0, score)), 3)
 
-
 def _has_any_content(
     schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema | LLMResponseSchema,
 ) -> bool:
@@ -942,7 +919,6 @@ def _has_any_content(
         return any(True for _ in _iter_spans(schema))
     except Exception:
         return False
-
 
 def _heuristic_judge(
     answer: str,
@@ -1047,13 +1023,11 @@ def _heuristic_judge(
 
     return JudgeResult(status="pass")
 
-
 def _collect_evidence_numbers(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema) -> set:
     numbers = set()
     for span in _iter_spans(schema):
         numbers.update(re.findall(r"\d+(?:[.,]\d+)?", span))
     return numbers
-
 
 def _iter_spans(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema | LLMResponseSchema) -> Iterable[str]:
     # LLMResponseSchema: the LLM answer text itself serves as evidence.
@@ -1091,7 +1065,6 @@ def _iter_spans(schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema |
             for span in entity.evidence_spans:
                 yield span.snippet
 
-
 def _extract_candidate_items(answer: str) -> list[str]:
     lines = [line.strip() for line in answer.splitlines() if line.strip()]
     candidates = []
@@ -1106,13 +1079,10 @@ def _extract_candidate_items(answer: str) -> list[str]:
                 candidates.append(part)
     return candidates
 
-
 def _normalize(text: str) -> str:
     return re.sub(r"\W+", " ", text.lower()).strip()
 
-
 _LLM_JUDGE_TIMEOUT_S = 15.0
-
 
 def _llm_judge(
     answer: str,
@@ -1152,7 +1122,6 @@ def _llm_judge(
         return JudgeResult(status=verdict, reason=str(payload.get("reason") or ""))
     return None
 
-
 def _infer_domain_label(
     schema: InvoiceSchema | HRSchema | LegalSchema | GenericSchema | MultiEntitySchema,
 ) -> str:
@@ -1171,7 +1140,6 @@ def _infer_domain_label(
     if isinstance(schema, MultiEntitySchema):
         return "multi-document"
     return "general"
-
 
 def _build_prompt(
     answer: str,
@@ -1230,7 +1198,6 @@ def _build_prompt(
 
     return "\n".join(prompt_parts)
 
-
 def _extract_json(raw: object) -> dict:
     if not raw:
         return {}
@@ -1247,7 +1214,6 @@ def _extract_json(raw: object) -> dict:
         except Exception:
             return {}
     return {}
-
 
 def _check_temporal_consistency(
     answer: str, evidence_texts: list[str],
@@ -1312,7 +1278,6 @@ def _check_temporal_consistency(
         return f"temporal_ungrounded: years {ungrounded_years} not in evidence"
 
     return None
-
 
 def _check_response_structure(answer: str, intent: str, query: str = "") -> Optional[str]:
     """Check for structural quality issues in the response.
@@ -1446,7 +1411,6 @@ def _check_response_structure(answer: str, intent: str, query: str = "") -> Opti
 
     return None
 
-
 def _has_forbidden_tokens(answer: str) -> bool:
     lowered = answer.lower()
     for token in (
@@ -1498,7 +1462,6 @@ def _has_forbidden_tokens(answer: str) -> bool:
     if re.search(r"^\s*answer\s*[:\-]", lowered, re.MULTILINE):
         return True
     return False
-
 
 def judge(
     *,

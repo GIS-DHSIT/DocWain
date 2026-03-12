@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import datetime as dt
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from src.utils.payload_utils import get_source_name
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TASK_MODE = "TASK_MODE"
 INFO_MODE = "INFO_MODE"
-
 
 INFO_KEYWORDS = (
     "document assistant",
@@ -77,7 +76,6 @@ DOC_CONTEXT_CUES = (
     "report",
 )
 
-
 DOCWAIN_INTRO_SHORT = (
     "Understanding & Scope: Intent: info. Scope: no document retrieval. Files used: none.\n\n"
     "Answer:\n"
@@ -114,12 +112,10 @@ BANNED_HEDGE_PHRASES = (
     "maybe",
 )
 
-
 def _normalize_text(text: str) -> str:
     cleaned = (text or "").lower()
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
-
 
 class ResponseModeClassifier:
     """Lightweight intent classifier with keyword rules + optional LLM fallback."""
@@ -218,7 +214,6 @@ class ResponseModeClassifier:
             logger.debug("Response mode LLM fallback failed: %s", exc)
         return TASK_MODE
 
-
 @dataclass(frozen=True)
 class EvidenceSnippet:
     source_id: int
@@ -229,14 +224,12 @@ class EvidenceSnippet:
     tokens: Tuple[str, ...]
     numbers: Tuple[str, ...]
 
-
 @dataclass
 class EvidenceLedger:
     entries: List[EvidenceSnippet]
     by_source_id: Dict[int, EvidenceSnippet]
     source_names: Tuple[str, ...]
     source_name_variants: Tuple[str, ...]
-
 
 def _chunk_text(chunk: Any) -> str:
     if hasattr(chunk, "text"):
@@ -245,14 +238,12 @@ def _chunk_text(chunk: Any) -> str:
         return str(chunk.get("text") or "")
     return ""
 
-
 def _chunk_meta(chunk: Any) -> Dict[str, Any]:
     if hasattr(chunk, "metadata"):
         return dict(chunk.metadata or {})
     if isinstance(chunk, dict):
         return dict(chunk.get("metadata") or {})
     return {}
-
 
 def _chunk_source_name(chunk: Any) -> str:
     meta = _chunk_meta(chunk)
@@ -263,10 +254,8 @@ def _chunk_source_name(chunk: Any) -> str:
         or ""
     )
 
-
 def _tokenize(text: str) -> List[str]:
     return re.findall(r"[A-Za-z0-9]+", text.lower())
-
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "by",
@@ -275,7 +264,6 @@ _STOPWORDS = {
     "can", "could", "may", "might", "will", "would", "should", "has", "have",
     "had", "not", "no",
 }
-
 
 def _content_tokens(tokens: Iterable[str]) -> List[str]:
     filtered = []
@@ -289,10 +277,8 @@ def _content_tokens(tokens: Iterable[str]) -> List[str]:
             filtered.append(token)
     return filtered
 
-
 def _extract_numbers(tokens: Iterable[str]) -> List[str]:
     return [t for t in tokens if any(ch.isdigit() for ch in t)]
-
 
 def _normalize_source_names(names: Iterable[str]) -> Tuple[str, ...]:
     variants = []
@@ -304,7 +290,6 @@ def _normalize_source_names(names: Iterable[str]) -> Tuple[str, ...]:
         base = lowered.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
         variants.append(base)
     return tuple(sorted(set(variants)))
-
 
 def _match_source_to_chunk(source: Dict[str, Any], chunks: Sequence[Any]) -> Optional[Any]:
     if not chunks:
@@ -332,7 +317,6 @@ def _match_source_to_chunk(source: Dict[str, Any], chunks: Sequence[Any]) -> Opt
             best_score = score
             best_chunk = chunk
     return best_chunk if best_score > 0 else None
-
 
 def build_evidence_ledger(chunks: Sequence[Any], sources: Sequence[Dict[str, Any]]) -> EvidenceLedger:
     entries: List[EvidenceSnippet] = []
@@ -378,7 +362,6 @@ def build_evidence_ledger(chunks: Sequence[Any], sources: Sequence[Dict[str, Any
     by_source_id = {entry.source_id: entry for entry in entries}
     return EvidenceLedger(entries=entries, by_source_id=by_source_id, source_names=tuple(source_names), source_name_variants=name_variants)
 
-
 def build_docwain_intro(*, query: str = "") -> str:
     if query:
         try:
@@ -390,7 +373,6 @@ def build_docwain_intro(*, query: str = "") -> str:
             pass
     return DOCWAIN_INTRO_SHORT
 
-
 def _extract_citation_ids(text: str) -> List[int]:
     ids = []
     for match in re.findall(r"SOURCE-(\d+)", text):
@@ -400,10 +382,8 @@ def _extract_citation_ids(text: str) -> List[int]:
             continue
     return ids
 
-
 def _strip_citations(text: str) -> str:
     return re.sub(r"\[SOURCE-[^\]]+\]", "", text).strip()
-
 
 def _contains_unretrieved_doc_name(text: str, source_name_variants: Tuple[str, ...]) -> bool:
     matches = list(re.finditer(r"\b[\w\-.]+\.(?:pdf|docx|pptx|xlsx|csv|txt)\b", text, flags=re.IGNORECASE))
@@ -415,11 +395,9 @@ def _contains_unretrieved_doc_name(text: str, source_name_variants: Tuple[str, .
             return True
     return False
 
-
 def _has_banned_phrases(text: str, phrases: Sequence[str]) -> bool:
     normalized = _normalize_text(text)
     return any(phrase in normalized for phrase in phrases)
-
 
 def _extract_dates(text: str) -> List[Tuple[int, dt.date]]:
     results: List[Tuple[int, dt.date]] = []
@@ -454,7 +432,6 @@ def _extract_dates(text: str) -> List[Tuple[int, dt.date]]:
             continue
     return sorted(results, key=lambda x: x[0])
 
-
 def _has_conflicting_date_range(text: str) -> bool:
     dates = _extract_dates(text)
     if len(dates) < 2:
@@ -466,7 +443,6 @@ def _has_conflicting_date_range(text: str) -> bool:
     first_date = dates[0][1]
     second_date = dates[1][1]
     return first_date > second_date
-
 
 def _is_supported_by_evidence(claim: str, citation_ids: List[int], ledger: EvidenceLedger) -> bool:
     stripped = _strip_citations(claim)
@@ -489,7 +465,6 @@ def _is_supported_by_evidence(claim: str, citation_ids: List[int], ledger: Evide
         if overlap >= 0.35:
             return True
     return False
-
 
 def apply_evidence_gate(answer: str, ledger: EvidenceLedger, response_mode: str = TASK_MODE) -> Tuple[str, Dict[str, Any]]:
     if response_mode != TASK_MODE or not answer:

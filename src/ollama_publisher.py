@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import platform
 import subprocess
@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """You are DocWain (Document Wise AI Node).
 
@@ -214,7 +214,6 @@ Your response should:
 Behave like a domain-aware, language-aware document intelligence system — not a generic chatbot."""
 
 DEFAULT_PARAMS = {"temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.1}
-
 
 class OllamaPublisher:
     """

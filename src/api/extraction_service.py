@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 import time
@@ -67,14 +67,13 @@ from src.storage.azure_blob_client import BlobDownloadError, CredentialError, no
 from src.utils.idempotency import acquire_lock, release_lock
 from src.embedding.layout_graph import build_layout_graph
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Semaphore to limit concurrent deep_analyze() calls — prevents CPU starvation
 # when multiple documents are uploaded simultaneously.
 _DOC_PROCESSING_SEMAPHORE = threading.Semaphore(
     int(os.getenv("DOC_PROCESSING_MAX_CONCURRENT", "2"))
 )
-
 
 def _mark_intelligence_ready(document_id: str) -> None:
     """Set intelligence_ready=true in MongoDB after understanding + deep analysis complete."""
@@ -87,7 +86,6 @@ def _mark_intelligence_ready(document_id: str) -> None:
         logger.info("Document %s marked intelligence_ready", document_id)
     except Exception as exc:
         logger.warning("Failed to mark intelligence_ready for %s: %s", document_id, exc)
-
 
 def _ingest_to_knowledge_graph(
     document_id: str,
@@ -178,7 +176,6 @@ def _ingest_to_knowledge_graph(
     except Exception as exc:  # noqa: BLE001
         logger.debug("KG ingestion skipped for %s: %s", document_id, exc)
 
-
 def _persist_layout_graph(
     *,
     document_id: str,
@@ -211,7 +208,6 @@ def _persist_layout_graph(
     except Exception as exc:  # noqa: BLE001
         logger.warning("LayoutGraph persistence skipped for %s: %s", document_id, exc)
         return None
-
 
 def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
     total_chars = 0
@@ -253,7 +249,6 @@ def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
         "chars": total_chars,
         "language": None,
     }
-
 
 def _update_understanding_fields(document_id: str, understanding: Dict[str, Any]) -> None:
     """Persist document understanding / deep-analysis fields to MongoDB."""
@@ -310,7 +305,6 @@ def _update_understanding_fields(document_id: str, understanding: Dict[str, Any]
                        document_id, filt)
         coll.update_one(filt, {"$set": update_fields}, upsert=True)
     logger.info("Persisted %d understanding fields for document %s", len(update_fields), document_id)
-
 
 def _process_document_intelligence(
     document_id: str,
@@ -393,7 +387,6 @@ def _process_document_intelligence(
         logger.warning("Intelligence processing failed for %s: %s", document_id, exc)
         return None
 
-
 def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> Any:
     if isinstance(extracted_docs, dict):
         normalized: Dict[str, Any] = {}
@@ -413,7 +406,6 @@ def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> A
             normalized[name] = content
         return normalized
     return extracted_docs
-
 
 def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> Dict[str, Any]:
     """Extract document type/classification from structured extraction results.
@@ -441,7 +433,6 @@ def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> 
             }
     return {"document_type": "GENERIC", "domain": "generic", "confidence": 0.0}
 
-
 # ── Ingestion-time entity metadata extraction ──────────────────────────
 
 import re as _re
@@ -451,7 +442,6 @@ _PHONE_RE = _re.compile(
     r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}"
 )
 _LINKEDIN_RE = _re.compile(r"linkedin\.com/in/[\w\-]+", _re.IGNORECASE)
-
 
 def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any]:
     """Extract entity name, email, and phone from raw text at ingestion time.
@@ -518,7 +508,6 @@ def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any
 
     return result
 
-
 def _validate_extraction_fields(
     doc_classification: Dict[str, Any],
     raw_docs: Any,
@@ -567,7 +556,6 @@ def _validate_extraction_fields(
         if not has_items:
             logger.warning("extraction_validation: invoice missing line items/total — doc=%s file=%s", filename, doc_type)
 
-
 # ---------------------------------------------------------------------------
 # Authoritative per-document domain assignment
 # ---------------------------------------------------------------------------
@@ -578,7 +566,6 @@ _DOC_TYPE_TO_DOMAIN = {
     "report": "generic", "brochure": "generic", "presentation": "generic",
     "other": "generic",
 }
-
 
 def _resolve_authoritative_domain(
     domain_signals: Dict[str, float],
@@ -638,7 +625,6 @@ def _resolve_authoritative_domain(
 
     return result
 
-
 def _persist_document_domain(document_id: str, domain_result: Dict[str, Any]) -> None:
     """Persist authoritative document domain to MongoDB."""
     try:
@@ -655,7 +641,6 @@ def _persist_document_domain(document_id: str, domain_result: Dict[str, Any]) ->
         }}, upsert=False)
     except Exception as exc:
         logger.warning("Failed to persist document domain for %s: %s", document_id, exc)
-
 
 def _extract_text_from_extracted_document(doc: "ExtractedDocument") -> str:
     """Extract usable text from an ExtractedDocument, trying all available fields.
@@ -694,7 +679,6 @@ def _extract_text_from_extracted_document(doc: "ExtractedDocument") -> str:
 
     logger.warning("ExtractedDocument has no usable text content")
     return ""
-
 
 def _sanitize_raw_text_fields(docs: Any) -> Any:
     """Ensure no stringified repr or dict garbage in text fields."""
@@ -749,7 +733,6 @@ def _sanitize_raw_text_fields(docs: Any) -> Any:
             content["texts"] = clean_texts
     return docs
 
-
 def _set_document_status(
     document_id: str,
     status: str,
@@ -766,7 +749,6 @@ def _set_document_status(
         fields.update(extra_fields)
     update_document_fields(document_id, fields)
     logger.info("Document %s status updated to %s", document_id, status)
-
 
 def _run_auto_screening(document_id: str, doc_type: Optional[str] = None) -> None:
     """Run screening automatically after extraction completes.
@@ -811,9 +793,7 @@ def _run_auto_screening(document_id: str, doc_type: Optional[str] = None) -> Non
         )
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
 
-
 _DEBOUNCE_TTL_SECONDS = 5
-
 
 def _debounce_extraction(subscription_id: str, doc_id: str) -> bool:
     """Return True if this extraction request is a duplicate within the debounce window."""
@@ -833,7 +813,6 @@ def _debounce_extraction(subscription_id: str, doc_id: str) -> bool:
         return False
     except Exception:
         return False
-
 
 def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Dict[str, Any]) -> Dict[str, Any]:
     profile_id = str(doc_data.get("profile")) if doc_data.get("profile") else None
@@ -1198,7 +1177,6 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         if lock.acquired:
             release_lock(lock)
 
-
 def extract_documents() -> Dict[str, Any]:
     try:
         doc_coll = extract_document_info()
@@ -1234,14 +1212,12 @@ def extract_documents() -> Dict[str, Any]:
         logger.error("Extraction process failed: %s", exc, exc_info=True)
         return {"status": "error", "message": str(exc), "results": None}
 
-
 def extract_single_document(doc_id: str) -> Dict[str, Any]:
     doc_coll = extract_document_info()
     if not doc_coll or doc_id not in doc_coll:
         return {"status": "not_found", "message": f"Document {doc_id} not found"}
     doc_info = doc_coll[doc_id]
     return _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
-
 
 def extract_uploaded_document(
     *,

@@ -5,7 +5,7 @@ to auto-tag documents WITHOUT hardcoded domain labels.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import re
 import threading
@@ -40,11 +40,10 @@ _PASSIVE_SUFFIX = "ed"
 
 _MAX_TEXT_CHARS = 100_000
 
-_logger = logging.getLogger(__name__)
+_logger = get_logger(__name__)
 
 _spacy_nlp = None
 _spacy_lock = threading.Lock()
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -54,13 +53,11 @@ def _collect_all_text(doc: StructuredDocument) -> str:
     """Concatenate all unit texts."""
     return " ".join(u.text for u in doc.units if u.text)
 
-
 def _compute_entity_distribution(extraction: ExtractionResult) -> dict[str, int]:
     counts: dict[str, int] = {}
     for ent in extraction.entities:
         counts[ent.label] = counts.get(ent.label, 0) + 1
     return counts
-
 
 def _compute_structure_profile(doc: StructuredDocument) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -68,7 +65,6 @@ def _compute_structure_profile(doc: StructuredDocument) -> dict[str, int]:
         key = u.unit_type.value  # e.g. "paragraph", "table"
         counts[key] = counts.get(key, 0) + 1
     return counts
-
 
 def _compute_numeric_density(all_text: str) -> float:
     if not all_text:
@@ -79,7 +75,6 @@ def _compute_numeric_density(all_text: str) -> float:
     numeric_count = sum(1 for t in tokens if _NUMERIC_RE.search(t))
     return numeric_count / len(tokens)
 
-
 def _compute_entity_density(all_text: str, extraction: ExtractionResult) -> float:
     if not all_text:
         return 0.0
@@ -87,7 +82,6 @@ def _compute_entity_density(all_text: str, extraction: ExtractionResult) -> floa
     if word_count == 0:
         return 0.0
     return len(extraction.entities) / word_count
-
 
 def _compute_formality(doc: StructuredDocument, all_text: str) -> float:
     if not all_text:
@@ -141,7 +135,6 @@ def _compute_formality(doc: StructuredDocument, all_text: str) -> float:
 
     return min(signals / total_checks, 1.0) if total_checks else 0.5
 
-
 def _compute_structure_complexity(doc: StructuredDocument) -> float:
     """Shannon entropy of unit type distribution."""
     if not doc.units:
@@ -155,7 +148,6 @@ def _compute_structure_complexity(doc: StructuredDocument) -> float:
             entropy -= p * math.log2(p)
     return entropy
 
-
 def _compute_relational_density(
     doc: StructuredDocument, extraction: ExtractionResult
 ) -> float:
@@ -163,7 +155,6 @@ def _compute_relational_density(
     if unit_count == 0:
         return 0.0
     return len(extraction.facts) / unit_count
-
 
 def _get_spacy_nlp():
     """Return a shared spaCy model instance using double-check locking."""
@@ -174,7 +165,6 @@ def _get_spacy_nlp():
                 import spacy
                 _spacy_nlp = spacy.load("en_core_web_sm")
     return _spacy_nlp
-
 
 def _compute_auto_tags(all_text: str) -> List[str]:
     """Extract top noun-chunk lemmas via spaCy. Returns empty list on failure."""
@@ -206,7 +196,6 @@ def _compute_auto_tags(all_text: str) -> List[str]:
         return [lemma for lemma, _ in chunk_counter.most_common(5)]
     except Exception:
         return []
-
 
 # ---------------------------------------------------------------------------
 # Public API

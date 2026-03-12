@@ -1,5 +1,5 @@
 import datetime
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -10,8 +10,7 @@ except Exception:  # noqa: BLE001
 from src.api.config import Config
 from src.api.dataHandler import db
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime.datetime]:
     if not value:
@@ -26,7 +25,6 @@ def _parse_dt(value: Optional[str]) -> Optional[datetime.datetime]:
             logger.debug("Could not parse datetime value: %s", value)
             return None
 
-
 def _resolve_name(doc: Dict[str, Any]) -> str:
     return (
         doc.get("name")
@@ -38,7 +36,6 @@ def _resolve_name(doc: Dict[str, Any]) -> str:
         or "Untitled Document"
     )
 
-
 def _resolve_type(doc: Dict[str, Any]) -> Optional[str]:
     return (
         doc.get("doc_type")
@@ -46,7 +43,6 @@ def _resolve_type(doc: Dict[str, Any]) -> Optional[str]:
         or doc.get("type")
         or doc.get("doctype")
     )
-
 
 def _resolve_created(doc: Dict[str, Any]) -> Optional[Any]:
     return (
@@ -58,7 +54,6 @@ def _resolve_created(doc: Dict[str, Any]) -> Optional[Any]:
         or doc.get("timestamp")
     )
 
-
 def _resolve_updated(doc: Dict[str, Any]) -> Optional[Any]:
     return (
         doc.get("updated_at")
@@ -69,14 +64,12 @@ def _resolve_updated(doc: Dict[str, Any]) -> Optional[Any]:
         or doc.get("lastUpdated")
     )
 
-
 def _resolve_profile_id(doc: Dict[str, Any]) -> Optional[str]:
     value = doc.get("profile_id") or doc.get("profileId") or doc.get("profile") or doc.get("profileID")
     if value is None:
         return None
     value_str = str(value)
     return value_str if value_str else None
-
 
 def _resolve_subscription_id(doc: Dict[str, Any]) -> Optional[str]:
     value = (
@@ -89,7 +82,6 @@ def _resolve_subscription_id(doc: Dict[str, Any]) -> Optional[str]:
         return None
     value_str = str(value)
     return value_str if value_str else None
-
 
 def list_documents(
     limit: int = 50,

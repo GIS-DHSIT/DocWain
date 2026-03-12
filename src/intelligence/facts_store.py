@@ -2,23 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
 from src.utils.payload_utils import token_count
 from src.intelligence.redis_schema import RedisSchema
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _now_ts() -> float:
     return float(time.time())
 
-
 def _safe_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
-
 
 class FactsStore:
     def __init__(
@@ -390,6 +387,5 @@ class FactsStore:
         merged["by_section_kind"] = by_kind
         merged["updated_at"] = _now_ts()
         return merged
-
 
 __all__ = ["FactsStore"]

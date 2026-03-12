@@ -6,7 +6,7 @@ Key Fixes:
 3. Strict source boundary preservation
 """
 
-import logging
+from src.utils.logging_utils import get_logger
 import hashlib
 import time
 import numpy as np
@@ -24,8 +24,7 @@ from src.kg.neo4j_store import Neo4jStore
 from src.utils.redis_cache import RedisJsonCache, hash_query, stamp_cache_payload
 from src.utils.payload_utils import get_canonical_text, get_source_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class ChunkMetadata:
@@ -40,7 +39,6 @@ class ChunkMetadata:
     next_chunk_id: str = None
     chunk_type: str = "text"
     page_number: int = None
-
 
 class EnhancedSemanticChunker:
     """Advanced chunking that preserves document structure"""
@@ -208,7 +206,6 @@ class EnhancedSemanticChunker:
         logger.info(f"Created {len(chunks)} chunks from {len(units)} units for {doc_name}")
         return chunks
 
-
 def chunk_text_for_embedding(text: str, doc_name: str, document_id: str) -> List[Tuple[str, dict]]:
     """
      FIXED: document_id is now REQUIRED (no default value)
@@ -259,7 +256,6 @@ def chunk_text_for_embedding(text: str, doc_name: str, document_id: str) -> List
 
     return result
 
-
 def normalize_chunk_links(
         chunk_metadata: List[dict],
         subscription_id: str,
@@ -294,7 +290,6 @@ def normalize_chunk_links(
         normalized.append(m)
 
     return normalized
-
 
 class AdaptiveRetriever:
     """
@@ -449,14 +444,12 @@ class AdaptiveRetriever:
         chunks.sort(key=lambda x: x['score'], reverse=True)
         return chunks
 
-
 @dataclass
 class KGProbeResult:
     document_ids: List[str]
     section_paths: List[str]
     hits: Dict[str, int]
     source: str = "neo4j"
-
 
 class GraphGuidedRetriever:
     """Lightweight KG probe + score boost layer for retrieval."""

@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -7,8 +7,7 @@ from typing import Any, Dict, List, Optional
 from src.api.config import Config
 from src.kg.entity_extractor import EntityExtractor
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class QueryAnalysis:
@@ -31,7 +30,6 @@ class QueryAnalysis:
             if candidate and candidate not in variants:
                 variants.append(candidate)
         return variants
-
 
 class QueryIntelligence:
     """Analyze, expand, and decompose queries to improve retrieval recall and precision."""

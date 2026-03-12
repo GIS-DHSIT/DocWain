@@ -1,10 +1,9 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from pathlib import Path
 from typing import Dict, Iterable
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class DatasetWriter:
     def __init__(self, path: Path):
@@ -24,7 +23,6 @@ class DatasetWriter:
         except Exception:
             pass
         logger.info("Wrote %d training pairs to %s", self.count, self.path)
-
 
 def load_dataset_count(path: Path) -> int:
     if not path.exists():

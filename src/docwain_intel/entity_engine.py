@@ -5,7 +5,7 @@ extraction from KV groups and tables.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 import uuid
@@ -20,14 +20,13 @@ from src.docwain_intel.models import (
     UnitType,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Lazy-loaded singletons
 # ---------------------------------------------------------------------------
 _spacy_lock = threading.Lock()
 _spacy_nlp = None
-
 
 def _get_spacy():
     """Load spaCy model (lazy singleton, thread-safe). Prefers en_core_web_lg."""
@@ -45,10 +44,103 @@ def _get_spacy():
             _spacy_nlp = spacy.load("en_core_web_sm")
     return _spacy_nlp
 
+# ---------------------------------------------------------------------------
+# Lazy-loaded GLiNER singleton
+# ---------------------------------------------------------------------------
+_gliner_lock = threading.Lock()
+_gliner_model = None
+_gliner_available = True  # set to False on first ImportError
+
+_GLINER_LABELS = [
+    "skill",
+    "qualification",
+    "product",
+    "service",
+    "medical_condition",
+    "legal_clause",
+    "policy_term",
+    "financial_metric",
+    "job_title",
+    "certification",
+]
+
+def _get_gliner():
+    """Load GLiNER model (lazy singleton, thread-safe). Returns None if unavailable."""
+    global _gliner_model, _gliner_available
+    if not _gliner_available:
+        return None
+    if _gliner_model is not None:
+        return _gliner_model
+    with _gliner_lock:
+        if not _gliner_available:
+            return None
+        if _gliner_model is not None:
+            return _gliner_model
+        try:
+            from gliner import GLiNER  # noqa: F401
+
+            _gliner_model = GLiNER.from_pretrained("urchade/gliner_multi_pii-v1")
+            logger.info("GLiNER model loaded successfully")
+        except ImportError:
+            logger.debug(
+                "GLiNER not installed — zero-shot entity extraction disabled. "
+                "Install with: pip install gliner"
+            )
+            _gliner_available = False
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("GLiNER model failed to load: %s", exc)
+            _gliner_available = False
+            return None
+    return _gliner_model
+
+# ---------------------------------------------------------------------------
+# GLiNER zero-shot entity extraction
+# ---------------------------------------------------------------------------
+def _extract_gliner_entities(text: str, unit_id: str) -> List[EntitySpan]:
+    """Extract domain-specific entities using GLiNER zero-shot NER.
+
+    Finds entities that spaCy misses: SKILL, QUALIFICATION, PRODUCT,
+    MEDICAL_CONDITION, JOB_TITLE, CERTIFICATION, etc.
+    """
+    model = _get_gliner()
+    if model is None:
+        return []
+
+    # Truncate to GLiNER's context window
+    truncated = text[:MAX_GLINER_TEXT_CHARS]
+    if not truncated.strip():
+        return []
+
+    entities: List[EntitySpan] = []
+    try:
+        predictions = model.predict_entities(truncated, _GLINER_LABELS, threshold=0.5)
+        for pred in predictions:
+            label_upper = pred["label"].upper()
+            ent_text = pred["text"]
+            entities.append(
+                EntitySpan(
+                    entity_id=f"ent_{_uid()}",
+                    text=ent_text,
+                    normalized=ent_text.lower().strip(),
+                    label=label_upper,
+                    unit_id=unit_id,
+                    char_start=pred.get("start", 0),
+                    char_end=pred.get("end", 0),
+                    confidence=0.80,
+                    source="gliner",
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("GLiNER extraction failed: %s", exc)
+
+    return entities
 
 # ---------------------------------------------------------------------------
 # Regex patterns for structured entity extraction
 # ---------------------------------------------------------------------------
+MAX_GLINER_TEXT_CHARS = 4096
+
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 # Phone: require at least 7 digit characters to avoid false positives
 _PHONE_RE = re.compile(
@@ -63,10 +155,8 @@ _DURATION_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _uid() -> str:
     return uuid.uuid4().hex[:12]
-
 
 # ---------------------------------------------------------------------------
 # spaCy NER extraction
@@ -91,7 +181,6 @@ def _extract_spacy_entities(text: str, unit_id: str) -> List[EntitySpan]:
             )
         )
     return entities
-
 
 # ---------------------------------------------------------------------------
 # Regex pattern extraction
@@ -139,7 +228,6 @@ def _extract_pattern_entities(text: str, unit_id: str) -> List[EntitySpan]:
             )
 
     return entities
-
 
 # ---------------------------------------------------------------------------
 # SVO fact extraction (textacy with fallback)
@@ -218,7 +306,6 @@ def _extract_svo_facts(
         logger.warning("SVO extraction failed: %s", exc)
     return facts
 
-
 # ---------------------------------------------------------------------------
 # KV group extraction
 # ---------------------------------------------------------------------------
@@ -258,7 +345,6 @@ def _extract_kv_facts(
         entities.extend(pat_entities)
 
     return entities, facts, kv_pairs
-
 
 # ---------------------------------------------------------------------------
 # Table extraction
@@ -314,7 +400,6 @@ def _extract_table_facts(
 
     return entities, facts, tables_structured
 
-
 # ---------------------------------------------------------------------------
 # Deduplication
 # ---------------------------------------------------------------------------
@@ -326,7 +411,6 @@ def _deduplicate_entities(entities: List[EntitySpan]) -> List[EntitySpan]:
         if key not in seen or ent.confidence > seen[key].confidence:
             seen[key] = ent
     return list(seen.values())
-
 
 # ---------------------------------------------------------------------------
 # Validation: no hallucinated entities
@@ -352,7 +436,6 @@ def _validate_entities(
                 ent.unit_id,
             )
     return valid
-
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -450,6 +533,15 @@ def extract_entities_and_facts(doc: StructuredDocument) -> ExtractionResult:
 
         pattern_ents = _extract_pattern_entities(text, unit.unit_id)
         all_entities.extend(pattern_ents)
+
+        # GLiNER zero-shot extraction for prose units (after spaCy)
+        if unit.unit_type in (
+            UnitType.PARAGRAPH,
+            UnitType.LIST,
+            UnitType.FRAGMENT,
+        ):
+            gliner_ents = _extract_gliner_entities(text, unit.unit_id)
+            all_entities.extend(gliner_ents)
 
         # SVO facts for prose units
         if unit.unit_type in (

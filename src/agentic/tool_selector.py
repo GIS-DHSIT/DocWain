@@ -15,12 +15,12 @@ Agent selection uses three signal sources (in priority order):
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Intent + domain → agent mapping  (ML-based, primary signal)
@@ -63,7 +63,6 @@ _DOMAIN_TOOLS = _DOMAIN_AGENTS  # backward-compat alias
 
 _NEVER_AUTO_SELECT = frozenset({"stt", "tts", "db_connector"})
 
-
 def _get_embedder() -> Any:
     """Get the sentence-transformer embedder (singleton, via NLU engine)."""
     try:
@@ -71,7 +70,6 @@ def _get_embedder() -> Any:
         return get_embedder()
     except Exception:
         return None
-
 
 class AgentSelector:
     """Selects agents automatically based on query analysis.
@@ -226,7 +224,6 @@ class AgentSelector:
         except Exception as exc:
             logger.debug("NLU agent matching failed: %s", exc)
             return []
-
 
 # Backward-compat aliases
 ToolSelector = AgentSelector

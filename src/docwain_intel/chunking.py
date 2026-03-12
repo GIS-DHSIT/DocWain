@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
 from .metadata_normalizer import normalize_chunk_payload
 from .models import Block, DocumentManifest, EntityFactBundle, ExtractedDocumentJSON
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
 
-
 def _tokenize(text: str) -> List[str]:
     return re.findall(r"[A-Za-z0-9]{3,}", (text or "").lower())
-
 
 def _anchors_from_text(text: str, limit: int = 8) -> List[str]:
     tokens = _tokenize(text)
@@ -30,11 +27,9 @@ def _anchors_from_text(text: str, limit: int = 8) -> List[str]:
             break
     return seen
 
-
 def _page_range_from_block(block: Block) -> List[int]:
     page = block.page_number or 1
     return [page, page]
-
 
 def _section_index(document: ExtractedDocumentJSON) -> Dict[str, List[str]]:
     mapping: Dict[str, List[str]] = {}
@@ -42,7 +37,6 @@ def _section_index(document: ExtractedDocumentJSON) -> Dict[str, List[str]]:
         for block_id in section.content_refs:
             mapping[block_id] = section.section_path
     return mapping
-
 
 def build_answerable_chunks(
     *,
@@ -184,6 +178,5 @@ def build_answerable_chunks(
         normalized.append(normalize_chunk_payload(payload))
 
     return normalized
-
 
 __all__ = ["build_answerable_chunks"]

@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.intelligence.kg_builder import KGStoreBase, MemoryKGStore, Neo4jKGStore, get_kg_store
 from src.kg.entity_extractor import EntityExtractor, normalize_entity_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class KGQueryResult:
     doc_ids: List[str] = field(default_factory=list)
     chunk_ids: List[str] = field(default_factory=list)
     entities: List[Dict[str, Any]] = field(default_factory=list)
-
 
 class KGQueryService:
     def __init__(
@@ -161,6 +159,5 @@ class KGQueryService:
             chunk_ids=sorted(set(chunk_ids)),
             entities=entities,
         )
-
 
 __all__ = ["KGQueryService", "KGQueryResult"]

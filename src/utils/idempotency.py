@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import time
 from dataclasses import dataclass
@@ -8,11 +8,10 @@ from typing import Optional
 
 from src.api.dw_newron import get_redis_client
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _MEMORY_LOCKS: dict[str, float] = {}
 _MEMORY_LOCK = threading.Lock()
-
 
 @dataclass(frozen=True)
 class IdempotencyLock:
@@ -20,11 +19,9 @@ class IdempotencyLock:
     acquired: bool
     backend: str
 
-
 def _lock_key(stage: str, subscription_id: Optional[str], document_id: str) -> str:
     scope = subscription_id or "unknown"
     return f"docwain:lock:{stage}:{scope}:{document_id}"
-
 
 def acquire_lock(
     *,
@@ -57,7 +54,6 @@ def acquire_lock(
         _MEMORY_LOCKS[key] = expiry
         return IdempotencyLock(key=key, acquired=True, backend="memory")
 
-
 def release_lock(lock: IdempotencyLock) -> None:
     if not lock or not lock.key:
         return
@@ -71,6 +67,5 @@ def release_lock(lock: IdempotencyLock) -> None:
         return
     with _MEMORY_LOCK:
         _MEMORY_LOCKS.pop(lock.key, None)
-
 
 __all__ = ["acquire_lock", "release_lock", "IdempotencyLock"]

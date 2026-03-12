@@ -4,7 +4,7 @@ form_extractor.py — Detects and extracts key-value pairs from structured form 
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import List, Optional
@@ -17,7 +17,7 @@ __all__ = [
     "form_fields_to_chunk_text",
 ]
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -107,11 +107,9 @@ _MULTILINE_PATTERN: re.Pattern = re.compile(
 )
 _MULTILINE_CONFIDENCE: float = 0.9
 
-
 # ---------------------------------------------------------------------------
 # Dataclass
 # ---------------------------------------------------------------------------
-
 
 @dataclass
 class FormField:
@@ -123,11 +121,9 @@ class FormField:
     page: Optional[int] = None
     section_title: Optional[str] = None
 
-
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
 
 def _looks_like_sentence(label: str) -> bool:
     """Return True if the label text looks like a prose sentence rather than a field name."""
@@ -144,22 +140,18 @@ def _looks_like_sentence(label: str) -> bool:
         return True
     return False
 
-
 def _normalize_label(label: str) -> str:
     """Strip whitespace and convert to title case."""
     return label.strip().title()
-
 
 def _is_false_positive_label(label: str) -> bool:
     """Return True if the label matches a known false-positive pattern."""
     normalized = label.strip().lower().rstrip(":").strip()
     return normalized in _FALSE_POSITIVE_LABELS
 
-
 # ---------------------------------------------------------------------------
 # Public functions
 # ---------------------------------------------------------------------------
-
 
 def is_form_like_section(text: str) -> bool:
     """
@@ -203,7 +195,6 @@ def is_form_like_section(text: str) -> bool:
         return True
 
     return False
-
 
 def extract_form_fields(
     text: str,
@@ -277,7 +268,6 @@ def extract_form_fields(
     )
     return fields
 
-
 def extract_all_form_fields(sections: List[dict]) -> List[FormField]:
     """
     Extract form fields from all form-like sections in a document.
@@ -328,7 +318,6 @@ def extract_all_form_fields(sections: List[dict]) -> List[FormField]:
         len(sections),
     )
     return all_fields
-
 
 def form_fields_to_chunk_text(fields: List[FormField]) -> str:
     """

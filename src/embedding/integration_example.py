@@ -8,6 +8,8 @@ into DocWain's existing RAG pipeline.
 from __future__ import annotations
 
 import logging
+
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 # Import enhanced components
@@ -15,8 +17,7 @@ from src.embedding.orchestrator import EnhancedEmbeddingOrchestrator
 from src.embedding.reranker import RerankingConfig
 from src.embedding.threshold_tuner import ThresholdConfig
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class EnhancedRAGPipeline:
     """
@@ -276,7 +277,6 @@ Answer:"""
 
         return chunks
 
-
 # Example usage function
 def example_usage():
     """Demonstrates how to use the enhanced RAG pipeline."""
@@ -318,7 +318,6 @@ def example_usage():
     print(f"Response: {result['response']}")
     print(f"Sources: {len(result['chunks'])} chunks")
     print(f"Cache hit rate: {result['metrics']['cache']['hit_rate']:.1%}")
-
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

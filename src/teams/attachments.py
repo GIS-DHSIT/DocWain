@@ -26,12 +26,10 @@ except ImportError as exc:
     _BLOB_WARNING_EMITTED = False
     _BLOB_IMPORT_ERROR = exc
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class AttachmentIngestError(Exception):
     """Raised when a Teams attachment cannot be ingested."""
-
 
 @dataclass
 class ScreeningSummary:
@@ -39,7 +37,6 @@ class ScreeningSummary:
     overall_score: float = 0.0
     top_findings: List[str] = field(default_factory=list)
     tools_run: int = 0
-
 
 @dataclass
 class DocumentIntelligence:
@@ -50,7 +47,6 @@ class DocumentIntelligence:
     intent_tags: List[str] = field(default_factory=list)
     chunks_created: int = 0
 
-
 @dataclass
 class AttachmentOutcome:
     filename: str
@@ -60,7 +56,6 @@ class AttachmentOutcome:
     screening: Optional[ScreeningSummary] = None
     intelligence: Optional[DocumentIntelligence] = None
 
-
 @dataclass
 class IngestionResult:
     filenames: List[str]
@@ -69,10 +64,8 @@ class IngestionResult:
     screening_results: List[ScreeningSummary] = field(default_factory=list)
     intelligence_results: List[DocumentIntelligence] = field(default_factory=list)
 
-
 def _attachment_type(attachment: Dict[str, Any]) -> str:
     return (attachment.get("contentType") or "").lower()
-
 
 def _attachment_content(attachment: Dict[str, Any]) -> Dict[str, Any]:
     """Safely extract the content dict from an attachment.
@@ -82,7 +75,6 @@ def _attachment_content(attachment: Dict[str, Any]) -> Dict[str, Any]:
     """
     content = attachment.get("content")
     return content if isinstance(content, dict) else {}
-
 
 def _blob_uploads_enabled(log: logging.LoggerAdapter) -> bool:
     if not _BLOB_AVAILABLE:
@@ -96,16 +88,13 @@ def _blob_uploads_enabled(log: logging.LoggerAdapter) -> bool:
         return False
     return True
 
-
 def _blob_configured() -> bool:
     return bool(getattr(Config.AzureBlob, "CONNECTION_STRING", "")) and bool(getattr(Config.Teams, "BLOB_CONTAINER", ""))
-
 
 def _build_blob_name(filename: str, subscription_id: str) -> str:
     prefix = getattr(Config.Teams, "BLOB_PATH_PREFIX", "") or getattr(Config.Teams, "UPLOAD_DIR", "")
     blob_name_parts = [prefix.strip("/"), subscription_id.strip("/"), filename]
     return "/".join(part for part in blob_name_parts if part)
-
 
 def _upload_to_blob(file_bytes: bytes, filename: str, subscription_id: str, log: logging.LoggerAdapter) -> None:
     if not _blob_uploads_enabled(log):
@@ -137,7 +126,6 @@ def _upload_to_blob(file_bytes: bytes, filename: str, subscription_id: str, log:
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to upload Teams attachment to blob storage: %s", exc, exc_info=True)
 
-
 async def _download_bytes(
     url: str,
     headers: Dict[str, str],
@@ -166,7 +154,6 @@ async def _download_bytes(
             await asyncio.sleep(backoff)
             backoff *= 2
     raise RuntimeError("Download failed unexpectedly")
-
 
 async def _resolve_auth_token(turn_context, provided_token: Optional[str]) -> str:
     if provided_token:
@@ -208,13 +195,11 @@ async def _resolve_auth_token(turn_context, provided_token: Optional[str]) -> st
     logger.warning("No connector token available for Teams attachment download; will try without auth.")
     return ""
 
-
 def _build_download_headers(auth_token: str) -> Dict[str, str]:
     """Build headers for attachment download. Skip Authorization if token is empty."""
     if auth_token:
         return {"Authorization": f"Bearer {auth_token}"}
     return {}
-
 
 def _resolve_doc_tag(attachment: Dict[str, Any], filename: str) -> str:
     content = _attachment_content(attachment)
@@ -225,7 +210,6 @@ def _resolve_doc_tag(attachment: Dict[str, Any], filename: str) -> str:
         or hashlib.sha256(filename.encode("utf-8")).hexdigest()[:16]
     )
 
-
 def _resolve_download_url(attachment: Dict[str, Any]) -> Optional[str]:
     """Resolve download URL from all possible sources in the attachment."""
     content = _attachment_content(attachment)
@@ -234,7 +218,6 @@ def _resolve_download_url(attachment: Dict[str, Any]) -> Optional[str]:
         or content.get("download_url")
         or attachment.get("contentUrl")
     )
-
 
 def _resolve_filename(attachment: Dict[str, Any]) -> str:
     """Resolve filename from all possible sources in the attachment."""
@@ -245,7 +228,6 @@ def _resolve_filename(attachment: Dict[str, Any]) -> str:
         or attachment.get("name")
         or f"teams-upload-{uuid.uuid4()}"
     )
-
 
 def _run_security_screening(text: str, filename: str, doc_tag: str, log: logging.LoggerAdapter) -> Optional[ScreeningSummary]:
     """Run security-only screening (PII, secrets, private data) on extracted text.
@@ -292,7 +274,6 @@ def _run_security_screening(text: str, filename: str, doc_tag: str, log: logging
     except Exception as exc:  # noqa: BLE001
         log.warning("Security screening failed for %s: %s", filename, exc)
         return None
-
 
 def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: "TeamsChatContext", log: logging.LoggerAdapter) -> Optional[DocumentIntelligence]:
     """Run Document Intelligence pipeline to enrich document metadata.
@@ -368,7 +349,6 @@ def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: 
     except Exception as exc:  # noqa: BLE001
         log.warning("Document intelligence pipeline error for %s: %s", filename, exc)
         return None
-
 
 async def _process_file_attachment(
     attachment: Dict[str, Any],
@@ -460,7 +440,6 @@ async def _process_file_attachment(
         screening=screening,
         intelligence=di_result,
     )
-
 
 async def ingest_attachments(
     activity: Dict[str, Any],

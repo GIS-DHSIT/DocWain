@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -10,8 +10,7 @@ from src.embedding.chunking.section_chunker import normalize_text
 from src.intelligence.domain_classifier import classify_domain
 from src.kg.entity_extractor import EntityExtractor
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 SECTION_KIND_TAXONOMY = [
     "identity_contact",
@@ -149,7 +148,6 @@ DOMAIN_SECTION_KINDS: Dict[str, Tuple[str, ...]] = {
     "bank_statement": ("account_identity", "transactions", "balances", "fees"),
 }
 
-
 @dataclass
 class SectionDescriptor:
     section_id: str
@@ -162,7 +160,6 @@ class SectionDescriptor:
     salience: float = 0.5
     start_index: int = 0
     end_index: int = 0
-
 
 @dataclass
 class SectionIntelligenceResult:
@@ -179,7 +176,6 @@ class SectionIntelligenceResult:
             "section_summaries": self.section_summaries,
         }
 
-
 def _is_heading_line(line: str) -> bool:
     clean = (line or "").strip()
     if not clean:
@@ -194,11 +190,9 @@ def _is_heading_line(line: str) -> bool:
         return True
     return False
 
-
 def _hash_section_id(document_id: str, title: str, index: int) -> str:
     seed = f"{document_id}|{title}|{index}"
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
-
 
 def _section_kind_score(section_title: str, text: str, allowed_kinds: Optional[Iterable[str]] = None) -> Dict[str, float]:
     kinds = list(allowed_kinds) if allowed_kinds else SECTION_KIND_TAXONOMY
@@ -214,7 +208,6 @@ def _section_kind_score(section_title: str, text: str, allowed_kinds: Optional[I
             if keyword in lowered_text:
                 scores[kind] += 1.0
     return scores
-
 
 def _infer_section_kind(section_title: str, text: str, doc_domain: str) -> str:
     allowed = DOMAIN_SECTION_KINDS.get(doc_domain)
@@ -262,11 +255,9 @@ def _infer_section_kind(section_title: str, text: str, doc_domain: str) -> str:
             return refined
     return best_kind
 
-
 def _split_paragraphs(text: str) -> List[str]:
     paragraphs = [p.strip() for p in (text or "").split("\n\n") if p.strip()]
     return paragraphs
-
 
 def _segment_by_headings(text: str, fallback_title: str = "Section") -> List[Tuple[str, str]]:
     normalized = normalize_text(text or "")
@@ -297,7 +288,6 @@ def _segment_by_headings(text: str, fallback_title: str = "Section") -> List[Tup
     _flush(current_title, current_lines)
     return sections
 
-
 def _segment_by_paragraphs(text: str, *, group_size: int = 3) -> List[Tuple[str, str]]:
     paragraphs = _split_paragraphs(text or "")
     if not paragraphs:
@@ -313,7 +303,6 @@ def _segment_by_paragraphs(text: str, *, group_size: int = 3) -> List[Tuple[str,
         sections.append((title, body))
     return sections
 
-
 def _is_line_item_line(line: str) -> bool:
     if not line:
         return False
@@ -325,7 +314,6 @@ def _is_line_item_line(line: str) -> bool:
     if re.search(r"\s{2,}\S+\s{2,}\S+", line):
         return True
     return False
-
 
 def _derive_invoice_sections(document_text: str) -> Dict[str, str]:
     lines = [ln.strip() for ln in (document_text or "").splitlines() if ln.strip()]
@@ -350,7 +338,6 @@ def _derive_invoice_sections(document_text: str) -> Dict[str, str]:
             buckets["terms_conditions"].append(line)
     return {k: "\n".join(v) for k, v in buckets.items() if v}
 
-
 def _refine_resume_misc(section_title: str, text: str) -> Optional[str]:
     lowered = f"{section_title} {text}".lower()
     if any(token in lowered for token in ["president", "director", "lead", "manager", "supervisor", "leadership"]):
@@ -362,7 +349,6 @@ def _refine_resume_misc(section_title: str, text: str) -> Optional[str]:
     if any(token in lowered for token in ["skill", "tools", "technologies", "stack"]):
         return "skills_technical"
     return None
-
 
 def _inject_invoice_sections(
     sections: List[SectionDescriptor],
@@ -438,7 +424,6 @@ def _group_chunks_by_section(
         _flush(current_title, start_idx, len(chunk_texts) - 1, buffer, (page_start, page_end))
     return groups
 
-
 def _ensure_min_sections(
     sections: List[SectionDescriptor],
     *,
@@ -479,7 +464,6 @@ def _ensure_min_sections(
         return new_sections
     return sections
 
-
 def _apply_section_salience(sections: List[SectionDescriptor], total_chars: int) -> None:
     if not sections:
         return
@@ -487,7 +471,6 @@ def _apply_section_salience(sections: List[SectionDescriptor], total_chars: int)
     for section in sections:
         length = len(section.raw_text or "")
         section.salience = max(0.05, min(1.0, length / denom))
-
 
 def _build_chunk_map(
     chunk_texts: List[str],
@@ -503,7 +486,6 @@ def _build_chunk_map(
             }
         )
     return chunk_map
-
 
 def _find_evidence_span(value: str, chunk_map: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not value:
@@ -523,10 +505,8 @@ def _find_evidence_span(value: str, chunk_map: List[Dict[str, Any]]) -> Optional
             }
     return None
 
-
 def _normalize_token(value: str) -> str:
     return re.sub(r"[^\w\-]", "", str(value or "")).strip()
-
 
 def _score_identifier(value: str, field: str) -> float:
     token = _normalize_token(value)
@@ -554,7 +534,6 @@ def _score_identifier(value: str, field: str) -> float:
     if "-" in token:
         score += 0.05
     return min(score, 1.0)
-
 
 class SectionIntelligenceBuilder:
     def __init__(
@@ -866,7 +845,6 @@ class SectionIntelligenceBuilder:
                 summary += "..."
             summaries[section.section_id] = summary
         return summaries
-
 
 __all__ = [
     "SECTION_KIND_TAXONOMY",

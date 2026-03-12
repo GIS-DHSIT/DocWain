@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import re
 from dataclasses import dataclass
@@ -14,8 +14,7 @@ from src.nlp.sentiment_rules import match_sentiment_rules
 from src.policy.response_policy import INFO_MODE, ResponseModeClassifier, build_docwain_intro
 from src.prompting.persona import enforce_docwain_identity, get_docwain_persona, sanitize_response
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class IntentResult:
@@ -23,7 +22,6 @@ class IntentResult:
     confidence: float
     method: str
     matched_rule: Optional[str] = None
-
 
 @dataclass(frozen=True)
 class SentimentResult:
@@ -33,7 +31,6 @@ class SentimentResult:
     should_recover: bool
     matched_rule: Optional[str] = None
 
-
 @dataclass(frozen=True)
 class RouteDecision:
     intent: IntentResult
@@ -42,7 +39,6 @@ class RouteDecision:
     response_text: Optional[str]
     use_retrieval: bool
     policy: str
-
 
 _INTENT_FALLBACK_PROMPT = (
     "Classify the user message into one intent: GREETING, THANKS_OR_PRAISE, "
@@ -59,7 +55,6 @@ _SENTIMENT_FALLBACK_PROMPT = (
     "Message: {text}"
 )
 
-
 _DOC_TASK_CUES = re.compile(
     r"\b(summarize|summarise|analyze|analyse|extract|find|identify|compare|rank|list|generate|" \
     r"review|explain|highlight|locate|compile|report)\b",
@@ -67,13 +62,11 @@ _DOC_TASK_CUES = re.compile(
 )
 _QUESTION_WORDS = re.compile(r"\b(what|why|how|which|when|where|who)\b", re.IGNORECASE)
 
-
 def _intent_from_rules(text: str) -> Optional[IntentResult]:
     match = match_intent_rules(text)
     if not match:
         return None
     return IntentResult(intent=match.intent, confidence=match.confidence, method="rules", matched_rule=match.rule_name)
-
 
 def _sentiment_from_rules(text: str) -> Optional[SentimentResult]:
     match = match_sentiment_rules(text)
@@ -88,12 +81,10 @@ def _sentiment_from_rules(text: str) -> Optional[SentimentResult]:
         matched_rule=match.rule_name,
     )
 
-
 def _has_document_task_cues(text: str) -> bool:
     if _QUESTION_WORDS.search(text):
         return True
     return bool(_DOC_TASK_CUES.search(text))
-
 
 def _classify_with_ollama(model_name: str, prompt: str, llm_client=None) -> Optional[dict]:
     if not model_name and llm_client is None:
@@ -110,7 +101,6 @@ def _classify_with_ollama(model_name: str, prompt: str, llm_client=None) -> Opti
         logger.debug("Ollama classification failed: %s", exc)
         return None
 
-
 def _classify_with_genai(prompt: str) -> Optional[dict]:
     api_key = os.getenv("GEMINI_API_KEY") or getattr(Config.Model, "GEMINI_API_KEY", "")
     model = os.getenv("DOCWAIN_SMALLTALK_MODEL") or getattr(Config.Model, "GEMINI_MODEL_NAME", "")
@@ -122,7 +112,6 @@ def _classify_with_genai(prompt: str) -> Optional[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("GenAI classification failed: %s", exc)
         return None
-
 
 def detect_intent(text: str) -> IntentResult:
     text = (text or "").strip()
@@ -145,7 +134,6 @@ def detect_intent(text: str) -> IntentResult:
         return IntentResult(intent=intent, confidence=confidence, method="llm")
 
     return IntentResult(intent="DOCUMENT_TASK", confidence=0.55, method="fallback")
-
 
 def analyze_sentiment(text: str) -> SentimentResult:
     text = (text or "").strip()
@@ -185,7 +173,6 @@ def analyze_sentiment(text: str) -> SentimentResult:
         should_recover=False,
         matched_rule=None,
     )
-
 
 def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentResult], response_mode: str, user_text: str = "") -> str:
     # Try dynamic engine first.
@@ -230,7 +217,6 @@ def _build_direct_response(intent: IntentResult, sentiment: Optional[SentimentRe
         return build_docwain_intro()
 
     return response
-
 
 def route_message(user_text: str, state: Optional[dict] = None) -> RouteDecision:
     state = state or {}

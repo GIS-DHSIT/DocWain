@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 from typing import Any, Dict, List, Optional
@@ -12,12 +12,11 @@ try:
 except ImportError:
     neo4j = None  # type: ignore[assignment]
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
-
 
 class GraphNode(BaseModel):
     """A node in the knowledge graph."""
@@ -26,7 +25,6 @@ class GraphNode(BaseModel):
         ..., description="Entity, Document, or Chunk"
     )
     properties: Dict[str, Any] = Field(default_factory=dict)
-
 
 class GraphEdge(BaseModel):
     """An edge (relationship) in the knowledge graph."""
@@ -38,11 +36,9 @@ class GraphEdge(BaseModel):
     )
     properties: Dict[str, Any] = Field(default_factory=dict)
 
-
 # ---------------------------------------------------------------------------
 # CypherGraphAdapter — works with Neo4j *or* Memgraph (both speak Cypher)
 # ---------------------------------------------------------------------------
-
 
 class CypherGraphAdapter:
     """Thin adapter that executes Cypher queries against a bolt driver."""
@@ -200,11 +196,9 @@ class CypherGraphAdapter:
         rows = self._run(query, {"sub": subscription_id, "prof": profile_id})
         return rows[0]["cnt"] if rows else 0
 
-
 # ---------------------------------------------------------------------------
 # Connection helpers
 # ---------------------------------------------------------------------------
-
 
 def _try_connect_neo4j() -> Any | None:
     """Attempt to connect to Neo4j. Returns a driver or None."""
@@ -222,7 +216,6 @@ def _try_connect_neo4j() -> Any | None:
         logger.debug("Neo4j not available at %s", uri)
         return None
 
-
 def _try_connect_memgraph() -> Any | None:
     """Attempt to connect to Memgraph. Returns a driver or None."""
     if neo4j is None:
@@ -237,14 +230,12 @@ def _try_connect_memgraph() -> Any | None:
         logger.debug("Memgraph not available at %s", uri)
         return None
 
-
 # ---------------------------------------------------------------------------
 # Thread-safe singleton
 # ---------------------------------------------------------------------------
 
 _adapter_instance: Optional[CypherGraphAdapter] = None
 _adapter_lock = threading.Lock()
-
 
 def get_graph_adapter() -> Optional[CypherGraphAdapter]:
     """Return a singleton CypherGraphAdapter (Neo4j preferred, Memgraph fallback).

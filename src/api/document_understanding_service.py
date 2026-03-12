@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -12,19 +12,16 @@ from src.doc_understanding import build_content_map, identify_document, understa
 from src.metadata.normalizer import MetadataNormalizationError, normalize_document_metadata
 from src.profiles.profile_store import resolve_profile_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class UnderstandingError(Exception):
     pass
-
 
 def _select_extracted(extracted_payload: Any) -> Tuple[str, Any]:
     if isinstance(extracted_payload, dict) and extracted_payload:
         filename, content = next(iter(extracted_payload.items()))
         return filename, content
     raise UnderstandingError("No extracted content available")
-
 
 def _update_metadata(document_id: str, metadata: Dict[str, Any]) -> None:
     update_fields: Dict[str, Any] = {}
@@ -46,7 +43,6 @@ def _update_metadata(document_id: str, metadata: Dict[str, Any]) -> None:
         update_fields[key] = value
         update_fields[f"metadata.{key}"] = value
     update_document_fields(document_id, update_fields)
-
 
 def run_document_understanding(
     *,
@@ -133,7 +129,6 @@ def run_document_understanding(
         "understanding": understanding,
         "embedding": embed_result,
     }
-
 
 def extract_and_understand(
     *,

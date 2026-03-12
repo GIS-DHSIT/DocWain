@@ -1,14 +1,14 @@
 """Algorithmic query geometry analyzer -- derives structural properties from NLP features."""
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
 from .query_router import QueryAnalysis, _get_spacy
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Temporal lemmas that signal chronological intent.
 _TEMPORAL_LEMMAS = frozenset({
@@ -37,7 +37,6 @@ _WH_WORDS = frozenset({"who", "whom", "what", "when", "where", "why", "how", "wh
 # Copula lemmas.
 _COPULA_LEMMAS = frozenset({"be"})
 
-
 class QueryGeometry(BaseModel):
     query: str
     intent_type: str = "narrative"
@@ -50,14 +49,12 @@ class QueryGeometry(BaseModel):
     question_word: Optional[str] = None
     requested_attributes: List[str] = Field(default_factory=list)
 
-
 def _find_question_word(doc) -> Optional[str]:
     """Extract the WH-word from the query, if present."""
     for token in doc:
         if token.lemma_.lower() in _WH_WORDS:
             return token.lemma_.lower()
     return None
-
 
 def _detect_temporal_ordering(doc, question_word: Optional[str]) -> bool:
     """Detect whether the query expects chronologically ordered results."""
@@ -70,7 +67,6 @@ def _detect_temporal_ordering(doc, question_word: Optional[str]) -> bool:
         if token.lemma_.lower() in _TEMPORAL_LEMMAS:
             return True
     return False
-
 
 def _derive_intent_type(
     doc,
@@ -119,7 +115,6 @@ def _derive_intent_type(
 
     return "narrative"
 
-
 def _derive_granularity(
     doc,
     analysis: QueryAnalysis,
@@ -154,7 +149,6 @@ def _derive_granularity(
         score -= 0.15
 
     return max(0.0, min(1.0, round(score, 3)))
-
 
 def _derive_focus_type(
     doc,
@@ -191,7 +185,6 @@ def _derive_focus_type(
     if entities:
         return "entity_centric"
     return "process_centric"
-
 
 def _extract_requested_attributes(doc, entities: List[str]) -> List[str]:
     """Extract requested attributes -- nouns/noun-phrases that are NOT named entities."""
@@ -232,7 +225,6 @@ def _extract_requested_attributes(doc, entities: List[str]) -> List[str]:
                 attributes.append(lemma)
 
     return attributes
-
 
 def analyze_query(query: str, analysis: QueryAnalysis) -> QueryGeometry:
     """Enrich a QueryAnalysis with geometric properties derived from NLP features."""

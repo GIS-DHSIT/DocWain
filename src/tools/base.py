@@ -1,18 +1,16 @@
 import asyncio
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import uuid
 from typing import Any, Callable, Dict, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def generate_correlation_id(value: Optional[str] = None) -> str:
     """Use provided correlation id when available, otherwise create a new UUID."""
     if value:
         return value
     return str(uuid.uuid4())
-
 
 def standard_response(
     tool_name: str,
@@ -40,7 +38,6 @@ def standard_response(
         "error": error,
     }
 
-
 class ToolError(Exception):
     """Structured error used by tool/agent implementations for predictable responses."""
 
@@ -52,17 +49,14 @@ class ToolError(Exception):
     def as_dict(self) -> Dict[str, Any]:
         return {"message": str(self), "code": self.code}
 
-
 # Agent-primary alias
 AgentError = ToolError
-
 
 async def _maybe_await(func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     if asyncio.iscoroutinefunction(func):
         return await func(*args, **kwargs)
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-
 
 class ToolRegistry:
     """
@@ -130,12 +124,10 @@ class ToolRegistry:
         )
         return response
 
-
 # Agent-primary alias
 AgentRegistry = ToolRegistry
 
 registry = ToolRegistry()
-
 
 def register_tool(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorator to simplify registration of agent handlers."""
@@ -145,7 +137,6 @@ def register_tool(name: str) -> Callable[[Callable[..., Any]], Callable[..., Any
         return func
 
     return _decorator
-
 
 # Agent-primary alias
 register_agent = register_tool

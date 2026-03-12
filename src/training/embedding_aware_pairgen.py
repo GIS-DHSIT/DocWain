@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import re
 import subprocess
@@ -8,17 +8,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _split_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[.!?])\s+", text.strip())
     return [p.strip() for p in parts if p.strip()]
 
-
 def _token_count(text: str) -> int:
     return len(text.split())
-
 
 @dataclass
 class Chunk:
@@ -26,7 +23,6 @@ class Chunk:
     text: str
     embedding: Optional[List[float]]
     metadata: Dict[str, Any]
-
 
 class LineFrequencyCleaner:
     def __init__(self, threshold: float = 0.6):
@@ -60,7 +56,6 @@ class LineFrequencyCleaner:
             kept.append(line)
         return "\n".join(kept).strip()
 
-
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     if a is None or b is None:
         return -1.0
@@ -68,7 +63,6 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     if denom == 0:
         return -1.0
     return float(np.dot(a, b) / denom)
-
 
 def mmr(anchor: np.ndarray, candidates: List[Tuple[int, np.ndarray]], k: int = 4, lambda_mult: float = 0.5) -> List[int]:
     selected: List[int] = []
@@ -95,7 +89,6 @@ def mmr(anchor: np.ndarray, candidates: List[Tuple[int, np.ndarray]], k: int = 4
         selected.append(best_idx)
     return selected
 
-
 def _bundle_adjacent(chunks: List[Chunk], min_size: int = 3, max_size: int = 6) -> List[List[Chunk]]:
     bundles: List[List[Chunk]] = []
     by_doc: Dict[str, List[Chunk]] = {}
@@ -111,7 +104,6 @@ def _bundle_adjacent(chunks: List[Chunk], min_size: int = 3, max_size: int = 6) 
                 bundles.append(bundle)
             i += max_size - 1
     return bundles
-
 
 def _bundle_knn(chunks: List[Chunk], k: int = 6) -> List[List[Chunk]]:
     bundles: List[List[Chunk]] = []
@@ -129,7 +121,6 @@ def _bundle_knn(chunks: List[Chunk], k: int = 6) -> List[List[Chunk]]:
         if len(bundle) >= 3:
             bundles.append(bundle)
     return bundles
-
 
 def _call_ollama(prompt: str, model: str, temperature: float = 0.15) -> Optional[str]:
     try:
@@ -149,7 +140,6 @@ def _call_ollama(prompt: str, model: str, temperature: float = 0.15) -> Optional
         logger.warning("ollama invocation failed: %s", exc)
         return None
 
-
 def _fallback_summary(text: str) -> str:
     sentences = _split_sentences(text)
     if not sentences:
@@ -157,7 +147,6 @@ def _fallback_summary(text: str) -> str:
     ranked = sorted(sentences, key=lambda s: len(s.split()), reverse=True)
     top = ranked[:3]
     return " ".join(top)
-
 
 def _fallback_structure(text: str) -> str:
     sentences = _split_sentences(text)
@@ -174,7 +163,6 @@ def _fallback_structure(text: str) -> str:
     }
     return json.dumps(result, ensure_ascii=False)
 
-
 def _bundle_text(bundle: List[Chunk]) -> str:
     parts = []
     for ch in bundle:
@@ -182,7 +170,6 @@ def _bundle_text(bundle: List[Chunk]) -> str:
         header = f"[{label}]" if label else ""
         parts.append(f"{header}\n{ch.text}")
     return "\n\n".join(parts).strip()
-
 
 def generate_examples(
     bundles: List[List[Chunk]],
@@ -256,7 +243,6 @@ def generate_examples(
         pairs.append(pair)
     return pairs
 
-
 def build_pairs_for_profile(
     chunks: List[Chunk],
     cleaner: LineFrequencyCleaner,
@@ -303,6 +289,5 @@ def build_pairs_for_profile(
         bundles.append(fallback_bundle)
     pairs = generate_examples(bundles, use_ollama=use_ollama, ollama_model=ollama_model)
     return pairs, drop_counters
-
 
 __all__ = ["Chunk", "LineFrequencyCleaner", "build_pairs_for_profile"]

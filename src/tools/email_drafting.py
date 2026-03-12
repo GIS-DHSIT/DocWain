@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header
@@ -10,10 +10,9 @@ from src.tools.base import generate_correlation_id, register_tool, standard_resp
 from src.tools.common.grounding import build_source_record
 from src.tools.common.text_extract import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/email", tags=["Tools-Email"])
-
 
 class EmailDraftRequest(BaseModel):
     intent: str = Field(default="compose email", description="Purpose of the email")
@@ -23,13 +22,11 @@ class EmailDraftRequest(BaseModel):
     context: Optional[Dict[str, Any]] = None
     text: Optional[str] = Field(default=None, description="Reference text to ground the draft")
 
-
 # ── JSON Schema for LLM drafting ───────────────────────────────────
 
 _JSON_SCHEMA = '{"subject": "...", "body": "...", "key_facts": ["..."]}'
 
 _EXPECTED_FIELDS = ["subject", "body"]
-
 
 # ── LLM drafting ───────────────────────────────────────────────────
 
@@ -56,7 +53,6 @@ def _llm_draft(request: EmailDraftRequest) -> Optional[Dict[str, Any]]:
         logger.debug("Email LLM drafting failed: %s", exc)
         return None
 
-
 def _normalize_llm_draft(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize LLM output into the expected email result shape."""
     subject = raw.get("subject", "")
@@ -65,7 +61,6 @@ def _normalize_llm_draft(raw: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(key_facts, str):
         key_facts = [key_facts]
     return {"subject": subject, "body": body, "key_facts": key_facts}
-
 
 # ── Template fallback ───────────────────────────────────────────────
 
@@ -90,7 +85,6 @@ def _template_build_email(request: EmailDraftRequest) -> Dict[str, Any]:
         "body": "\n".join(body_lines),
         "key_facts": bullets[:6],
     }
-
 
 # ── Unified drafting ───────────────────────────────────────────────
 
@@ -122,7 +116,6 @@ def _build_email(request: EmailDraftRequest) -> Dict[str, Any]:
         result["rendered"] = "\n\n".join(rendered_parts)
     return result
 
-
 def _extract_intent_from_query(query: str) -> str:
     """Extract email intent from a natural language query."""
     q = query.lower()
@@ -144,7 +137,6 @@ def _extract_intent_from_query(query: str) -> str:
             return intent_label
     # Fall back to the query itself as the intent
     return query[:120] if query else "compose email"
-
 
 def _extract_recipient_from_query(query: str) -> str:
     """Extract recipient role from a natural language query."""
@@ -170,7 +162,6 @@ def _extract_recipient_from_query(query: str) -> str:
         return to_match.group(1)
     return "recipient"
 
-
 @register_tool("email_drafting")
 async def email_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     raw = payload.get("input") or payload
@@ -190,7 +181,6 @@ async def email_handler(payload: Dict[str, Any], correlation_id: Optional[str] =
     draft = _build_email(req)
     sources = [build_source_record("tool", correlation_id or "email", title=req.intent)]
     return {"result": draft, "sources": sources, "grounded": True, "context_found": True}
-
 
 @router.post("/draft")
 async def draft(request: EmailDraftRequest, x_correlation_id: str | None = Header(None)):

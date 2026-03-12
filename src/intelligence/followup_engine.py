@@ -8,17 +8,16 @@ Templates: 6 domains x 5 intents = 30 template sets.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
-
 
 @dataclass
 class FollowUpSuggestion:
@@ -34,7 +33,6 @@ class FollowUpSuggestion:
             "source": self.source,
             "relevance": round(self.relevance, 2),
         }
-
 
 # ── Domain x Intent Template Sets ─────────────────────────────────────────
 
@@ -233,7 +231,6 @@ _DOMAIN_INTENT_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
     },
 }
 
-
 # ── Analytical Intent Templates (cross-doc, timeline, risk, trend) ────────
 
 _ANALYTICAL_INTENT_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
@@ -371,15 +368,12 @@ _ANALYTICAL_INTENT_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
     },
 }
 
-
 def _tokenize(text: str) -> Set[str]:
     return {t.lower() for t in _TOKEN_RE.findall(text) if len(t) > 2}
-
 
 _ANALYTICAL_INTENT_KEYS = frozenset({
     "cross_document", "timeline", "analytics", "risk",
 })
-
 
 def _infer_intent_key(intent_type: Optional[str]) -> str:
     """Map intent type to template key."""
@@ -407,7 +401,6 @@ def _infer_intent_key(intent_type: Optional[str]) -> str:
         return "extraction"
     return "factual"
 
-
 def _infer_domain_key(domain: Optional[str]) -> str:
     """Map domain to template key."""
     if not domain:
@@ -424,7 +417,6 @@ def _infer_domain_key(domain: Optional[str]) -> str:
         "insurance": "policy",
     }
     return domain_map.get(lower, "generic")
-
 
 def _template_suggestions(
     domain: Optional[str],
@@ -477,7 +469,6 @@ def _template_suggestions(
                 break
 
     return results[:max_count]
-
 
 def _semantic_suggestions(
     query: str,
@@ -552,7 +543,6 @@ def _semantic_suggestions(
 
     return results
 
-
 def _llm_suggestions(
     query: str,
     response: str,
@@ -603,7 +593,6 @@ def _llm_suggestions(
         logger.debug("LLM follow-up generation failed: %s", exc)
         return []
 
-
 def _call_llm(llm_client: Any, prompt: str) -> str:
     """Call LLM client, handling gateway, generate_with_metadata, and raw ollama patterns."""
     # Prefer generate_with_metadata (gateway client pattern)
@@ -618,7 +607,6 @@ def _call_llm(llm_client: Any, prompt: str) -> str:
             return result[0] if result[0] else ""
         return result or ""
     return ""
-
 
 def generate_followups(
     query: str,
@@ -706,7 +694,6 @@ def generate_followups(
             unique.append(s)
 
     return [s.to_dict() for s in unique[:max_count]]
-
 
 def _extract_primary_entity(response: str, query: str) -> Optional[str]:
     """Extract the primary entity name from the response or query for personalization."""

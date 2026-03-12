@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Optional, Tuple
 
 try:
@@ -8,11 +8,10 @@ except ImportError:  # pragma: no cover - fallback for older SDK
     import google.generativeai as _genai  # type: ignore
     _GENAI_IMPORT = "google.generativeai"
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _client: Any | None = None
 _client_api_key: str | None = None
-
 
 def _coerce_generation_config(config: Optional[dict]) -> Optional[Any]:
     """Convert plain dicts into the SDK's config type when available."""
@@ -34,7 +33,6 @@ def _coerce_generation_config(config: Optional[dict]) -> Optional[Any]:
         return config
     return config
 
-
 def get_genai_client(api_key: str) -> Any:
     """
     Return a configured GenAI client, compatible with both google.genai and
@@ -52,7 +50,6 @@ def get_genai_client(api_key: str) -> Any:
     _client_api_key = api_key
     logger.info("Initialized %s client", _GENAI_IMPORT)
     return _client
-
 
 def _extract_response_text(response: Any) -> str:
     """Best-effort extraction of text from GenAI responses across SDK versions."""
@@ -74,7 +71,6 @@ def _extract_response_text(response: Any) -> str:
             if content_text:
                 return str(content_text).strip()
     return ""
-
 
 def generate_text(
     api_key: str,

@@ -3,6 +3,8 @@ import json
 import time
 import threading
 import logging
+
+from src.utils.logging_utils import get_logger
 import hashlib
 import concurrent.futures
 import random
@@ -101,7 +103,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 STOP_TOKENS = {
     "<|endoftext|>",
@@ -110,7 +112,6 @@ STOP_TOKENS = {
     "<|end|>",
 }
 
-
 def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
     if not model_name:
         return model_name
@@ -118,7 +119,6 @@ def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
     if normalized in ("docwain-agent", "gpt-oss"):
         return "qwen3:14b"
     return model_name
-
 
 def _is_generation_empty(text: Optional[str], stop_tokens: Optional[Set[str]] = None) -> bool:
     if text is None:
@@ -134,13 +134,11 @@ def _is_generation_empty(text: Optional[str], stop_tokens: Optional[Set[str]] = 
             return True
     return False
 
-
 def _sanitize_snippet(text: Optional[str], limit: int = 80) -> str:
     sample = re.sub(r"\s+", " ", (text or "").strip())
     if len(sample) > limit:
         sample = sample[:limit].rstrip() + "..."
     return sample
-
 
 def _collect_documents_seen(chunks: List[Any]) -> List[str]:
     names: List[str] = []
@@ -156,7 +154,6 @@ def _collect_documents_seen(chunks: List[Any]) -> List[str]:
             seen.add(base)
     return names
 
-
 def _coerce_page_number(value: Any) -> Optional[int]:
     if value is None:
         return None
@@ -164,7 +161,6 @@ def _coerce_page_number(value: Any) -> Optional[int]:
         return int(value)
     except Exception:
         return None
-
 
 def _build_evidence_packets_from_chunks(
     chunks: List[Any],
@@ -222,7 +218,6 @@ def _build_evidence_packets_from_chunks(
 
     return [packets[name] for name in order if packets[name]["excerpts"]]
 
-
 def _collect_profile_documents(
     subscription_id: str,
     profile_id: str,
@@ -242,7 +237,6 @@ def _collect_profile_documents(
         return [str(doc) for doc in docs if doc]
     except Exception:
         return []
-
 
 def _filter_invalid_retrieved_chunks(
     chunks: List[Any],
@@ -266,7 +260,6 @@ def _filter_invalid_retrieved_chunks(
                 }
             )
     return valid, invalid_samples
-
 
 def _build_retrieval_empty_text_response(
     *,
@@ -322,7 +315,6 @@ def _build_retrieval_empty_text_response(
         "retrieval_stats": {"initial_retrieved": 0, "final_context": 0},
     }
 
-
 def _build_retrieval_filter_error_response(
     *,
     query: str,
@@ -368,12 +360,10 @@ def _build_retrieval_filter_error_response(
         "documents_searched": documents_searched,
     }
 
-
 def _requires_detailed_summary(query: str) -> bool:
     lowered = (query or "").lower()
     summary_cues = ("summarize", "summary", "summarise", "overview", "key points", "recap", "compare")
     return any(cue in lowered for cue in summary_cues)
-
 
 def _extract_requested_fields(query: str) -> List[str]:
     if not query:
@@ -399,7 +389,6 @@ def _extract_requested_fields(query: str) -> List[str]:
                     fields.append(item)
             return fields
     return []
-
 
 def build_summary_from_chunks(query: str, chunks: List[Any]) -> str:
     if not chunks:
@@ -454,7 +443,6 @@ def build_summary_from_chunks(query: str, chunks: List[Any]) -> str:
     if target_name and target_name.lower() not in summary.lower():
         summary = f"{target_name}: {summary}"
     return summary or "I couldn't find enough document context to summarize."
-
 
 def sanitize_response_obj(response_obj: Dict[str, Any]) -> Dict[str, Any]:
     cleaned = sanitize_user_payload(response_obj or {})
@@ -512,7 +500,6 @@ def sanitize_response_obj(response_obj: Dict[str, Any]) -> Dict[str, Any]:
         cleaned.pop(key, None)
     return cleaned
 
-
 def render_source_citations(answer: str, sources: List[Dict[str, Any]]) -> str:
     if not answer or not sources:
         return answer
@@ -544,7 +531,6 @@ def render_source_citations(answer: str, sources: List[Dict[str, Any]]) -> str:
     rendered = re.sub(r"\[(SOURCE-[^\]]+)\]", _replace, answer)
     return rendered.strip()
 
-
 def _build_evidence_ledger(chunks: List[Any], max_snippet_chars: int = 240) -> List[Dict[str, str]]:
     ledger = []
     for chunk in chunks:
@@ -555,7 +541,6 @@ def _build_evidence_ledger(chunks: List[Any], max_snippet_chars: int = 240) -> L
         ledger.append({"doc_name": doc_name, "snippet": snippet})
     return ledger
 
-
 def _find_field_value(field: str, ledger: List[Dict[str, str]]) -> Optional[str]:
     if not field:
         return None
@@ -565,7 +550,6 @@ def _find_field_value(field: str, ledger: List[Dict[str, str]]) -> Optional[str]
         if match:
             return match.group(1).strip()
     return None
-
 
 def _format_evidence_fallback(query: str, ledger: List[Dict[str, str]]) -> str:
     requested_fields = _extract_requested_fields(query)
@@ -585,7 +569,6 @@ def _format_evidence_fallback(query: str, ledger: List[Dict[str, str]]) -> str:
         lines.append("No matching information was found in the documents.")
     return "\n".join(lines).strip()
 
-
 class QdrantCollectionNotFoundError(ValueError):
     def __init__(self, collection_name: str, available_collections: Optional[List[str]] = None):
         available = available_collections or []
@@ -596,12 +579,10 @@ class QdrantCollectionNotFoundError(ValueError):
         self.collection_name = collection_name
         self.available_collections = available
 
-
 _QDRANT_INDEX_CACHE: Set[str] = set()
 _QDRANT_FILTER_INDEX_CACHE: Set[Tuple[str, str]] = set()
 _COLLECTION_COUNT_CACHE: Dict[str, Tuple[float, int]] = {}
 _COLLECTION_COUNT_TTL_SEC = int(os.getenv("QDRANT_COUNT_TTL_SEC", "120"))
-
 
 def _ensure_qdrant_indexes(client: QdrantClient, collection_name: str) -> None:
     if not collection_name:
@@ -617,7 +598,6 @@ def _ensure_qdrant_indexes(client: QdrantClient, collection_name: str) -> None:
         # the actual query will fail more specifically if indexes are missing.
         logger.warning("Index bootstrap check failed for %s: %s", collection_name, exc)
         _QDRANT_INDEX_CACHE.add(collection_name)  # Cache to avoid retry spam
-
 
 def _resolve_collection_name(
     *,
@@ -647,13 +627,11 @@ ANSWER_CACHE_VERSION = "v3"
 NO_ANSWER_CACHE = os.getenv("NO_ANSWER_CACHE", "true").strip().lower() in {"true", "1", "yes", "on"}
 ENABLE_ANSWER_CACHE = False if NO_ANSWER_CACHE else os.getenv("ENABLE_ANSWER_CACHE", "false").strip().lower() == "true"
 
-
 def _torch_cuda_available() -> bool:
     try:
         return bool(torch) and bool(torch.cuda.is_available())
     except Exception:  # noqa: BLE001
         return False
-
 
 def _embedding_device() -> str:
     # Always use CPU for embeddings — the embedding model (bge-large, ~3GB GPU)
@@ -662,11 +640,9 @@ def _embedding_device() -> str:
     env_device = (os.getenv("EMBEDDING_DEVICE") or "cpu").strip().lower()
     return env_device
 
-
 def _is_meta_tensor_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "meta tensor" in msg or "cannot copy out of meta tensor" in msg
-
 
 def _resolve_torch_dtype():
     if not torch:
@@ -680,14 +656,12 @@ def _resolve_torch_dtype():
         return torch.float32
     return torch.float32
 
-
 def _model_kwargs_for_device(device: str) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {"device_map": None, "low_cpu_mem_usage": False}
     dtype = _resolve_torch_dtype()
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
     return kwargs
-
 
 def _parse_redis_connection_string(conn_str: str):
     """
@@ -747,7 +721,6 @@ def _parse_redis_connection_string(conn_str: str):
     settings["ssl"] = bool(settings.get("ssl"))
     return settings
 
-
 def _slug(value: str) -> str:
     """Safe, lowercase slug for cache keys."""
     if not value:
@@ -755,14 +728,12 @@ def _slug(value: str) -> str:
     cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return cleaned or "default"
 
-
 def _clean_password(password: Optional[str]) -> Optional[str]:
     """Normalize password strings, trimming accidental whitespace and empty values."""
     if password is None:
         return None
     cleaned = password.strip()
     return cleaned or None
-
 
 def _configure_hf_env() -> None:
     """Set HuggingFace hub timeouts/retries to avoid default short timeouts."""
@@ -782,7 +753,6 @@ def _configure_hf_env() -> None:
     if getattr(Config.Model, "TRANSFORMERS_OFFLINE", False):
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
-
 def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
     """Coerce truthy string/env values into a boolean with a sensible default."""
     if value is None:
@@ -790,7 +760,6 @@ def _coerce_bool(value: Optional[Any], default: Optional[bool] = None) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes", "on"}
-
 
 _METRICS_EMBED_SAMPLE_RATE = float(os.getenv("METRICS_EMBED_SAMPLE_RATE", "0.0"))
 _METRICS_EMBED_MAX_CHARS = int(os.getenv("METRICS_EMBED_MAX_CHARS", "1200"))
@@ -803,10 +772,8 @@ def _is_gemini_backend(llm_client: Any) -> bool:
     model_name = getattr(llm_client, "model_name", "") or ""
     return str(model_name).lower().startswith("gemini")
 
-
 def _approx_token_count(text: Optional[str]) -> int:
     return len((text or "").split())
-
 
 def _token_overlap_score(left: str, right: str) -> float:
     left_tokens = set(re.findall(r"[A-Za-z0-9]{3,}", (left or "").lower()))
@@ -816,7 +783,6 @@ def _token_overlap_score(left: str, right: str) -> float:
     overlap = left_tokens & right_tokens
     union = left_tokens | right_tokens
     return len(overlap) / max(len(union), 1)
-
 
 def _embedding_similarity_score(left: str, right: str) -> Optional[float]:
     if not left or not right:
@@ -834,13 +800,11 @@ def _embedding_similarity_score(left: str, right: str) -> Optional[float]:
     except Exception:
         return None
 
-
 def _semantic_similarity(left: str, right: str) -> float:
     sim = _embedding_similarity_score(left, right)
     if sim is not None:
         return sim
     return _token_overlap_score(left, right)
-
 
 def _build_namespace(
         subscription_id: str,
@@ -860,7 +824,6 @@ def _build_namespace(
     if session_id:
         parts.append(_slug(session_id))
     return ":".join(parts)
-
 
 def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransformer:
     candidates = []
@@ -906,7 +869,6 @@ def _load_model_candidates(required_dim: Optional[int] = None) -> SentenceTransf
                     logger.warning("Failed to load model '%s' on CPU: %s", name, cpu_e)
     raise RuntimeError(f"Could not load any sentence transformer model from {candidates}: {last_error}")
 
-
 def resolve_embedding_model_for_generation(model_name: Optional[str]) -> Optional[str]:
     if not model_name:
         return None
@@ -915,7 +877,6 @@ def resolve_embedding_model_for_generation(model_name: Optional[str]) -> Optiona
         return None
     key = str(model_name).lower()
     return mapping.get(key) or mapping.get(model_name) or mapping.get(key.split(":")[0])
-
 
 def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> SentenceTransformer:
     """Load a specific embedding model by name with optional dimension enforcement."""
@@ -952,7 +913,6 @@ def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> Se
     logger.warning("Embedding model %s dim=%s does not match required=%s; using default embedder", model_name, dim, required_dim)
     return get_model(required_dim=required_dim)
 
-
 def get_model(required_dim: Optional[int] = None):
     """Lazy load sentence transformer model."""
     global _MODEL
@@ -988,7 +948,6 @@ def get_model(required_dim: Optional[int] = None):
         logger.warning(f"Failed to load fallback model for dim {required_dim}: {exc}; continuing with primary model")
         return _MODEL
 
-
 class _FallbackEmbedder:
     """Local stub to avoid HuggingFace network calls when disabled."""
 
@@ -1000,7 +959,6 @@ class _FallbackEmbedder:
 
     def get_sentence_embedding_dimension(self) -> int:
         return self._dim
-
 
 def get_cross_encoder():
     """Lazy load cross encoder model."""
@@ -1033,7 +991,6 @@ def get_cross_encoder():
             _CROSS_ENCODER = None
     return _CROSS_ENCODER
 
-
 def get_qdrant_client():
     """Lazy load Qdrant client."""
     global _QDRANT_CLIENT
@@ -1056,7 +1013,6 @@ def get_qdrant_client():
             logger.error(f"Failed to initialize Qdrant client: {e}")
             raise
     return _QDRANT_CLIENT
-
 
 def get_redis_client():
     """Lazy init for Redis client with comprehensive error handling."""
@@ -1123,7 +1079,6 @@ def get_redis_client():
 
     return _REDIS_CLIENT
 
-
 def configure_gemini():
     """Configure Gemini API with proper error handling."""
     try:
@@ -1137,7 +1092,6 @@ def configure_gemini():
         logger.error(f"Failed to configure Gemini API: {e}")
         raise
 
-
 @dataclass
 class RetrievedChunk:
     id: str
@@ -1147,14 +1101,12 @@ class RetrievedChunk:
     source: str | None = None
     method: str = "dense"
 
-
 @dataclass
 class ConversationTurn:
     """Data class for conversation history."""
     user_message: str
     assistant_response: str
     timestamp: float
-
 
 @dataclass
 class ProfileContextSnapshot:
@@ -1163,7 +1115,6 @@ class ProfileContextSnapshot:
     document_hints: List[str]
     total_chunks: int
     last_updated: float
-
 
 class ChatFeedbackMemory:
     """Stores compact Q/A feedback to steer future responses."""
@@ -1245,7 +1196,6 @@ class ChatFeedbackMemory:
             source_hint = f" | sources: {', '.join(item['sources'][:3])}" if item.get("sources") else ""
             lines.append(f"{idx}) Q: {item['q']} | A: {item['a'][:180]}{source_hint}")
         return "RECENT CHAT FEEDBACK (reuse tone/precision):\n" + "\n".join(lines) + "\n"
-
 
 class ConversationHistory:
     """Manages conversation history with a sliding window."""
@@ -1423,7 +1373,6 @@ class ConversationHistory:
             except Exception as exc:
                 logger.warning(f"Failed to clear Redis memory for user {user_id}: {exc}")
 
-
 class TextPreprocessor:
     """Handles text preprocessing for consistent tokenization."""
 
@@ -1464,7 +1413,6 @@ class TextPreprocessor:
                 lemmatized.append(token)
 
         return lemmatized
-
 
 class GreetingHandler:
     """Handles greeting and farewell detection."""
@@ -1607,7 +1555,6 @@ class GreetingHandler:
 
         return True
 
-
 class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
@@ -1701,13 +1648,11 @@ class OllamaClient:
             return "I don’t have enough information in the documents to answer that."
         return text
 
-
 class RateLimitCooldownError(RuntimeError):
     def __init__(self, message: str, retry_after: Optional[float] = None):
         super().__init__(message)
         self.code = 429
         self.retry_after = retry_after
-
 
 class GeminiClient:
     def __init__(self, model_name: Optional[str] = None):
@@ -1978,7 +1923,6 @@ class GeminiClient:
 
         return "I apologize, but I encountered an error generating a response."
 
-
 class OpenAICompatibleClient:
     """Handles OpenAI-compatible local LLM endpoints (chat completions)."""
 
@@ -2073,7 +2017,6 @@ class OpenAICompatibleClient:
 
         return "I apologize, but I encountered an error generating a response."
 
-
 class QueryReformulator:
     """Reformulates conversational queries into clear, concise search queries."""
 
@@ -2120,7 +2063,6 @@ REFORMULATED QUERY:"""
         except Exception as e:
             logger.warning(f"Query reformulation failed: {e}")
             return query
-
 
 class QdrantRetriever:
     """Handles retrieval from Qdrant using native search functionality."""
@@ -2713,7 +2655,6 @@ class QdrantRetriever:
         self.profile_context_cache[cache_key] = snapshot
         return snapshot
 
-
 class HybridReranker:
     """Reranks retrieved chunks using BM25 + vector scores with dynamic weighting."""
 
@@ -2852,7 +2793,6 @@ class HybridReranker:
             logger.error(f"Error in reranking: {e}", exc_info=True)
             return sorted(chunks, key=lambda c: c.score, reverse=True)[:top_k]
 
-
 class ContextBuilder:
     """Builds formatted context for LLM with source citations."""
 
@@ -2917,7 +2857,6 @@ class ContextBuilder:
             })
         return sources
 
-
 class DomainPromptAdapter:
     """Creates lightweight, in-context adapters to steer local LLM responses."""
 
@@ -2947,7 +2886,6 @@ class DomainPromptAdapter:
             f"If the user query is vague ('{query}'), proactively ground the answer in the domain cues above."
         )
         return "\n".join(adapter_lines)
-
 
 class AnswerabilityDetector:
     """Detects if a question can be answered from provided context."""
@@ -2994,7 +2932,6 @@ Your response:"""
         except Exception as e:
             logger.warning(f"Answerability check failed: {e}")
             return True, "Check failed"
-
 
 class MetricsTracker:
     """Lightweight metrics sink for usage and quality signals."""
@@ -3133,7 +3070,6 @@ class MetricsTracker:
             }
         }
 
-
 class PromptBuilder:
     """Builds structured prompts with strict grounding and citation requirements."""
 
@@ -3241,7 +3177,6 @@ SUMMARY:"""
         except Exception as e:
             logger.warning(f"Conversation summarization failed: {e}")
             return ""
-
 
 class EnterpriseRAGSystem:
     """
@@ -3444,7 +3379,6 @@ class EnterpriseRAGSystem:
 
         contextual_query = " ; ".join([query] + extras)
         return contextual_query, {"profile_keywords_used": keywords, "profile_hints_used": hints}
-
 
     def extract_person_name_from_query(self, query: str) -> Optional[str]:
         """
@@ -3880,7 +3814,6 @@ class EnterpriseRAGSystem:
             "profile_context": profile_context_data,
             "graph_hints": graph_hints,
         }
-
 
     def _warm_up_llm(self):
         """Warm LLM backend so first user calls do not fail cold."""
@@ -5161,7 +5094,6 @@ class EnterpriseRAGSystem:
                 "processing_time": time.time() - start_time
             }
 
-
 # Global RAG system instance (lazy initialization)
 _RAG_SYSTEM = None
 _RAG_MODEL = None
@@ -5170,7 +5102,6 @@ _RAG_BACKEND = None
 _RAG_MODEL_PATH = None
 _LLM_CLIENTS: dict[tuple[str, str, str | None], Any] = {}
 _LLM_SEMAPHORE: Optional[threading.Semaphore] = None
-
 
 class _LLMClientWrapper:
     """Wrap LLM clients to enforce concurrency limits without changing callers."""
@@ -5185,7 +5116,6 @@ class _LLMClientWrapper:
     def generate(self, *args, **kwargs):
         with self._semaphore:
             return self._client.generate(*args, **kwargs)
-
 
 class ResilientLLMClient:
     """Fallback to a secondary client when the primary fails with rate/timeout errors."""
@@ -5277,7 +5207,6 @@ class ResilientLLMClient:
             except Exception:
                 pass
 
-
 def create_llm_client(
         model_name: Optional[str] = None,
         backend_override: Optional[str] = None,
@@ -5322,14 +5251,12 @@ def create_llm_client(
     model_name = _resolve_model_alias(model_name)
     return OllamaClient(model_name)
 
-
 def get_metrics_tracker() -> MetricsTracker:
     """Singleton metrics tracker."""
     global _METRICS_TRACKER
     if _METRICS_TRACKER is None:
         _METRICS_TRACKER = MetricsTracker(get_redis_client())
     return _METRICS_TRACKER
-
 
 def get_rag_system(
         model_name: Optional[str] = None,
@@ -5374,7 +5301,6 @@ def get_rag_system(
         logger.error(f"Failed to initialize RAG system: {e}")
         raise
     return _RAG_SYSTEM
-
 
 def answer_question(
         query: str,
@@ -5434,7 +5360,6 @@ def answer_question(
         enable_internet=enable_internet,
     )
 
-
 def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[str, Any]:
     """
     Debug utility to check collection status with defensive error handling.
@@ -5491,7 +5416,6 @@ def debug_collection(profile_id: str, subscription_id: str = "default") -> Dict[
             "status": "error"
         }
 
-
 def add_domain_terms(terms: List[str]):
     """
     Legacy hook for domain terms; kept for API compatibility.
@@ -5503,7 +5427,6 @@ def add_domain_terms(terms: List[str]):
         logger.info("Spell checking is disabled; ignoring %d domain terms", len(terms))
     except Exception as e:
         logger.error(f"Error adding domain terms: {e}")
-
 
 def clear_conversation_history(
         user_id: str,
@@ -5534,14 +5457,12 @@ def clear_conversation_history(
     except Exception as e:
         logger.error(f"Error clearing conversation history: {e}")
 
-
 def metrics_summary(days: int = 7) -> Dict[str, Any]:
     """
     Aggregate metrics for the requested window (defaults to 7 days).
     """
     tracker = get_metrics_tracker()
     return tracker.summary(days=days)
-
 
 class RAGEvaluator:
     """Evaluation utilities for monitoring RAG performance."""
@@ -5612,7 +5533,6 @@ class RAGEvaluator:
             "precision_at_5": np.mean(p_at_5) if p_at_5 else 0.0,
             "num_queries": len(queries)
         }
-
 
 __all__ = [
     'answer_question',

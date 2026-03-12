@@ -14,7 +14,7 @@ This is the central orchestrator (Task 9) that ties together all components:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -31,8 +31,7 @@ from .conversation_graph import ConversationGraph
 from .graph_adapter import get_graph_adapter, CypherGraphAdapter
 from .response_assembler import assemble_response, AssembledResponse
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Output model
@@ -52,7 +51,6 @@ class IntelligentResponse(BaseModel):
     prompt: Optional[ConstrainedPrompt] = None
     needs_llm: bool = False
     stage_timings: Dict[str, float] = Field(default_factory=dict)
-
 
 # ---------------------------------------------------------------------------
 # IntelligenceEngine
@@ -417,7 +415,6 @@ class IntelligenceEngine:
             base = max(0.0, base - 0.1 * len(evidence.gaps))
 
         return round(max(0.0, min(1.0, base)), 4)
-
 
 __all__ = [
     "IntelligenceEngine",

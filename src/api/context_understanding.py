@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from collections import Counter
 from typing import Any, Dict, List, Optional
@@ -8,13 +8,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 from src.api.pipeline_models import ExtractedDocument, Section
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 try:
     import ollama
 except Exception:  # noqa: BLE001
     ollama = None
-
 
 def list_local_models() -> List[str]:
     """Return available local Ollama models (empty list when unavailable)."""
@@ -26,7 +25,6 @@ def list_local_models() -> List[str]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to list ollama models: %s", exc)
         return []
-
 
 class ContextUnderstanding:
     """Generates document and section summaries using local models or extractive fallback."""

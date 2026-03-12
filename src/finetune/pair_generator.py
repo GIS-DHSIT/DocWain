@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -7,14 +7,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.utils.payload_utils import get_document_type, get_source_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)\b(api[_-]?key|secret|token|password)\b\s*[:=]\s*([^\s]+)"),
     re.compile(r"(?i)\b(aws_access_key_id|aws_secret_access_key)\b\s*[:=]\s*([^\s]+)"),
 ]
-
 
 def normalize_text(text: str) -> str:
     if not text:
@@ -24,17 +22,14 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-
 def redact_secrets(text: str) -> str:
     redacted = text
     for pattern in SECRET_PATTERNS:
         redacted = pattern.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
     return redacted
 
-
 def token_count(text: str) -> int:
     return len(text.split())
-
 
 def detect_language(text: str) -> str:
     if not text:
@@ -46,14 +41,12 @@ def detect_language(text: str) -> str:
     ratio = ascii_letters / letters
     return "en" if ratio >= 0.6 else "non_en"
 
-
 @dataclass
 class ChunkRecord:
     text: str
     metadata: Dict[str, Any]
     vector: Optional[List[float]] = None
     chunk_id: Optional[str] = None
-
 
 def compute_line_frequencies(chunks: Iterable[ChunkRecord]) -> Dict[str, int]:
     freq: Dict[str, int] = {}
@@ -64,7 +57,6 @@ def compute_line_frequencies(chunks: Iterable[ChunkRecord]) -> Dict[str, int]:
                 continue
             freq[line] = freq.get(line, 0) + 1
     return freq
-
 
 def strip_boilerplate(chunks: List[ChunkRecord], threshold: float = 0.6) -> List[ChunkRecord]:
     if not chunks:
@@ -79,7 +71,6 @@ def strip_boilerplate(chunks: List[ChunkRecord], threshold: float = 0.6) -> List
         kept = [line for line in ch.text.splitlines() if line.strip() not in culprits]
         cleaned.append(ChunkRecord(text="\n".join(kept).strip(), metadata=ch.metadata, vector=ch.vector, chunk_id=ch.chunk_id))
     return cleaned
-
 
 def dedup_blocks(blocks: List[ChunkRecord], threshold: float = 0.92) -> List[ChunkRecord]:
     seen_hashes = set()
@@ -101,7 +92,6 @@ def dedup_blocks(blocks: List[ChunkRecord], threshold: float = 0.92) -> List[Chu
         seen_hashes.add(key)
         result.append(block)
     return result
-
 
 def merge_adjacent(
     chunks: List[ChunkRecord],
@@ -137,11 +127,9 @@ def merge_adjacent(
             i += max(1, len(buf))
     return merged_blocks
 
-
 def _extract_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[.!?])\s+", text.strip())
     return [p.strip() for p in parts if p.strip()]
-
 
 def _pick_key_sentences(text: str, max_sentences: int = 4) -> List[str]:
     sentences = _extract_sentences(text)
@@ -149,7 +137,6 @@ def _pick_key_sentences(text: str, max_sentences: int = 4) -> List[str]:
         return []
     ranked = sorted(sentences, key=lambda s: len(s.split()), reverse=True)
     return ranked[:max_sentences]
-
 
 class MultiStrategyPairGenerator:
     def __init__(
@@ -315,7 +302,6 @@ class MultiStrategyPairGenerator:
             seen.add(key)
             output.append(pair)
         return output
-
 
 def _parse_pairs(raw: str) -> List[Dict[str, Any]]:
     try:

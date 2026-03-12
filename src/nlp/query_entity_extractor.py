@@ -15,19 +15,18 @@ The key NLP signals used:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from functools import lru_cache
 from typing import List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── spaCy model (thread-safe lazy-loaded singleton) ──────────────────
 
 _nlp = None
 _nlp_load_attempted = False
 _nlp_lock = threading.Lock()
-
 
 def _get_nlp():
     """Lazy-load spaCy English model. Thread-safe; returns None if unavailable."""
@@ -50,11 +49,9 @@ def _get_nlp():
             logger.warning("spaCy model load failed (NLP entity extraction degraded): %s", exc)
             return None
 
-
 def preload_spacy():
     """Pre-load spaCy model at startup to avoid first-request latency."""
     return _get_nlp() is not None
-
 
 # ── Domain stopwords (never extracted as entity names) ───────────────
 
@@ -145,7 +142,6 @@ _ENTITY_VERBS = frozenset({
     "describe", "review", "contact", "reach",
 })
 
-
 def _is_likely_entity(token) -> bool:
     """Check if a spaCy token is a likely entity name (not a common word)."""
     text_lower = token.text.lower()
@@ -180,7 +176,6 @@ def _is_likely_entity(token) -> bool:
 
     return True
 
-
 def _extract_compound_noun_phrase(token) -> Optional[str]:
     """When a pobj is a stopword, look for prepositional children.
 
@@ -207,7 +202,6 @@ def _extract_compound_noun_phrase(token) -> Optional[str]:
                     if phrase.lower() not in _DOMAIN_STOPWORDS and len(phrase) > 2:
                         return phrase
     return None
-
 
 def _extract_via_dependency_parse(query: str) -> Optional[str]:
     """Extract entity name from query using spaCy dependency parsing.
@@ -305,7 +299,6 @@ def _extract_via_dependency_parse(query: str) -> Optional[str]:
     # Return the first candidate (priority: dependency parse > PROPN > NER)
     return candidates[0]
 
-
 def _capitalized_word_fallback(query: str) -> Optional[str]:
     """Last-resort fallback: extract capitalized multi-word sequences as entity hints.
 
@@ -341,7 +334,6 @@ def _capitalized_word_fallback(query: str) -> Optional[str]:
             i += 1
     return candidates[0] if candidates else None
 
-
 # ── Regex-based fallback when spaCy is unavailable ─────────────────────
 
 # Common English words that should never be extracted as entity names
@@ -365,7 +357,6 @@ _COMMON_WORDS = _DOMAIN_STOPWORDS | frozenset({
     "worked", "working", "on", "in", "at", "to", "from", "up", "down",
     "out", "over", "under", "off", "into",
 })
-
 
 def _regex_fallback(query: str) -> Optional[str]:
     """Regex-based entity extraction fallback when spaCy is unavailable.
@@ -501,7 +492,6 @@ def _regex_fallback(query: str) -> Optional[str]:
 
     return None
 
-
 def extract_entity_from_query(query: str) -> Optional[str]:
     """Extract the target entity name from a user query.
 
@@ -524,7 +514,6 @@ def extract_entity_from_query(query: str) -> Optional[str]:
 
     # Last resort: look for capitalized multi-word sequences
     return _capitalized_word_fallback(query)
-
 
 def extract_all_entities(query: str) -> List[str]:
     """Extract all entity mentions from a query (for multi-entity queries).

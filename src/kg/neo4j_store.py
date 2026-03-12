@@ -1,5 +1,5 @@
 import datetime as dt
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -10,15 +10,13 @@ except Exception:  # noqa: BLE001
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class KGState:
     name: str
     last_qdrant_offset: Optional[Any]
     last_sync_at: Optional[str]
-
 
 class Neo4jStore:
     def __init__(

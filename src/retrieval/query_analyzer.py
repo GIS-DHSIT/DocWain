@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 _STOPWORDS = {
     "a", "an", "the", "and", "or", "but", "if", "then", "so", "of", "in", "on", "at", "by",
@@ -15,7 +14,6 @@ _STOPWORDS = {
     "my", "your", "our", "their", "what", "which", "who", "where", "when", "how", "why",
     "does", "do", "did", "can", "could", "should", "would", "may", "might", "will", "shall",
 }
-
 
 def _nlu_detect_intent(query: str) -> Optional[str]:
     """Detect query intent using NLU engine."""
@@ -37,7 +35,6 @@ def _nlu_detect_intent(query: str) -> Optional[str]:
         return _NLU_TO_ANALYZER.get(intent)
     except Exception:
         return None
-
 
 _NUMERIC_HINTS = [
     "how many",
@@ -100,7 +97,6 @@ _ERROR_TOKEN_PATTERN = re.compile(r"\b[A-Z]{2,}[\w-]*\d+[\w-]*\b")
 
 _QUOTED_PATTERN = re.compile(r"['\"]([^'\"]{2,})['\"]")
 
-
 @dataclass
 class QueryAnalysis:
     intent_type: str
@@ -123,7 +119,6 @@ class QueryAnalysis:
             "comparison_entities": self.comparison_entities,
             "high_stakes": self.high_stakes,
         }
-
 
 class QueryAnalyzer:
     """Fast, rule-based query analyzer for intent and evidence constraints."""

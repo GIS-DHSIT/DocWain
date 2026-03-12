@@ -12,11 +12,11 @@ Usage:
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # System prompt used during training — must match the one in training_data_generator.py
 _TRAINING_SYSTEM_PROMPT = (
@@ -27,7 +27,6 @@ _TRAINING_SYSTEM_PROMPT = (
     "bullet points for lists."
 )
 
-
 def _get_feedback_collection():
     """Get the MongoDB feedback collection."""
     try:
@@ -37,7 +36,6 @@ def _get_feedback_collection():
     except Exception as exc:
         logger.warning("Cannot connect to MongoDB feedback collection: %s", exc)
     return None
-
 
 def collect_training_pairs(
     *,
@@ -159,7 +157,6 @@ def collect_training_pairs(
     logger.info("Collected %d training pairs from production feedback", len(pairs))
     return pairs
 
-
 def export_training_pairs(
     output_path: str = "finetune_data/feedback_training.jsonl",
     **kwargs,
@@ -182,7 +179,6 @@ def export_training_pairs(
 
     logger.info("Exported %d training pairs to %s", len(pairs), output_path)
     return len(pairs)
-
 
 def get_feedback_stats(days_back: int = 90) -> Dict[str, Any]:
     """Get statistics about available feedback data."""

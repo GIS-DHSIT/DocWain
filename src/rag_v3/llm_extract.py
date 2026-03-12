@@ -10,14 +10,14 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from .types import LLMBudget, LLMResponseSchema
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────
 LLM_EXTRACT_TIMEOUT_S = 120.0  # qwen3:14b: ~60tok/s on T4, 4K tokens = ~67s + prompt overhead
@@ -26,7 +26,6 @@ LLM_MAX_CONTEXT_CHARS = 8192  # Expanded for qwen3:14b's larger context window
 LLM_MAX_CONTEXT_CHARS_MULTI = 16384  # Multi-document gets more context
 LLM_MAX_CHUNKS = 10  # More evidence = better answers
 LLM_MAX_CHUNKS_MULTI = 20  # Multi-doc queries need broad evidence
-
 
 def _get_num_ctx(_intent: str = "", _num_chunks: int = 0) -> int:
     """Context window size.  Fixed at 8192 to match the pinned model and avoid
@@ -42,7 +41,6 @@ _DEDUP_NUM_RE = _re_mod.compile(
     r'\b\d+(?:[.,]\d+)?(?:\s*(?:%|years?|months?|days?|hrs?|kg|mg|ml|lbs?|USD|\$|€|£|₹))?',
     _re_mod.IGNORECASE,
 )
-
 
 _INTENT_CHUNK_LIMITS = {
     "factual": 6,
@@ -114,7 +112,6 @@ def _is_multi_part_query(query: str) -> bool:
 
     return False
 
-
 def _decompose_query(query: str) -> List[str]:
     """Split a multi-part query into sub-questions for the LLM to address individually.
 
@@ -155,7 +152,6 @@ def _decompose_query(query: str) -> List[str]:
 
     return []
 
-
 def _effective_max_chunks(num_documents: int, intent: str = "", query: str = "") -> int:
     """Return chunk limit scaled by document count, intent, and query complexity."""
     if intent and intent in _INTENT_CHUNK_LIMITS:
@@ -174,7 +170,6 @@ def _effective_max_chunks(num_documents: int, intent: str = "", query: str = "")
         base = min(base + 4, 30)  # Extra 4 chunks for multi-part
     return base
 
-
 def _effective_context_chars(num_documents: int, intent: str = "") -> int:
     """Return context char limit scaled by document count and intent."""
     if intent and intent in _INTENT_CONTEXT_CHARS:
@@ -190,7 +185,6 @@ def _effective_context_chars(num_documents: int, intent: str = "") -> int:
         base = min(base + extra, 28672)  # cap at 28K chars (qwen3:14b supports 40K)
     return base
 
-
 # ── LLM extraction cache ──────────────────────────────────────────
 
 def _build_cache_key(query: str, chunks: List[Any], intent: Optional[str]) -> str:
@@ -198,7 +192,6 @@ def _build_cache_key(query: str, chunks: List[Any], intent: Optional[str]) -> st
     chunk_ids = sorted(getattr(c, "id", "") or "" for c in chunks)
     raw = f"{query}|{'|'.join(chunk_ids)}|{intent or ''}"
     return f"llm_extract:{hashlib.sha256(raw.encode()).hexdigest()}"
-
 
 def _cache_get(redis_client: Any, key: str) -> Optional[LLMResponseSchema]:
     """Try to retrieve a cached LLM extraction result."""
@@ -216,7 +209,6 @@ def _cache_get(redis_client: Any, key: str) -> Optional[LLMResponseSchema]:
         pass
     return None
 
-
 def _cache_set(redis_client: Any, key: str, result: LLMResponseSchema, ttl: int = 3600) -> None:
     """Store an LLM extraction result in Redis cache."""
     if redis_client is None:
@@ -229,7 +221,6 @@ def _cache_set(redis_client: Any, key: str, result: LLMResponseSchema, ttl: int 
         redis_client.setex(key, ttl, payload)
     except Exception:
         pass
-
 
 def _lightweight_grounding_check(
     answer: str,
@@ -324,7 +315,6 @@ def _lightweight_grounding_check(
 
     return round(max(0.0, base_score - entity_penalty), 3)
 
-
 def _check_entity_coverage(
     query: str,
     response: str,
@@ -408,7 +398,6 @@ def _check_entity_coverage(
 
     return "\n".join(parts)
 
-
 def _verify_self_consistency(
     answer: str,
     evidence_text: str,
@@ -452,7 +441,6 @@ def _verify_self_consistency(
     except Exception as exc:
         logger.debug("Self-consistency check failed (keeping original): %s", exc)
         return True, answer
-
 
 def llm_extract_and_respond(
     *,
@@ -656,9 +644,7 @@ def llm_extract_and_respond(
 
     return result
 
-
 # ── intent detection ─────────────────────────────────────────────────
-
 
 def _classify_intent(query: str, intent_hint: Optional[str]) -> str:
     """Map query + optional hint to one of: rank, detail, contact, general.
@@ -696,7 +682,6 @@ def _classify_intent(query: str, intent_hint: Optional[str]) -> str:
         pass
     return "general"
 
-
 # ── expanded intent classification (8 types) ─────────────────────────
 
 def classify_query_intent(query: str, *, intent_hint: str | None = None) -> str:
@@ -707,7 +692,6 @@ def classify_query_intent(query: str, *, intent_hint: str | None = None) -> str:
     """
     from src.nlp.nlu_engine import classify_intent
     return classify_intent(query, intent_hint=intent_hint)
-
 
 # ── prompt construction ───────────────────────────────────────────────
 
@@ -764,7 +748,6 @@ _PROMPT_TEMPLATES = {
         "- Cite source: '(source: filename.pdf)' once per section\n"
     ),
 }
-
 
 # ── intent-adaptive generation templates (8 types) ───────────────────
 
@@ -971,7 +954,6 @@ _GENERATION_TEMPLATES = {
     ),
 }
 
-
 # ── Few-shot examples for format compliance ────────────────────────────
 
 _FEW_SHOT_EXAMPLES = {
@@ -1118,7 +1100,6 @@ _FEW_SHOT_EXAMPLES = {
     ),
 }
 
-
 # ── Domain-specific reasoning injection ────────────────────────────────
 
 _DOMAIN_REASONING = {
@@ -1182,7 +1163,6 @@ _DOMAIN_REASONING = {
     ),
 }
 
-
 _REASONING_PREAMBLE = (
     "ANALYTICAL APPROACH — follow these steps before answering:\n"
     "1. Identify all relevant data points across the evidence\n"
@@ -1197,7 +1177,6 @@ _COMPLEX_INTENTS = frozenset({
     "comparison", "ranking", "reasoning", "cross_document", "analytics", "summary",
     "generate",
 })
-
 
 def _build_multi_resolution_context(chunks: List[Any]) -> Optional[Dict[str, Any]]:
     """Build a multi-resolution context dict from chunks with resolution metadata.
@@ -1255,7 +1234,6 @@ def _build_multi_resolution_context(chunks: List[Any]) -> Optional[Dict[str, Any
         "section_context": section_chunks,
         "chunk_evidence": regular_chunks,
     }
-
 
 def _assess_evidence_quality(evidence_text: str, query: str, num_documents: int) -> str:
     """Generate a brief evidence quality signal for the LLM prompt.
@@ -1325,7 +1303,6 @@ def _assess_evidence_quality(evidence_text: str, query: str, num_documents: int)
         parts.append("Moderate evidence available — answer from what is provided")
     return "EVIDENCE STATUS: " + "; ".join(parts) + ".\n"
 
-
 def _build_entity_reminder(query: str, evidence_text: str) -> str:
     """Build an entity coverage reminder for the LLM prompt.
 
@@ -1375,7 +1352,6 @@ def _build_entity_reminder(query: str, evidence_text: str) -> str:
         f"Cover each entity above in your response. "
         f"If information for any entity is missing from the evidence, explicitly state that.\n"
     )
-
 
 def build_generation_prompt(
     *,
@@ -1734,7 +1710,6 @@ def build_generation_prompt(
 
     return "\n".join(parts)
 
-
 def _get_domain_knowledge_section(domain: str, intent: str) -> str:
     """Build a domain knowledge section for LLM prompt injection."""
     try:
@@ -1755,7 +1730,6 @@ def _get_domain_knowledge_section(domain: str, intent: str) -> str:
     except Exception:
         logger.debug("Domain knowledge provider unavailable for domain=%s intent=%s", domain, intent, exc_info=True)
     return ""
-
 
 def _build_prompt(
     query: str,
@@ -1787,7 +1761,6 @@ def _build_prompt(
         f"{_self_check}\n\n"
         "Provide your answer directly. Be thorough but concise."
     )
-
 
 def _deduplicate_evidence_chunks(chunks: List[Any], threshold: float = 0.85) -> List[Any]:
     """Remove near-duplicate chunks using Jaccard word overlap.
@@ -1835,7 +1808,6 @@ def _deduplicate_evidence_chunks(chunks: List[Any], threshold: float = 0.85) -> 
 
     return kept
 
-
 def _enforce_chunk_diversity(chunks: list, max_chunks: int) -> list:
     """Select top chunks ensuring diversity across documents and section types.
 
@@ -1870,7 +1842,6 @@ def _enforce_chunk_diversity(chunks: list, max_chunks: int) -> list:
         selected.extend(remaining[:max_chunks - len(selected)])
 
     return selected
-
 
 def _detect_evidence_contradictions(chunks: List[Any]) -> List[str]:
     """Detect contradicting claims across chunks from different documents.
@@ -1924,7 +1895,6 @@ def _detect_evidence_contradictions(chunks: List[Any]) -> List[str]:
             )
     return contradictions[:5]  # Cap to avoid prompt bloat
 
-
 def _clean_evidence_text(text: str) -> str:
     """Clean OCR artifacts and normalize whitespace in evidence text.
 
@@ -1967,7 +1937,6 @@ def _clean_evidence_text(text: str) -> str:
         lines.pop()
     cleaned = "\n".join(lines)
     return cleaned.strip()
-
 
 def _build_grouped_evidence(chunks: List[Any], max_context_chars: int = 0, domain: str = "", query: str = "") -> str:
     """Group chunks by document and format with headers.
@@ -2174,13 +2143,11 @@ def _build_grouped_evidence(chunks: List[Any], max_context_chars: int = 0, domai
 
     return "\n\n".join(parts)
 
-
 # ── LLM call with timeout ────────────────────────────────────────────
 
 def _estimate_tokens(text: str) -> int:
     """Rough token count estimate based on character length."""
     return max(1, len(text) // _CHARS_PER_TOKEN)
-
 
 def _build_simplified_prompt(query: str, evidence: str, chunks: List[Any] = None) -> str:
     """Shorter prompt for intermediate-timeout fallback.
@@ -2226,7 +2193,6 @@ def _build_simplified_prompt(query: str, evidence: str, chunks: List[Any] = None
         f"{_format_line}"
         "Answer concisely and accurately:"
     )
-
 
 def _generate(
     llm_client: Any,
@@ -2424,20 +2390,17 @@ def _generate(
     finally:
         executor.shutdown(wait=False)
 
-
 _METADATA_TOKENS = frozenset({
     "section_id", "chunk_type", "section_title", "section_kind",
     "page_start", "page_end", "start_page", "end_page",
     "canonical_text", "embedding_text", "doc_domain", "document_id",
 })
 
-
 def _looks_like_metadata(text: str) -> bool:
     """Return True if text looks like stringified metadata rather than content."""
     lowered = text.lower()
     hits = sum(1 for tok in _METADATA_TOKENS if tok in lowered)
     return hits >= 2
-
 
 # ── response parsing ──────────────────────────────────────────────────
 
@@ -2451,7 +2414,6 @@ def _is_repetitive_output(text: str) -> bool:
         if text.count(segment) >= 3:
             return True
     return False
-
 
 def _parse_response(raw: str, chunks: List[Any], query: str = "") -> Optional[LLMResponseSchema]:
     # Primary path: treat LLM output as direct markdown text.
@@ -2480,7 +2442,6 @@ def _parse_response(raw: str, chunks: List[Any], query: str = "") -> Optional[LL
             return LLMResponseSchema(text=answer, evidence_chunks=chunks_used)
 
     return None
-
 
 def _deduplicate_bold_values(text: str) -> str:
     """Remove duplicate bold values in consecutive sentences.
@@ -2514,7 +2475,6 @@ def _deduplicate_bold_values(text: str) -> str:
         fixed_paragraphs.append(_bold_re.sub(_dedup_bold, para))
 
     return "\n\n".join(fixed_paragraphs)
-
 
 def _detect_evidence_field_gaps(query: str, evidence_text: str) -> str:
     """Detect specific fields requested in query that are missing from evidence.
@@ -2564,7 +2524,6 @@ def _detect_evidence_field_gaps(query: str, evidence_text: str) -> str:
         f"'{', '.join(missing_fields)} not found in the provided documents.'\n"
     )
 
-
 def _repair_unclosed_markdown(text: str) -> str:
     """Close unclosed bold, italic, and code markers to prevent broken rendering."""
     if not text:
@@ -2594,7 +2553,6 @@ def _repair_unclosed_markdown(text: str) -> str:
         text += "*"
 
     return text
-
 
 def _clean_raw_response(raw: str) -> str:
     """Clean LLM response text: strip markdown fences, JSON artifacts, etc."""
@@ -2643,7 +2601,6 @@ def _clean_raw_response(raw: str) -> str:
 
     return text.strip()
 
-
 def _extract_json(raw: str) -> dict:
     if not raw:
         return {}
@@ -2666,7 +2623,6 @@ def _extract_json(raw: str) -> dict:
         except Exception:
             pass
     return {}
-
 
 def _count_unique_documents(chunks: List[Any]) -> int:
     """Count unique document IDs across chunks."""

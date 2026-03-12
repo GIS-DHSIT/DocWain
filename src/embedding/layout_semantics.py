@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,7 +10,7 @@ from src.api.config import Config
 from src.embedding.chunking.section_chunker import normalize_text
 from src.embedding.layout_graph import build_layout_graph
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 _ID_RE = re.compile(r"\b(?=[A-Za-z0-9]{6,})(?=.*\d)(?=.*[A-Za-z])[A-Za-z0-9\-]+\b")
@@ -18,7 +18,6 @@ _EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 _PHONE_RE = re.compile(r"(?:\+?\d[\d\s\-()]{6,}\d)")
 _MONEY_RE = re.compile(r"[$€£]\s?\d+(?:[,\d]*)(?:\.\d{2})?")
 _DATE_RE = re.compile(r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4})\b")
-
 
 @dataclass
 class SemanticBuildResult:
@@ -29,7 +28,6 @@ class SemanticBuildResult:
     doc_summary: Optional[str]
     entity_facts: List[Dict[str, Any]]
     doc_domain: str
-
 
 class GenericEntityExtractor:
     def __init__(self, *, model: str = "en_core_web_sm") -> None:
@@ -102,7 +100,6 @@ class GenericEntityExtractor:
 
         return list(entities.values())
 
-
 def _sentence_summary(text: str, *, max_sentences: int = 3, max_chars: int = 700) -> str:
     text = normalize_text(text or "")
     if not text:
@@ -112,7 +109,6 @@ def _sentence_summary(text: str, *, max_sentences: int = 3, max_chars: int = 700
     if len(summary) > max_chars:
         summary = summary[:max_chars].rsplit(" ", 1)[0].strip()
     return summary
-
 
 def _section_kind(block_types: List[str]) -> str:
     types = {t for t in block_types if t}
@@ -127,7 +123,6 @@ def _section_kind(block_types: List[str]) -> str:
     if "list" in types:
         return "list_region" if len(types) == 1 else "mixed"
     return "mixed" if len(types) > 1 else "body"
-
 
 def build_layout_sections(layout_graph: Dict[str, Any]) -> List[Dict[str, Any]]:
     sections: List[Dict[str, Any]] = []
@@ -206,7 +201,6 @@ def build_layout_sections(layout_graph: Dict[str, Any]) -> List[Dict[str, Any]]:
         section["section_path"] = [title]
 
     return sections
-
 
 def _chunk_blocks(
     blocks: List[Dict[str, Any]],
@@ -287,7 +281,6 @@ def _chunk_blocks(
     _flush()
     return chunks, metadata
 
-
 def _infer_doc_domain(entity_counts: Dict[str, int], layout_graph: Dict[str, Any], texts: List[str]) -> str:
     scores: Dict[str, float] = {}
     doc_signals = layout_graph.get("doc_signals") or {}
@@ -325,7 +318,6 @@ def _infer_doc_domain(entity_counts: Dict[str, int], layout_graph: Dict[str, Any
     best = max(scores.items(), key=lambda kv: kv[1])
     return best[0] if best[1] >= 1.2 else "generic"
 
-
 def _semantic_kind_from_entities(counts: Dict[str, int], fallback: str) -> str:
     if counts.get("person") or counts.get("email") or counts.get("phone"):
         return "identity_contact"
@@ -342,7 +334,6 @@ def _semantic_kind_from_entities(counts: Dict[str, int], fallback: str) -> str:
     if counts.get("money", 0) >= 3:
         return "financial_summary"
     return fallback or "body"
-
 
 def build_semantic_payloads(
     *,
@@ -555,7 +546,6 @@ def build_semantic_payloads(
         entity_facts=entity_facts,
         doc_domain=doc_domain or "generic",
     )
-
 
 __all__ = [
     "GenericEntityExtractor",

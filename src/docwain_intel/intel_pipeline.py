@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import enum
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Optional
 
@@ -18,8 +18,7 @@ from .entity_resolver import resolve_entities
 from .document_fingerprint import compute_fingerprint
 from .verification import verify_extraction
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class PipelineStage(str, enum.Enum):
     STRUCTURED = "STRUCTURED"
@@ -30,7 +29,6 @@ class PipelineStage(str, enum.Enum):
     STORED = "STORED"
     AUDITED = "AUDITED"
     FAILED = "FAILED"
-
 
 class ProcessingResult(BaseModel):
     document_id: str
@@ -43,7 +41,6 @@ class ProcessingResult(BaseModel):
     verification: Optional[VerificationResult] = None
     stage_timings: Dict[str, float] = Field(default_factory=dict)
     error: Optional[str] = None
-
 
 def process_document(
     *,

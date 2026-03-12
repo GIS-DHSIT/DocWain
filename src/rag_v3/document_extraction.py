@@ -12,13 +12,12 @@ This approach ensures:
 
 from typing import Any, Dict, List, Optional
 import re
-import logging
+from src.utils.logging_utils import get_logger
 from datetime import datetime
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _REPR_PREFIX_RE = re.compile(r"^(?:Extracted\s*Document|ExtractedDocument)\s*\(\s*full_text='", re.IGNORECASE)
-
 
 def _unwrap_extracted_document_repr(text: str) -> str:
     """Strip ExtractedDocument repr wrapper if present, returning the actual full_text content."""
@@ -28,7 +27,6 @@ def _unwrap_extracted_document_repr(text: str) -> str:
     # Remove trailing ') or ',field=...) at the end
     stripped = re.sub(r"(?:',\s*\w+=.*|'\s*\)\s*)$", "", stripped, flags=re.DOTALL)
     return stripped.replace("\\n", "\n").strip()
-
 
 def extract_hr_from_complete_document(document_data: Any) -> Dict[str, Any]:
     """
@@ -76,7 +74,6 @@ def extract_hr_from_complete_document(document_data: Any) -> Dict[str, Any]:
         logger.warning(f"Error in extract_hr_from_complete_document: {e}")
 
     return _empty_candidate()
-
 
 def _extract_from_resume_profile(resume_profile: Any) -> Dict[str, Any]:
     """Extract from ResumeProfile object with correct Pydantic field names."""
@@ -179,7 +176,6 @@ def _extract_from_resume_profile(resume_profile: Any) -> Dict[str, Any]:
 
     return result
 
-
 def _build_experience_summary(experiences: List[Any]) -> Dict[str, Any]:
     """Build experience summary and calculate years from experience list."""
     result = {}
@@ -232,7 +228,6 @@ def _build_experience_summary(experiences: List[Any]) -> Dict[str, Any]:
         logger.debug(f"Error building experience summary: {e}")
 
     return result
-
 
 def _extract_from_structured_document(document_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -378,7 +373,6 @@ def _extract_from_structured_document(document_data: Dict[str, Any]) -> Dict[str
 
     return result
 
-
 def _title_looks_like_name(title: str) -> bool:
     """Check if a section title looks like a person's name."""
     if not title or len(title) > 50:
@@ -409,7 +403,6 @@ def _title_looks_like_name(title: str) -> bool:
 
     return True
 
-
 def _clean_text(text: str, preserve_newlines: bool = False) -> str:
     """Clean text by removing special characters and normalizing whitespace."""
     if not text:
@@ -427,7 +420,6 @@ def _clean_text(text: str, preserve_newlines: bool = False) -> str:
         text = re.sub(r'\s+', ' ', text)
 
     return text.strip()
-
 
 def _extract_skills_from_section_text(text: str) -> List[str]:
     """Extract skills from a skills section text."""
@@ -475,7 +467,6 @@ def _extract_skills_from_section_text(text: str) -> List[str]:
 
     return unique[:25]
 
-
 def _extract_education_items(text: str) -> List[str]:
     """Extract education items from education section text."""
     items = []
@@ -510,7 +501,6 @@ def _extract_education_items(text: str) -> List[str]:
 
     return items[:5]
 
-
 def _extract_certification_items(text: str) -> List[str]:
     """Extract certification items from certification section text."""
     items = []
@@ -536,7 +526,6 @@ def _extract_certification_items(text: str) -> List[str]:
 
     return items[:10]
 
-
 def _extract_achievement_items(text: str) -> List[str]:
     """Extract achievement items from achievements section text."""
     items = []
@@ -553,7 +542,6 @@ def _extract_achievement_items(text: str) -> List[str]:
             items.append(line)
 
     return items[:5]
-
 
 def _extract_education_from_cert_section(text: str) -> List[str]:
     """Extract education items that may be mixed into certification sections."""
@@ -589,7 +577,6 @@ def _extract_education_from_cert_section(text: str) -> List[str]:
 
     return items[:5]
 
-
 def _extract_name_from_full_text(text: str) -> Optional[str]:
     """Extract candidate name from full document text."""
     if not text:
@@ -622,7 +609,6 @@ def _extract_name_from_full_text(text: str) -> Optional[str]:
 
     return None
 
-
 def _extract_name_from_section(content: str) -> Optional[str]:
     """Extract name from contact/header section."""
     if not content:
@@ -648,14 +634,12 @@ def _extract_name_from_section(content: str) -> Optional[str]:
 
     return None
 
-
 def _extract_contact_from_text(text: str) -> Dict[str, List[str]]:
     """Extract contact info from text."""
     emails = _extract_emails(text)
     phones = _extract_phones(text)
     linkedins = _extract_linkedin(text)
     return {"emails": emails, "phones": phones, "linkedins": linkedins}
-
 
 def _extract_skills_from_content(content: str) -> List[str]:
     """Extract skills from section content."""
@@ -688,7 +672,6 @@ def _extract_skills_from_content(content: str) -> List[str]:
 
     return unique[:30]  # Return top 30
 
-
 def _extract_name_from_text(text: str) -> Optional[str]:
     """Extract name from raw text."""
     if not text:
@@ -719,7 +702,6 @@ def _extract_name_from_text(text: str) -> Optional[str]:
 
     return None
 
-
 def _merge_lists(existing: List[str], new_items: List[str]) -> List[str]:
     """Merge two lists, avoiding duplicates."""
     result = list(existing or [])
@@ -730,7 +712,6 @@ def _merge_lists(existing: List[str], new_items: List[str]) -> List[str]:
             seen.add(item.lower())
     return result
 
-
 def _truncate(text: str, max_len: int) -> str:
     """Truncate text to max length."""
     if not text:
@@ -739,7 +720,6 @@ def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return text[:max_len].rsplit(' ', 1)[0] + '...'
-
 
 def _extract_from_dict(document_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract from dictionary format."""
@@ -794,7 +774,6 @@ def _extract_from_dict(document_data: Dict[str, Any]) -> Dict[str, Any]:
 
     return result
 
-
 def _extract_content(document_data: Dict[str, Any]) -> str:
     """Extract text content from various document structures."""
     if not document_data:
@@ -827,7 +806,6 @@ def _extract_content(document_data: Dict[str, Any]) -> str:
 
     return "\n".join(all_text)
 
-
 def _extract_name(content: str, document_data: Dict[str, Any]) -> Optional[str]:
     """Extract candidate name from content or metadata."""
     # Try metadata first
@@ -848,7 +826,6 @@ def _extract_name(content: str, document_data: Dict[str, Any]) -> Optional[str]:
             return cleaned
 
     return None
-
 
 def _looks_like_name(text: str) -> bool:
     """Check if text looks like a person's name."""
@@ -880,13 +857,11 @@ def _looks_like_name(text: str) -> bool:
 
     return capital_words >= 2 and letter_ratio > 0.8
 
-
 def _extract_emails(content: str) -> List[str]:
     """Extract email addresses from content."""
     email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
     matches = re.findall(email_pattern, content)
     return list(dict.fromkeys(matches))  # Remove duplicates while preserving order
-
 
 def _extract_phones(content: str) -> List[str]:
     """Extract phone numbers from content."""
@@ -905,13 +880,11 @@ def _extract_phones(content: str) -> List[str]:
 
     return list(dict.fromkeys(all_matches))  # Remove duplicates
 
-
 def _extract_linkedin(content: str) -> List[str]:
     """Extract LinkedIn profile URLs from content."""
     linkedin_pattern = r'(?:https?://)?(?:www\.)?linkedin\.com/in/[A-Za-z0-9-]+'
     matches = re.findall(linkedin_pattern, content, re.IGNORECASE)
     return list(dict.fromkeys(matches))
-
 
 def _extract_technical_skills(content: str) -> List[str]:
     """Extract technical skills from content."""
@@ -947,7 +920,6 @@ def _extract_technical_skills(content: str) -> List[str]:
 
     return sorted(list(found_skills))
 
-
 def _extract_functional_skills(content: str) -> List[str]:
     """Extract functional/soft skills from content."""
     func_keywords = {
@@ -978,7 +950,6 @@ def _extract_functional_skills(content: str) -> List[str]:
 
     return sorted(list(found_skills))
 
-
 def _extract_certifications(content: str) -> List[str]:
     """Extract certifications from content."""
     # Explicit certification patterns
@@ -1002,7 +973,6 @@ def _extract_certifications(content: str) -> List[str]:
             certs.append(cert)
 
     return certs
-
 
 def _extract_education(content: str) -> List[str]:
     """Extract education information from content."""
@@ -1052,7 +1022,6 @@ def _extract_education(content: str) -> List[str]:
 
     return edu_list[:5]
 
-
 def _extract_experience_summary(content: str) -> Optional[str]:
     """Extract professional summary or experience overview."""
     # Look for explicit summary sections
@@ -1073,7 +1042,6 @@ def _extract_experience_summary(content: str) -> Optional[str]:
 
     return None
 
-
 def _extract_years_of_experience(content: str) -> Optional[str]:
     """Extract total years of experience."""
     # Look for explicit years patterns
@@ -1090,7 +1058,6 @@ def _extract_years_of_experience(content: str) -> Optional[str]:
 
     return None
 
-
 def _extract_achievements(content: str) -> List[str]:
     """Extract achievements, awards, and accomplishments."""
     # Look for achievement sections
@@ -1103,7 +1070,6 @@ def _extract_achievements(content: str) -> List[str]:
         achievements.extend(item.strip() for item in items if item.strip())
 
     return achievements
-
 
 def _infer_source_type(document_data: Dict[str, Any]) -> str:
     """Infer document source type from metadata or content."""
@@ -1127,7 +1093,6 @@ def _infer_source_type(document_data: Dict[str, Any]) -> str:
 
     return "Resume"  # Default
 
-
 def _empty_candidate() -> Dict[str, Any]:
     """Return empty candidate structure."""
     return {
@@ -1144,9 +1109,4 @@ def _empty_candidate() -> Dict[str, Any]:
         "achievements": [],
         "source_type": "Resume",
     }
-
-
-
-
-
 

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import re
 from typing import Optional, List
 
 from src.policy.response_policy import INFO_MODE, ResponseModeClassifier, build_docwain_intro
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 _DOCWAIN_PERSONA = (
     "You are DocWain-Agent, a document intelligence model. You are NOT a chatbot.\n\n"
@@ -69,7 +68,6 @@ _DOCWAIN_PERSONA = (
 
 DOCWAIN_META_RESPONSE = build_docwain_intro()
 
-
 def get_docwain_persona(
     profile_id: Optional[str],
     subscription_id: Optional[str],
@@ -90,7 +88,6 @@ def get_docwain_persona(
             logger.debug("Unable to load persona memory: %s", exc)
     return base
 
-
 def build_persona_block(persona: Optional[str], persona_memory: str) -> str:
     persona = (persona or "").strip()
     base = persona_memory.strip()
@@ -99,7 +96,6 @@ def build_persona_block(persona: Optional[str], persona_memory: str) -> str:
     if not base:
         return ""
     return f"SYSTEM INSTRUCTIONS:\n{base}\n"
-
 
 META_QUESTION_PATTERNS = [
     re.compile(r"\bwho\s+are\s+you\b"),
@@ -114,13 +110,11 @@ META_QUESTION_PATTERNS = [
     re.compile(r"\bhow\s+do\s+you\s+work\b"),
 ]
 
-
 def _normalize_user_text(user_text: str) -> str:
     text = (user_text or "").lower()
     text = re.sub(r"[^\w\s'’]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
-
 
 def is_meta_question(user_text: str) -> bool:
     text = _normalize_user_text(user_text)
@@ -129,7 +123,6 @@ def is_meta_question(user_text: str) -> bool:
     if any(pattern.search(text) for pattern in META_QUESTION_PATTERNS):
         return True
     return ResponseModeClassifier.classify(text) == INFO_MODE
-
 
 def enforce_docwain_identity(
     response: str,
@@ -149,7 +142,6 @@ def enforce_docwain_identity(
         return DOCWAIN_META_RESPONSE
     return response
 
-
 _INTERNAL_PATTERNS = [
     re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b"),
     re.compile(r"\b[0-9a-fA-F]{24}\b"),
@@ -163,14 +155,12 @@ _INTERNAL_PATTERNS = [
     re.compile(r"/(?:[\w\-.]+/)+[\w\-.]+"),
 ]
 
-
 _AI_DISCLAIMER_PATTERNS = [
     # Only match "As an AI" followed by disclaimer words, not job titles like "AI Engineer"
     re.compile(r"\bAs an AI(?:\s+(?:language\s+model|assistant|model|chatbot|system))\b[^.]*\.", re.IGNORECASE),
     re.compile(r"\bAs a language model\b[^.]*\.", re.IGNORECASE),
     re.compile(r"\bI(?:'m| am) (?:just )?an? AI(?:\s+(?:language\s+model|assistant|model|chatbot))\b[^.]*\.", re.IGNORECASE),
 ]
-
 
 def sanitize_response(text: str) -> str:
     sanitized = text or ""

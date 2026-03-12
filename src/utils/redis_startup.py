@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Iterable, List
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def clear_unsafe_keys(redis_client: Any, patterns: Iterable[str]) -> Dict[str, Any]:
     if not redis_client:
@@ -38,12 +37,10 @@ def clear_unsafe_keys(redis_client: Any, patterns: Iterable[str]) -> Dict[str, A
                 break
     return {"cleared": cleared, "patterns": patterns, "errors": errors}
 
-
 def parse_unsafe_patterns(raw: str) -> List[str]:
     if not raw:
         return []
     tokens = [tok.strip() for tok in raw.split(",") if tok.strip()]
     return tokens
-
 
 __all__ = ["clear_unsafe_keys", "parse_unsafe_patterns"]

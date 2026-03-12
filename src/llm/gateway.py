@@ -5,7 +5,7 @@ All 16+ files that previously did `import ollama` route through here.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 import time
@@ -19,11 +19,10 @@ from src.llm.clients import (
     ResilientLLMClient,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _GATEWAY: Optional["LLMGateway"] = None
 _GATEWAY_LOCK = threading.Lock()
-
 
 class LLMGateway:
     """Single entry point for ALL LLM calls.
@@ -147,7 +146,6 @@ class LLMGateway:
             return checker()
         return False
 
-
 def create_llm_gateway(
     model_name: Optional[str] = None,
     backend_override: Optional[str] = None,
@@ -205,7 +203,6 @@ def create_llm_gateway(
 
     return LLMGateway(primary, fallback, name=f"{getattr(primary, 'backend', 'primary')}-with-ollama-fallback")
 
-
 def get_llm_gateway() -> LLMGateway:
     """Get the singleton LLMGateway, creating it if needed."""
     global _GATEWAY
@@ -216,7 +213,6 @@ def get_llm_gateway() -> LLMGateway:
             return _GATEWAY
         _GATEWAY = create_llm_gateway()
         return _GATEWAY
-
 
 def set_llm_gateway(gateway: LLMGateway) -> None:
     """Set the singleton LLMGateway (called during app startup)."""

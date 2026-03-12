@@ -9,14 +9,14 @@ unavailable (e.g., during bare-metal unit tests).
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DOMAIN_LABELS = [
     "resume",
@@ -110,7 +110,6 @@ _DOMAIN_PROTOTYPES: Dict[str, List[str]] = {
 _centroids: Optional[Dict[str, Any]] = None
 _centroid_lock = threading.Lock()
 
-
 def _get_embedder() -> Optional[Any]:
     """Retrieve the already-loaded sentence-transformer embedder."""
     try:
@@ -126,7 +125,6 @@ def _get_embedder() -> Optional[Any]:
     except Exception:
         pass
     return None
-
 
 def _build_centroids(embedder: Any) -> Dict[str, Any]:
     """Encode prototype sentences and compute per-domain centroids."""
@@ -151,7 +149,6 @@ def _build_centroids(embedder: Any) -> Dict[str, Any]:
         _centroids = result
         logger.info("Domain classifier: built %d prototype centroids", len(result))
         return result
-
 
 def _semantic_classify(text: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[DomainClassification]:
     """Classify document using embedding cosine similarity against prototypes."""
@@ -228,7 +225,6 @@ def _semantic_classify(text: str, metadata: Optional[Dict[str, Any]] = None) -> 
         logger.debug("Semantic domain classification failed: %s", exc)
         return None
 
-
 # ── Lightweight keyword fallback (no regex, only substring match) ────────
 # Used when embedder is unavailable (testing, cold start).
 
@@ -284,7 +280,6 @@ DOC_TYPE_HINTS = {
     "policy": "policy",
 }
 
-
 @dataclass(frozen=True)
 class DomainClassification:
     domain: str
@@ -292,7 +287,6 @@ class DomainClassification:
     scores: Dict[str, float]
     method: str
     uncertain: bool
-
 
 def _keyword_fallback_classify(
     text: str,
@@ -341,7 +335,6 @@ def _keyword_fallback_classify(
         domain=best_domain, confidence=confidence, scores=scores,
         method="keyword_fallback", uncertain=uncertain,
     )
-
 
 def classify_domain(
     document_text: str,
@@ -398,17 +391,14 @@ def classify_domain(
 
     return fallback
 
-
 def infer_domain(document_text: str, *, metadata: Optional[Dict[str, Any]] = None) -> str:
     """Convenience: return just the domain string."""
     return classify_domain(document_text, metadata).domain
-
 
 def reset_centroids() -> None:
     """Clear cached centroids (for testing)."""
     global _centroids
     _centroids = None
-
 
 # ── Canonical domain normalization ──────────────────────────────────────
 # Maps legacy/variant labels from all classifiers to a canonical set.
@@ -432,7 +422,6 @@ _CANONICAL_DOMAIN_MAP: Dict[str, str] = {
     "generic": "general",
 }
 
-
 def normalize_domain(label: str) -> str:
     """Normalize any domain label to a canonical form.
 
@@ -449,7 +438,6 @@ def normalize_domain(label: str) -> str:
     if canonical:
         return canonical
     return cleaned.lower() or "general"
-
 
 # Keep for backward compat — some modules import these
 DOMAIN_KEYWORDS: Dict[str, Tuple[str, ...]] = {d: () for d in DOMAIN_LABELS}

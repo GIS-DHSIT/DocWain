@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,8 +21,7 @@ from src.intelligence.document_intelligence import (
     DocumentSection,
 )
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class GeneratedQA:
@@ -53,7 +52,6 @@ class GeneratedQA:
             "metadata": self.metadata,
         }
 
-
 @dataclass
 class QAGenerationResult:
     """Result of Q&A generation for a document."""
@@ -77,7 +75,6 @@ class QAGenerationResult:
             value = json.dumps(qa.to_dict())
             pairs.append((key, value))
         return pairs
-
 
 class QAGenerator:
     """
@@ -470,7 +467,6 @@ class QAGenerator:
         
         return unique_pairs
 
-
 class QACacheManager:
     """
     Manages Q&A pair caching in Redis for fast retrieval.
@@ -605,7 +601,6 @@ class QACacheManager:
         # Sort by score and return top results
         scored_pairs.sort(key=lambda x: x["match_score"], reverse=True)
         return scored_pairs[:max_results]
-
 
 __all__ = [
     "QAGenerator",

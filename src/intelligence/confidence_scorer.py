@@ -12,12 +12,12 @@ Five weighted scoring dimensions:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -34,7 +34,6 @@ _DIMENSION_WEIGHTS = {
     "extraction_completeness": 0.15,
     "judge_verdict": 0.30,
 }
-
 
 @dataclass
 class ConfidenceResult:
@@ -53,7 +52,6 @@ class ConfidenceResult:
             "reasoning": self.reasoning,
         }
 
-
 _NUMERIC_PRECISION_RE = re.compile(r"\b\d+(?:[.,]\d+)*%?\b")
 _TRIVIAL_NUMS = frozenset({
     "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
@@ -61,17 +59,14 @@ _TRIVIAL_NUMS = frozenset({
     "24", "25", "30", "40", "48", "50", "60", "72", "75", "90", "100",
 })
 
-
 def _tokenize(text: str) -> Set[str]:
     """Extract lowercase tokens from text (includes 2-char domain abbreviations like IV, BP, HR)."""
     return {t.lower() for t in _TOKEN_RE.findall(text) if len(t) >= 2}
-
 
 def _split_sentences(text: str) -> List[str]:
     """Split text into sentences."""
     parts = _SENTENCE_RE.split(text.strip())
     return [s.strip() for s in parts if s and len(s.strip()) > 5]
-
 
 # TitleCase words that are common labels, not named entities
 _ENTITY_FALSE_POSITIVES = frozenset({
@@ -89,7 +84,6 @@ _ENTITY_FALSE_POSITIVES = frozenset({
     "note", "based", "according", "evidence", "document",
 })
 
-
 def _extract_entities(text: str) -> Set[str]:
     """Extract named entities (TitleCase multi-word phrases + acronyms) from text."""
     entities = set()
@@ -106,7 +100,6 @@ def _extract_entities(text: str) -> Set[str]:
                 if m.group().lower() not in _generic_acronyms}
     return entities | acronyms
 
-
 def _jaccard(a: Set[str], b: Set[str]) -> float:
     if not a or not b:
         return 0.0
@@ -114,14 +107,12 @@ def _jaccard(a: Set[str], b: Set[str]) -> float:
     union = a | b
     return len(inter) / max(len(union), 1)
 
-
 def _asymmetric_containment(response_tokens: Set[str], evidence_tokens: Set[str]) -> float:
     """Asymmetric keyword containment: what fraction of response tokens appear in evidence."""
     if not response_tokens:
         return 0.0
     overlap = response_tokens & evidence_tokens
     return len(overlap) / len(response_tokens)
-
 
 def score_evidence_coverage(
     response: str, chunk_texts: List[str], threshold: float = 0.40
@@ -169,7 +160,6 @@ def score_evidence_coverage(
     reason = f"Evidence coverage: {supported}/{len(sentences)} sentences supported, {_partial_support} partial ({ratio:.0%})"
     return min(ratio, 1.0), reason
 
-
 def score_source_diversity(
     sources: List[Dict[str, Any]], max_expected: int = 5
 ) -> tuple[float, str]:
@@ -194,7 +184,6 @@ def score_source_diversity(
     reason = f"Source diversity: {count} unique document(s) (score {score:.2f})"
     return score, reason
 
-
 def _fuzzy_entity_match(entity: str, evidence_lower: str, evidence_entities: Set[str]) -> bool:
     """Check if entity appears in evidence, with fuzzy matching for names.
 
@@ -218,7 +207,6 @@ def _fuzzy_entity_match(entity: str, evidence_lower: str, evidence_entities: Set
             if len(ent_parts) >= 2 and ent_parts[-1] == last and ent_parts[0].startswith(initial):
                 return True
     return False
-
 
 def score_entity_grounding(
     response: str, chunk_texts: List[str]
@@ -254,7 +242,6 @@ def score_entity_grounding(
     reason = f"Entity grounding: {grounded}/{len(response_entities)} entities found in evidence ({ratio:.0%})"
     return ratio, reason
 
-
 # Domain-specific critical fields — if these are missing, penalize harder
 _DOMAIN_CRITICAL_FIELDS: Dict[str, set] = {
     "hr": {"name", "skills", "technical_skills", "experience", "education"},
@@ -263,7 +250,6 @@ _DOMAIN_CRITICAL_FIELDS: Dict[str, set] = {
     "legal": {"clauses", "parties", "obligations", "effective_date"},
     "policy": {"coverage", "premium", "policyholder", "exclusions", "effective_date"},
 }
-
 
 def score_extraction_completeness(
     schema: Any, domain: Optional[str] = None
@@ -336,7 +322,6 @@ def score_extraction_completeness(
     reason = f"Extraction completeness: {filled}/{total} fields ({critical_filled}/{critical_total} critical)"
     return weighted_score, reason
 
-
 def score_numeric_precision(
     response: str, chunk_texts: List[str]
 ) -> tuple[float, str]:
@@ -361,7 +346,6 @@ def score_numeric_precision(
     reason = f"Numeric precision: {grounded}/{len(response_nums)} numbers grounded ({ratio:.0%})"
     return ratio, reason
 
-
 def score_judge_verdict(verdict_status: Optional[str]) -> tuple[float, str]:
     """Convert judge verdict to confidence score."""
     if verdict_status is None:
@@ -370,7 +354,6 @@ def score_judge_verdict(verdict_status: Optional[str]) -> tuple[float, str]:
     score = _VERDICT_SCORES.get(verdict_status, 0.5)
     reason = f"Judge verdict: '{verdict_status}' -> {score:.1f}"
     return score, reason
-
 
 def compute_confidence(
     response: str,
