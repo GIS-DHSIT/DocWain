@@ -159,6 +159,17 @@ Respond with ONLY valid JSON:
   "reasoning": "brief verification summary"
 }}"""
 
+_FORMAT_PRINCIPLES = """\
+RESPONSE FORMATTING (adapt to content, do not force structure):
+- Use tables ONLY when comparing 2+ entities across shared attributes
+- Use bullet points ONLY when listing 3+ discrete items
+- Use numbered steps ONLY for sequential procedures
+- Use sections with bold headers ONLY when covering 3+ distinct topics
+- For direct factual answers, write clear prose — no unnecessary structure
+- Every factual claim must cite [SOURCE-N] inline
+- Lead with the answer, not the preamble
+- Match response length to complexity — short answers for simple questions"""
+
 
 # ---------------------------------------------------------------------------
 # ReasoningEngine
@@ -703,16 +714,22 @@ class ReasoningEngine:
         if conversation_history:
             history_block = f"\nCONVERSATION HISTORY:\n{conversation_history}\n"
 
-        intent_guidance = self._intent_guidance(plan.intent if plan else "factual")
+        # Build user intent context from THINK step
+        intent_block = ""
+        if plan and plan.user_intent:
+            intent_block = f"\nUSER INTENT: {plan.user_intent}"
+            if plan.implicit_context:
+                intent_block += f"\nIMPLICIT CONTEXT: {plan.implicit_context}"
 
         prompt = f"""{persona_prompt or 'You are DocWain-Agent, a document intelligence model.'}
 
 DOCUMENT CONTEXT:
 {context_text}
-{findings_block}{contradictions_block}{history_block}
-TASK: Answer the user's question using ONLY the document context above.
-Intent: {plan.intent if plan else 'factual'} query.
-{intent_guidance}
+{findings_block}{contradictions_block}{history_block}{intent_block}
+
+You are answering a {plan.intent if plan else 'factual'} query. Shape your response to best serve this intent.
+
+{_FORMAT_PRINCIPLES}
 
 GROUNDING RULES (MANDATORY):
 1. Use ONLY the document context above. If information is missing, say so.
@@ -723,7 +740,7 @@ GROUNDING RULES (MANDATORY):
 
 USER QUESTION: {query}
 
-Provide the answer now with inline citations."""
+Provide a clear, well-structured answer with inline citations."""
 
         try:
             options = {
@@ -878,18 +895,6 @@ Provide the answer now with inline citations."""
             lines.append(f"\n[SOURCE-{i}] From {item.source_name}: \"{excerpt}...\"")
         lines.append("\n\nPlease refer to the source documents for complete details.")
         return "\n".join(lines)
-
-    def _intent_guidance(self, intent: str) -> str:
-        """Provide intent-specific generation guidance."""
-        guidance = {
-            "comparison": "Compare entities systematically. Use a table or side-by-side structure. Highlight commonalities AND differences.",
-            "summary": "Provide a concise synthesis. Start with a 1-2 sentence overview, then key details.",
-            "extraction": "Extract and list the requested fields clearly. Use structured format.",
-            "reasoning": "Analyze the evidence logically. Present your reasoning chain step by step.",
-            "procedural": "List steps in order. Be specific about each step.",
-            "factual": "Answer directly and concisely. Cite the relevant source immediately.",
-        }
-        return guidance.get(intent, guidance["factual"])
 
     def _no_evidence_response(self, query: str, elapsed: float) -> Dict[str, Any]:
         return {
