@@ -82,6 +82,9 @@ class Config:
         SECTION_SUMMARY_MAX_CHARS = int(os.getenv("DWX_SECTION_SUMMARY_MAX_CHARS", "700"))
         SECTION_SUMMARY_TOPK = int(os.getenv("DWX_SECTION_SUMMARY_TOPK", "6"))
         SECTION_RETRIEVAL_ENABLED = os.getenv("DWX_SECTION_RETRIEVAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        REASONING_ENGINE_ENABLED = os.getenv("DWX_REASONING_ENGINE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        REASONING_FAST_PATH_ENABLED = os.getenv("DWX_REASONING_FAST_PATH", "true").lower() in {"1", "true", "yes", "on"}
+        VERIFY_CONFIDENCE_THRESHOLD = float(os.getenv("DWX_VERIFY_CONFIDENCE_THRESHOLD", "0.8"))
 
     class Gemini:
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
@@ -225,7 +228,7 @@ class Config:
 
     class Reranker:
         DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
-        TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "12.0"))
+        TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "6.0"))
 
     class RagV3:
         DEBUG_LOGS = os.getenv("DOCWAIN_RAG_V3_DEBUG_LOGS", "false").lower() in {"1", "true", "yes", "on"}
@@ -243,13 +246,13 @@ class Config:
         CHUNK_COVERAGE_THRESHOLD = float(os.getenv("CHUNK_COVERAGE_THRESHOLD", "0.98"))
         TOPK_DENSE = int(os.getenv("TOPK_DENSE", "50"))
         TOPK_RERANK = int(os.getenv("TOPK_RERANK", "20"))
-        FINAL_CONTEXT_CHUNKS = int(os.getenv("FINAL_CONTEXT_CHUNKS", "8"))
+        FINAL_CONTEXT_CHUNKS = int(os.getenv("FINAL_CONTEXT_CHUNKS", "12"))
         HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.75"))
         MIN_CONFIDENCE_TO_ANSWER = float(os.getenv("MIN_CONFIDENCE_TO_ANSWER", "0.62"))
         DEDUP_THRESHOLD = float(os.getenv("RETRIEVAL_DEDUP_THRESHOLD", "0.92"))
-        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2048"))
-        MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
-        MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
+        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "4096"))
+        MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "16"))
+        MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
         SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
         USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
         USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"
@@ -327,14 +330,14 @@ class Config:
         TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
         TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
         MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
-        MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
+        MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "8"))
         DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
 
     class VLLM:
-        """vLLM serving config — SafeTensor models via OpenAI-compatible API."""
-        ENABLED = os.getenv("VLLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+        """vLLM serving config — Qwen2.5-14B-Instruct-AWQ via OpenAI-compatible API."""
+        ENABLED = os.getenv("VLLM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8000/v1/chat/completions")
-        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "DocWain-Agent")
+        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "Qwen2.5-14B-Instruct-AWQ")
         API_KEY = os.getenv("VLLM_API_KEY", "")
         TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "30"))
 
