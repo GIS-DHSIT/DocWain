@@ -42,6 +42,8 @@ class SearchPlan:
     actions: List[SearchAction] = field(default_factory=list)
     key_entities: List[str] = field(default_factory=list)
     reasoning: str = ""
+    user_intent: str = ""
+    implicit_context: str = ""
 
 
 @dataclass
@@ -88,16 +90,22 @@ USER QUERY: {query}
 PROFILE CONTEXT (available documents):
 {profile_context}
 
+{conversation_context}
+
 {prior_evidence_block}
 
-TASK: Produce a JSON search plan. Think about:
-1. What is the user actually asking? (intent)
-2. How complex is this? (simple=1 search, moderate=2, complex=3)
-3. What specific searches should we run to find the answer?
-4. What entities/names/terms are critical?
+TASK: Before planning searches, analyze the query:
+1. INTENT: What does the user want to KNOW or DO?
+2. SCOPE: About which entity/document/topic?
+3. DEPTH: Surface-level answer or comprehensive analysis?
+4. IMPLICIT: What is implied but not stated, given the conversation and domain?
+
+Then produce a JSON search plan.
 
 Respond with ONLY valid JSON:
 {{
+  "user_intent": "what the user actually wants in plain language",
+  "implicit_context": "what is implied but not stated",
   "intent": "factual|comparison|summary|extraction|reasoning|procedural",
   "complexity": "simple|moderate|complex",
   "actions": [
@@ -279,9 +287,9 @@ class ReasoningEngine:
         elapsed_generate = time.perf_counter() - t1
 
         # Adaptive VERIFY — skip when confidence signals are strong
-        citation_count = len(sources)
-        top_evidence_score = all_evidence[0].score if all_evidence else 0.0
-        skip_verify = citation_count >= 3 and top_evidence_score >= 0.8
+        citation_count = len(re.findall(r"\[SOURCE-\d+\]", answer_text))
+        avg_evidence_score = sum(e.score for e in all_evidence[:5]) / min(len(all_evidence), 5) if all_evidence else 0.0
+        skip_verify = citation_count >= 3 and avg_evidence_score >= 0.8
 
         elapsed_verify = 0.0
         if skip_verify:
@@ -313,7 +321,7 @@ class ReasoningEngine:
                 "complexity": "simple",
                 "iterations": 1,
                 "evidence_count": len(all_evidence),
-                "confidence": top_evidence_score,
+                "confidence": avg_evidence_score,
                 "gaps": [],
                 "verification": {
                     "ok": verification.ok,
@@ -356,7 +364,7 @@ class ReasoningEngine:
             if iteration > 0 and assessment:
                 prior_block = self._format_prior_evidence_block(all_evidence, assessment)
 
-            plan = self._think(query, profile_context, prior_block)
+            plan = self._think(query, profile_context, prior_block, conversation_context=conversation_history)
             logger.debug(
                 "ReasoningEngine iteration=%d intent=%s complexity=%s actions=%d",
                 iteration, plan.intent, plan.complexity, len(plan.actions),
@@ -464,10 +472,12 @@ class ReasoningEngine:
         query: str,
         profile_context: str,
         prior_evidence_block: str,
+        conversation_context: str = "",
     ) -> SearchPlan:
         prompt = _THINK_PROMPT.format(
             query=query,
             profile_context=profile_context or "No profile context available.",
+            conversation_context=conversation_context,
             prior_evidence_block=prior_evidence_block,
         )
         raw = self._call_thinker(prompt, max_tokens=512)
@@ -499,6 +509,8 @@ class ReasoningEngine:
             actions=actions,
             key_entities=parsed.get("key_entities", []),
             reasoning=parsed.get("reasoning", ""),
+            user_intent=parsed.get("user_intent", ""),
+            implicit_context=parsed.get("implicit_context", ""),
         )
 
     # ------------------------------------------------------------------
@@ -893,6 +905,7 @@ Provide the answer now with inline citations."""
                 "engine": "reasoning_engine",
                 "intent": "unknown",
                 "evidence_count": 0,
+                "verification": {"ok": False, "skipped": True, "unsupported": []},
                 "timing_ms": {"total": round(elapsed * 1000, 1)},
             },
         }
