@@ -233,7 +233,7 @@ class OllamaClient:
             extra["options"] = kwargs.pop("options")
         text, response = self.generate_with_metadata(prompt, max_retries=max_retries, backoff=backoff, **extra)
         if not text:
-            logger.warning("Ollama returned empty response: %s", response)
+            logger.debug("Ollama returned empty response: %s", response)
             return "I don't have enough information in the documents to answer that."
         return text
 
@@ -709,7 +709,7 @@ class OpenAICompatibleClient:
         except Exception as exc:
             logger.warning("Local LLM warm-up failed (continuing): %s", exc)
 
-    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5) -> str:
+    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5, **kwargs) -> str:
         metrics_store = _get_metrics_store()
         request_started = time.time()
         if metrics_store.available:
@@ -718,12 +718,16 @@ class OpenAICompatibleClient:
                 distributions={"model_usage": {self.model_name: 1}},
                 model_id=self.model_name,
             )
+        call_temp = kwargs.get("temperature", self.temperature)
+        call_max_tokens = kwargs.get("max_tokens", self.max_tokens)
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "temperature": call_temp,
+            "max_tokens": call_max_tokens,
         }
+        if "top_p" in kwargs:
+            payload["top_p"] = kwargs["top_p"]
         data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -777,7 +781,15 @@ class OpenAICompatibleClient:
         self, prompt: str, *, options: Optional[Dict[str, Any]] = None, max_retries: int = 3, backoff: float = 1.0,
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate with metadata for pipeline compatibility."""
-        text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
+        call_kwargs = {}
+        if options:
+            if "temperature" in options:
+                call_kwargs["temperature"] = options["temperature"]
+            if "max_tokens" in options or "num_predict" in options:
+                call_kwargs["max_tokens"] = options.get("max_tokens") or options.get("num_predict")
+            if "top_p" in options:
+                call_kwargs["top_p"] = options["top_p"]
+        text = self.generate(prompt, max_retries=max_retries, backoff=backoff, **call_kwargs)
         return text, {"response": text, "model": self.model_name, "backend": "vllm"}
 
 # ── _LLMClientWrapper (semaphore-based concurrency control) ────────
