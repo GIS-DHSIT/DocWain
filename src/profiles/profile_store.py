@@ -21,19 +21,20 @@ def create_profile(
 ) -> Dict[str, Any]:
     now = time.time()
     profile_id = profile_id or str(uuid.uuid4())
+    profile_id = str(profile_id)
     record = {
-        "profile_id": str(profile_id),
+        "profile_id": profile_id,
         "subscription_id": str(subscription_id),
         "profile_name": profile_name,
         "status": status,
-        "created_at": now,
         "updated_at": now,
     }
     _profiles_collection().update_one(
-        {"profile_id": str(profile_id), "subscription_id": str(subscription_id)},
+        {"profile_id": profile_id, "subscription_id": str(subscription_id)},
         {"$set": record, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
+    record["created_at"] = now
     return record
 
 

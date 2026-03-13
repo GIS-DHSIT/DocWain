@@ -50,6 +50,7 @@ async def upload_document_for_profile(
         profile_name=profile_name,
         content_type=file.content_type,
         content_size=len(contents),
+        embed_after=False,
     )
     return {"document_id": doc_id, "status": "COMPLETED", "result": result}
 

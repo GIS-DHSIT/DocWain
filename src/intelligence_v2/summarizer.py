@@ -103,20 +103,29 @@ class DocumentSummarizer:
         prompt = build_analysis_prompt(text, filename, doc_type)
 
         try:
+            # Use think=False for analysis: thinking tokens consume from
+            # num_predict budget, leaving no room for the JSON response.
+            # Keep default num_ctx (8192) and truncate text to fit.
             raw_response, _meta = self.llm.generate_with_metadata(
-                prompt, think=True, temperature=0.1, max_tokens=4096
+                prompt, think=False, temperature=0.1, max_tokens=4096,
+            )
+            logger.info(
+                "[SUMMARIZER] LLM response length=%d for %s, first 500 chars: %s",
+                len(raw_response), filename, raw_response[:500],
             )
         except Exception:
             logger.warning(
-                "LLM call failed for %s; returning fallback result", filename
+                "LLM call failed for %s; returning fallback result", filename,
+                exc_info=True,
             )
             return _fallback_result(text, filename, doc_type)
 
         parsed = _extract_json(raw_response)
         if parsed is None:
             logger.warning(
-                "Could not parse JSON from LLM response for %s; returning fallback",
-                filename,
+                "Could not parse JSON from LLM response for %s; returning fallback. "
+                "Raw response (first 1000 chars): %s",
+                filename, raw_response[:1000],
             )
             return _fallback_result(text, filename, doc_type)
 

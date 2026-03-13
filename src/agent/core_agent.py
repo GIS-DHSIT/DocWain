@@ -140,19 +140,20 @@ class CoreAgent:
         if understanding.is_conversational:
             return self._handle_conversational(query)
 
-        # --- DOMAIN DISPATCH ---
-        domain_result = self._domain_dispatcher.try_handle(
-            query=understanding.resolved_query,
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-            evidence=[],
-            doc_context={},
-            agent_name=agent_name,
-            document_id=document_id,
-        )
-        if domain_result is not None:
-            domain_result.setdefault("metadata", {})["timing"] = timing
-            return domain_result
+        # --- DOMAIN DISPATCH (only when explicitly requested) ---
+        if agent_name:
+            domain_result = self._domain_dispatcher.try_handle(
+                query=understanding.resolved_query,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                evidence=[],
+                doc_context={},
+                agent_name=agent_name,
+                document_id=document_id,
+            )
+            if domain_result is not None:
+                domain_result.setdefault("metadata", {})["timing"] = timing
+                return domain_result
 
         # --- RETRIEVE ---
         t0 = time.monotonic()
@@ -187,7 +188,7 @@ class CoreAgent:
             document_ids=document_ids,
         )
 
-        reranked = rerank_chunks(understanding.resolved_query, retrieval_result.chunks, top_k=15)
+        reranked = rerank_chunks(understanding.resolved_query, retrieval_result.chunks, top_k=6)
         evidence, doc_context = build_context(reranked, doc_intelligence_dict)
         timing["retrieve_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
@@ -208,22 +209,21 @@ class CoreAgent:
 
         # --- REASON ---
         t0 = time.monotonic()
-        use_thinking = understanding.complexity == "complex"
+        # Thinking mode disabled: on T4 GPU, Qwen3 thinking tokens add
+        # 10-20s latency per call with minimal quality gain.
+        use_thinking = False
 
-        if understanding.is_complex:
-            reason_result = self._handle_complex(
-                understanding, evidence, doc_context, conversation_history,
-            )
-        else:
-            reason_result = self._reasoner.reason(
-                query=understanding.resolved_query,
-                task_type=understanding.task_type,
-                output_format=understanding.output_format,
-                evidence=evidence,
-                doc_context=doc_context,
-                conversation_history=conversation_history,
-                use_thinking=use_thinking,
-            )
+        # Single-GPU: skip sub-agent decomposition — parallel LLM calls
+        # serialize on Ollama, causing timeouts. Use the reasoner directly.
+        reason_result = self._reasoner.reason(
+            query=understanding.resolved_query,
+            task_type=understanding.task_type,
+            output_format=understanding.output_format,
+            evidence=evidence,
+            doc_context=doc_context,
+            conversation_history=conversation_history,
+            use_thinking=use_thinking,
+        )
         timing["reason_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
         # --- COMPOSE ---
@@ -285,7 +285,7 @@ class CoreAgent:
                 evidence=evidence,
                 doc_context=doc_context,
                 conversation_history=conversation_history,
-                use_thinking=True,
+                use_thinking=False,
             )
 
         # Partition evidence round-robin
@@ -335,7 +335,7 @@ class CoreAgent:
             evidence=synthesis_evidence if synthesis_evidence else evidence,
             doc_context=doc_context,
             conversation_history=conversation_history,
-            use_thinking=True,
+            use_thinking=False,
         )
 
     # ------------------------------------------------------------------

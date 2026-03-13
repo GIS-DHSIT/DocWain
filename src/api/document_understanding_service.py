@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple
 from src.api.content_store import load_extracted_pickle
 from src.api.document_status import set_error, update_document_fields, update_stage
 from src.api.embedding_service import embed_documents
+from src.api.screening_service import promote_to_screening_completed
 from src.api.extraction_service import extract_uploaded_document
 from src.doc_understanding import build_content_map, identify_document
 from src.metadata.normalizer import MetadataNormalizationError, normalize_document_metadata
@@ -19,6 +20,13 @@ class UnderstandingError(Exception):
 
 def _select_extracted(extracted_payload: Any) -> Tuple[str, Any]:
     if isinstance(extracted_payload, dict) and extracted_payload:
+        # Enriched pickle format: {raw: {filename: content}, structured: ..., ...}
+        # Navigate into 'raw' to find the actual extracted document.
+        raw = extracted_payload.get("raw")
+        if isinstance(raw, dict) and raw:
+            filename, content = next(iter(raw.items()))
+            return filename, content
+        # Legacy format: {filename: content} directly
         filename, content = next(iter(extracted_payload.items()))
         return filename, content
     raise UnderstandingError("No extracted content available")
@@ -119,10 +127,20 @@ def run_document_understanding(
         # Fallback: LLM analysis without KG
         from src.intelligence_v2.summarizer import DocumentSummarizer
         from src.intelligence_v2.analyzer import _get_text
+        logger.info("[UNDERSTANDING] Neo4j unavailable, using fallback LLM analysis for doc=%s", document_id)
         summarizer = DocumentSummarizer(llm_gateway=llm)
         text = _get_text(extracted)
-        analysis = summarizer.analyze(text=text, filename=filename, doc_type=identification.document_type)
-        understanding = analysis.to_dict()
+        logger.info("[UNDERSTANDING] Extracted text length=%d for doc=%s", len(text), document_id)
+        try:
+            analysis = summarizer.analyze(text=text, filename=filename, doc_type=identification.document_type)
+            understanding = analysis.to_dict()
+            logger.info(
+                "[UNDERSTANDING] Analysis complete for doc=%s: entities=%d, facts=%d, summary_len=%d",
+                document_id, len(analysis.entities), len(analysis.facts), len(analysis.summary),
+            )
+        except Exception:
+            logger.error("[UNDERSTANDING] Summarizer failed for doc=%s", document_id, exc_info=True)
+            understanding = {"document_type": identification.document_type, "summary": text[:500]}
         mongodb.update_one(
             {"document_id": document_id},
             {"$set": {"intelligence": understanding, "intelligence_ready": True}},
@@ -142,6 +160,7 @@ def run_document_understanding(
 
     embed_result = None
     if embed_after:
+        promote_to_screening_completed(document_id)
         embed_result = embed_documents(
             document_id=document_id,
             subscription_id=subscription_id,

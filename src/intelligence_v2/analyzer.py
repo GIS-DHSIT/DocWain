@@ -68,9 +68,18 @@ class DocumentAnalyzer:
         """
         # 1. Extract text
         text = _get_text(extracted)
+        logger.info(
+            "[ANALYZER] Text length=%d for doc=%s, first 200 chars: %s",
+            len(text), document_id, text[:200],
+        )
 
         # 2. LLM analysis
         analysis = self.summarizer.analyze(text, filename, doc_type)
+        logger.info(
+            "[ANALYZER] Analysis result for doc=%s: summary_len=%d, entities=%d, facts=%d, topics=%d",
+            document_id, len(analysis.summary), len(analysis.entities),
+            len(analysis.facts), len(analysis.answerable_topics),
+        )
         intelligence = analysis.to_dict()
 
         # 3. Write intelligence to MongoDB

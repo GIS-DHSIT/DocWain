@@ -108,7 +108,9 @@ def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
     if not model_name:
         return model_name
     normalized = str(model_name).strip().lower()
-    if normalized in ("docwain-agent", "gpt-oss"):
+    # Strip Ollama tag suffix (e.g. "gpt-oss:latest" → "gpt-oss")
+    base_name = normalized.split(":")[0]
+    if base_name in ("docwain-agent", "gpt-oss"):
         return "qwen3:14b"
     return model_name
 

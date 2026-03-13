@@ -123,7 +123,7 @@ class IntentAnalyzer:
                 prompt,
                 system="You are a document intelligence query analyzer. Respond ONLY with JSON.",
                 temperature=0.1,
-                max_tokens=512,
+                max_tokens=256,
             )
         except Exception:
             logger.exception("LLM call failed for intent analysis")
