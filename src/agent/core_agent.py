@@ -19,6 +19,7 @@ from src.generation.reasoner import Reasoner, ReasonerResult
 from src.retrieval.context_builder import build_context
 from src.retrieval.reranker import rerank_chunks
 from src.retrieval.retriever import UnifiedRetriever
+from src.agent.domain_dispatch import DomainDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class CoreAgent:
         self._retriever = UnifiedRetriever(qdrant_client=qdrant_client, embedder=embedder)
         self._reasoner = Reasoner(llm_gateway=llm_gateway)
         self.kg_query_service = kg_query_service
+        self._domain_dispatcher = DomainDispatcher(llm_gateway=llm_gateway)
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,6 +139,20 @@ class CoreAgent:
 
         if understanding.is_conversational:
             return self._handle_conversational(query)
+
+        # --- DOMAIN DISPATCH ---
+        domain_result = self._domain_dispatcher.try_handle(
+            query=understanding.resolved_query,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            evidence=[],
+            doc_context={},
+            agent_name=agent_name,
+            document_id=document_id,
+        )
+        if domain_result is not None:
+            domain_result.setdefault("metadata", {})["timing"] = timing
+            return domain_result
 
         # --- RETRIEVE ---
         t0 = time.monotonic()
