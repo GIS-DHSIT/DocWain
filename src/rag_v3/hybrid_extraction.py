@@ -44,7 +44,7 @@ def extract_hr_hybrid(
             candidate_data = extract_hr_from_complete_document(document_data)
             candidates.append(_convert_to_candidate(candidate_data))
         except Exception as e:
-            logger.warning(f"Document-level extraction failed for {document_id}: {e}. Falling back to chunks.")
+            logger.debug(f"Document-level extraction failed for {document_id}: {e}. Falling back to chunks.")
             candidates = []
 
     # STRATEGY 2: Fallback to chunk-based extraction

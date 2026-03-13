@@ -9,7 +9,10 @@ from qdrant_client import QdrantClient
 from src.api.config import Config
 from src.api.vector_store import build_collection_name, build_qdrant_filter
 from src.retrieval.profile_document_index import ProfileDocumentIndex
+from src.utils.logging_utils import get_logger
 from src.utils.payload_utils import get_canonical_text, get_source_name
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -47,6 +50,7 @@ def _extract_identifier_tokens(query: str) -> List[str]:
 
 
 def route_query(user_query: str, pdi: ProfileDocumentIndex) -> RetrievalPlan:
+    logger.debug("route_query: profile_id=%s, doc_count=%d", pdi.profile_id, len(pdi.document_ids))
     normalized_query = _normalize(user_query)
     matched_doc_ids: List[str] = []
     matched_names: List[str] = []
@@ -91,8 +95,10 @@ def route_query(user_query: str, pdi: ProfileDocumentIndex) -> RetrievalPlan:
 
     if matched_doc_ids:
         unique_doc_ids = sorted(set(matched_doc_ids))
+        logger.debug("route_query: scope=DOCUMENT, matched_docs=%d, reasons=%s", len(unique_doc_ids), reasons)
         return RetrievalPlan(scope="DOCUMENT", target_document_ids=unique_doc_ids, matched_document_names=matched_names, reasons=reasons)
 
+    logger.debug("route_query: scope=PROFILE, all_docs=%d", len(pdi.document_ids))
     return RetrievalPlan(
         scope="PROFILE",
         target_document_ids=list(pdi.document_ids),
@@ -105,6 +111,7 @@ def _find_docs_with_identifiers(pdi: ProfileDocumentIndex, identifiers: Iterable
     identifiers_lower = {identifier.lower() for identifier in identifiers if identifier}
     if not identifiers_lower:
         return []
+    logger.debug("_find_docs_with_identifiers: identifiers=%d", len(identifiers_lower))
     client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
     collection = build_collection_name(pdi.subscription_id)
     scroll_filter = build_qdrant_filter(
@@ -133,10 +140,12 @@ def _find_docs_with_identifiers(pdi: ProfileDocumentIndex, identifiers: Iterable
         if next_offset is None:
             break
         offset = next_offset
+    logger.debug("_find_docs_with_identifiers: matched_docs=%d", len(matched_docs))
     return sorted(matched_docs)
 
 
 def fetch_document_corpus(subscription_id: str, profile_id: str, document_id: str) -> List[Dict[str, Any]]:
+    logger.debug("fetch_document_corpus: subscription_id=%s, profile_id=%s, document_id=%s", subscription_id, profile_id, document_id)
     client = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=60)
     collection = build_collection_name(subscription_id)
     scroll_filter = build_qdrant_filter(
@@ -174,6 +183,7 @@ def fetch_document_corpus(subscription_id: str, profile_id: str, document_id: st
         if next_offset is None:
             break
         offset = next_offset
+    logger.debug("fetch_document_corpus: returning %d chunks", len(corpus))
     return corpus
 
 

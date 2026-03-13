@@ -318,14 +318,14 @@ def encode_with_fallback(
     except Exception as exc:  # noqa: BLE001
         if _is_meta_tensor_error(exc) or _is_cuda_oom(exc):
             if _is_cuda_oom(exc):
-                logger.warning("%sCUDA OOM during encode; falling back to cpu model: %s", _request_prefix(), exc)
+                logger.debug("%sCUDA OOM during encode; falling back to cpu model: %s", _request_prefix(), exc)
                 try:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except Exception:  # noqa: BLE001
                     pass
             else:
-                logger.warning("%sMeta tensor error during encode; falling back to cpu model: %s", _request_prefix(), exc)
+                logger.debug("%sMeta tensor error during encode; falling back to cpu model: %s", _request_prefix(), exc)
             model, _ = get_embedding_model(reload=True, device="cpu")
             cpu_batch = _optimal_batch_size("cpu", batch_size, len(texts))
             return model.encode(

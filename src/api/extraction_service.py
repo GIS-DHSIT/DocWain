@@ -138,15 +138,18 @@ def _ingest_to_knowledge_graph(
         if deep_result is not None:
             try:
                 deep_entities = [e.to_dict() for e in (deep_result.entities or [])]
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract deep entities from analysis result", exc_info=True)
                 deep_entities = None
             try:
                 typed_relationships = list(deep_result.typed_relationships or [])
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract typed relationships from analysis result", exc_info=True)
                 typed_relationships = None
             try:
                 temporal_spans = list(deep_result.temporal_spans or [])
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract temporal spans from analysis result", exc_info=True)
                 temporal_spans = None
 
         doc_classification = payload_to_save.get("document_classification") or {}
@@ -359,8 +362,8 @@ def _process_document_intelligence(
         try:
             from src.api.dataHandler import get_redis_client
             redis_client = get_redis_client()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to get Redis client for intelligence processing", exc_info=True)
 
         # Process through intelligence layer
         result = process_document_intelligence(
@@ -488,8 +491,8 @@ def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any
         try:
             from src.rag_v3.extract import _name_from_filename
             name = _name_from_filename(filename) or ""
-        except ImportError:
-            pass
+        except ImportError as exc:
+            logger.debug("_name_from_filename not available from rag_v3.extract", exc_info=True)
     if not name and text:
         # Use first non-empty line that looks like a name (2-4 words, no special chars)
         for line in text.split("\n")[:5]:
@@ -620,8 +623,8 @@ def _resolve_authoritative_domain(
     try:
         from src.intelligence.domain_classifier import normalize_domain
         result["domain"] = normalize_domain(result["domain"])
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.debug("normalize_domain not available from domain_classifier", exc_info=True)
 
     return result
 
@@ -811,7 +814,8 @@ def _debounce_extraction(subscription_id: str, doc_id: str) -> bool:
             return True
         redis_client.setex(debounce_key, _DEBOUNCE_TTL_SECONDS, "1")
         return False
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to check extraction debounce in Redis", exc_info=True)
         return False
 
 def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -1075,8 +1079,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                         bg = get_background_analyzer()
                         if bg and getattr(_Cfg.DeepAnalysis, "BACKGROUND_ENABLED", True):
                             bg.enqueue(doc_id, subscription_id, profile_id)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed to enqueue background analysis for connector %s", doc_id, exc_info=True)
                     break
         except Exception as exc:
             logger.warning("Deep analysis skipped for %s: %s", doc_id, exc)
@@ -1162,8 +1166,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             from src.profiles.profile_domain_tagger import refresh_profile_domain_on_document_change
             if subscription_id and profile_id:
                 refresh_profile_domain_on_document_change(subscription_id, profile_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to refresh profile domain tag after connector extraction", exc_info=True)
 
         summary = _build_extraction_summary(masked_docs)
         return {
@@ -1301,7 +1305,8 @@ def extract_uploaded_document(
             except Exception as sexc:  # noqa: BLE001
                 logger.warning("Structured extraction failed for upload %s: %s", fname, sexc)
                 structured_docs[fname] = {"document_id": document_id, "original_filename": fname, "document_type": "GENERIC", "sections": [{"section_id": "section_0", "section_type": "content", "content": raw_text}], "extraction_quality_score": 0.0}
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to build structured documents for upload", exc_info=True)
         structured_docs = {}
 
     # Intelligence layer processing: entity extraction, Q&A generation
@@ -1372,8 +1377,8 @@ def extract_uploaded_document(
                     bg = get_background_analyzer()
                     if bg and getattr(_Cfg.DeepAnalysis, "BACKGROUND_ENABLED", True):
                         bg.enqueue(document_id, subscription_id, profile_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to enqueue background analysis for upload %s", document_id, exc_info=True)
                 break
     except Exception as exc:
         logger.warning("Deep analysis skipped for upload %s: %s", document_id, exc)
@@ -1458,8 +1463,8 @@ def extract_uploaded_document(
         from src.profiles.profile_domain_tagger import refresh_profile_domain_on_document_change
         if subscription_id and profile_id:
             refresh_profile_domain_on_document_change(subscription_id, profile_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to refresh profile domain tag after upload extraction", exc_info=True)
 
     summary = _build_extraction_summary(extracted)
     return {

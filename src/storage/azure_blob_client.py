@@ -223,7 +223,7 @@ def validate_containers_once() -> None:
         getattr(Config.AzureBlob, "DOCUMENT_CONTAINER_NAME", ""),
     ):
         if not name:
-            logger.warning("Configured container is empty; please verify Azure Blob setup.")
+            logger.debug("Configured container is empty; please verify Azure Blob setup.")
             continue
         try:
             container = get_container_client(name)
@@ -232,7 +232,7 @@ def validate_containers_once() -> None:
             logger.warning("Container check failed for %s: %s", name, exc)
             continue
         if not exists:
-            logger.warning("Configured container %s not found. Please verify Azure Blob setup.", name)
+            logger.debug("Configured container %s not found. Please verify Azure Blob setup.", name)
 
 def validate_storage_configured_once() -> bool:
     """Validate blob credentials once and log a single actionable message."""
@@ -241,7 +241,7 @@ def validate_storage_configured_once() -> bool:
         return has_blob_credentials()
     _STORAGE_CONFIG_VALIDATED = True
     if not has_blob_credentials():
-        logger.warning("Azure blob storage is not configured; set AzureBlob.CONNECTION_STRING to enable storage.")
+        logger.debug("Azure blob storage is not configured; set AzureBlob.CONNECTION_STRING to enable storage.")
         return False
     logger.info("Azure blob storage configured.")
     return True

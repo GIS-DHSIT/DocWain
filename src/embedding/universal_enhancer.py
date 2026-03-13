@@ -180,7 +180,7 @@ class ContentTypeDetector:
                 dtype=np.float32,
             ).ravel()
         except Exception:
-            logger.warning("Embedder encode failed in detect_ml, falling back to regex", exc_info=True)
+            logger.debug("Embedder encode failed in detect_ml, falling back to regex", exc_info=True)
             return self.detect(text, section_title)
 
         return self._classify_vector(vec, text)
@@ -215,7 +215,7 @@ class ContentTypeDetector:
                 dtype=np.float32,
             )
         except Exception:
-            logger.warning("Batch encode failed in detect_ml_batch, falling back to regex", exc_info=True)
+            logger.debug("Batch encode failed in detect_ml_batch, falling back to regex", exc_info=True)
             return [self.detect(t, s) for t, s in zip(texts, titles)]
 
         return [self._classify_vector(vecs[i], texts[i]) for i in range(len(texts))]

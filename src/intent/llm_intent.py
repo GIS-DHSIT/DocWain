@@ -361,9 +361,9 @@ def _neural_parse(query: str) -> Optional[Dict[str, Any]]:
     domain = result.get("domain", "generic")
     domain_conf = result.get("domain_confidence", 0.0)
 
-    if intent_conf < 0.45:
+    if intent_conf < 0.30:
         intent = "qa"
-    if domain_conf < 0.40:
+    if domain_conf < 0.25:
         domain = "generic"
 
     logger.debug(

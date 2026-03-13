@@ -222,13 +222,15 @@ def run_agent_mode(
     answer["sources"] = (answer.get("sources") or [])[:max_evidence]
 
     if not answer["sources"]:
-        answer["response"] = (
-            answer.get("response")
-            or "No grounded answer available. Unable to proceed without evidence."
-        )
+        # Only refuse if the response itself is empty — don't override a
+        # valid LLM response just because source metadata is missing.
+        if not (answer.get("response") or "").strip():
+            answer["response"] = (
+                "No grounded answer available. Unable to proceed without evidence."
+            )
         answer["grounded"] = False
         answer["metadata"]["agent"] = {
-            "limitations": "No supporting evidence found; withheld ungrounded response.",
+            "limitations": "No supporting evidence found in source metadata.",
             "max_evidence": max_evidence,
         }
     else:

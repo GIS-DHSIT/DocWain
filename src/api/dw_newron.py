@@ -35,10 +35,7 @@ from src.api.enhanced_retrieval import GraphGuidedRetriever
 from src.api.reasoning_layer import EvidencePlanner, AnswerVerifier, ConfidenceScorer
 from src.api.learning_signals import LearningSignalStore
 from src.agentic.memory import AgentMemory
-from src.agentic.clarification_agent import ClarificationAgent
-from src.agentic.model_arbitration import ModelArbitrationLayer, ModelCandidate
-from src.agentic.post_processor import PostProcessor
-from src.agentic.response_templates import ResponseTemplateSelector
+# Legacy agentic imports removed — handled by ReasoningEngine intelligence pipeline
 from src.chat.companion_classifier import CompanionClassifier
 from src.chat.opener_generator import contains_banned_opener, generate_opener
 from src.kg.neo4j_store import Neo4jStore
@@ -98,11 +95,6 @@ try:
 except Exception:  # noqa: BLE001
     torch = None
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = get_logger(__name__)
 
 STOP_TOKENS = {
@@ -159,7 +151,8 @@ def _coerce_page_number(value: Any) -> Optional[int]:
         return None
     try:
         return int(value)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to coerce page number from %r", value, exc_info=True)
         return None
 
 def _build_evidence_packets_from_chunks(
@@ -712,7 +705,8 @@ def _parse_redis_connection_string(conn_str: str):
                 settings["password"] = value
             elif key == "ssl":
                 settings["ssl"] = value.lower() in {"true", "1", "yes", "on"}
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to parse Redis connection string", exc_info=True)
         return settings
 
     if isinstance(settings.get("password"), str):
@@ -797,7 +791,8 @@ def _embedding_similarity_score(left: str, right: str) -> Optional[float]:
         vectors = model.encode([left_trimmed, right_trimmed], normalize_embeddings=True)
         sim = float(np.dot(vectors[0], vectors[1]))
         return max(0.0, min(1.0, sim))
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to compute embedding similarity score", exc_info=True)
         return None
 
 def _semantic_similarity(left: str, right: str) -> float:
@@ -887,8 +882,8 @@ def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> Se
         if singleton_guard_active() and _MODEL is not None and model_name not in _MODEL_BY_NAME:
             logger.error("Embedding model reinit requested (%s); reusing existing singleton", model_name)
             return get_model(required_dim=required_dim)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to check singleton guard for embedding model", exc_info=True)
     if model_name in _MODEL_BY_NAME:
         model = _MODEL_BY_NAME[model_name]
     else:
@@ -910,7 +905,7 @@ def get_model_by_name(model_name: str, required_dim: Optional[int] = None) -> Se
     dim = model.get_sentence_embedding_dimension()
     if dim == required_dim:
         return model
-    logger.warning("Embedding model %s dim=%s does not match required=%s; using default embedder", model_name, dim, required_dim)
+    logger.debug("Embedding model %s dim=%s does not match required=%s; using default embedder", model_name, dim, required_dim)
     return get_model(required_dim=required_dim)
 
 def get_model(required_dim: Optional[int] = None):
@@ -921,8 +916,8 @@ def get_model(required_dim: Optional[int] = None):
 
         if singleton_guard_active() and _MODEL is None:
             logger.error("Embedding model requested after startup; initializing lazily (bug)")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to check singleton guard for model init", exc_info=True)
     if _MODEL is None:
         _MODEL = _load_model_candidates()
 
@@ -968,8 +963,8 @@ def get_cross_encoder():
 
         if singleton_guard_active() and _CROSS_ENCODER is None:
             logger.error("Cross-encoder requested after startup; initializing lazily (bug)")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to check singleton guard for cross-encoder", exc_info=True)
     if _CROSS_ENCODER is None:
         if not getattr(Config.Retrieval, "RERANKER_ENABLED", True):
             logger.info("Cross-encoder reranker disabled via configuration")
@@ -999,8 +994,8 @@ def get_qdrant_client():
 
         if singleton_guard_active() and _QDRANT_CLIENT is None:
             logger.error("Qdrant client requested after startup; initializing lazily (bug)")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to check singleton guard for Qdrant client", exc_info=True)
     if _QDRANT_CLIENT is None:
         try:
             _QDRANT_CLIENT = QdrantClient(
@@ -1022,8 +1017,8 @@ def get_redis_client():
 
         if singleton_guard_active() and _REDIS_CLIENT is None:
             logger.error("Redis client requested after startup; initializing lazily (bug)")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to check singleton guard for Redis client", exc_info=True)
     if _REDIS_CLIENT is None:
         try:
             raw_conn = (
@@ -1644,7 +1639,7 @@ class OllamaClient:
             backoff=backoff,
         )
         if not text:
-            logger.warning(f"Ollama returned empty response: {response}")
+            logger.debug(f"Ollama returned empty response: {response}")
             return "I don’t have enough information in the documents to answer that."
         return text
 
@@ -1695,7 +1690,8 @@ class GeminiClient:
         if self._redis_client is None:
             try:
                 self._redis_client = get_redis_client()
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to initialize Redis client for LLM wrapper", exc_info=True)
                 self._redis_client = None
         return self._redis_client
 
@@ -1705,7 +1701,8 @@ class GeminiClient:
             return None
         try:
             raw = redis_client.get(self._cooldown_key)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to read cooldown from Redis", exc_info=True)
             return None
         if not raw:
             return None
@@ -1713,7 +1710,8 @@ class GeminiClient:
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             return float(raw)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to parse cooldown timestamp from Redis", exc_info=True)
             return None
 
     def in_cooldown(self) -> bool:
@@ -1733,8 +1731,8 @@ class GeminiClient:
             try:
                 ttl = max(1, int(until_ts - time.time()))
                 redis_client.setex(self._cooldown_key, ttl, str(int(until_ts)))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to persist cooldown to Redis", exc_info=True)
 
     def _record_rate_limit_hit(self) -> bool:
         now = time.time()
@@ -1754,14 +1752,16 @@ class GeminiClient:
             if callable(value):
                 try:
                     value = value()
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to call status extraction method", exc_info=True)
                     value = None
             if isinstance(value, int):
                 return value
             try:
                 if hasattr(value, "value"):
                     return int(value.value)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract status code from exception attribute", exc_info=True)
                 continue
         msg = str(exc)
         if "429" in msg or "too many requests" in msg.lower():
@@ -1787,14 +1787,15 @@ class GeminiClient:
                     if parsed:
                         delta = (parsed - datetime.now(parsed.tzinfo)).total_seconds()
                         return max(0.0, delta)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to parse Retry-After header", exc_info=True)
                     return None
         retry_delay = getattr(exc, "retry_delay", None)
         try:
             if retry_delay is not None:
                 return float(retry_delay)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to parse retry_delay from exception", exc_info=True)
         return None
 
     def generate(
@@ -2219,8 +2220,8 @@ class QdrantRetriever:
                                 )
                             finally:
                                 _QDRANT_FILTER_INDEX_CACHE.add(cache_key)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to ensure Qdrant payload indexes", exc_info=True)
             kwargs = dict(
                 collection_name=collection_name,
                 query=query_vector,
@@ -2352,7 +2353,7 @@ class QdrantRetriever:
         )
 
         if not results or not getattr(results, "points", []):
-            logger.warning(f"No results found in collection '{collection_name}'")
+            logger.debug(f"No results found in collection '{collection_name}'")
             return []
 
         points = results.points or []
@@ -2492,7 +2493,8 @@ class QdrantRetriever:
             # Fallback to chunk_index equality (not range) to avoid 400s when stored as keyword.
             try:
                 idx_int = int(idx)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to parse chunk index as integer", exc_info=True)
                 idx_int = None
             if idx_int is not None and window > 0:
                 neighbor_values = []
@@ -3012,18 +3014,21 @@ class MetricsTracker:
                         total[k] += float(v)
                     else:
                         total[k] += int(v)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to parse metrics value for key %s", k, exc_info=True)
                     continue
 
             for k, v in (self.redis.hgetall(model_key) or {}).items():
                 try:
                     model_usage[k] += int(v)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to parse model usage value for key %s", k, exc_info=True)
                     continue
             for k, v in (self.redis.hgetall(profile_key) or {}).items():
                 try:
                     profile_usage[k] += int(v)
-                except Exception:
+                except Exception as exc:
+                    logger.debug("Failed to parse profile usage value for key %s", k, exc_info=True)
                     continue
 
         grand_total = int(total.get("total", 0))
@@ -3911,7 +3916,7 @@ class EnterpriseRAGSystem:
                     _COLLECTION_COUNT_CACHE[_count_cache_key] = (now, total_points)
                 logger.info(f"Collection '{collection_name}' profile='{profile_id}' point count: {total_points}")
                 if total_points == 0:
-                    logger.warning(f"Collection '{collection_name}' is empty for profile '{profile_id}'; retrieval will return no results")
+                    logger.debug(f"Collection '{collection_name}' is empty for profile '{profile_id}'; retrieval will return no results")
             except Exception as diag_exc:
                 logger.warning(f"Could not count collection '{collection_name}': {diag_exc}")
 
@@ -4004,8 +4009,8 @@ class EnterpriseRAGSystem:
                             "query_type": _conv_resp.intent.lower(),
                             "grounded": True,
                         }
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Conversation-driven response failed", exc_info=True)
 
             if getattr(Config, "RAGV3", None) and getattr(Config.RAGV3, "ENABLED", False):
                 try:
@@ -4031,8 +4036,8 @@ class EnterpriseRAGSystem:
                                     "Multi-turn context injected: %d chars for follow-up query",
                                     len(_v3_conv_context),
                                 )
-                    except Exception:
-                        pass  # conversation history is optional
+                    except Exception as exc:
+                        logger.debug("Failed to load conversation history for multi-turn context", exc_info=True)
 
                     v3_answer = run_docwain_rag_v3(
                         query=query,
@@ -4131,7 +4136,7 @@ class EnterpriseRAGSystem:
                     if intelligent_answer:
                         return intelligent_answer
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("Intelligent pipeline failed, falling back: %s", exc)
+                    logger.debug("Intelligent pipeline failed, falling back: %s", exc)
 
             logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
 
@@ -4532,7 +4537,7 @@ class EnterpriseRAGSystem:
                         include_metadata=True
                     )
                 except Exception as ctx_exc:
-                    logger.warning(f"Enhanced context builder failed; falling back: {ctx_exc}")
+                    logger.debug(f"Enhanced context builder failed; falling back: {ctx_exc}")
                     context = self.context_builder.build_context(
                         chunks=final_chunks,
                         max_chunks=context_chunk_limit
@@ -4610,7 +4615,7 @@ class EnterpriseRAGSystem:
                     import asyncio
                     from src.tools.base import registry
                 except Exception as tool_import_exc:  # noqa: BLE001
-                    logger.warning("Tool registry not available: %s", tool_import_exc)
+                    logger.debug("Tool registry not available: %s", tool_import_exc)
                     tool_list = []
                 tool_chunks: List[str] = []
                 for tool_name in tool_list:
@@ -4817,7 +4822,7 @@ class EnterpriseRAGSystem:
             try:
                 answer, raw_response = _generate_with_metadata(prompt, options=base_options)
             except Exception as gen_exc:  # noqa: BLE001
-                logger.warning("Generation failed; falling back to evidence summary: %s", gen_exc)
+                logger.debug("Generation failed; falling back to evidence summary: %s", gen_exc)
                 raw_response = {"done_reason": "error", "error": str(gen_exc)}
                 if final_chunks:
                     ledger = _build_evidence_ledger(final_chunks)
@@ -4862,7 +4867,7 @@ class EnterpriseRAGSystem:
                                     include_metadata=True,
                                 )
                             except Exception as ctx_exc:
-                                logger.warning("Retry context rebuild failed; using fallback: %s", ctx_exc)
+                                logger.debug("Retry context rebuild failed; using fallback: %s", ctx_exc)
                                 retry_context = self.context_builder.build_context(
                                     chunks=retry_chunks,
                                     max_chunks=expanded_limit,
@@ -5047,8 +5052,8 @@ class EnterpriseRAGSystem:
             try:
                 if telemetry:
                     telemetry.increment("retrieval_failures_count")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to increment retrieval_failures_count telemetry", exc_info=True)
 
             error_response = "Sorry, something went wrong on my side. Please try again, and let me know if it keeps happening."
 
@@ -5142,7 +5147,8 @@ class ResilientLLMClient:
         if callable(checker):
             try:
                 return bool(checker())
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to check primary LLM cooldown status", exc_info=True)
                 return False
         return False
 
@@ -5198,14 +5204,14 @@ class ResilientLLMClient:
         if callable(warm):
             try:
                 warm()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Primary LLM warm-up failed", exc_info=True)
         warm_fb = getattr(self.fallback, "warm_up", None)
         if callable(warm_fb):
             try:
                 warm_fb()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Fallback LLM warm-up failed", exc_info=True)
 
 def create_llm_client(
         model_name: Optional[str] = None,
@@ -5237,15 +5243,15 @@ def create_llm_client(
         gateway = get_llm_gateway()
         if gateway is not None:
             return gateway
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to get existing LLM gateway singleton", exc_info=True)
 
     # Fallback: create gateway directly
     try:
         from src.llm.gateway import create_llm_gateway
         return create_llm_gateway(model_name=model_name, backend_override=backend_override)
     except Exception as exc:
-        logger.warning("Gateway creation failed, falling back to direct Ollama: %s", exc)
+        logger.debug("Gateway creation failed, falling back to direct Ollama: %s", exc)
 
     # Ultimate fallback: bare Ollama
     model_name = _resolve_model_alias(model_name)
@@ -5272,8 +5278,8 @@ def get_rag_system(
         app_state = get_app_state()
         if app_state and app_state.rag_system:
             return app_state.rag_system
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to get RAG system from app state", exc_info=True)
 
     if _RAG_SYSTEM is not None:
         if (model_name and model_name != _RAG_MODEL) or (_RAG_BACKEND != backend_override) or (_RAG_MODEL_PATH != model_path):

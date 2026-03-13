@@ -257,7 +257,7 @@ def discover_collections_and_profiles(
                 client=client,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Skipping collection %s due to discovery error: %s", collection_name, exc)
+            logger.debug("Skipping collection %s due to discovery error: %s", collection_name, exc)
             continue
         if profiles:
             discovered[sub] = profiles
@@ -551,7 +551,7 @@ def build_dataset_from_qdrant(
         try:
             llm_client = _get_llm_client(gen_model)
         except Exception as exc:
-            logger.warning("LLM generation unavailable (%s); falling back to heuristic strategies.", exc)
+            logger.debug("LLM generation unavailable (%s); falling back to heuristic strategies.", exc)
 
     generator = MultiStrategyPairGenerator(
         llm_client=llm_client,

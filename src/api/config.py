@@ -334,12 +334,16 @@ class Config:
         DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
 
     class VLLM:
-        """vLLM serving config — Qwen2.5-14B-Instruct-AWQ via OpenAI-compatible API."""
+        """vLLM serving config — Qwen3-14B-AWQ via OpenAI-compatible API."""
         ENABLED = os.getenv("VLLM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-        ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8000/v1/chat/completions")
-        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "Qwen2.5-14B-Instruct-AWQ")
+        ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8001/v1/chat/completions")
+        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen3-14B-AWQ")
         API_KEY = os.getenv("VLLM_API_KEY", "")
         TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "30"))
+
+    class DocumentProfiler:
+        """Ingestion-time document profiling via LLM."""
+        ENABLED = os.getenv("DOC_PROFILER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
     class TaskRouting:
         ENABLED = os.getenv("TASK_ROUTING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

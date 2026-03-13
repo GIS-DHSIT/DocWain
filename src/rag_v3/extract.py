@@ -61,7 +61,8 @@ def _nlu_subintent(query: str) -> Optional[str]:
     try:
         from src.nlp.nlu_engine import classify_query_subintent
         return classify_query_subintent(query)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to classify query sub-intent via NLU", exc_info=True)
         return None
 
 _CONTACT_KEYWORDS = frozenset({
@@ -78,7 +79,8 @@ def _nlu_is_contact(query: str) -> bool:
     try:
         from src.nlp.nlu_engine import is_contact_query
         return is_contact_query(query)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to check contact query via NLU", exc_info=True)
         return False
 
 def schema_extract(
@@ -240,8 +242,8 @@ def _majority_chunk_domain(chunks: List[Any]) -> Optional[str]:
     try:
         from src.intelligence.domain_classifier import normalize_domain
         best = normalize_domain(best)
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.debug("normalize_domain not available for domain normalization", exc_info=True)
 
     domain_map = {
         "resume": "hr", "hr": "hr", "cv": "hr",
@@ -393,8 +395,8 @@ def _infer_domain_intent(
                     _verb_intent = "analysis"
                 elif any(v in _EXPLAIN_VERBS for v in _all_words):
                     _verb_intent = "analysis"
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed NLU-based verb intent classification", exc_info=True)
 
             if _verb_intent:
                 intent = _verb_intent
@@ -425,8 +427,8 @@ def _infer_domain_intent(
                         elif not any(n in _TOTAL_CONFIRM_NOUNS for n in
                                      set(_tsem.target_nouns) | set(_tsem.context_words)):
                             subintent = None  # no financial signal — likely misclassified
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed NLU guard for totals sub-intent", exc_info=True)
                 # Guard: "product_item" requires product/item-related nouns
                 if subintent == "product_item":
                     try:
@@ -436,8 +438,8 @@ def _infer_domain_intent(
                         if not any(n in _PRODUCT_NOUNS for n in
                                    set(_psem.target_nouns) | set(_psem.context_words)):
                             subintent = None
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed NLU guard for product_item sub-intent", exc_info=True)
                 if subintent and subintent in _SUBINTENT_MAP:
                     intent = _SUBINTENT_MAP[subintent]
                 else:
@@ -2093,7 +2095,8 @@ def _llm_extract(
         if domain == "policy":
             return PolicySchema.model_validate(cleaned)
         return GenericSchema.model_validate(cleaned)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to validate extraction schema for domain %s", domain, exc_info=True)
         return None
 
 def _build_llm_prompt(
@@ -2284,13 +2287,15 @@ def _extract_json(raw: Any) -> dict:
     if text.startswith("{") and text.endswith("}"):
         try:
             return json.loads(text)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to parse text as JSON object", exc_info=True)
             return {}
     if "{" in text and "}" in text:
         snippet = text[text.find("{") : text.rfind("}") + 1]
         try:
             return json.loads(snippet)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to parse extracted JSON snippet", exc_info=True)
             return {}
     return {}
 

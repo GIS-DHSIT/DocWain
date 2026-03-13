@@ -58,6 +58,8 @@ def _sanitize_response_text(text: str) -> str:
     text = re.sub(r"\bAs a language model\b[^.]*\.", "", text, flags=re.IGNORECASE)
     # Strip internal references
     text = re.sub(r"\[SOURCE[^\]]*\]", "", text, flags=re.IGNORECASE)
+    # Strip leaked internal metadata tags (e.g. [META]{"grounded": true, ...})
+    text = re.sub(r"\n*\[META\]\{[^}]*\}", "", text)
     return text
 
 
@@ -145,28 +147,6 @@ def chunk_text_stream_with_metadata(
                 yield chunk_text
             pos = end
 
-    # Emit final metadata event with confidence signals
-    if metadata:
-        meta_payload = {}
-        # Extract key grounding fields
-        if "grounded" in metadata:
-            meta_payload["grounded"] = metadata["grounded"]
-        if "context_found" in metadata:
-            meta_payload["context_found"] = metadata["context_found"]
-        # Confidence from nested metadata
-        raw_meta = metadata.get("metadata", {})
-        if isinstance(raw_meta, dict):
-            confidence = raw_meta.get("confidence", {})
-            if isinstance(confidence, dict):
-                meta_payload["confidence"] = confidence.get("score", -1)
-                dims = confidence.get("dimensions", {})
-                if isinstance(dims, dict):
-                    meta_payload["evidence_coverage"] = dims.get("evidence_coverage", -1)
-            judge = raw_meta.get("judge", {})
-            if isinstance(judge, dict):
-                meta_payload["judge_status"] = judge.get("status", "unknown")
-            if raw_meta.get("thinking_used"):
-                meta_payload["thinking_used"] = True
-
-        if meta_payload:
-            yield f"\n\n[META]{_json.dumps(meta_payload)}"
+    # Internal metadata is returned via the response structure (headers / JSON),
+    # NOT appended to the streamed text.  Emitting [META] tags in the text stream
+    # leaks internal data to end users.

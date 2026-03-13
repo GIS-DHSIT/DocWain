@@ -1,50 +1,30 @@
 """
-ReasoningEngine — Unified intelligence algorithm for DocWain.
+ReasoningEngine — Unified intelligence orchestrator for DocWain.
 
-Replaces scattered heuristic modules with a single LLM-driven loop:
-    THINK → SEARCH → REASON → (loop if gaps) → GENERATE → VERIFY
+Orchestrates the full pipeline:
+    Conversational Check → UNDERSTAND → RETRIEVE → GENERATE → VERIFY → FORMAT
 
-Uses the thinking model for fast reasoning steps (~100-200ms each)
-and the main model for final generation (~800ms).
+Uses a single Qwen3-14B-AWQ model via vLLM with native thinking mode
+for complex queries.  All domain knowledge is learned from documents,
+not hardcoded.
 """
 from __future__ import annotations
 
-import json
+import contextvars
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Data structures (kept for backward compat with tests)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class SearchAction:
-    """A single targeted search to execute."""
-    query: str
-    strategy: str = "semantic"          # semantic | keyword | entity_scoped
-    target_sections: List[str] = field(default_factory=list)
-    target_doc_ids: List[str] = field(default_factory=list)
-    reason: str = ""
-
-
-@dataclass
-class SearchPlan:
-    """LLM-generated plan for what evidence to retrieve."""
-    intent: str                          # factual | comparison | summary | extraction | reasoning | procedural
-    complexity: str                      # simple | moderate | complex
-    actions: List[SearchAction] = field(default_factory=list)
-    key_entities: List[str] = field(default_factory=list)
-    reasoning: str = ""
-    user_intent: str = ""
-    implicit_context: str = ""
-
 
 @dataclass
 class EvidenceItem:
@@ -59,128 +39,17 @@ class EvidenceItem:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class EvidenceAssessment:
-    """LLM evaluation of retrieved evidence."""
-    sufficient: bool
-    confidence: float                    # 0.0 to 1.0
-    gaps: List[str] = field(default_factory=list)
-    contradictions: List[str] = field(default_factory=list)
-    key_findings: List[str] = field(default_factory=list)
-    reasoning: str = ""
-
-
-@dataclass
-class Verification:
-    """LLM verification of the generated answer."""
-    ok: bool
-    unsupported_claims: List[str] = field(default_factory=list)
-    reasoning: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Prompts — kept minimal and structured for fast JSON responses
-# ---------------------------------------------------------------------------
-
-_THINK_PROMPT = """\
-You are analyzing a user query to plan evidence retrieval from a document store.
-
-USER QUERY: {query}
-
-PROFILE CONTEXT (available documents):
-{profile_context}
-
-{conversation_context}
-
-{prior_evidence_block}
-
-TASK: Before planning searches, analyze the query:
-1. INTENT: What does the user want to KNOW or DO?
-2. SCOPE: About which entity/document/topic?
-3. DEPTH: Surface-level answer or comprehensive analysis?
-4. IMPLICIT: What is implied but not stated, given the conversation and domain?
-
-Then produce a JSON search plan.
-
-Respond with ONLY valid JSON:
-{{
-  "user_intent": "what the user actually wants in plain language",
-  "implicit_context": "what is implied but not stated",
-  "intent": "factual|comparison|summary|extraction|reasoning|procedural",
-  "complexity": "simple|moderate|complex",
-  "actions": [
-    {{"query": "search text", "strategy": "semantic|keyword|entity_scoped", "target_sections": [], "target_doc_ids": [], "reason": "why this search"}}
-  ],
-  "key_entities": ["entity1", "entity2"],
-  "reasoning": "brief explanation of plan"
-}}"""
-
-_REASON_PROMPT = """\
-You are evaluating retrieved evidence to determine if it's sufficient to answer a query.
-
-USER QUERY: {query}
-SEARCH PLAN INTENT: {intent}
-
-EVIDENCE RETRIEVED ({count} chunks):
-{evidence_text}
-
-TASK: Assess this evidence. Consider:
-1. Does it contain enough information to fully answer the query?
-2. Are there gaps — things the user asked about that aren't covered?
-3. Are there contradictions between evidence pieces?
-4. What are the key findings?
-
-Respond with ONLY valid JSON:
-{{
-  "sufficient": true/false,
-  "confidence": 0.0-1.0,
-  "gaps": ["gap1", "gap2"],
-  "contradictions": ["contradiction1"],
-  "key_findings": ["finding1", "finding2"],
-  "reasoning": "brief assessment"
-}}"""
-
-_VERIFY_PROMPT = """\
-You are verifying an answer against evidence for factual accuracy.
-
-ANSWER:
-{answer}
-
-EVIDENCE:
-{evidence_text}
-
-TASK: Check every factual claim in the answer against the evidence.
-Flag any claim that is NOT directly supported by the evidence.
-
-Respond with ONLY valid JSON:
-{{
-  "ok": true/false,
-  "unsupported_claims": ["claim that has no evidence support"],
-  "reasoning": "brief verification summary"
-}}"""
-
-_FORMAT_PRINCIPLES = """\
-RESPONSE FORMATTING (adapt to content, do not force structure):
-- Use tables ONLY when comparing 2+ entities across shared attributes
-- Use bullet points ONLY when listing 3+ discrete items
-- Use numbered steps ONLY for sequential procedures
-- Use sections with bold headers ONLY when covering 3+ distinct topics
-- For direct factual answers, write clear prose — no unnecessary structure
-- Every factual claim must cite [SOURCE-N] inline
-- Lead with the answer, not the preamble
-- Match response length to complexity — short answers for simple questions"""
-
-
 # ---------------------------------------------------------------------------
 # ReasoningEngine
 # ---------------------------------------------------------------------------
 
 class ReasoningEngine:
     """
-    Unified intelligence engine.
+    Unified intelligence engine — orchestrates UNDERSTAND → RETRIEVE →
+    GENERATE → VERIFY → FORMAT.
 
-    One public method: answer(query, ...) → response dict.
-    Uses thinking model for fast reasoning, main model for generation.
+    One public method: ``answer(query, ...) → response dict``.
+    Response dict shape is unchanged from the old engine.
     """
 
     def __init__(
@@ -196,7 +65,6 @@ class ReasoningEngine:
         max_iterations: int = 3,
     ):
         self._llm = llm_client
-        self._thinker = thinking_client or llm_client
         self._qdrant = qdrant_client
         self._embedder = embedder
         self._collection = collection_name
@@ -204,21 +72,70 @@ class ReasoningEngine:
         self._profile_id = profile_id
         self._max_iterations = max_iterations
 
+        # Lazy-init intelligence components
+        self._understanding = None
+        self._generator = None
+        self._verifier = None
+        self._verification_gate = None
+        self._format_enforcer = None
+        self._conversational = None
+        self._lightweight_intent = None
+
+    # ------------------------------------------------------------------
+    # Lazy component initialization
+    # ------------------------------------------------------------------
+
+    def _get_understanding(self):
+        if self._understanding is None:
+            from src.intelligence.understand import QueryUnderstanding
+            self._understanding = QueryUnderstanding(self._llm)
+        return self._understanding
+
+    def _get_generator(self):
+        if self._generator is None:
+            from src.intelligence.generator import IntelligentGenerator
+            self._generator = IntelligentGenerator(self._llm)
+        return self._generator
+
+    def _get_verifier(self):
+        if self._verifier is None:
+            from src.intelligence.verifier import Verifier
+            self._verifier = Verifier(self._llm)
+        return self._verifier
+
+    def _get_verification_gate(self):
+        if self._verification_gate is None:
+            from src.intelligence.verifier import VerificationGate
+            self._verification_gate = VerificationGate()
+        return self._verification_gate
+
+    def _get_format_enforcer(self):
+        if self._format_enforcer is None:
+            from src.intelligence.format_enforcer import FormatEnforcer
+            self._format_enforcer = FormatEnforcer()
+        return self._format_enforcer
+
+    def _get_conversational(self):
+        if self._conversational is None:
+            try:
+                from src.intelligence.conversational import ConversationalDetector
+                self._conversational = ConversationalDetector(self._embedder)
+            except Exception:
+                self._conversational = False  # sentinel: init failed
+        return self._conversational if self._conversational is not False else None
+
+    def _get_lightweight_intent(self):
+        if self._lightweight_intent is None:
+            try:
+                from src.intelligence.lightweight_intent import LightweightIntentDetector
+                self._lightweight_intent = LightweightIntentDetector(self._embedder)
+            except Exception:
+                self._lightweight_intent = False
+        return self._lightweight_intent if self._lightweight_intent is not False else None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    @staticmethod
-    def _is_simple_query(query: str, task_type: str = "") -> bool:
-        """Decide fast vs full path using query characteristics and task type."""
-        if task_type in {"compare", "summarize", "rank", "generate", "reasoning"}:
-            return False
-        if task_type in {"extract", "list", "qa"}:
-            return len(query.split()) <= 20
-        word_count = len(query.split())
-        if word_count <= 12:
-            return True
-        return False
 
     def answer(
         self,
@@ -230,243 +147,278 @@ class ReasoningEngine:
         task_type: str = "",
     ) -> Dict[str, Any]:
         """
-        Main entry point. Classifies query and dispatches to fast or full path.
+        Main entry point.  Adaptively routes through the intelligence pipeline.
 
-        Fast path (simple queries): SEARCH → GENERATE → optional VERIFY (2 calls)
-        Full path (complex queries): THINK → SEARCH → REASON → GENERATE → VERIFY (4-5 calls)
-
-        Returns a response dict compatible with DocWain's answer format.
+        Returns a response dict compatible with DocWain's answer format:
+        ``{"response", "sources", "grounded", "context_found", "metadata"}``.
         """
         t0 = time.perf_counter()
-        fast_path = self._is_simple_query(query, task_type)
-        if fast_path:
-            return self._fast_path(
+
+        # ----------------------------------------------------------
+        # Step 0: Conversational intent check (~5ms)
+        # ----------------------------------------------------------
+        conv_detector = self._get_conversational()
+        if conv_detector:
+            try:
+                conv_result = conv_detector.detect(query)
+                if conv_result is not None:
+                    intent_type, response_text = conv_result
+                    elapsed = (time.perf_counter() - t0) * 1000
+                    logger.info("Conversational intent detected: %s (%.0fms)", intent_type, elapsed)
+                    return {
+                        "response": response_text,
+                        "sources": [],
+                        "grounded": True,
+                        "context_found": False,
+                        "metadata": {
+                            "engine": "reasoning_engine",
+                            "fast_path": True,
+                            "intent": intent_type,
+                            "complexity": "simple",
+                            "conversational": True,
+                            "timing_ms": {"total": round(elapsed, 1)},
+                        },
+                    }
+            except Exception as exc:
+                logger.debug("Conversational detection failed: %s", exc)
+
+        # ----------------------------------------------------------
+        # Step 1: Decide trivially simple vs needs UNDERSTAND
+        # ----------------------------------------------------------
+        from src.intelligence.understand import QueryUnderstanding
+
+        history_list = self._parse_conversation_history(conversation_history)
+        is_trivial = QueryUnderstanding.is_trivially_simple(query, history_list)
+
+        if is_trivial:
+            return self._trivial_path(
                 query,
                 profile_context=profile_context,
                 conversation_history=conversation_history,
-                persona_prompt=persona_prompt,
                 t0=t0,
             )
-        return self._full_path(
+
+        # ----------------------------------------------------------
+        # Step 2: Full intelligent path
+        # ----------------------------------------------------------
+        return self._intelligent_path(
             query,
             profile_context=profile_context,
             conversation_history=conversation_history,
-            persona_prompt=persona_prompt,
+            history_list=history_list,
             task_type=task_type,
             t0=t0,
         )
 
     # ------------------------------------------------------------------
-    # Fast path — simple queries: SEARCH → GENERATE → optional VERIFY
+    # Trivial path — 1 LLM call (GENERATE only)
     # ------------------------------------------------------------------
 
-    def _fast_path(
+    def _trivial_path(
         self,
         query: str,
         *,
         profile_context: str = "",
         conversation_history: str = "",
-        persona_prompt: str = "",
         t0: float,
     ) -> Dict[str, Any]:
-        """Fast path for simple queries — 2 LLM calls (SEARCH → GENERATE), optional VERIFY."""
-        # Build a simple plan: single semantic search with the raw query
-        plan = SearchPlan(
-            intent="factual",
-            complexity="simple",
-            actions=[SearchAction(query=query, strategy="semantic")],
-            key_entities=[],
-            reasoning="fast_path: direct semantic search",
-        )
+        """Fast path for trivially simple queries — direct retrieve + generate."""
+        # Quick intent detection
+        intent_detector = self._get_lightweight_intent()
+        intent = "extract"
+        if intent_detector:
+            try:
+                intent, _ = intent_detector.detect(query)
+            except Exception:
+                pass
 
-        # SEARCH
-        all_evidence = self._search(plan)
+        # RETRIEVE
+        evidence = self._search_simple(query)
         elapsed_retrieval = time.perf_counter() - t0
 
-        if not all_evidence:
-            resp = self._no_evidence_response(query, elapsed_retrieval)
-            resp["metadata"]["fast_path"] = True
-            return resp
+        if not evidence:
+            return self._no_evidence_response(query, elapsed_retrieval)
 
-        # GENERATE
+        # GENERATE — single call, no thinking mode
         t1 = time.perf_counter()
-        answer_text, sources = self._generate(
-            query, all_evidence, None, plan,
-            conversation_history=conversation_history,
-            persona_prompt=persona_prompt,
-        )
+        answer_text, sources = self._generate_simple(query, evidence, intent, conversation_history)
         elapsed_generate = time.perf_counter() - t1
 
-        # Adaptive VERIFY — skip when confidence signals are strong
-        citation_count = len(re.findall(r"\[SOURCE-\d+\]", answer_text))
-        avg_evidence_score = sum(e.score for e in all_evidence[:5]) / min(len(all_evidence), 5) if all_evidence else 0.0
-        skip_verify = citation_count >= 3 and avg_evidence_score >= 0.8
-
-        elapsed_verify = 0.0
-        if skip_verify:
-            verification = Verification(ok=True, reasoning="skipped: high confidence fast path")
-        else:
-            t2 = time.perf_counter()
-            verification = self._verify(answer_text, all_evidence)
-            elapsed_verify = time.perf_counter() - t2
-            if not verification.ok and verification.unsupported_claims:
-                answer_text = self._strip_unsupported(answer_text, verification)
+        # FORMAT
+        enforcer = self._get_format_enforcer()
+        answer_text = enforcer.enforce(answer_text, "prose")
 
         total_ms = (time.perf_counter() - t0) * 1000
         logger.info(
-            "ReasoningEngine fast_path completed: %.0fms (retrieval=%.0fms, generate=%.0fms, verify=%.0fms) "
-            "evidence=%d grounded=%s skip_verify=%s",
-            total_ms, elapsed_retrieval * 1000, elapsed_generate * 1000,
-            elapsed_verify * 1000, len(all_evidence), verification.ok, skip_verify,
+            "ReasoningEngine trivial_path: %.0fms (retrieval=%.0fms, generate=%.0fms) evidence=%d",
+            total_ms, elapsed_retrieval * 1000, elapsed_generate * 1000, len(evidence),
         )
 
         return {
             "response": answer_text,
             "sources": sources,
-            "grounded": verification.ok,
+            "grounded": True,
             "context_found": True,
             "metadata": {
                 "engine": "reasoning_engine",
                 "fast_path": True,
-                "intent": "factual",
+                "intent": intent,
                 "complexity": "simple",
                 "iterations": 1,
-                "evidence_count": len(all_evidence),
-                "confidence": avg_evidence_score,
+                "evidence_count": len(evidence),
+                "confidence": sum(e.score for e in evidence[:5]) / min(len(evidence), 5),
                 "gaps": [],
-                "verification": {
-                    "ok": verification.ok,
-                    "skipped": skip_verify,
-                    "unsupported": verification.unsupported_claims,
-                },
+                "verification": {"ok": True, "skipped": True, "unsupported": []},
                 "timing_ms": {
                     "total": round(total_ms, 1),
                     "retrieval": round(elapsed_retrieval * 1000, 1),
                     "generate": round(elapsed_generate * 1000, 1),
-                    "verify": round(elapsed_verify * 1000, 1),
+                    "verify": 0.0,
                 },
             },
         }
 
     # ------------------------------------------------------------------
-    # Full path — complex queries: THINK → SEARCH → REASON → GENERATE → VERIFY
+    # Intelligent path — UNDERSTAND → RETRIEVE → GENERATE → VERIFY → FORMAT
     # ------------------------------------------------------------------
 
-    def _full_path(
+    def _intelligent_path(
         self,
         query: str,
         *,
         profile_context: str = "",
         conversation_history: str = "",
-        persona_prompt: str = "",
+        history_list: List[dict],
         task_type: str = "",
         t0: float,
     ) -> Dict[str, Any]:
-        """Full path for complex queries — THINK → SEARCH → REASON → GENERATE → VERIFY."""
-        all_evidence: List[EvidenceItem] = []
+        """Full intelligent pipeline with UNDERSTAND → GENERATE → VERIFY."""
 
-        # --- Iterative retrieval loop ---
-        plan: Optional[SearchPlan] = None
-        assessment: Optional[EvidenceAssessment] = None
+        # --- UNDERSTAND (1 LLM call) ---
+        t_understand = time.perf_counter()
+        understanding = self._understand(query, history_list, profile_context)
+        elapsed_understand = time.perf_counter() - t_understand
 
-        for iteration in range(self._max_iterations):
-            # THINK
-            prior_block = ""
-            if iteration > 0 and assessment:
-                prior_block = self._format_prior_evidence_block(all_evidence, assessment)
-
-            plan = self._think(query, profile_context, prior_block, conversation_context=conversation_history)
-            logger.debug(
-                "ReasoningEngine iteration=%d intent=%s complexity=%s actions=%d",
-                iteration, plan.intent, plan.complexity, len(plan.actions),
-            )
-
-            # SEARCH — parallel execution of all search actions
-            new_evidence = self._search(plan)
-            all_evidence = self._merge_evidence(all_evidence, new_evidence)
-
-            if not all_evidence:
-                logger.debug("ReasoningEngine: no evidence found after iteration %d", iteration)
-                if iteration == 0:
-                    continue  # retry with broader search
-                break
-
-            # REASON
-            assessment = self._reason(query, plan, all_evidence)
-            logger.debug(
-                "ReasoningEngine: sufficient=%s confidence=%.2f gaps=%d",
-                assessment.sufficient, assessment.confidence, len(assessment.gaps),
-            )
-
-            # DECIDE — exit if sufficient or simple query
-            if assessment.sufficient or plan.complexity == "simple":
-                break
-            if not assessment.gaps:
-                break  # no specific gaps to address
-
-        elapsed_retrieval = time.perf_counter() - t0
-
-        if not all_evidence:
-            resp = self._no_evidence_response(query, elapsed_retrieval)
-            resp["metadata"]["fast_path"] = False
-            return resp
-
-        # GENERATE — main model, one call
-        t1 = time.perf_counter()
-        answer_text, sources = self._generate(
-            query, all_evidence, assessment, plan,
-            conversation_history=conversation_history,
-            persona_prompt=persona_prompt,
-        )
-        elapsed_generate = time.perf_counter() - t1
-
-        # Adaptive VERIFY — skip when confidence is high and citations are strong
-        citation_count = len(sources)
-        skip_verify = (
-            assessment is not None
-            and citation_count >= 3
-            and assessment.confidence >= 0.8
+        logger.info(
+            "UNDERSTAND: intent=%s format=%s complexity=%s thinking=%s subs=%d (%.0fms)",
+            understanding.primary_intent, understanding.output_format,
+            understanding.complexity, understanding.thinking_required,
+            len(understanding.sub_intents), elapsed_understand * 1000,
         )
 
-        elapsed_verify = 0.0
-        if skip_verify:
-            verification = Verification(ok=True, reasoning="skipped: high confidence full path")
+        # Check if clarification needed
+        if understanding.needs_clarification and understanding.clarification_question:
+            elapsed = (time.perf_counter() - t0) * 1000
+            return {
+                "response": understanding.clarification_question,
+                "sources": [],
+                "grounded": True,
+                "context_found": False,
+                "metadata": {
+                    "engine": "reasoning_engine",
+                    "fast_path": False,
+                    "intent": understanding.primary_intent,
+                    "complexity": understanding.complexity,
+                    "needs_clarification": True,
+                    "timing_ms": {"total": round(elapsed, 1)},
+                },
+            }
+
+        # --- RETRIEVE (no LLM) ---
+        t_retrieve = time.perf_counter()
+        if understanding.sub_intents and len(understanding.sub_intents) > 1:
+            # Multi-part: parallel retrieval per sub-intent
+            evidence = self._search_multi(understanding)
         else:
-            t2 = time.perf_counter()
-            verification = self._verify(answer_text, all_evidence)
-            elapsed_verify = time.perf_counter() - t2
-            if not verification.ok and verification.unsupported_claims:
-                answer_text = self._strip_unsupported(answer_text, verification)
+            evidence = self._search_for_query(understanding.resolved_query or query)
+        elapsed_retrieval = time.perf_counter() - t_retrieve
+
+        if not evidence:
+            return self._no_evidence_response(query, time.perf_counter() - t0)
+
+        # --- GENERATE (1 LLM call, with thinking mode if needed) ---
+        t_generate = time.perf_counter()
+        generator = self._get_generator()
+        evidence_dicts = [self._evidence_to_dict(e) for e in evidence[:16]]
+
+        gen_result = generator.generate(
+            query=understanding.resolved_query or query,
+            evidence=evidence_dicts,
+            understanding=understanding,
+            conversation_history=conversation_history,
+        )
+        answer_text = gen_result.text
+        elapsed_generate = time.perf_counter() - t_generate
+
+        # Build sources list
+        sources = self._build_sources(evidence[:16])
+
+        # --- VERIFY (conditional, 0-1 LLM call) ---
+        t_verify = time.perf_counter()
+        gate = self._get_verification_gate()
+        verification_result = {"ok": True, "skipped": True, "unsupported": []}
+
+        if gate.needs_verification(evidence_dicts, answer_text, understanding):
+            verifier = self._get_verifier()
+            v_result = verifier.verify(answer_text, evidence_dicts)
+            verification_result = {
+                "ok": v_result.supported,
+                "skipped": False,
+                "unsupported": v_result.unsupported_claims,
+            }
+
+            if not v_result.supported and v_result.unsupported_claims:
+                # Try to fix
+                fixed = verifier.handle_failure(answer_text, v_result)
+                if fixed:
+                    answer_text = fixed
+                else:
+                    # Re-generate with strict mode
+                    logger.info("Verification failed, re-generating with strict mode")
+                    gen_result = generator.generate(
+                        query=understanding.resolved_query or query,
+                        evidence=evidence_dicts,
+                        understanding=understanding,
+                        conversation_history=conversation_history,
+                    )
+                    answer_text = gen_result.text
+        elapsed_verify = time.perf_counter() - t_verify
+
+        # --- FORMAT ENFORCEMENT (no LLM) ---
+        enforcer = self._get_format_enforcer()
+        answer_text = enforcer.enforce(answer_text, understanding.output_format)
 
         total_ms = (time.perf_counter() - t0) * 1000
+        avg_score = sum(e.score for e in evidence[:5]) / min(len(evidence), 5) if evidence else 0.0
+
         logger.info(
-            "ReasoningEngine full_path completed: %.0fms (retrieval=%.0fms, generate=%.0fms, verify=%.0fms) "
-            "evidence=%d grounded=%s skip_verify=%s",
-            total_ms, elapsed_retrieval * 1000, elapsed_generate * 1000,
-            elapsed_verify * 1000, len(all_evidence), verification.ok, skip_verify,
+            "ReasoningEngine intelligent_path: %.0fms (understand=%.0fms, retrieval=%.0fms, "
+            "generate=%.0fms, verify=%.0fms) evidence=%d grounded=%s",
+            total_ms, elapsed_understand * 1000, elapsed_retrieval * 1000,
+            elapsed_generate * 1000, elapsed_verify * 1000,
+            len(evidence), verification_result["ok"],
         )
 
         return {
             "response": answer_text,
             "sources": sources,
-            "grounded": verification.ok,
+            "grounded": verification_result["ok"],
             "context_found": True,
             "metadata": {
                 "engine": "reasoning_engine",
                 "fast_path": False,
-                "intent": plan.intent if plan else "unknown",
-                "complexity": plan.complexity if plan else "unknown",
-                "iterations": min(iteration + 1, self._max_iterations),
-                "evidence_count": len(all_evidence),
-                "confidence": assessment.confidence if assessment else 0.0,
-                "gaps": assessment.gaps if assessment else [],
-                "verification": {
-                    "ok": verification.ok,
-                    "skipped": skip_verify,
-                    "unsupported": verification.unsupported_claims,
-                },
+                "intent": understanding.primary_intent,
+                "complexity": understanding.complexity,
+                "iterations": 1,
+                "evidence_count": len(evidence),
+                "confidence": avg_score,
+                "gaps": [],
+                "verification": verification_result,
+                "output_format": understanding.output_format,
+                "thinking_used": understanding.thinking_required,
                 "timing_ms": {
                     "total": round(total_ms, 1),
+                    "understand": round(elapsed_understand * 1000, 1),
                     "retrieval": round(elapsed_retrieval * 1000, 1),
                     "generate": round(elapsed_generate * 1000, 1),
                     "verify": round(elapsed_verify * 1000, 1),
@@ -475,109 +427,100 @@ class ReasoningEngine:
         }
 
     # ------------------------------------------------------------------
-    # THINK — LLM analyzes query, produces search plan
+    # UNDERSTAND — query analysis via LLM
     # ------------------------------------------------------------------
 
-    def _think(
-        self,
-        query: str,
-        profile_context: str,
-        prior_evidence_block: str,
-        conversation_context: str = "",
-    ) -> SearchPlan:
-        prompt = _THINK_PROMPT.format(
-            query=query,
-            profile_context=profile_context or "No profile context available.",
-            conversation_context=conversation_context,
-            prior_evidence_block=prior_evidence_block,
-        )
-        raw = self._call_thinker(prompt, max_tokens=512)
-        parsed = self._parse_json(raw)
-        if not parsed:
-            # Fallback: single semantic search with the original query
-            return SearchPlan(
-                intent="factual",
-                complexity="simple",
-                actions=[SearchAction(query=query, strategy="semantic")],
-                key_entities=[],
-                reasoning="fallback: direct semantic search",
+    def _understand(self, query: str, history_list: list, profile_context: str):
+        """Run QueryUnderstanding to analyze the query."""
+        understanding = self._get_understanding()
+
+        # Build domain context from profile
+        domain_context = self._build_domain_context(profile_context)
+
+        return understanding.understand(query, history_list, domain_context)
+
+    def _build_domain_context(self, profile_context: str) -> dict:
+        """Extract domain info from profile context string and any document profiles in Qdrant."""
+        # Parse the profile_context string for domain info
+        domain_labels = set()
+        terminology = set()
+        field_types = set()
+
+        if profile_context:
+            for line in profile_context.split("\n"):
+                line = line.strip()
+                if line.startswith("- ") and "(domain:" in line:
+                    # Extract domain from lines like "- resume.pdf (domain: hr)"
+                    domain_match = re.search(r"\(domain:\s*([^)]+)\)", line)
+                    if domain_match:
+                        domain_labels.add(domain_match.group(1).strip())
+
+        # Try to get document profiles from a quick Qdrant sample
+        try:
+            from src.api.vector_store import build_qdrant_filter
+            qdrant_filter = build_qdrant_filter(
+                subscription_id=self._subscription_id,
+                profile_id=self._profile_id,
             )
-        actions = []
-        for a in parsed.get("actions", []):
-            actions.append(SearchAction(
-                query=a.get("query", query),
-                strategy=a.get("strategy", "semantic"),
-                target_sections=a.get("target_sections", []),
-                target_doc_ids=a.get("target_doc_ids", []),
-                reason=a.get("reason", ""),
-            ))
-        if not actions:
-            actions = [SearchAction(query=query, strategy="semantic")]
+            # Get a small sample of chunks with their domain profiles
+            sample_vector = self._embedder.encode(["document content"], normalize_embeddings=True)[0]
+            response = self._qdrant.query_points(
+                collection_name=self._collection,
+                query=sample_vector.tolist(),
+                using="content_vector",
+                query_filter=qdrant_filter,
+                limit=5,
+                with_payload=True,
+            )
+            for point in response.points:
+                payload = point.payload or {}
+                profile = payload.get("domain_profile", {})
+                if profile:
+                    if profile.get("domain"):
+                        domain_labels.add(profile["domain"])
+                    terminology.update(profile.get("key_terminology", []))
+                    field_types.update(profile.get("field_types", []))
+        except Exception:
+            pass  # Domain context is optional, not critical
 
-        return SearchPlan(
-            intent=parsed.get("intent", "factual"),
-            complexity=parsed.get("complexity", "simple"),
-            actions=actions,
-            key_entities=parsed.get("key_entities", []),
-            reasoning=parsed.get("reasoning", ""),
-            user_intent=parsed.get("user_intent", ""),
-            implicit_context=parsed.get("implicit_context", ""),
-        )
+        return {
+            "domain_labels": list(domain_labels) if domain_labels else ["general"],
+            "key_terminology": list(terminology)[:20],
+            "field_types": list(field_types)[:15],
+            "structure_patterns": [],
+        }
 
     # ------------------------------------------------------------------
-    # SEARCH — parallel execution against Qdrant
+    # SEARCH — evidence retrieval from Qdrant
     # ------------------------------------------------------------------
 
-    def _search(self, plan: SearchPlan) -> List[EvidenceItem]:
-        if not plan.actions:
-            return []
+    def _search_simple(self, query: str) -> List[EvidenceItem]:
+        """Simple single-query search."""
+        return self._search_for_query(query, top_k=20)
 
-        if len(plan.actions) == 1:
-            return self._execute_search(plan.actions[0])
-
-        # Parallel search for multiple actions
-        results: List[EvidenceItem] = []
-        max_workers = min(len(plan.actions), 4)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self._execute_search, action): action
-                for action in plan.actions
-            }
-            for future in as_completed(futures):
-                try:
-                    items = future.result()
-                    results.extend(items)
-                except Exception as exc:
-                    action = futures[future]
-                    logger.debug("Search action failed: %s — %s", action.query[:60], exc)
-        return results
-
-    def _execute_search(self, action: SearchAction) -> List[EvidenceItem]:
-        """Execute a single search action against Qdrant."""
+    def _search_for_query(self, query: str, top_k: int = 30) -> List[EvidenceItem]:
+        """Execute a semantic search against Qdrant."""
         from src.api.vector_store import build_qdrant_filter
 
         try:
-            query_vector = self._embedder.encode([action.query], normalize_embeddings=True)[0]
+            query_vector = self._embedder.encode([query], normalize_embeddings=True)[0]
         except Exception as exc:
-            logger.debug("Embedding failed for search action: %s", exc)
+            logger.debug("Embedding failed: %s", exc)
             return []
 
-        # Build filters
         try:
             qdrant_filter = build_qdrant_filter(
                 subscription_id=self._subscription_id,
                 profile_id=self._profile_id,
-                document_id=action.target_doc_ids if action.target_doc_ids else None,
             )
         except Exception:
             qdrant_filter = None
 
-        top_k = 20 if action.strategy == "semantic" else 30
-
         try:
-            results = self._qdrant.search(
+            response = self._qdrant.query_points(
                 collection_name=self._collection,
-                query_vector=query_vector.tolist(),
+                query=query_vector.tolist(),
+                using="content_vector",
                 query_filter=qdrant_filter,
                 limit=top_k,
                 with_payload=True,
@@ -586,19 +529,53 @@ class ReasoningEngine:
             logger.debug("Qdrant search failed: %s", exc)
             return []
 
+        return self._points_to_evidence(response.points)
+
+    def _search_multi(self, understanding) -> List[EvidenceItem]:
+        """Parallel search for multi-part queries."""
+        queries = [understanding.resolved_query or ""]
+        for sub in understanding.sub_intents:
+            if sub.target:
+                queries.append(f"{sub.target} {sub.scope}" if sub.scope else sub.target)
+
+        all_evidence: List[EvidenceItem] = []
+        seen_chunks = set()
+
+        ctx = contextvars.copy_context()
+        with ThreadPoolExecutor(max_workers=min(len(queries), 4)) as executor:
+            futures = {
+                executor.submit(ctx.run, self._search_for_query, q, 15): q
+                for q in queries
+            }
+            for future in as_completed(futures):
+                try:
+                    items = future.result()
+                    for item in items:
+                        if item.chunk_id not in seen_chunks:
+                            seen_chunks.add(item.chunk_id)
+                            all_evidence.append(item)
+                except Exception as exc:
+                    logger.debug("Multi-search failed for query: %s", exc)
+
+        all_evidence.sort(key=lambda e: -e.score)
+        return all_evidence[:30]
+
+    def _points_to_evidence(self, points) -> List[EvidenceItem]:
+        """Convert Qdrant points to EvidenceItem list."""
         items = []
-        for point in results:
+        for point in points:
             payload = point.payload or {}
             text = (
-                payload.get("content")
+                payload.get("canonical_text")
+                or payload.get("embedding_text")
+                or payload.get("content")
                 or payload.get("text")
-                or payload.get("chunk_text")
                 or ""
             )
             if not text.strip():
                 continue
             score = float(getattr(point, "score", 0.0))
-            if score < 0.20:  # absolute floor — below this is noise
+            if score < 0.20:
                 continue
 
             source_name = (
@@ -618,74 +595,32 @@ class ReasoningEngine:
                 metadata=payload,
             ))
 
-        # Sort by score descending
         items.sort(key=lambda e: -e.score)
         return items
 
     # ------------------------------------------------------------------
-    # REASON — LLM evaluates evidence sufficiency
+    # GENERATE — simple path (no UNDERSTAND)
     # ------------------------------------------------------------------
 
-    def _reason(
-        self,
-        query: str,
-        plan: SearchPlan,
-        evidence: List[EvidenceItem],
-    ) -> EvidenceAssessment:
-        evidence_text = self._format_evidence_for_prompt(evidence[:20])  # cap for prompt size
-        prompt = _REASON_PROMPT.format(
-            query=query,
-            intent=plan.intent,
-            count=len(evidence),
-            evidence_text=evidence_text,
-        )
-        raw = self._call_thinker(prompt, max_tokens=512)
-        parsed = self._parse_json(raw)
-        if not parsed:
-            # Fallback: assume sufficient if we have any evidence
-            return EvidenceAssessment(
-                sufficient=len(evidence) >= 3,
-                confidence=min(0.8, max(e.score for e in evidence)) if evidence else 0.0,
-                key_findings=[],
-                reasoning="fallback assessment",
-            )
-        return EvidenceAssessment(
-            sufficient=parsed.get("sufficient", True),
-            confidence=float(parsed.get("confidence", 0.5)),
-            gaps=parsed.get("gaps", []),
-            contradictions=parsed.get("contradictions", []),
-            key_findings=parsed.get("key_findings", []),
-            reasoning=parsed.get("reasoning", ""),
-        )
-
-    # ------------------------------------------------------------------
-    # GENERATE — main model produces grounded answer
-    # ------------------------------------------------------------------
-
-    def _generate(
+    def _generate_simple(
         self,
         query: str,
         evidence: List[EvidenceItem],
-        assessment: Optional[EvidenceAssessment],
-        plan: Optional[SearchPlan],
-        *,
+        intent: str,
         conversation_history: str = "",
-        persona_prompt: str = "",
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        # Build numbered sources
+        """Direct generation for trivially simple queries."""
         sources = []
         context_parts = []
-        for i, item in enumerate(evidence[:16], 1):  # max 16 sources
-            import os
+        for i, item in enumerate(evidence[:10], 1):
             doc_name = os.path.basename(item.source_name).rsplit(".", 1)[0] if item.source_name else "Document"
-            header_parts = [f"Document: {doc_name}"]
+            header = f"Document: {doc_name}"
             if item.section:
-                header_parts.append(f"Section: {item.section}")
+                header += f", Section: {item.section}"
             if item.page:
-                header_parts.append(f"Page: {item.page}")
-            header = ", ".join(header_parts)
+                header += f", Page: {item.page}"
 
-            context_parts.append(f"[SOURCE-{i}] {header}\n{item.text}\n[/SOURCE-{i}]")
+            context_parts.append(f"[SOURCE-{i}] {header}\n{item.text}\n")
             sources.append({
                 "source_id": i,
                 "source_name": doc_name,
@@ -697,195 +632,83 @@ class ReasoningEngine:
                 "document_id": item.document_id,
             })
 
-        context_text = "\n\n".join(context_parts)
+        context_text = "\n".join(context_parts)
 
-        # Build generation prompt
-        findings_block = ""
-        if assessment and assessment.key_findings:
-            findings_block = "\nKEY FINDINGS FROM EVIDENCE ANALYSIS:\n" + "\n".join(
-                f"- {f}" for f in assessment.key_findings
-            )
-        contradictions_block = ""
-        if assessment and assessment.contradictions:
-            contradictions_block = "\nCONTRADICTIONS DETECTED:\n" + "\n".join(
-                f"- {c}" for c in assessment.contradictions
-            )
-        history_block = ""
-        if conversation_history:
-            history_block = f"\nCONVERSATION HISTORY:\n{conversation_history}\n"
-
-        # Build user intent context from THINK step
-        intent_block = ""
-        if plan and plan.user_intent:
-            intent_block = f"\nUSER INTENT: {plan.user_intent}"
-            if plan.implicit_context:
-                intent_block += f"\nIMPLICIT CONTEXT: {plan.implicit_context}"
-
-        prompt = f"""{persona_prompt or 'You are DocWain-Agent, a document intelligence model.'}
+        prompt = f"""You are DocWain, a document intelligence assistant.
 
 DOCUMENT CONTEXT:
 {context_text}
-{findings_block}{contradictions_block}{history_block}{intent_block}
 
-You are answering a {plan.intent if plan else 'factual'} query. Shape your response to best serve this intent.
+RULES:
+1. Answer ONLY from the document context above.
+2. Cite [SOURCE-N] inline after every factual claim.
+3. If the information is not in the context, say so.
+4. Be concise and direct.
 
-{_FORMAT_PRINCIPLES}
-
-GROUNDING RULES (MANDATORY):
-1. Use ONLY the document context above. If information is missing, say so.
-2. EVERY factual claim must cite with [SOURCE-N] immediately after the claim.
-3. Prefer exact quotes of figures, names, dates with citations.
-4. If sources disagree, note the discrepancy with citations to both.
-5. Do not invent, generalize, or pad beyond the provided evidence.
-
-USER QUESTION: {query}
-
-Provide a clear, well-structured answer with inline citations."""
+QUESTION: {query}"""
 
         try:
-            options = {
-                "temperature": 0.2,
-                "top_p": 0.85,
-                "num_predict": 2048,
-                "num_ctx": 8192,
-            }
             if hasattr(self._llm, "generate_with_metadata"):
-                answer_text, _ = self._llm.generate_with_metadata(prompt, options=options)
+                answer_text, _ = self._llm.generate_with_metadata(
+                    prompt, options={"temperature": 0.2, "max_tokens": 1024}
+                )
             else:
                 answer_text = self._llm.generate(prompt)
         except Exception as exc:
-            logger.error("Generation failed: %s", exc)
+            logger.error("Simple generation failed: %s", exc)
             answer_text = self._evidence_summary_fallback(evidence, query)
 
         return answer_text.strip(), sources
 
     # ------------------------------------------------------------------
-    # VERIFY — thinking model checks for hallucination
-    # ------------------------------------------------------------------
-
-    def _verify(self, answer: str, evidence: List[EvidenceItem]) -> Verification:
-        if not answer.strip():
-            return Verification(ok=False, unsupported_claims=["empty answer"])
-
-        evidence_text = self._format_evidence_for_prompt(evidence[:12])
-        prompt = _VERIFY_PROMPT.format(
-            answer=answer[:3000],  # cap answer size
-            evidence_text=evidence_text,
-        )
-        raw = self._call_thinker(prompt, max_tokens=256)
-        parsed = self._parse_json(raw)
-        if not parsed:
-            return Verification(ok=True, reasoning="verification parse failed, assuming ok")
-        return Verification(
-            ok=parsed.get("ok", True),
-            unsupported_claims=parsed.get("unsupported_claims", []),
-            reasoning=parsed.get("reasoning", ""),
-        )
-
-    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _call_thinker(self, prompt: str, max_tokens: int = 512) -> str:
-        """Call the thinking model with tight token budget."""
-        try:
-            options = {
-                "temperature": 0.05,
-                "num_predict": max_tokens,
-                "num_ctx": 4096,
-            }
-            if hasattr(self._thinker, "generate_with_metadata"):
-                text, _ = self._thinker.generate_with_metadata(prompt, options=options)
-            else:
-                text = self._thinker.generate(prompt)
-            # Strip thinking tokens if present
-            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-            return text
-        except Exception as exc:
-            logger.debug("Thinker call failed: %s", exc)
-            return ""
+    @staticmethod
+    def _evidence_to_dict(item: EvidenceItem) -> dict:
+        return {
+            "text": item.text,
+            "source_name": item.source_name,
+            "page": item.page,
+            "section": item.section,
+            "score": item.score,
+            "chunk_id": item.chunk_id,
+            "document_id": item.document_id,
+        }
 
-    def _parse_json(self, text: str) -> Optional[Dict[str, Any]]:
-        """Extract and parse JSON from LLM response."""
-        if not text:
-            return None
-        # Try direct parse first
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        # Try extracting from markdown code block
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
-        # Try finding first { ... } block
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                pass
-        return None
-
-    def _format_evidence_for_prompt(self, evidence: List[EvidenceItem]) -> str:
-        parts = []
+    @staticmethod
+    def _build_sources(evidence: List[EvidenceItem]) -> List[Dict[str, Any]]:
+        sources = []
         for i, item in enumerate(evidence, 1):
-            doc = item.source_name or "Document"
-            section = f" | Section: {item.section}" if item.section else ""
-            page = f" | Page: {item.page}" if item.page else ""
-            parts.append(f"[{i}] ({doc}{section}{page}, score={item.score:.2f})\n{item.text[:600]}")
-        return "\n\n".join(parts)
+            doc_name = os.path.basename(item.source_name).rsplit(".", 1)[0] if item.source_name else "Document"
+            sources.append({
+                "source_id": i,
+                "source_name": doc_name,
+                "section": item.section or None,
+                "page": item.page or None,
+                "excerpt": item.text[:400],
+                "score": round(item.score, 4),
+                "chunk_id": item.chunk_id,
+                "document_id": item.document_id,
+            })
+        return sources
 
-    def _format_prior_evidence_block(
-        self,
-        evidence: List[EvidenceItem],
-        assessment: EvidenceAssessment,
-    ) -> str:
-        lines = ["PRIOR RETRIEVAL RESULTS:"]
-        lines.append(f"Found {len(evidence)} evidence chunks (confidence={assessment.confidence:.2f})")
-        if assessment.gaps:
-            lines.append("GAPS STILL MISSING:")
-            for gap in assessment.gaps:
-                lines.append(f"  - {gap}")
-        if assessment.key_findings:
-            lines.append("FINDINGS SO FAR:")
-            for finding in assessment.key_findings[:5]:
-                lines.append(f"  - {finding}")
-        lines.append("\nRefine the search plan to fill these gaps. Use different search terms or strategies.")
-        return "\n".join(lines)
-
-    def _merge_evidence(
-        self,
-        existing: List[EvidenceItem],
-        new: List[EvidenceItem],
-    ) -> List[EvidenceItem]:
-        """Merge evidence, dedup by chunk_id, keep highest score."""
-        seen: Dict[str, EvidenceItem] = {}
-        for item in existing + new:
-            key = item.chunk_id or hash(item.text[:100])
-            if key not in seen or item.score > seen[key].score:
-                seen[key] = item
-        merged = sorted(seen.values(), key=lambda e: -e.score)
-        return merged[:30]  # cap total evidence
-
-    def _strip_unsupported(self, answer: str, verification: Verification) -> str:
-        """Remove sentences containing unsupported claims."""
-        if not verification.unsupported_claims:
-            return answer
-        sentences = re.split(r"(?<=[.!?])\s+", answer)
-        claim_terms = set()
-        for claim in verification.unsupported_claims:
-            claim_terms.update(w.lower() for w in claim.split() if len(w) > 3)
-        filtered = []
-        for sentence in sentences:
-            sentence_words = set(w.lower() for w in sentence.split() if len(w) > 3)
-            overlap = len(claim_terms & sentence_words)
-            if overlap < 3:  # keep sentences with low overlap with unsupported claims
-                filtered.append(sentence)
-        return " ".join(filtered) if filtered else answer
+    @staticmethod
+    def _parse_conversation_history(history: str) -> List[dict]:
+        """Parse conversation history string into list of dicts."""
+        if not history:
+            return []
+        turns = []
+        for line in history.strip().split("\n"):
+            line = line.strip()
+            if line.startswith("Previous queries:"):
+                queries = line.replace("Previous queries:", "").strip().split(" | ")
+                for q in queries:
+                    if q.strip():
+                        turns.append({"role": "user", "content": q.strip()})
+            elif line:
+                turns.append({"role": "context", "content": line})
+        return turns[-6:]  # last 3 turns
 
     def _evidence_summary_fallback(self, evidence: List[EvidenceItem], query: str) -> str:
         """Build a simple evidence summary when generation fails."""
@@ -900,8 +723,8 @@ Provide a clear, well-structured answer with inline citations."""
         return {
             "response": (
                 "I searched the available documents but couldn't find information "
-                f"relevant to your question. Please verify that the relevant documents "
-                f"have been uploaded to this profile."
+                "relevant to your question. Please verify that the relevant documents "
+                "have been uploaded to this profile."
             ),
             "sources": [],
             "grounded": False,

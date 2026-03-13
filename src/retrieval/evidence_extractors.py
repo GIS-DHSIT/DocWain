@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
 
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 URL_RE = re.compile(r"\bhttps?://[^\s<>]+|\bwww\.[^\s<>]+\b", re.IGNORECASE)
@@ -56,6 +60,7 @@ def _make_item(value: str, chunk: Dict[str, str], snippet: Optional[str] = None,
 
 
 def extract_contacts(chunks: Iterable[Dict[str, str]]) -> Dict[str, List[EvidenceItem]]:
+    logger.debug("extract_contacts: starting extraction")
     phones: Dict[str, EvidenceItem] = {}
     emails: Dict[str, EvidenceItem] = {}
     urls: Dict[str, EvidenceItem] = {}
@@ -72,14 +77,17 @@ def extract_contacts(chunks: Iterable[Dict[str, str]]) -> Dict[str, List[Evidenc
             normalized = _normalize_phone(match)
             if normalized:
                 phones.setdefault(normalized, _make_item(match.strip(), chunk, snippet=text))
-    return {
+    result = {
         "phones": list(phones.values()),
         "emails": list(emails.values()),
         "urls": list(urls.values()),
     }
+    logger.debug("extract_contacts: phones=%d, emails=%d, urls=%d", len(result["phones"]), len(result["emails"]), len(result["urls"]))
+    return result
 
 
 def extract_dates(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
+    logger.debug("extract_dates: starting extraction")
     seen: Dict[str, EvidenceItem] = {}
     for chunk in chunks:
         text = chunk.get("text") or ""
@@ -92,10 +100,12 @@ def extract_dates(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
         for match in YEAR_RE.finditer(text):
             value = match.group(0)
             seen.setdefault(value, _make_item(value, chunk, snippet=text))
+    logger.debug("extract_dates: returning %d items", len(seen))
     return list(seen.values())
 
 
 def extract_identifiers(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
+    logger.debug("extract_identifiers: starting extraction")
     seen: Dict[str, EvidenceItem] = {}
     for chunk in chunks:
         text = chunk.get("text") or ""
@@ -107,10 +117,12 @@ def extract_identifiers(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
                 key,
                 _make_item(value, chunk, snippet=text, meta={"type": label}),
             )
+    logger.debug("extract_identifiers: returning %d items", len(seen))
     return list(seen.values())
 
 
 def extract_entities(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
+    logger.debug("extract_entities: starting extraction")
     seen: Dict[str, EvidenceItem] = {}
     for chunk in chunks:
         text = chunk.get("text") or ""
@@ -118,10 +130,12 @@ def extract_entities(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
         for cand in candidates:
             key = cand.lower()
             seen.setdefault(key, _make_item(cand, chunk, snippet=text))
+    logger.debug("extract_entities: returning %d items", len(seen))
     return list(seen.values())
 
 
 def extract_sections(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
+    logger.debug("extract_sections: starting extraction")
     seen: Dict[str, EvidenceItem] = {}
     for chunk in chunks:
         section_title = chunk.get("section_title")
@@ -134,16 +148,19 @@ def extract_sections(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
                 head = match.group("head").strip()
                 key = head.lower()
                 seen.setdefault(key, _make_item(head, chunk, snippet=head))
+    logger.debug("extract_sections: returning %d items", len(seen))
     return list(seen.values())
 
 
 def extract_tables(chunks: Iterable[Dict[str, str]]) -> List[EvidenceItem]:
+    logger.debug("extract_tables: starting extraction")
     tables: List[EvidenceItem] = []
     for chunk in chunks:
         role = (chunk.get("chunk_role") or "").lower()
         ctype = (chunk.get("chunk_type") or "").lower()
         if role == "table_text" or ctype in {"table", "table_row", "table_header"}:
             tables.append(_make_item(chunk.get("text") or "", chunk, snippet=chunk.get("text") or ""))
+    logger.debug("extract_tables: returning %d items", len(tables))
     return tables
 
 

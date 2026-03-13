@@ -164,7 +164,7 @@ def get_kg_store() -> KGStoreBase:
         try:
             return Neo4jKGStore()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Neo4j unavailable; falling back to memory KG store: %s", exc)
+            logger.debug("Neo4j unavailable; falling back to memory KG store: %s", exc)
     if _MEMORY_STORE is None:
         _MEMORY_STORE = MemoryKGStore()
     return _MEMORY_STORE

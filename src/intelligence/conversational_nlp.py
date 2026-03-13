@@ -916,7 +916,7 @@ def compose_response(
         # Try case-insensitive lookup before falling back to GREETING
         pools = _FRAGMENT_POOLS.get(intent.upper()) if intent else None
         if pools is None:
-            logger.warning("Unknown conversational intent '%s', falling back to GREETING", intent)
+            logger.debug("Unknown conversational intent '%s', falling back to GREETING", intent)
             pools = _FRAGMENT_POOLS[GREETING]
     seed = _make_seed(intent, user_key)
 

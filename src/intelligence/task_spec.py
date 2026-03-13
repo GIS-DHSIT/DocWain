@@ -8,11 +8,12 @@ instead of ad-hoc classification scattered across modules.
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
-log = logging.getLogger(__name__)
+from src.utils.logging_utils import get_logger
+
+log = get_logger(__name__)
 
 # ── Valid value enums ────────────────────────────────────────────────────────
 

@@ -4,6 +4,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
 from src.api.vector_store import build_qdrant_filter
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 _PROFILE_ID_KEYS: Tuple[str, ...] = ("profile_id", "profileId", "profile", "candidate_id", "candidateId")
@@ -34,6 +37,7 @@ def get_all_profile_ids(
 
     Use the catalog index or explicit profile_ids instead.
     """
+    logger.debug("get_all_profile_ids: called but disabled, subscription_id=%s, collection=%s", subscription_id, collection)
     _ = (client, subscription_id, collection, batch_limit)
     raise ValueError("Profile discovery across Qdrant is disabled; use catalog-indexed profile ids.")
 
@@ -51,6 +55,7 @@ def get_profile_points(
 
     Returns all point payloads for that (subscription_id, profile_id) scope.
     """
+    logger.debug("get_profile_points: subscription_id=%s, profile_id=%s, collection=%s", subscription_id, profile_id, collection)
     if not subscription_id:
         raise ValueError("subscription_id is required")
     if not profile_id:
@@ -79,6 +84,7 @@ def get_profile_points(
                 payloads.append(payload)
         if not offset:
             break
+    logger.debug("get_profile_points: returning %d payloads", len(payloads))
     return payloads
 
 

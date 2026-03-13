@@ -34,6 +34,7 @@ def _nlu_detect_intent(query: str) -> Optional[str]:
         }
         return _NLU_TO_ANALYZER.get(intent)
     except Exception:
+        logger.debug("_nlu_detect_intent: NLU engine unavailable", exc_info=True)
         return None
 
 _NUMERIC_HINTS = [
@@ -124,6 +125,7 @@ class QueryAnalyzer:
     """Fast, rule-based query analyzer for intent and evidence constraints."""
 
     def analyze(self, query: str) -> QueryAnalysis:
+        logger.debug("analyze: query_len=%d", len(query or ""))
         query = (query or "").strip()
         lowered = query.lower()
         intent = self._detect_intent(lowered)
@@ -152,7 +154,7 @@ class QueryAnalyzer:
         explicitness = self._explicitness_score(query, entities, keywords, quoted)
         high_stakes = self._is_high_stakes(lowered)
 
-        return QueryAnalysis(
+        result = QueryAnalysis(
             intent_type=intent,
             required_evidence=required_evidence,
             output_format_preference=output_pref,
@@ -162,6 +164,8 @@ class QueryAnalyzer:
             comparison_entities=comparison_entities,
             high_stakes=high_stakes,
         )
+        logger.debug("analyze: intent=%s, entities=%d, keywords=%d, high_stakes=%s", intent, len(entities), len(keywords), high_stakes)
+        return result
 
     @staticmethod
     def _detect_intent(lowered: str) -> str:
@@ -203,6 +207,7 @@ class QueryAnalyzer:
                     if word and word.lower() not in _STOPWORDS and word not in entities:
                         entities.append(word)
         except Exception:
+            logger.debug("_extract_entities: spaCy unavailable, using fallback", exc_info=True)
             # Fallback: find capitalized words
             for word in query.split():
                 word = word.strip(".,!?;:\"'()[]{}")
@@ -220,7 +225,7 @@ class QueryAnalyzer:
             keywords = sem.action_verbs + sem.target_nouns + sem.context_words
             return list(dict.fromkeys(keywords))[:6]
         except Exception:
-            pass
+            logger.debug("_extract_keywords: NLU engine unavailable, using fallback", exc_info=True)
         # Fallback: simple tokenization
         tokens = [w for w in query.lower().split() if len(w) >= 3]
         keywords = [tok.strip(".,!?;:\"'()[]{}") for tok in tokens if tok.strip(".,!?;:\"'()[]{}") not in _STOPWORDS]
@@ -269,7 +274,7 @@ class QueryAnalyzer:
                         if len(entities) >= 2:
                             return entities[:2]
         except Exception:
-            pass
+            logger.debug("_extract_comparison_entities: spaCy unavailable, using regex fallback", exc_info=True)
         # Regex fallback when spaCy is unavailable
         import re as _re
         vs_match = _re.search(r'(?i)\b(\w+)\s+(?:vs\.?|versus)\s+(\w+)', query)

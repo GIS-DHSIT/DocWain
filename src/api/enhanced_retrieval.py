@@ -120,7 +120,7 @@ class EnhancedSemanticChunker:
         Tuple[str, ChunkMetadata]]:
         """FIXED: Added document_id parameter"""
         if not text or not text.strip():
-            logger.warning(f"Empty text for document: {doc_name}")
+            logger.debug(f"Empty text for document: {doc_name}")
             return []
 
         units = self._split_into_semantic_units(text)
@@ -727,7 +727,7 @@ class GraphGuidedRetriever:
 
         # Strategy 2: Fallback without threshold
         if not chunks:
-            logger.warning("No results with threshold, retrying without")
+            logger.debug("No results with threshold, retrying without")
             chunks = self._dense_search(
                 collection_name, query, subscription_id, profile_id, top_k,
                 document_ids=document_ids,
@@ -737,7 +737,7 @@ class GraphGuidedRetriever:
 
         # Strategy 3: Remove document filter if still empty
         if not chunks and (document_ids or source_files):
-            logger.warning("No results with document filter, retrying without filter")
+            logger.debug("No results with document filter, retrying without filter")
             chunks = self._dense_search(
                 collection_name, query, subscription_id, profile_id, top_k * 2,
                 score_threshold=None

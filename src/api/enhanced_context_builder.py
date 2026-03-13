@@ -27,7 +27,7 @@ class IntelligentContextBuilder:
     4. Includes chunk relationship information
     """
 
-    def __init__(self, max_context_chunks: int = 7):
+    def __init__(self, max_context_chunks: int = 12):
         self.max_context_chunks = max_context_chunks
 
     @staticmethod
@@ -88,38 +88,37 @@ class IntelligentContextBuilder:
         return len(intersection) / len(union)
 
     def _deduplicate_chunks(self, chunks: List[Dict], threshold: float = 0.7) -> List[Dict]:
-        """Remove highly similar chunks"""
+        """Remove near-duplicate chunks using shingled hashing (O(n) instead of O(n²)).
+
+        Builds a set of 4-word shingles per chunk and uses their frozenset hash
+        as a fingerprint. Chunks with identical fingerprints keep only the
+        highest-scoring version.
+        """
         if len(chunks) <= 1:
             return chunks
 
-        unique_chunks = []
+        def _fingerprint(text: str) -> int:
+            words = text.lower().split()
+            if len(words) < 4:
+                return hash(tuple(words))
+            shingles = set()
+            for i in range(len(words) - 3):
+                shingles.add(tuple(words[i:i + 4]))
+            return hash(frozenset(shingles))
 
+        best: Dict[int, Dict] = {}
         for chunk in chunks:
-            is_duplicate = False
             meta = chunk.get("metadata") or {}
             chunk_text = get_content_text(meta) or chunk.get("text", "")
+            if not chunk_text.strip():
+                continue
+            fp = _fingerprint(chunk_text)
+            if fp not in best or float(chunk.get("score", 0)) > float(best[fp].get("score", 0)):
+                best[fp] = chunk
 
-            for unique in unique_chunks:
-                unique_meta = unique.get("metadata") or {}
-                unique_text = get_content_text(unique_meta) or unique.get("text", "")
-                similarity = self._calculate_text_similarity(
-                    chunk_text,
-                    unique_text,
-                )
-
-                if similarity >= threshold:
-                    # Keep the one with higher score
-                    if chunk['score'] > unique['score']:
-                        unique_chunks.remove(unique)
-                        break
-                    else:
-                        is_duplicate = True
-                        break
-
-            if not is_duplicate:
-                unique_chunks.append(chunk)
-
-        logger.info(f"Deduplicated {len(chunks)} → {len(unique_chunks)} chunks")
+        unique_chunks = list(best.values())
+        if len(unique_chunks) != len(chunks):
+            logger.info("Deduplicated %d -> %d chunks", len(chunks), len(unique_chunks))
         return unique_chunks
 
     def _group_by_document(self, chunks: List[Dict]) -> Dict[str, List[Dict]]:
@@ -423,12 +422,12 @@ class IntelligentContextBuilder:
 
         filtered_signal = self._filter_low_signal(valid_chunks, min_len=min_len)
         if not filtered_signal:
-            logger.warning("Context filter removed all chunks due to low signal; falling back to valid chunks")
+            logger.debug("Context filter removed all chunks due to low signal; falling back to valid chunks")
             filtered_signal = list(valid_chunks)
 
         filtered = self._filter_low_confidence(filtered_signal, min_conf)
         if not filtered:
-            logger.warning("Context filter removed all chunks due to low confidence; falling back to valid chunks")
+            logger.debug("Context filter removed all chunks due to low confidence; falling back to valid chunks")
             filtered = list(valid_chunks)
         elif extraction_like and len(filtered) < len(filtered_signal):
             # Avoid dropping short fields (e.g., names/skills) during extraction queries.

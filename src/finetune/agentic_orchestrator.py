@@ -115,7 +115,7 @@ class NemotronOrchestratorAgent:
             data = json.loads(raw)
             return FinetunePlan.model_validate(data)
         except (ValidationError, json.JSONDecodeError) as exc:
-            logger.warning("Nemotron plan parse failed; using defaults: %s | raw=%s", exc, raw)
+            logger.debug("Nemotron plan parse failed; using defaults: %s | raw=%s", exc, raw)
             return FinetunePlan()
 
     @staticmethod

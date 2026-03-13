@@ -13,15 +13,15 @@ the system falls back to the existing NLU engine with confidence=0.4.
 from __future__ import annotations
 
 import json
-import logging
 import re
 import threading
 import time
 from typing import Any, Dict, Optional
 
 from src.intelligence.task_spec import TaskSpec
+from src.utils.logging_utils import get_logger
 
-log = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 

@@ -267,7 +267,7 @@ class OllamaPublisher:
         if code == 0:
             logger.info("Ollama detected: %s", out or err)
             return True, out or err
-        logger.warning("Ollama CLI not available: %s %s", out, err)
+        logger.debug("Ollama CLI not available: %s %s", out, err)
         return False, err or out or "ollama CLI not found"
 
     def check_ollama_running(self) -> Tuple[bool, str]:

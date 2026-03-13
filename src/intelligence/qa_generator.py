@@ -501,7 +501,7 @@ class QACacheManager:
             Number of pairs cached.
         """
         if not self.redis_client:
-            logger.warning("Redis client not available for Q&A caching")
+            logger.debug("Redis client not available for Q&A caching")
             return 0
         
         cached = 0

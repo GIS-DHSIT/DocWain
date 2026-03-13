@@ -506,11 +506,11 @@ def _is_transition_sentence(sentence: str) -> bool:
 
 
 _DOMAIN_THRESHOLDS = {
-    "medical": (0.25, 0.40),  # (base, critical) — stricter for medical accuracy
-    "legal": (0.18, 0.30),    # more lenient — legal boilerplate rarely matches token-for-token
-    "invoice": (0.20, 0.30),  # structured with short values
-    "hr": (0.22, 0.35),       # default
-    "policy": (0.18, 0.30),   # policy docs have boilerplate like legal — lenient matching
+    "medical": (0.35, 0.50),  # (base, critical) — strict for medical accuracy
+    "legal": (0.28, 0.40),    # tightened — catch unsupported legal claims
+    "invoice": (0.30, 0.42),  # structured: numbers must match evidence
+    "hr": (0.28, 0.40),       # moderate strictness
+    "policy": (0.28, 0.40),   # policy claims need evidence support
 }
 
 
@@ -518,7 +518,7 @@ def evaluate_grounding(
     answer: str,
     chunk_texts: Sequence[str],
     *,
-    support_threshold: float = 0.22,
+    support_threshold: float = 0.30,
     domain: str = "",
 ) -> GroundingResult:
     """Evaluate how well the answer is grounded in evidence chunks.

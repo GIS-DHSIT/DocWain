@@ -1071,7 +1071,7 @@ def _deep_analyze_impl(
     page_count = _get_page_count(extracted)
 
     if not full_text and not sections:
-        logger.warning("Deep analysis received empty document -- returning minimal result.")
+        logger.debug("Deep analysis received empty document -- returning minimal result.")
         return DeepAnalysisResult(domain_signals={d: 0.0 for d in _DOMAIN_KEYWORDS})
 
     # -----------------------------------------------------------------------

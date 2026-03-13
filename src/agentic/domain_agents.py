@@ -2044,7 +2044,7 @@ class AnalyticsVisualizationAgent(DomainAgent):
                 },
             )
         except Exception as exc:
-            logger.warning("Chart generation failed, falling back to text: %s", exc)
+            logger.debug("Chart generation failed, falling back to text: %s", exc)
             prompt = f"Summarize this data as a text table:\nQuery: {query}\nData: {data[:10]}"
             output = self._generate(prompt, temperature=0.2, max_tokens=1024)
             return AgentTaskResult(task_type="generate_chart", success=bool(output), output=output)

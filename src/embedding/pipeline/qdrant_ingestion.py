@@ -191,11 +191,58 @@ def ingest_payloads(
     for raw in raw_payloads:
         payload = transform_payload(raw)
         if not payload.get("canonical_text") and not payload.get("content"):
-            logger.warning("Skipping payload without content (document_id=%s)", payload.get("document_id"))
+            logger.debug("Skipping payload without content (document_id=%s)", payload.get("document_id"))
             continue
         if not payload.get("subscription_id"):
             raise ValueError("subscription_id is required for Qdrant ingestion")
         transformed.append(payload)
+
+    # --- Document profiling: learn domain from content at ingestion ---
+    _profiler_enabled = getattr(Config, "DocumentProfiler", None) and getattr(Config.DocumentProfiler, "ENABLED", False)
+    if _profiler_enabled:
+        try:
+            from src.intelligence.document_profiler import DocumentProfiler
+            from src.llm.gateway import get_llm_gateway
+
+            _profiler = DocumentProfiler(get_llm_gateway())
+            # Group chunks by document_id, profile first 5 chunks per doc
+            _doc_chunks: Dict[str, List[str]] = {}
+            _doc_filenames: Dict[str, str] = {}
+            for p in transformed:
+                doc_id = p.get("document_id", "unknown")
+                text = p.get("canonical_text") or p.get("content") or ""
+                if text and doc_id not in _doc_filenames:
+                    _doc_chunks.setdefault(doc_id, [])
+                    _doc_filenames[doc_id] = p.get("source_name") or (p.get("metadata") or {}).get("source_file") or "document"
+                if text and len(_doc_chunks.get(doc_id, [])) < 5:
+                    _doc_chunks.setdefault(doc_id, []).append(text)
+
+            _profiles: Dict[str, Dict[str, Any]] = {}
+            for doc_id, chunks in _doc_chunks.items():
+                try:
+                    profile = _profiler.profile(chunks, _doc_filenames.get(doc_id, "document"))
+                    _profiles[doc_id] = {
+                        "domain": profile.domain,
+                        "document_type": profile.document_type,
+                        "key_terminology": profile.key_terminology,
+                        "field_types": profile.field_types,
+                        "structure_pattern": profile.structure_pattern,
+                        "language_register": profile.language_register,
+                    }
+                    logger.info("Document profiled: %s → %s (%s)", doc_id, profile.domain, profile.document_type)
+                except Exception as exc:
+                    logger.debug("Document profiling failed for %s: %s", doc_id, exc)
+
+            # Inject profiles into payloads
+            for p in transformed:
+                doc_id = p.get("document_id", "unknown")
+                if doc_id in _profiles:
+                    p["domain_profile"] = _profiles[doc_id]
+                    # Also set doc_domain for backward compat
+                    p["doc_domain"] = _profiles[doc_id].get("domain", "generic")
+
+        except Exception as exc:
+            logger.warning("Document profiling skipped: %s", exc)
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for payload in transformed:

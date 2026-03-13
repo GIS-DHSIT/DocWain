@@ -15,14 +15,14 @@ logger = get_logger(__name__)
 MIN_RESULTS = 6  # Reduced: prefer quality over quantity
 FALLBACK_LIMIT = 100  # Reduced from 200
 MAX_UNION_RESULTS = 16  # Reduced from 24
-LOW_SCORE_THRESHOLD = 0.45  # Increased from 0.2 - reject low-quality matches
-HIGH_SCORE_THRESHOLD = 0.7  # New: high-confidence threshold
-MAX_EXPANDED_DOCS = 3
-MAX_DOC_CHUNKS = 15  # Reduced from 20
-MAX_FULL_SCAN_DOCS = 2  # Reduced from 3
-MAX_FULL_SCAN_CHUNKS = 40  # Reduced from 160 - critical fix for noise reduction
-MAX_PROFILE_SCAN_CHUNKS = 500  # Reduced from 5000
-MAX_UNSCOPED_SCAN_CHUNKS = 200  # Reduced from 2000
+LOW_SCORE_THRESHOLD = 0.30  # Balanced: reject garbage, keep borderline-relevant chunks
+HIGH_SCORE_THRESHOLD = 0.7  # High-confidence threshold
+MAX_EXPANDED_DOCS = 4
+MAX_DOC_CHUNKS = 20  # Allow more chunks per doc for complete context
+MAX_FULL_SCAN_DOCS = 3
+MAX_FULL_SCAN_CHUNKS = 60  # Moderate scan to capture relevant chunks without noise
+MAX_PROFILE_SCAN_CHUNKS = 800
+MAX_UNSCOPED_SCAN_CHUNKS = 400
 SECTION_KEYWORDS_BY_DOMAIN = {
     "hr": ["experience", "summary", "skills", "certification", "education", "project",
            "achievement", "reference", "objective", "contact", "language"],
@@ -961,11 +961,11 @@ def _needs_hybrid_fallback(chunks: List[Chunk], raw_query: str = "") -> bool:
     top_score = max(scores, default=0.0)
     if top_score < LOW_SCORE_THRESHOLD:
         return True
-    # Wide score spread with low median indicates uncertain retrieval
+    # Wide score spread with very low median indicates uncertain retrieval
     if len(scores) >= 4:
         sorted_scores = sorted(scores, reverse=True)
         median_score = sorted_scores[len(sorted_scores) // 2]
-        if top_score - median_score > 0.30 and median_score < 0.35:
+        if top_score - median_score > 0.35 and median_score < 0.20:
             return True
     # Entity-aware: if query contains proper nouns that aren't found in top chunks,
     # hybrid keyword fallback may recover entity-specific results

@@ -76,7 +76,8 @@ def _get_nlp():
             import spacy
             _nlp_model = spacy.load("en_core_web_sm", disable=["ner"])
             return _nlp_model
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to load spaCy NLP model", exc_info=True)
             return None
 
 _embedder_instance = None
@@ -96,15 +97,15 @@ def get_embedder() -> Any:
         model = _get_model()
         if model is not None and hasattr(model, "encode"):
             return model
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to load embedder from dw_newron", exc_info=True)
     try:
         from src.api.dataHandler import get_model
         model = get_model()
         if model is not None and hasattr(model, "encode"):
             return model
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to load embedder from dataHandler", exc_info=True)
     # Direct load fallback — ensures NLU engine works even in tests
     with _embedder_lock:
         if _embedder_instance is not None:
@@ -115,8 +116,8 @@ def get_embedder() -> Any:
                 "BAAI/bge-large-en-v1.5", device="cpu",
             )
             return _embedder_instance
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to load SentenceTransformer directly as embedder fallback", exc_info=True)
     return None
 
 # ── Query parsing ─────────────────────────────────────────────────────────
@@ -261,8 +262,8 @@ class ClassificationRegistry:
         if embedder is not None:
             try:
                 query_vec = embedder.encode([query], normalize_embeddings=True)[0]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to encode query for classification", exc_info=True)
 
         for name, entry in self._entries.items():
             nlu_score = _compute_nlu_score(query_sem, entry)
@@ -329,8 +330,8 @@ def _extract_features(entry: CategoryEntry) -> None:
             token.lemma_ for token in doc
             if token.pos_ in ("NOUN", "PROPN") and not token.is_stop and len(token.lemma_) > 2
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to extract NLU features from category description", exc_info=True)
 
 def _compute_nlu_score(query_sem: QuerySemantics, entry: CategoryEntry) -> float:
     """Compute NLU structural overlap between parsed query and category entry.
@@ -370,7 +371,8 @@ def _embedding_score(query: str, entry: CategoryEntry, embedder: Any) -> float:
 
         query_vec = embedder.encode([query], normalize_embeddings=True)[0]
         return float(np.dot(query_vec, entry._embedding))
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to compute embedding score", exc_info=True)
         return 0.0
 
 def _embedding_score_vec(query_vec: Any, entry: CategoryEntry, embedder: Any) -> float:
@@ -380,7 +382,8 @@ def _embedding_score_vec(query_vec: Any, entry: CategoryEntry, embedder: Any) ->
             vecs = embedder.encode([entry.description], normalize_embeddings=True)
             entry._embedding = vecs[0]
         return float(np.dot(query_vec, entry._embedding))
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to compute embedding vector score", exc_info=True)
         return 0.0
 
 # ── Global registry management ───────────────────────────────────────────
@@ -430,7 +433,7 @@ def classify(
     """
     reg = get_registry(registry_name, create=False)
     if reg is None:
-        logger.warning("NLU registry '%s' not found", registry_name)
+        logger.debug("NLU registry '%s' not found", registry_name)
         return None
 
     if embedder is None:
@@ -468,8 +471,8 @@ def _ensure_registry(name: str) -> ClassificationRegistry:
         # Pre-compute embeddings for all entries (batch encode once)
         try:
             reg.precompute_embeddings(get_embedder())
-        except Exception:
-            pass  # embedder not available yet, will encode lazily
+        except Exception as exc:
+            logger.debug("Failed to precompute embeddings (embedder not available yet, will encode lazily)", exc_info=True)
         return reg
 
 def _init_intent_registry() -> None:
@@ -1304,8 +1307,8 @@ def _score_entry_with_vec(
                     [entry.description], normalize_embeddings=True,
                 )
                 entry._embedding = vecs[0]
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to encode category entry embedding", exc_info=True)
         if entry._embedding is not None:
             emb_score = float(np.dot(query_vec, entry._embedding))
 
@@ -1433,8 +1436,8 @@ def classify_query_routing(text: str) -> Tuple[str, str, float]:
             query_vec = embedder.encode(
                 [text], normalize_embeddings=True,
             )[0]
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to encode text for scope classification", exc_info=True)
 
     doc_reg = _ensure_registry("document_query")
     conv_reg = _ensure_registry("conversational")
@@ -1491,8 +1494,8 @@ def classify_query_routing(text: str) -> Tuple[str, str, float]:
                                    "show me example queries",
                                    "what can you do", "what do you do"):
                 _is_meta_question = True
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed NLU meta-question detection", exc_info=True)
 
     # Conversational wins only if it scores higher AND has reasonable confidence
     _MIN_CONV_CONFIDENCE = 0.25
