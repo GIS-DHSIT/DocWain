@@ -1,5 +1,12 @@
-"""Agent mode orchestration utilities."""
+"""DocWain Core Agent — intelligent document analysis orchestration."""
 
-from src.agent.orchestrator import AgentOrchestrator
+
+def __getattr__(name: str):
+    """Lazy imports to avoid heavy import chains at module load time."""
+    if name == "AgentOrchestrator":
+        from src.agent.orchestrator import AgentOrchestrator
+        return AgentOrchestrator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = ["AgentOrchestrator"]
