@@ -234,24 +234,45 @@ def build_reason_prompt(
         parts.append("--- DOCUMENT INTELLIGENCE ---")
         if doc_context.get("summary"):
             parts.append(f"Overview: {doc_context['summary']}")
-        if doc_context.get("entities"):
-            entity_strs = []
-            for e in doc_context["entities"][:15]:
+
+        # Structured entity context
+        entities = doc_context.get("entities")
+        if entities:
+            parts.append("")
+            parts.append("## Known Entities")
+            for e in entities[:15]:
                 if isinstance(e, dict):
-                    name = e.get("name", "")
                     etype = e.get("type", "")
-                    context = e.get("context", "")
-                    entry = f"{name} ({etype})" if etype else name
-                    if context:
-                        entry += f" — {context}"
-                    entity_strs.append(entry)
+                    value = e.get("value", e.get("name", ""))
+                    role = e.get("role", e.get("context", ""))
+                    if etype and value:
+                        entry = f"- {etype}: {value}"
+                    elif value:
+                        entry = f"- {value}"
+                    else:
+                        entry = f"- {etype}"
+                    if role:
+                        entry += f" ({role})"
+                    parts.append(entry)
                 else:
-                    entity_strs.append(str(e))
-            parts.append(f"Key entities: {'; '.join(entity_strs)}")
-        if doc_context.get("key_facts"):
-            parts.append("Key facts:")
-            for fact in doc_context["key_facts"][:10]:
-                parts.append(f"  - {fact}")
+                    parts.append(f"- {e}")
+
+        # Pre-extracted facts as grounding anchors
+        key_facts = doc_context.get("key_facts")
+        if key_facts:
+            parts.append("")
+            parts.append("## Pre-Extracted Facts (use as grounding anchors)")
+            for fact in key_facts[:10]:
+                if isinstance(fact, dict):
+                    claim = fact.get("claim", str(fact))
+                    evidence_ref = fact.get("evidence", "")
+                    entry = f"- {claim}"
+                    if evidence_ref:
+                        entry += f" [{evidence_ref}]"
+                    parts.append(entry)
+                else:
+                    parts.append(f"- {fact}")
+
         parts.append("--- END DOCUMENT INTELLIGENCE ---")
         parts.append("")
 
