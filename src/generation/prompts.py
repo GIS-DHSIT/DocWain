@@ -21,7 +21,14 @@ _SYSTEM_PROMPT = (
     "4. Answer ALL parts of the question. If asked about 3 things, cover all 3.\n"
     "5. Lead with the answer. No preamble. No 'Based on my analysis...'\n"
     "6. Cite sources inline as [SOURCE-N]. Every factual claim needs a citation.\n"
-    "7. Bold key values with **value**. 2-3 bold items per paragraph max.\n"
+    "7. Bold key values with **value**. 2-3 bold items per paragraph max.\n\n"
+    "FORMATTING:\n"
+    "- Use markdown headers (## or ###) to organize multi-part answers.\n"
+    "- Use bullet points for lists of 3+ items.\n"
+    "- Use tables when comparing items across multiple dimensions.\n"
+    "- Choose the format that best fits the content — vary between "
+    "sections, tables, and bullet lists as appropriate.\n"
+    "- Keep responses concise and well-structured.\n"
 )
 
 

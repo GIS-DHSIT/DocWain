@@ -50,14 +50,27 @@ def initialize_app_state(app: FastAPI) -> AppState:
     ollama_client = None
     rag_system = None
 
-    try:
-        embedding_model = dw_newron.get_model()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Embedding model init failed: %s", exc)
-    try:
-        cross_encoder = dw_newron.get_cross_encoder()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Reranker init failed: %s", exc)
+    # Load embedding model + cross-encoder in parallel (they're CPU-bound and independent)
+    def _load_embedding():
+        nonlocal embedding_model
+        try:
+            embedding_model = dw_newron.get_model()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Embedding model init failed: %s", exc)
+
+    def _load_cross_encoder():
+        nonlocal cross_encoder
+        try:
+            cross_encoder = dw_newron.get_cross_encoder()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Reranker init failed: %s", exc)
+
+    t_embed = threading.Thread(target=_load_embedding, daemon=True)
+    t_rerank = threading.Thread(target=_load_cross_encoder, daemon=True)
+    t_embed.start()
+    t_rerank.start()
+
+    # While models load, initialize clients (I/O bound, fast)
     try:
         qdrant_client = dw_newron.get_qdrant_client()
     except Exception as exc:  # noqa: BLE001
@@ -66,6 +79,10 @@ def initialize_app_state(app: FastAPI) -> AppState:
         redis_client = dw_newron.get_redis_client()
     except Exception as exc:  # noqa: BLE001
         logger.error("Redis client init failed: %s", exc)
+
+    # Wait for model loading to finish
+    t_embed.join()
+    t_rerank.join()
     if redis_client and getattr(Config.Redis, "CLEAR_UNSAFE_ON_STARTUP", False):
         try:
             from src.utils.redis_startup import clear_unsafe_keys, parse_unsafe_patterns

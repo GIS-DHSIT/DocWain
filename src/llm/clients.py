@@ -85,10 +85,11 @@ class OllamaClient:
     # Must be >= LLM_EXTRACT_TIMEOUT_S (90s) to avoid premature cancellation.
     # Qwen3 generates ~2048 tokens (1K thinking + 1K content) at ~45tok/s = 45s
     # + prompt processing overhead, so 100s gives comfortable margin.
-    _OLLAMA_HTTP_TIMEOUT_S = 180.0
+    _OLLAMA_HTTP_TIMEOUT_S = 300.0
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "qwen3:14b")
+        resolved = _resolve_model_alias(model_name) or _resolve_model_alias(os.getenv("OLLAMA_MODEL")) or "qwen3:14b"
+        self.model_name = resolved
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         self.backend = "ollama"
@@ -129,7 +130,11 @@ class OllamaClient:
             "num_predict": getattr(Config.LLM, "MAX_TOKENS", 4096),
         }
         if options:
-            generation_options.update({k: v for k, v in options.items() if v is not None})
+            merged = {k: v for k, v in options.items() if v is not None}
+            # Map max_tokens to Ollama's num_predict
+            if "max_tokens" in merged:
+                merged.setdefault("num_predict", merged.pop("max_tokens"))
+            generation_options.update(merged)
 
         # Explicitly set think=False to avoid thinking token overhead.
         # qwen3:14b thinking tokens consume from num_predict budget.
@@ -156,7 +161,11 @@ class OllamaClient:
                         keep_alive="24h",
                     )
                 last_response = response or {}
-                text = (last_response.get("response") or "").strip()
+                # Handle both dict and Pydantic GenerateResponse objects
+                if hasattr(last_response, "response"):
+                    text = (last_response.response or "").strip()
+                else:
+                    text = (last_response.get("response") or "").strip()
                 reasoning = ""
                 if thinking and "<think>" in text:
                     reasoning, text = _split_thinking(text)
@@ -172,7 +181,10 @@ class OllamaClient:
                             counters={"llm_retry_count": attempt - 1},
                             model_id=self.model_name,
                         )
-                meta = dict(last_response)
+                try:
+                    meta = dict(last_response)
+                except (TypeError, ValueError):
+                    meta = {"model": self.model_name, "backend": "ollama"}
                 if reasoning:
                     meta["reasoning"] = reasoning
                 return text, meta
@@ -265,7 +277,10 @@ class OllamaClient:
             "num_predict": getattr(Config.LLM, "MAX_TOKENS", 4096),
         }
         if options:
-            generation_options.update({k: v for k, v in options.items() if v is not None})
+            merged = {k: v for k, v in options.items() if v is not None}
+            if "max_tokens" in merged:
+                merged.setdefault("num_predict", merged.pop("max_tokens"))
+            generation_options.update(merged)
 
         # Explicitly set think=False to avoid thinking token overhead.
         extra_kwargs: Dict[str, Any] = {"think": thinking}
@@ -291,8 +306,15 @@ class OllamaClient:
                     )
                 last_response = response or {}
                 # Chat API returns message.content instead of response
-                msg = last_response.get("message") or {}
-                text = (msg.get("content") or "").strip()
+                # Handle both dict and Pydantic ChatResponse objects
+                if hasattr(last_response, "message"):
+                    msg = last_response.message or {}
+                else:
+                    msg = last_response.get("message") or {}
+                if hasattr(msg, "content"):
+                    text = (msg.content or "").strip()
+                else:
+                    text = (msg.get("content") or "").strip()
                 reasoning = ""
                 if thinking and "<think>" in text:
                     reasoning, text = _split_thinking(text)
@@ -304,7 +326,7 @@ class OllamaClient:
                 # internal reasoning that can hallucinate.  The pipeline's
                 # emergency chunk summary will handle the empty response.
                 if not text:
-                    thinking_text = (msg.get("thinking") or "").strip()
+                    thinking_text = (getattr(msg, "thinking", None) or (msg.get("thinking") if isinstance(msg, dict) else "") or "").strip()
                     if thinking_text and len(thinking_text) > 100:
                         logger.warning(
                             "Content empty but thinking has %d chars — returning empty "
@@ -312,7 +334,10 @@ class OllamaClient:
                             len(thinking_text),
                         )
 
-                meta = dict(last_response)
+                try:
+                    meta = dict(last_response)
+                except (TypeError, ValueError):
+                    meta = {"model": self.model_name, "backend": "ollama"}
                 if reasoning:
                     meta["reasoning"] = reasoning
                 return text, meta

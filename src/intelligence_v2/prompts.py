@@ -1,6 +1,6 @@
 """Prompt templates for LLM-powered document analysis."""
 
-_MAX_TEXT_CHARS = 32_000
+_MAX_TEXT_CHARS = 6_000
 
 _ANALYSIS_TEMPLATE = """\
 You are a document analysis engine. Analyze the following document and return \

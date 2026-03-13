@@ -106,71 +106,29 @@ class LLMGateway:
     # ------------------------------------------------------------------
 
     def _init_clients(self) -> None:
-        """Create backend clients based on configuration."""
+        """Create backend clients based on configuration.
 
-        # --- vLLM (primary) ---
-        if getattr(Config, "VLLM", None) and getattr(Config.VLLM, "ENABLED", False):
-            try:
-                from src.llm.clients import OpenAICompatibleClient
-
-                # Derive base URL for OpenAI client (strip /chat/completions)
-                endpoint = Config.VLLM.ENDPOINT
-                if endpoint.endswith("/chat/completions"):
-                    endpoint = endpoint[: -len("/chat/completions")]
-
-                self._primary = OpenAICompatibleClient(
-                    model_name=Config.VLLM.MODEL_NAME,
-                    endpoint=endpoint,
-                    api_key=Config.VLLM.API_KEY or None,
-                )
-                self.model_name = Config.VLLM.MODEL_NAME
-                self.backend = "vllm"
-                logger.info(
-                    "vLLM primary client initialised (model=%s, endpoint=%s)",
-                    Config.VLLM.MODEL_NAME,
-                    endpoint,
-                )
-
-                # Start background health monitor
-                self._health_monitor = VLLMHealthMonitor(
-                    endpoint=Config.VLLM.ENDPOINT,
-                    interval=30.0,
-                    timeout=getattr(Config.VLLM, "TIMEOUT", 5),
-                )
-                self._health_monitor.start()
-
-            except Exception as exc:
-                logger.warning("Failed to create vLLM client: %s", exc)
-                self._primary = None
-
-        # --- Ollama (dev fallback) ---
+        Uses Ollama as the sole backend (GPU-efficient, single-server).
+        vLLM support removed to eliminate dual-backend complexity.
+        """
+        # --- Ollama (primary) ---
         try:
             from src.llm.clients import OllamaClient
-            self._fallback = OllamaClient()
-            logger.info("Ollama dev-fallback client available")
+            self._primary = OllamaClient()
+            self.backend = "ollama"
+            self.model_name = self._primary.model_name
+            logger.info("Ollama primary client initialised (model=%s)", self.model_name)
         except Exception as exc:
-            logger.debug("Ollama client not available: %s", exc)
-            self._fallback = None
+            logger.error("Failed to create Ollama client: %s", exc)
+            self._primary = None
 
-        # Set backend/model_name from whatever is available
-        if self._primary is None and self._fallback is not None:
-            self.backend = getattr(self._fallback, "backend", "ollama")
-            self.model_name = getattr(self._fallback, "model_name", None)
-
-        if self._primary is None and self._fallback is None:
+        if self._primary is None:
             logger.error("No LLM backend available - all calls will fail")
 
     def _pick_client(self):
-        """Return the best available client, preferring vLLM."""
+        """Return the primary Ollama client."""
         if self._primary is not None:
-            # If health monitor says healthy (or monitor not started yet), use primary
-            if self._health_monitor is None or self._health_monitor.is_healthy():
-                return self._primary
-            # Unhealthy - try fallback
-            logger.debug("vLLM unhealthy, attempting fallback")
-
-        if self._fallback is not None:
-            return self._fallback
+            return self._primary
 
         # Last resort: return primary even if unhealthy so caller gets a real error
         if self._primary is not None:
@@ -257,7 +215,6 @@ class LLMGateway:
         so the server can activate Qwen3 thinking mode.
         """
         client = self._pick_client()
-        is_vllm = getattr(client, "backend", None) == "vllm"
 
         temperature = temperature if temperature is not None else Config.LLM.TEMPERATURE
         max_tokens = max_tokens if max_tokens is not None else Config.LLM.MAX_TOKENS
@@ -269,42 +226,20 @@ class LLMGateway:
 
         self._record_request()
 
-        try:
-            # --- vLLM path (via OpenAICompatibleClient.generate_with_metadata) ---
-            if is_vllm:
-                raw, usage_meta = self._vllm_chat(client, messages, think=think, opts=opts, **kwargs)
-            else:
-                # Ollama chat path
-                raw, usage_meta = client.chat_with_metadata(
-                    messages, options=opts, thinking=think, **kwargs,
-                )
+        raw, usage_meta = client.chat_with_metadata(
+            messages, options=opts, thinking=think, **kwargs,
+        )
 
-            answer, thinking = _split_thinking(raw)
+        answer, thinking = _split_thinking(raw)
 
-            meta: Dict[str, Any] = {
-                "usage": usage_meta,
-                "backend": getattr(client, "backend", "unknown"),
-            }
-            if thinking:
-                meta["thinking"] = thinking
+        meta: Dict[str, Any] = {
+            "usage": usage_meta,
+            "backend": "ollama",
+        }
+        if thinking:
+            meta["thinking"] = thinking
 
-            return answer, meta
-
-        except Exception as exc:
-            self._record_failure(exc)
-            # If primary failed, try fallback
-            if client is self._primary and self._fallback is not None:
-                logger.warning("Primary chat failed, falling back to Ollama: %s", exc)
-                self._record_fallback()
-                raw, usage_meta = self._fallback.chat_with_metadata(
-                    messages, options=opts, thinking=think, **kwargs,
-                )
-                answer, thinking = _split_thinking(raw)
-                meta = {"usage": usage_meta, "backend": "ollama"}
-                if thinking:
-                    meta["thinking"] = thinking
-                return answer, meta
-            raise
+        return answer, meta
 
     # ------------------------------------------------------------------
     # Classification helper
@@ -328,25 +263,12 @@ class LLMGateway:
 
     def health_check(self) -> Dict[str, Any]:
         """Return a health summary dict."""
-        primary_ok = False
-        if self._health_monitor:
-            primary_ok = self._health_monitor.is_healthy()
-        elif self._primary is not None:
-            primary_ok = True  # no monitor, assume ok
-
-        fallback_ok = self._fallback is not None
-
         return {
-            "healthy": primary_ok or fallback_ok,
+            "healthy": self._primary is not None,
             "primary": {
                 "available": self._primary is not None,
-                "healthy": primary_ok,
                 "backend": getattr(self._primary, "backend", None),
                 "model": getattr(self._primary, "model_name", None),
-            },
-            "fallback": {
-                "available": fallback_ok,
-                "backend": getattr(self._fallback, "backend", None),
             },
         }
 
@@ -381,48 +303,26 @@ class LLMGateway:
     ) -> LLMResponse:
         """Unified generation logic shared by generate() and generate_with_metadata()."""
         client = self._pick_client()
-        is_vllm = getattr(client, "backend", None) == "vllm"
 
         temperature = temperature if temperature is not None else Config.LLM.TEMPERATURE
         max_tokens = max_tokens if max_tokens is not None else Config.LLM.MAX_TOKENS
 
+        # Extract extra options to merge later (avoids duplicate kwarg for 'options')
+        extra_options = kwargs.pop("options", None)
+
         self._record_request()
 
-        try:
-            if is_vllm:
-                # Build chat messages for vLLM
-                messages = self._build_messages(prompt, system)
-                opts = {
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "top_p": Config.LLM.TOP_P,
-                }
-                raw, usage_meta = self._vllm_chat(client, messages, think=think, opts=opts, **kwargs)
-            else:
-                # Ollama fallback - use generate_with_metadata
-                full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
-                opts = {"temperature": temperature, "max_tokens": max_tokens}
-                raw, usage_meta = client.generate_with_metadata(
-                    full_prompt, options=opts, thinking=think, **kwargs,
-                )
+        full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
+        opts = {"temperature": temperature, "max_tokens": max_tokens}
+        if extra_options:
+            opts.update(extra_options)
 
-            answer, thinking = _split_thinking(raw)
-            return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)
+        raw, usage_meta = client.generate_with_metadata(
+            full_prompt, options=opts, thinking=think, **kwargs,
+        )
 
-        except Exception as exc:
-            self._record_failure(exc)
-            # Attempt fallback
-            if client is self._primary and self._fallback is not None:
-                logger.warning("Primary generate failed, falling back to Ollama: %s", exc)
-                self._record_fallback()
-                full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
-                opts = {"temperature": temperature, "max_tokens": max_tokens}
-                raw, usage_meta = self._fallback.generate_with_metadata(
-                    full_prompt, options=opts, thinking=think, **kwargs,
-                )
-                answer, thinking = _split_thinking(raw)
-                return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)
-            raise
+        answer, thinking = _split_thinking(raw)
+        return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)
 
     def _vllm_chat(
         self,

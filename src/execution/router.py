@@ -21,7 +21,7 @@ def _get_core_agent():
         from src.agent.core_agent import CoreAgent
         from src.llm.gateway import get_llm_gateway
         from src.api.config import Config
-        from src.embedding.model_loader import embed_request_context
+        from src.embedding.model_loader import get_embedding_model
         from qdrant_client import QdrantClient
         from pymongo import MongoClient
 
@@ -30,7 +30,7 @@ def _get_core_agent():
             url=Config.Qdrant.URL,
             api_key=Config.Qdrant.API,
         )
-        embedder = embed_request_context()
+        embedder, _ = get_embedding_model()
         mongo_client = MongoClient(Config.MongoDB.URI)
         mongodb = mongo_client[Config.MongoDB.DB][Config.MongoDB.DOCUMENTS]
 

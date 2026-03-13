@@ -135,6 +135,7 @@ class UnifiedRetriever:
             result = self.qdrant_client.query_points(
                 collection_name=collection_name,
                 query=query_vector,
+                using="content_vector",
                 query_filter=qfilter,
                 limit=top_k,
                 with_payload=True,
