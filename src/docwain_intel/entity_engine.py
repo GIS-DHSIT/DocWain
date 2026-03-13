@@ -40,7 +40,7 @@ def _get_spacy():
         try:
             _spacy_nlp = spacy.load("en_core_web_lg")
         except OSError:
-            logger.warning("en_core_web_lg not found, falling back to en_core_web_sm")
+            logger.debug("en_core_web_lg not found, falling back to en_core_web_sm")
             _spacy_nlp = spacy.load("en_core_web_sm")
     return _spacy_nlp
 

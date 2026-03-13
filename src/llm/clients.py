@@ -85,7 +85,7 @@ class OllamaClient:
     # Must be >= LLM_EXTRACT_TIMEOUT_S (90s) to avoid premature cancellation.
     # Qwen3 generates ~2048 tokens (1K thinking + 1K content) at ~45tok/s = 45s
     # + prompt processing overhead, so 100s gives comfortable margin.
-    _OLLAMA_HTTP_TIMEOUT_S = 100.0
+    _OLLAMA_HTTP_TIMEOUT_S = 180.0
 
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "qwen3:14b")
@@ -453,6 +453,7 @@ class GeminiClient:
 
     def generate_with_metadata(
         self, prompt: str, max_retries: int = 3, backoff: float = 1.0, options: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
         text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
         return text, {"response": text}
@@ -779,6 +780,7 @@ class OpenAICompatibleClient:
 
     def generate_with_metadata(
         self, prompt: str, *, options: Optional[Dict[str, Any]] = None, max_retries: int = 3, backoff: float = 1.0,
+        **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
         """Generate with metadata for pipeline compatibility."""
         call_kwargs = {}
@@ -786,7 +788,10 @@ class OpenAICompatibleClient:
             if "temperature" in options:
                 call_kwargs["temperature"] = options["temperature"]
             if "max_tokens" in options or "num_predict" in options:
-                call_kwargs["max_tokens"] = options.get("max_tokens") or options.get("num_predict")
+                val = options.get("max_tokens")
+                if val is None:
+                    val = options.get("num_predict")
+                call_kwargs["max_tokens"] = val
             if "top_p" in options:
                 call_kwargs["top_p"] = options["top_p"]
         text = self.generate(prompt, max_retries=max_retries, backoff=backoff, **call_kwargs)

@@ -21,7 +21,7 @@ def _build_redis_client() -> Optional[redis.Redis]:
             decode_responses=True,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Redis client unavailable; falling back to in-memory store: %s", exc)
+        logger.debug("Redis client unavailable; falling back to in-memory store: %s", exc)
         return None
 
 class TeamsStateStore:

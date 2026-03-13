@@ -5,9 +5,12 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from src.utils.logging_utils import get_logger
 from src.utils.payload_utils import get_source_name
 
 from .evidence_constraints import EvidenceConstraints, EvidenceRequirements
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -42,6 +45,7 @@ class RetrievalQualityScorer:
         chunks: List[Any],
         requirements: EvidenceRequirements,
     ) -> RetrievalQualityResult:
+        logger.debug("evaluate: chunks=%d", len(chunks))
         start = self.time_fn()
         if not chunks:
             return RetrievalQualityResult(0.0, {"overlap": 0.0, "evidence": 0.0, "gap": 0.0, "diversity": 0.0}, True, False, 0.0)
@@ -60,13 +64,15 @@ class RetrievalQualityScorer:
             "gap": round(gap, 4),
             "diversity": round(diversity, 4),
         }
-        return RetrievalQualityResult(
+        result = RetrievalQualityResult(
             score=round(score, 4),
             breakdown=breakdown,
             is_low=score < self.threshold_low,
             is_high=score >= self.threshold_high,
             elapsed_ms=round(elapsed, 2),
         )
+        logger.debug("evaluate: score=%.4f, is_low=%s, is_high=%s, elapsed_ms=%.2f", result.score, result.is_low, result.is_high, result.elapsed_ms)
+        return result
 
     @staticmethod
     def _overlap_score(query: str, chunks: List[Any]) -> float:

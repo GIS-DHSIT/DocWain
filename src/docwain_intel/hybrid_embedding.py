@@ -63,7 +63,7 @@ class _SpaCyTokenizer:
         try:
             self._nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
         except OSError:
-            logger.warning("spaCy model 'en_core_web_sm' not found; falling back to blank English model")
+            logger.debug("spaCy model 'en_core_web_sm' not found; falling back to blank English model")
             self._nlp = spacy.blank("en")
 
     @classmethod
@@ -149,7 +149,7 @@ class HybridEmbedder:
             data = resp.json()
             embedding = data.get("embedding", [])
             if not embedding:
-                logger.warning("Ollama returned empty embedding for model=%s", self._model)
+                logger.debug("Ollama returned empty embedding for model=%s", self._model)
             return embedding
         except requests.ConnectionError:
             logger.warning(

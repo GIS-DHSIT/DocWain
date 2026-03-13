@@ -283,7 +283,7 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
         texts = _extract_text_from_extracted(extracted)
         if texts:
             return "\n\n".join(texts)
-        logger.warning("Extracted pickle for doc_id=%s had no text; falling back", doc_id)
+        logger.debug("Extracted pickle for doc_id=%s had no text; falling back", doc_id)
     except Exception as exc:  # noqa: BLE001
         if allow_fallback:
             logger.warning("Blob pickle unavailable for doc_id=%s: %s", doc_id, exc)

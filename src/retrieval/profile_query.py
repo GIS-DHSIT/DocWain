@@ -5,6 +5,9 @@ from typing import Any, Dict, Optional
 
 from src.orchestrator.orchestrator import run_query
 from src.profiles.profile_store import resolve_profile_name
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 def query_profile(
@@ -15,6 +18,7 @@ def query_profile(
     model_name: Optional[str] = None,
     top_k: int = 6,
 ) -> Dict[str, Any]:
+    logger.debug("query_profile: subscription_id=%s, profile_id=%s, top_k=%d", subscription_id, profile_id, top_k)
     profile_name = resolve_profile_name(subscription_id=subscription_id, profile_id=profile_id)
     return run_query(
         subscription_id=subscription_id,
@@ -32,6 +36,7 @@ def build_grounded_answer(
     retrieved: list[Dict[str, Any]],
     model_name: Optional[str] = None,
 ) -> Dict[str, Any]:
+    logger.debug("build_grounded_answer: retrieved=%d", len(retrieved))
     _ = (query, intent, model_name)
     raw_texts = [str(item.get("text") or "") for item in retrieved if item.get("text")]
     answer = " ".join(raw_texts).strip() if raw_texts else "No grounded evidence found in the retrieved context."
@@ -50,6 +55,7 @@ def build_grounded_answer(
         citation = f"{file_name} {page_span}".strip()
         citation = re.sub(r"document_id\s*=\s*\w+", "[redacted]", citation, flags=re.IGNORECASE)
         citations.append(citation)
+    logger.debug("build_grounded_answer: returning %d citations", len(citations))
     return {"answer": answer, "citations": citations}
 
 

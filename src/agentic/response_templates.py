@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class ResponseTemplate:
@@ -125,6 +129,7 @@ class ResponseTemplateSelector:
 
     @staticmethod
     def select(intent: str, instructions: Dict[str, str | bool | None]) -> ResponseTemplate:
+        logger.debug("select called with intent=%s", intent)
         normalized_intent = ResponseTemplateSelector._normalize_intent(intent)
         style = (instructions.get("style") or "").lower()
         format_hint = (instructions.get("format") or "").lower()
@@ -209,6 +214,7 @@ class ResponseTemplateSelector:
                 guidance="Write 4-6 concise sentences with citations, no bullets.",
             )
 
+        logger.debug("select returning template=factual (default)")
         return ResponseTemplate(
             name="factual",
             format_style="factual",

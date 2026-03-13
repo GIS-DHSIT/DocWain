@@ -205,8 +205,8 @@ def _cache_get(redis_client: Any, key: str) -> Optional[LLMResponseSchema]:
                 text=payload.get("text", ""),
                 evidence_chunks=payload.get("evidence_chunks", []),
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to retrieve LLM extraction result from cache", exc_info=True)
     return None
 
 def _cache_set(redis_client: Any, key: str, result: LLMResponseSchema, ttl: int = 3600) -> None:
@@ -219,8 +219,8 @@ def _cache_set(redis_client: Any, key: str, result: LLMResponseSchema, ttl: int 
             "evidence_chunks": result.evidence_chunks,
         })
         redis_client.setex(key, ttl, payload)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to store LLM extraction result in cache", exc_info=True)
 
 def _lightweight_grounding_check(
     answer: str,
@@ -475,8 +475,8 @@ def llm_extract_and_respond(
         from src.api.config import Config
         _cache_enabled = getattr(getattr(Config, "LLMCache", None), "ENABLED", False)
         _cache_ttl = getattr(getattr(Config, "LLMCache", None), "TTL_SECONDS", 3600)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to load LLM cache configuration", exc_info=True)
 
     _cache_key = None
     if _cache_enabled and redis_client and chunks:
@@ -525,8 +525,8 @@ def llm_extract_and_respond(
             from .evidence_chain import build_evidence_chain
             chain = build_evidence_chain(query, top_chunks)
             evidence_context = chain.render_for_prompt()
-        except Exception:
-            pass  # evidence chain is optional enhancement
+        except Exception as exc:
+            logger.debug("Failed to build evidence chain (optional enhancement)", exc_info=True)
 
     # Build intent-adaptive prompt
     if evidence_context:
@@ -553,8 +553,8 @@ def llm_extract_and_respond(
         from src.llm.multi_agent import MultiAgentGateway, AgentRole
         if isinstance(llm_client, MultiAgentGateway):
             _gen_role = AgentRole.GENERATOR
-    except ImportError:
-        pass
+    except ImportError as exc:
+        logger.debug("MultiAgentGateway not available for generator role selection", exc_info=True)
 
     # Build simplified fallback prompt for intermediate timeout
     est_tokens = _estimate_tokens(full_evidence)
@@ -589,8 +589,8 @@ def llm_extract_and_respond(
         try:
             from src.api.config import Config as _VCfg
             _verify_enabled = getattr(getattr(_VCfg, "Verification", None), "ENABLED", False)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to load verification configuration", exc_info=True)
         if _is_cloud and _verify_enabled:
             consistent, corrected = _verify_self_consistency(
                 result.text, full_evidence, llm_client, correlation_id
@@ -678,8 +678,8 @@ def _classify_intent(query: str, intent_hint: Optional[str]) -> str:
         _RANK_NOUNS = {"ranking", "comparison", "evaluation", "assessment"}
         if any(n in _RANK_NOUNS for n in sem.target_nouns + sem.context_words):
             return "rank"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed NLU-based intent classification", exc_info=True)
     return "general"
 
 # ── expanded intent classification (8 types) ─────────────────────────
@@ -2294,8 +2294,8 @@ def _generate(
             from src.llm.multi_agent import MultiAgentGateway
             if isinstance(llm_client, MultiAgentGateway):
                 _actual_client = llm_client._get_client(role)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to unwrap MultiAgentGateway client for role %s", role, exc_info=True)
 
     _use_chat = hasattr(_actual_client, "chat_with_metadata")
 
@@ -2614,14 +2614,14 @@ def _extract_json(raw: str) -> dict:
     if text.startswith("{") and text.endswith("}"):
         try:
             return json.loads(text)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to parse LLM response as JSON object", exc_info=True)
     if "{" in text and "}" in text:
         snippet = text[text.find("{"):text.rfind("}") + 1]
         try:
             return json.loads(snippet)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to parse extracted JSON snippet from LLM response", exc_info=True)
     return {}
 
 def _count_unique_documents(chunks: List[Any]) -> int:

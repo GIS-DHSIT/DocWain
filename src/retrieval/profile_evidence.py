@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
 
+from src.utils.logging_utils import get_logger
+
 from src.retrieval.evidence_extractors import (
     EvidenceItem,
     extract_contacts,
@@ -12,6 +14,8 @@ from src.retrieval.evidence_extractors import (
     extract_sections,
     extract_tables,
 )
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -41,6 +45,7 @@ class ProfileEvidenceGraph:
 
 
 def build_document_evidence(document_id: str, chunks: Iterable[Dict[str, str]]) -> DocumentEvidence:
+    logger.debug("build_document_evidence: document_id=%s", document_id)
     chunk_list = list(chunks)
     source_name = chunk_list[0].get("source_name") if chunk_list else None
     contacts = extract_contacts(chunk_list)
@@ -49,7 +54,7 @@ def build_document_evidence(document_id: str, chunks: Iterable[Dict[str, str]]) 
     entities = extract_entities(chunk_list)
     sections = extract_sections(chunk_list)
     tables = extract_tables(chunk_list)
-    return DocumentEvidence(
+    result = DocumentEvidence(
         document_id=document_id,
         source_name=source_name,
         contacts=contacts,
@@ -59,9 +64,13 @@ def build_document_evidence(document_id: str, chunks: Iterable[Dict[str, str]]) 
         sections=sections,
         tables=tables,
     )
+    logger.debug("build_document_evidence: document_id=%s, dates=%d, identifiers=%d, entities=%d, sections=%d, tables=%d",
+                 document_id, len(dates), len(identifiers), len(entities), len(sections), len(tables))
+    return result
 
 
 def build_profile_evidence_graph(corpora: Dict[str, List[Dict[str, str]]]) -> ProfileEvidenceGraph:
+    logger.debug("build_profile_evidence_graph: documents=%d", len(corpora))
     documents: Dict[str, DocumentEvidence] = {}
     for doc_id, chunks in corpora.items():
         documents[doc_id] = build_document_evidence(doc_id, chunks)
@@ -83,6 +92,7 @@ def build_profile_evidence_graph(corpora: Dict[str, List[Dict[str, str]]]) -> Pr
                         shared_entities=shared_entities,
                     )
                 )
+    logger.debug("build_profile_evidence_graph: returning %d documents, %d edges", len(documents), len(edges))
     return ProfileEvidenceGraph(documents=documents, edges=edges)
 
 

@@ -1311,7 +1311,7 @@ def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
                     text_content = _salvage_repr_text(str(value).strip())
                 from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
                 if _is_metadata_garbage(text_content):
-                    logger.warning("Skipping garbage text from structured value for %s", name)
+                    logger.debug("Skipping garbage text from structured value for %s", name)
                     continue
                 if text_content:
                     normalized[name] = {
@@ -2499,8 +2499,8 @@ def _process_blob(
                 try:
                     from src.api.document_status import update_document_fields
                     update_document_fields(doc_id, _schema_mongo_fields)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to persist schema fields to MongoDB for %s", doc_id, exc_info=True)
             except Exception as schema_exc:
                 logger.debug("Schema/answerability detection failed for %s: %s", doc_id, schema_exc)
 
@@ -2633,8 +2633,8 @@ def _process_blob(
                             _cd_model_result = _cd_get_model()
                             _cd_model = _cd_model_result[0] if isinstance(_cd_model_result, tuple) else _cd_model_result
                             _cd_doc_vector = _cd_model.encode([_mre["text"]], show_progress_bar=False)[0].tolist()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Failed to encode document vector for cross-doc intelligence", exc_info=True)
                         break
 
             _cd_entities = (_understanding or {}).get("key_entities") or []
@@ -2655,8 +2655,8 @@ def _process_blob(
 
             _cd_thread = _cd_threading.Thread(target=_run_cross_doc, daemon=True)
             _cd_thread.start()
-        except Exception:
-            pass  # cross-doc is purely additive, never blocks pipeline
+        except Exception as exc:
+            logger.debug("Cross-doc intelligence setup failed (purely additive, never blocks pipeline)", exc_info=True)
 
         deleted = False
         # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
@@ -3298,8 +3298,8 @@ def _process_local_document(
 
             _cd_thread_local = _cd_threading_local.Thread(target=_run_cross_doc_local, daemon=True)
             _cd_thread_local.start()
-        except Exception:
-            pass  # cross-doc is purely additive, never blocks pipeline
+        except Exception as exc:
+            logger.debug("Cross-doc intelligence setup failed (purely additive, never blocks pipeline)", exc_info=True)
 
         deleted = False
         # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
@@ -3418,7 +3418,7 @@ def _embed_from_local_pickles(
     max_blobs: Optional[int],
     embed_request_id: Optional[str],
 ) -> Dict[str, Any]:
-    logger.warning("Blob storage not configured; using local pickles (deprecated).")
+    logger.debug("Blob storage not configured; using local pickles (deprecated).")
     requested_ids = _normalize_requested_ids(document_id, document_ids)
     filter_ids = _fetch_document_ids_by_filters(subscription_id=subscription_id, profile_id=profile_id)
     all_ids = requested_ids + filter_ids

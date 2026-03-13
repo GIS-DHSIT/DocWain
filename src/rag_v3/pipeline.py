@@ -332,8 +332,8 @@ def _infer_query_scope(
                             for child in token.head.children:
                                 if child.pos_ in ("NOUN", "PROPN") and child.tag_ in ("NNS", "NNPS"):
                                     return QueryScope(mode="all_profile")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to parse all-profile scope via NLP", exc_info=True)
             # Skip generic nouns that aren't real entity names
             _hint = intent_parse.entity_hints[0]
             if _hint.lower().strip() not in _ENTITY_HINT_STOP_PHRASES:
@@ -383,8 +383,8 @@ def _infer_query_scope(
         _sem = _parse_q(query or "")
         if any(v in ("compare", "rank", "versus") for v in _sem.action_verbs):
             return QueryScope(mode="all_profile")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to parse query semantics for scope resolution", exc_info=True)
 
     # Default: all_profile — collectively analyze all documents unless a specific
     # document or entity was explicitly identified above.  This prevents the common
@@ -959,7 +959,8 @@ def _detect_target_language(query: str) -> Optional[str]:
                 lang_name = m.group(1).lower().strip()
                 return _LANG_CODE_MAP.get(lang_name, lang_name[:2] if len(lang_name) >= 2 else None)
         return _llm_detect_target_language(query)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to detect target translation language", exc_info=True)
         return None
 
 def _is_non_english(text: str) -> bool:
@@ -1105,7 +1106,7 @@ def _dispatch_agents(
         import asyncio
         from src.tools.base import registry
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Agent registry not available: %s", exc, extra={"correlation_id": correlation_id})
+        logger.debug("Agent registry not available: %s", exc, extra={"correlation_id": correlation_id})
         return []
 
     # Serialize reranked chunks for tool consumption
@@ -1838,7 +1839,8 @@ def _load_document_data_for_extraction(
                                 document_data = asdict(first_val)
                             else:
                                 document_data = first_val
-                        except Exception:
+                        except Exception as exc:
+                            logger.debug("Failed to convert dataclass to dict for document data", exc_info=True)
                             document_data = first_val
                     else:
                         # fallback: pass the raw payload
@@ -2161,8 +2163,8 @@ def _run_all_profile_analysis(
             )
             if _agent_answer is not None:
                 return _agent_answer
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Domain agent dispatch failed in all-profile path", exc_info=True)
 
     # ── Agent dispatch inside all-profile path ─────────────────────────
     # Only dispatch content-generation agents (email_drafting, insights,
@@ -2197,8 +2199,8 @@ def _run_all_profile_analysis(
                         from .enterprise import _NER_LABEL_RE, _NER_INLINE_RE
                         _clean_text = _NER_LABEL_RE.sub("", _clean_text)
                         _clean_text = _NER_INLINE_RE.sub(" ", _clean_text)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("NER label cleanup import/apply failed", exc_info=True)
                     _tool_meta = {
                         "domain": tc.meta.get("domain") or tool_domain,
                         "intent": intent_parse.intent if intent_parse else "factual",
@@ -2764,8 +2766,8 @@ def run(
             if _fc is not None and focus.field_probabilities is None:
                 focus.field_probabilities = _fc.predict(focus.query_embedding)
                 focus.field_tags.update(focus.field_probabilities.keys())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Field importance classifier initialization failed", exc_info=True)
 
     # Lazy-init trained intent classifier
     if embedder is not None:
@@ -2773,8 +2775,8 @@ def run(
             from src.intent.intent_classifier import get_intent_classifier, ensure_intent_classifier
             if get_intent_classifier() is None:
                 ensure_intent_classifier(embedder)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Intent classifier initialization failed", exc_info=True)
 
     # Lazy-init line role classifier (ML-based KV extraction)
     if embedder is not None:
@@ -2782,8 +2784,8 @@ def run(
             from .line_classifier import get_line_classifier, ensure_line_classifier
             if get_line_classifier() is None:
                 ensure_line_classifier(embedder)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Line role classifier initialization failed", exc_info=True)
 
     # Entity hint enrichment from TaskSpec (replaces multi-agent LLM classifier)
     if _task_spec and _task_spec.entities and not scope.entity_hint:
@@ -2870,8 +2872,8 @@ def run(
     try:
         from src.agentic.domain_agents import detect_agent_task as _dat
         _agent_detection = _dat(original_query, domain=tool_domain or "")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Domain agent task detection failed", exc_info=True)
 
     # ── Proactive web search when enable_internet=True ──────────────
     # If user explicitly requested internet and no document-domain tools
@@ -2913,8 +2915,8 @@ def run(
                         from .enterprise import _NER_LABEL_RE, _NER_INLINE_RE
                         _clean_text = _NER_LABEL_RE.sub("", _clean_text)
                         _clean_text = _NER_INLINE_RE.sub(" ", _clean_text)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("NER label cleanup import/apply failed", exc_info=True)
                     _elapsed = time.time() - _pipeline_start
                     logger.info(
                         "Early tool dispatch complete in %.1fs | tool=%s | cid=%s",
@@ -3322,7 +3324,7 @@ def run(
             )
             retrieved = iter_result.chunks
         except Exception as exc:
-            logger.warning("Multi-strategy retrieval failed, falling back: %s", exc)
+            logger.debug("Multi-strategy retrieval failed, falling back: %s", exc)
             decomposed = None  # Fall through to standard path
 
     if decomposed and retrieved:
@@ -3424,8 +3426,8 @@ def run(
                         from .enterprise import _NER_LABEL_RE, _NER_INLINE_RE
                         _clean_text = _NER_LABEL_RE.sub("", _clean_text)
                         _clean_text = _NER_INLINE_RE.sub(" ", _clean_text)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("NER label cleanup import/apply failed", exc_info=True)
                     return _build_answer(
                         response_text=_clean_text,
                         sources=_collect_sources([]),
@@ -3499,8 +3501,8 @@ def run(
             try:
                 from src.api.config import Config as _WsCfg
                 _try_web = getattr(_WsCfg.WebSearch, "FALLBACK_ON_NO_RESULTS", False) and enable_internet
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to check web search fallback config", exc_info=True)
 
         if _try_web:
             try:
@@ -3691,8 +3693,8 @@ def run(
                                 )
                     except Exception as _df_exc:
                         logger.debug("Domain-filtered re-retrieval failed: %s", _df_exc)
-        except Exception:
-            pass  # Domain mismatch check is best-effort
+        except Exception as exc:
+            logger.debug("Domain mismatch check failed (best-effort)", exc_info=True)
 
     sufficiency = None  # Evidence sufficiency — will be set if evaluator succeeds
 
@@ -3737,8 +3739,8 @@ def run(
                 query=original_query,
                 include_acknowledgement=False,
             )
-    except Exception:
-        pass  # Evidence gate is best-effort, never blocks pipeline
+    except Exception as exc:
+        logger.debug("Evidence sufficiency gate failed (best-effort, never blocks pipeline)", exc_info=True)
 
     # ── Chunk translation: translate content before extraction ──────────
     # When translator is in the tool list, translate chunk text so that
@@ -3777,8 +3779,8 @@ def run(
                         from .enterprise import _NER_LABEL_RE, _NER_INLINE_RE
                         _clean_text = _NER_LABEL_RE.sub("", _clean_text)
                         _clean_text = _NER_INLINE_RE.sub(" ", _clean_text)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("NER label cleanup import/apply failed", exc_info=True)
                     _tool_meta = {
                         "domain": tc.meta.get("domain") or tool_domain,
                         "intent": intent_type,
@@ -3858,8 +3860,8 @@ def run(
         try:
             from src.tools.intelligence import build_tool_context_for_llm
             _tool_llm_context = build_tool_context_for_llm(tools, intent_type or "factual")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to build tool context for LLM extraction", exc_info=True)
 
     _targeted_thinking = _should_use_thinking(
         query=original_query,
@@ -4641,8 +4643,8 @@ def _synthesize_cross_document(
                     try:
                         y = float(c.total_years_experience.split()[0])
                         years_values.append(y)
-                    except (ValueError, IndexError):
-                        pass
+                    except (ValueError, IndexError) as exc:
+                        logger.debug("Failed to parse years of experience value", exc_info=True)
 
         if years_values:
             avg = sum(years_values) / len(years_values)
@@ -4672,8 +4674,8 @@ def _synthesize_cross_document(
                 for n in nums:
                     try:
                         total_amounts.append(float(n))
-                    except ValueError:
-                        pass
+                    except ValueError as exc:
+                        logger.debug("Failed to parse invoice amount from %r", n, exc_info=True)
             parties_items = (getattr(schema, "parties", None) and schema.parties.items) or []
             for item in parties_items:
                 if item.value:
@@ -4730,7 +4732,8 @@ def _llm_synthesize(
         _synth_enabled = getattr(getattr(_SCfg, "Synthesis", None), "ENABLED", False)
         _synth_timeout = getattr(getattr(_SCfg, "Synthesis", None), "TIMEOUT", 20.0)
         _synth_min_docs = getattr(getattr(_SCfg, "Synthesis", None), "MIN_DOCUMENTS", 2)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to load synthesis configuration", exc_info=True)
         return None
 
     if not _synth_enabled or num_documents < _synth_min_docs:
@@ -4896,9 +4899,9 @@ def _build_answer(
             final_response = f"{acknowledgement}\n\n{response_text}"
             metadata["acknowledgement"] = acknowledgement
             metadata["query_intent"] = formatted.intent.value
-        except Exception:
+        except Exception as exc:
             # Fallback: don't modify response if formatter fails
-            pass
+            logger.debug("Response formatter failed, keeping original response", exc_info=True)
 
     # ── Enterprise intelligence: follow-ups and confidence (parallel) ─
     chunk_texts = []
@@ -4961,12 +4964,14 @@ def _build_answer(
 
         try:
             followups = _fu_future.result(timeout=1.5)
-        except (TimeoutError, concurrent.futures.TimeoutError, Exception):
+        except (TimeoutError, concurrent.futures.TimeoutError, Exception) as exc:
             _fu_future.cancel()
+            logger.debug("Follow-up suggestions timed out or failed", exc_info=True)
         try:
             confidence = _conf_future.result(timeout=1.5)
-        except (TimeoutError, concurrent.futures.TimeoutError, Exception):
+        except (TimeoutError, concurrent.futures.TimeoutError, Exception) as exc:
             _conf_future.cancel()
+            logger.debug("Confidence scoring timed out or failed", exc_info=True)
     except Exception as _intel_exc:
         logger.debug("Intelligence enrichment skipped: %s", _intel_exc)
 
@@ -5018,8 +5023,8 @@ def _build_answer(
                 if _sc is not None:
                     try:
                         _completeness_values.append(float(_sc))
-                    except (TypeError, ValueError):
-                        pass
+                    except (TypeError, ValueError) as exc:
+                        logger.debug("Failed to parse schema_completeness value", exc_info=True)
             if _resolution_levels:
                 metadata["resolution_levels_used"] = sorted(_resolution_levels)
             if _completeness_values:
@@ -5134,8 +5139,8 @@ def _build_answer(
             gw = get_llm_gateway()
             if gw:
                 llm_backend = getattr(gw, "backend", "unknown")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to detect LLM backend for metrics", exc_info=True)
         record_query_metrics(QueryMetrics(
             query=query or "",
             latency_ms=metadata.get("_latency_ms", 0.0),
@@ -5148,8 +5153,8 @@ def _build_answer(
             scope_mode=metadata.get("scope_mode", "unknown"),
             domain=metadata.get("domain") or "unknown",
         ))
-    except Exception:
-        pass  # Metrics never block pipeline
+    except Exception as exc:
+        logger.debug("Failed to record query metrics (best-effort)", exc_info=True)
 
     return result
 
@@ -5212,8 +5217,9 @@ def _resolve_intent_future(future: Optional[concurrent.futures.Future]) -> Optio
     if future is None:
         return None
     try:
-        return future.result(timeout=0.5)
-    except Exception:
+        return future.result(timeout=1.5)
+    except Exception as exc:
+        logger.debug("Failed to resolve intent future", exc_info=True)
         return None
 
 def _infer_scope_document_id(query: str, explicit_document_id: Optional[str]) -> Optional[str]:

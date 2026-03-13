@@ -28,7 +28,7 @@ try:
     UNIVERSAL_ENHANCER_AVAILABLE = True
 except ImportError:
     UNIVERSAL_ENHANCER_AVAILABLE = False
-    logger.warning("Universal enhancer not available, using fallback enhancement")
+    logger.debug("Universal enhancer not available, using fallback enhancement")
 
 @dataclass
 class EmbeddingEnhancementResult:
@@ -321,7 +321,7 @@ def _enhance_with_legacy_pipeline(
         )
 
     except ImportError as e:
-        logger.warning(f"Enhanced embedding not available: {e}. Using original texts.")
+        logger.debug(f"Enhanced embedding not available: {e}. Using original texts.")
         return EmbeddingEnhancementResult(
             enhanced_texts=list(texts),
             enhanced_metadata=list(chunk_metadata),

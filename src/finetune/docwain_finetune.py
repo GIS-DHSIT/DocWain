@@ -60,7 +60,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-log = logging.getLogger(__name__)
+from src.utils.logging_utils import get_logger
+
+log = get_logger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 

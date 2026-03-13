@@ -4,8 +4,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from .evidence_constraints import EvidenceConstraints, EvidenceRequirements
+from src.utils.logging_utils import get_logger
 from src.utils.payload_utils import get_source_name
+
+from .evidence_constraints import EvidenceConstraints, EvidenceRequirements
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -43,6 +47,7 @@ class HybridRanker:
         *,
         relax_evidence: bool = False,
     ) -> List[Any]:
+        logger.debug("rank: chunks=%d, intent_type=%s, relax_evidence=%s", len(chunks), intent_type, relax_evidence)
         if not chunks:
             return []
         query_tokens = self._tokenize(query)
@@ -79,7 +84,10 @@ class HybridRanker:
             ranked.append((combined, chunk))
 
         ranked.sort(key=lambda item: item[0], reverse=True)
-        return [chunk for _, chunk in ranked]
+        result = [chunk for _, chunk in ranked]
+        if result:
+            logger.debug("rank: returning %d chunks, top_score=%.4f", len(result), ranked[0][0])
+        return result
 
     def _metadata_boost(self, meta: Dict[str, Any], query: str, intent_type: str) -> float:
         score = 0.0
@@ -91,6 +99,7 @@ class HybridRanker:
         try:
             importance_score = float(importance) if importance is not None else 0.0
         except (TypeError, ValueError):
+            logger.debug("_metadata_boost: failed to parse importance=%s", importance, exc_info=True)
             importance_score = 0.0
 
         score += min(0.35, max(0.0, importance_score)) * 0.6

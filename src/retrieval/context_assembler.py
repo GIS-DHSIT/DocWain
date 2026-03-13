@@ -7,11 +7,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.utils.logging_utils import get_logger
 from src.utils.payload_utils import (
     get_chunk_hash,
     get_chunk_sentence_complete,
     get_source_name,
 )
+
+logger = get_logger(__name__)
 
 @dataclass
 class ContextBuildResult:
@@ -24,7 +27,7 @@ class ContextBuildResult:
 class ContextAssembler:
     """Section-aware context assembler with dedup and coherence hints."""
 
-    def __init__(self, max_tokens: int = 2048, max_chunks: int = 8):
+    def __init__(self, max_tokens: int = 4096, max_chunks: int = 12):
         self.max_tokens = max_tokens
         self.max_chunks = max_chunks
 
@@ -34,6 +37,7 @@ class ContextAssembler:
         *,
         intent_type: str = "factual",
     ) -> ContextBuildResult:
+        logger.debug("build: chunks=%d, intent_type=%s", len(chunks), intent_type)
         if not chunks:
             return ContextBuildResult("", [], [], 0)
 
@@ -47,9 +51,9 @@ class ContextAssembler:
         token_budget = self.max_tokens
         source_id = 1
 
-        max_per_section = 2
+        max_per_section = 3
         if intent_type in {"summarization", "deep_analysis"}:
-            max_per_section = 1
+            max_per_section = 2
 
         for key in group_order:
             items = grouped[key]
@@ -85,9 +89,12 @@ class ContextAssembler:
                 break
 
         context_text = "\n\n".join(context_parts)
-        return ContextBuildResult(context_text, sources, selected_chunks, self._approx_tokens(context_text))
+        result = ContextBuildResult(context_text, sources, selected_chunks, self._approx_tokens(context_text))
+        logger.debug("build: returning %d sources, %d tokens", len(result.sources), result.token_count)
+        return result
 
     def _deduplicate(self, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        logger.debug("_deduplicate: input chunks=%d", len(chunks))
         seen: Dict[str, Dict[str, Any]] = {}
         for chunk in chunks:
             text = chunk.get("text") or ""
@@ -101,6 +108,7 @@ class ContextAssembler:
                     seen[key] = chunk
             else:
                 seen[key] = chunk
+        logger.debug("_deduplicate: output chunks=%d", len(seen))
         return list(seen.values())
 
     def _group_by_section(self, chunks: List[Dict[str, Any]]) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
@@ -165,6 +173,7 @@ class ContextAssembler:
         try:
             return int(idx) if idx is not None else None
         except Exception:
+            logger.debug("_chunk_index: failed to parse idx=%s", idx, exc_info=True)
             return None
 
     @staticmethod
@@ -189,6 +198,7 @@ class ContextAssembler:
         try:
             return str(int(page))
         except Exception:
+            logger.debug("_safe_page: failed to parse page=%s", page, exc_info=True)
             return str(page)
 
     def _header(self, meta: Dict[str, Any]) -> str:

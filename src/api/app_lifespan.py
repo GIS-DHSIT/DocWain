@@ -138,72 +138,9 @@ def initialize_app_state(app: FastAPI) -> AppState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Zombie document recovery skipped: %s", exc)
 
-    # Task-aware multi-model routing (auto-discovers available Ollama models)
-    if getattr(Config, "TaskRouting", None) and getattr(Config.TaskRouting, "ENABLED", False):
-        try:
-            from src.llm.model_registry import ModelRegistry, set_model_registry
-            from src.llm.task_router import TaskRouter
-            from src.llm.multi_agent import TaskAwareGateway
-
-            registry = ModelRegistry()
-            registry.discover()
-            set_model_registry(registry)
-            logger.info(
-                "ModelRegistry discovered %d models: %s",
-                len(registry.get_available()),
-                [m.name for m in registry.get_available()],
-            )
-
-            router = TaskRouter(registry)
-            task_aware_gateway = TaskAwareGateway(
-                router=router,
-                fallback_gateway=llm_gateway,
-            )
-
-            # Replace the llm_gateway singleton so all existing code uses task routing
-            set_llm_gateway(task_aware_gateway)
-            llm_gateway = task_aware_gateway
-            ollama_client = task_aware_gateway
-            logger.info("TaskAwareGateway active — task routing enabled")
-
-            # Pin DocWain-Agent (Qwen3-8B) in GPU memory to eliminate model swap latency.
-            # First evict non-essential models to free GPU memory.
-            try:
-                import ollama as _ollama
-
-                # Evict ALL other models to make room for DocWain-Agent
-                try:
-                    _running = _ollama.ps()
-                    for _m in getattr(_running, "models", []) or []:
-                        _name = getattr(_m, "name", "") or ""
-                        if _name and "docwainagent" not in _name.lower().replace("-", "").replace("_", ""):
-                            try:
-                                _ollama.generate(model=_name, prompt="", options={"num_predict": 0}, keep_alive="0s")
-                                logger.info("Evicted %s from GPU to make room for DocWain-Agent", _name)
-                            except Exception:  # noqa: BLE001
-                                pass
-                except Exception:  # noqa: BLE001
-                    pass
-
-                _ollama.generate(
-                    model="qwen3:14b",
-                    prompt="ping",
-                    options={"num_predict": 1, "num_ctx": 8192},
-                    keep_alive="24h",
-                )
-                logger.info("qwen3:14b pinned in GPU memory (keep_alive=24h, num_ctx=8192)")
-
-                # DocWain-Agent-v2 (TaskSpec model) — DISABLED.
-                # Loading this 4.9GB model alongside DocWain-Agent (13GB) exceeds T4 16GB.
-                # TaskSpec uses NLU fallback (CPU-based, <50ms) instead.
-
-            except Exception as _pin_exc:  # noqa: BLE001
-                logger.warning("DocWain-Agent pinning FAILED — expect model swap latency: %s", _pin_exc)
-
-            # NOTE: lfm2.5-thinking (1GB) loads on-demand in ~3s — no need to pin.
-            # T4 16GB cannot hold both DocWain-Agent and lfm2.5-thinking simultaneously.
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Task routing init failed (continuing with single-model): %s", exc)
+    # Legacy task-aware routing disabled — single vLLM model handles all tasks.
+    # ModelRegistry, TaskRouter, TaskAwareGateway are no longer used.
+    # vLLM pre-loads the model at server start, no GPU pinning needed.
 
     # Multi-agent gateway (role-specific Ollama models)
     multi_agent_gateway = None
@@ -265,7 +202,8 @@ def _precreate_subscription_collections(qdrant_client) -> None:
         try:
             for col in (qdrant_client.get_collections().collections or []):
                 existing.add(getattr(col, "name", str(col)))
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to list Qdrant collections for pre-creation", exc_info=True)
             return
         vec_size = int(getattr(Config.Model, "EMBEDDING_DIM", 1024))
         vs = VectorStoreClient(client=qdrant_client)
@@ -376,7 +314,7 @@ async def lifespan(app: FastAPI):
             if client and client.is_available():
                 logger.info("Vision OCR ready: %s", Config.VisionOCR.MODEL)
             else:
-                logger.warning("Vision OCR model not available; traditional OCR will be used")
+                logger.debug("Vision OCR model not available; traditional OCR will be used")
         except Exception as exc:
             logger.warning("Vision OCR init failed: %s", exc)
 
@@ -402,8 +340,8 @@ async def lifespan(app: FastAPI):
         if _cloud_enabled:
             try:
                 _gemini = GeminiClient()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to initialize Gemini client", exc_info=True)
             _az_ep = getattr(_cloud_cfg, "AZURE_OPENAI_ENDPOINT", "")
             _az_key = getattr(_cloud_cfg, "AZURE_OPENAI_API_KEY", "")
             if _az_ep and _az_key:
@@ -413,14 +351,14 @@ async def lifespan(app: FastAPI):
                         deployment=getattr(_cloud_cfg, "AZURE_DEPLOYMENT", "gpt-4.1"),
                         api_version=getattr(_cloud_cfg, "AZURE_API_VERSION", "2024-05-01-preview"),
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to initialize Azure OpenAI client", exc_info=True)
             _cl_key = getattr(_cloud_cfg, "CLAUDE_API_KEY", "")
             if _cl_key:
                 try:
                     _claude = ClaudeClient(api_key=_cl_key, model=getattr(_cloud_cfg, "CLAUDE_MODEL", "claude-sonnet-4-20250514"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to initialize Claude client", exc_info=True)
         router = IntelligenceRouter(_local, _gemini, _openai, _claude)
         if _cloud_enabled and _cloud_cfg:
             router.configure(
@@ -452,7 +390,7 @@ async def lifespan(app: FastAPI):
         from src.utils.logging_utils import configure_logging
         configure_logging(
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            json_format=os.getenv("JSON_LOGGING", "false").lower() in {"1", "true", "yes"},
+            json_format=os.getenv("JSON_LOGGING", "true").lower() in {"1", "true", "yes"},
             include_correlation_id=True,
         )
     except Exception as exc:
@@ -460,15 +398,15 @@ async def lifespan(app: FastAPI):
     try:
         from src.storage.blob_persistence import validate_storage_configured_once
         validate_storage_configured_once()
-    except (ImportError, AttributeError):
-        pass  # function not yet implemented
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Azure blob storage validation not available (function not yet implemented)", exc_info=True)
     except Exception as exc:
         logger.warning("Azure blob storage configuration check skipped: %s", exc)
     try:
         from src.storage.blob_persistence import validate_containers_once
         validate_containers_once()
-    except (ImportError, AttributeError):
-        pass  # function not yet implemented
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Azure blob container validation not available (function not yet implemented)", exc_info=True)
     except Exception as exc:
         logger.warning("Azure blob container validation skipped: %s", exc)
     try:
@@ -486,8 +424,8 @@ async def lifespan(app: FastAPI):
         bg = get_background_analyzer()
         if bg:
             bg.stop_worker()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to stop background analyzer worker during shutdown", exc_info=True)
     logger.info("DocWain API shutting down")
 
 __all__ = ["initialize_app_state", "lifespan"]

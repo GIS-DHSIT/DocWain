@@ -141,7 +141,7 @@ def normalize_chunk_kind(
         if strict:
             logger.error("Invalid chunk_kind: %s", chunk_kind)
             raise MetadataNormalizationError(f"Invalid chunk_kind: {chunk_kind}")
-        logger.warning("Unknown chunk_kind '%s'; falling back to %s", chunk_kind, fallback)
+        logger.debug("Unknown chunk_kind '%s'; falling back to %s", chunk_kind, fallback)
         return fallback
     return chunk_kind
 

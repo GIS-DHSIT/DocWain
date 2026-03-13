@@ -1,6 +1,5 @@
 import hashlib
 import hmac
-import logging
 import re
 from typing import Any, Dict, List, Optional
 

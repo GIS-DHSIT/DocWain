@@ -214,8 +214,8 @@ def _build_experience_summary(experiences: List[Any]) -> Dict[str, Any]:
 
                     delta = (end - start).days
                     total_months += delta / 30.5
-                except:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to calculate experience duration from dates", exc_info=True)
 
         if total_months >= 12:
             years = total_months / 12

@@ -413,24 +413,36 @@ async def _process_file_attachment(
 
     log.info("Ingested %s: %d document(s), tag=%s", filename, documents_created, doc_tag)
 
-    # Run Document Intelligence pipeline (identify + understand)
-    # Returns structured results for the DI report card
-    di_result: Optional[DocumentIntelligence] = None
-    if first_extracted is not None:
+    extracted_text = "\n\n".join(all_text_parts)
+
+    # Run DI, blob upload, and security screening concurrently
+    async def _di_task():
+        if first_extracted is None:
+            return None
         try:
-            di_result = await asyncio.to_thread(_run_document_intelligence, first_extracted, filename, str(doc_tag), context, log)
-            if di_result:
-                di_result.chunks_created = documents_created
+            result = await asyncio.to_thread(
+                _run_document_intelligence, first_extracted, filename, str(doc_tag), context, log,
+            )
+            if result:
+                result.chunks_created = documents_created
+            return result
         except Exception as exc:  # noqa: BLE001
             log.warning("Document intelligence failed for %s (non-blocking): %s", filename, exc)
+            return None
 
-    _upload_to_blob(file_bytes, filename, context.subscription_id, log)
+    async def _screening_task():
+        if not extracted_text.strip():
+            return None
+        return await asyncio.to_thread(
+            _run_security_screening, extracted_text[:50000], filename, str(doc_tag), log,
+        )
 
-    # Run security screening on the extracted text
-    extracted_text = "\n\n".join(all_text_parts)
-    screening = None
-    if extracted_text.strip():
-        screening = await asyncio.to_thread(_run_security_screening, extracted_text[:50000], filename, str(doc_tag), log)
+    async def _blob_task():
+        await asyncio.to_thread(_upload_to_blob, file_bytes, filename, context.subscription_id, log)
+
+    di_result, screening, _ = await asyncio.gather(
+        _di_task(), _screening_task(), _blob_task(),
+    )
 
     return AttachmentOutcome(
         filename=filename,
@@ -462,6 +474,11 @@ async def ingest_attachments(
     outcomes: List[AttachmentOutcome] = []
     errors: List[str] = []
 
+    # Resolve auth token once (shared across all attachments)
+    token = connector_token
+
+    # Separate attachments into processable vs skipped
+    processable: List[Dict[str, Any]] = []
     for idx, attachment in enumerate(attachments):
         content_type = _attachment_type(attachment)
         log.info(
@@ -471,30 +488,39 @@ async def ingest_attachments(
             bool(attachment.get("contentUrl")),
             bool(_attachment_content(attachment).get("downloadUrl")),
         )
-        try:
-            # Resolve download URL from any available source
-            download_url = _resolve_download_url(attachment)
+        download_url = _resolve_download_url(attachment)
+        if not download_url:
+            if content_type and content_type not in ("text/html", "unknown"):
+                errors.append(f"Attachment '{attachment.get('name', 'unknown')}' has no download URL.")
+            else:
+                errors.append(f"Unsupported attachment type: {content_type or 'unknown'}.")
+            continue
+        processable.append(attachment)
 
-            if not download_url:
-                if content_type and content_type not in ("text/html", "unknown"):
-                    errors.append(f"Attachment '{attachment.get('name', 'unknown')}' has no download URL.")
-                else:
-                    errors.append(f"Unsupported attachment type: {content_type or 'unknown'}.")
-                continue
+    if processable:
+        if token is None:
+            token = await _resolve_auth_token(turn_context, connector_token)
 
-            # All attachments with a download URL go through the same path
-            if token is None:
-                token = await _resolve_auth_token(turn_context, connector_token)
-            outcome = await _process_file_attachment(
-                attachment,
-                context,
-                log,
-                auth_token=token,
-                timeout=timeout,
-                retries=retries,
-                max_bytes=max_bytes,
-            )
+        async def _ingest_one(attachment: Dict[str, Any]) -> Optional[AttachmentOutcome]:
+            try:
+                return await _process_file_attachment(
+                    attachment, context, log,
+                    auth_token=token or "",
+                    timeout=timeout, retries=retries, max_bytes=max_bytes,
+                )
+            except AttachmentIngestError as exc:
+                log.warning("Attachment ingest error: %s", exc)
+                errors.append(str(exc))
+                return None
+            except Exception as exc:  # noqa: BLE001
+                log.error("Attachment processing failed: %s", exc, exc_info=True)
+                errors.append(f"Failed to process '{attachment.get('name', 'unknown')}'. Please try again.")
+                return None
 
+        # Process all attachments concurrently
+        results = await asyncio.gather(*[_ingest_one(a) for a in processable])
+
+        for outcome in results:
             if outcome:
                 outcomes.append(outcome)
                 if state_store:
@@ -507,13 +533,8 @@ async def ingest_attachments(
                         document_type=outcome.intelligence.doc_type if outcome.intelligence else None,
                     )
             else:
-                errors.append("Attachment had no extractable content.")
-        except AttachmentIngestError as exc:
-            log.warning("Attachment ingest error: %s", exc)
-            errors.append(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            log.error("Attachment processing failed: %s", exc, exc_info=True)
-            errors.append(f"Failed to process '{attachment.get('name', 'unknown')}'. Please try again.")
+                if not errors:  # Only add generic error if no specific error was recorded
+                    errors.append("Attachment had no extractable content.")
 
     if outcomes:
         return IngestionResult(

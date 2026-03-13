@@ -311,7 +311,8 @@ def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Option
         from src.api.dw_newron import get_redis_client
 
         redis_client = get_redis_client()
-    except Exception:
+    except Exception as exc:
+        logging.debug("Failed to get Redis client for profile resolution", exc_info=True)
         redis_client = None
 
     cache = RedisIntelCache(redis_client)
@@ -319,15 +320,15 @@ def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Option
         state = cache.get_session_state(subscription_id, session_key)
         if state.active_profile_id:
             return str(state.active_profile_id), "session"
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Failed to get active profile from session state", exc_info=True)
 
     try:
         latest = _latest_profile_from_catalog(cache, subscription_id)
         if latest:
             return latest, "catalog"
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Failed to resolve latest profile from catalog", exc_info=True)
 
     return None, "missing"
 
@@ -370,7 +371,8 @@ def _hydrate_runtime_session_context(
 
     try:
         from src.api.dw_newron import _build_namespace
-    except Exception:
+    except Exception as exc:
+        logging.debug("Failed to import _build_namespace for conversation hydration", exc_info=True)
         return
 
     namespace = _build_namespace(
@@ -385,8 +387,8 @@ def _hydrate_runtime_session_context(
             existing = conversation_history.get_context(namespace, user_id, max_turns=1)
             if existing:
                 return
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Failed to check existing conversation context", exc_info=True)
 
     archived_session = get_session_by_id(user_id, session_id)
     if not archived_session:
@@ -413,7 +415,8 @@ def _hydrate_runtime_session_context(
             else:
                 break
             restored += 1
-        except Exception:
+        except Exception as exc:
+            logging.debug("Failed to restore conversation turn during hydration", exc_info=True)
             continue
 
     if restored:
@@ -667,7 +670,8 @@ def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> D
     """Construct a minimal Teams-like activity from a plain text payload."""
     try:
         text = raw_body.decode("utf-8", errors="ignore").strip()
-    except Exception:
+    except Exception as exc:
+        logging.debug("Failed to decode raw body for text fallback activity", exc_info=True)
         return None
     if not text:
         return None
@@ -976,8 +980,8 @@ def ask_question_api(
                     )
                     if _rag_text:
                         _agent_ctx["text"] = _rag_text
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.debug("Failed to retrieve RAG context for agent dispatch", exc_info=True)
 
                 # Add tool_inputs if provided
                 if request.tool_inputs:
@@ -1158,12 +1162,12 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
             return summary
         except OllamaModelMissing as exc:
             if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
-                logger.warning("Agentic path missing model; falling back to legacy: %s", exc)
+                logger.debug("Agentic path missing model; falling back to legacy: %s", exc)
             else:
                 raise HTTPException(status_code=400, detail=str(exc))
         except OllamaUnavailable as exc:
             if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
-                logger.warning("Agentic path Ollama unavailable; falling back to legacy: %s", exc)
+                logger.debug("Agentic path Ollama unavailable; falling back to legacy: %s", exc)
             else:
                 raise HTTPException(status_code=503, detail=str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -1465,8 +1469,8 @@ def delete_document_embeddings_api(
                 _cname = _bcn(subscription_id)
                 _COLLECTION_COUNT_CACHE.pop(f"{_cname}:{profile_id}", None)
                 _COLLECTION_COUNT_CACHE.pop(_cname, None)
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.debug("Failed to invalidate collection count cache after deletion", exc_info=True)
 
             return {
                 "status": "success",
@@ -1541,8 +1545,8 @@ def get_metrics(
             if cached:
                 try:
                     return json.loads(cached)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.debug("Failed to parse cached metrics snapshot", exc_info=True)
 
         repo = MetricsRepository(store)
         hourly = repo.fetch_hourly(
@@ -1584,8 +1588,8 @@ def get_metrics(
         if cache_key and store.redis and cache_ttl > 0:
             try:
                 store.redis.setex(cache_key, cache_ttl, json.dumps(response))
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.debug("Failed to cache metrics snapshot in Redis", exc_info=True)
         return response
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")

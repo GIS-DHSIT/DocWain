@@ -9,8 +9,11 @@ from qdrant_client.models import Filter
 
 from src.api.config import Config
 from src.api.vector_store import build_collection_name, build_qdrant_filter
+from src.utils.logging_utils import get_logger
 from src.utils.payload_utils import get_document_type, get_source_name
 from src.utils.redis_cache import RedisJsonCache, stamp_cache_payload
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -98,16 +101,19 @@ def get_redis_client():
 
         return _get_redis_client()
     except Exception:  # noqa: BLE001
+        logger.debug("get_redis_client: failed to get redis client", exc_info=True)
         return None
 
 
 def build_profile_document_index(subscription_id: str, profile_id: str) -> ProfileDocumentIndex:
+    logger.debug("build_profile_document_index: subscription_id=%s, profile_id=%s", subscription_id, profile_id)
     cache_key = f"docwain:pdi:v1:{subscription_id}:{profile_id}"
     redis_client = None
     redis_client = get_redis_client()
     cache = RedisJsonCache(redis_client, default_ttl=300)
     cached = cache.get_json(cache_key, feature="profile_document_index")
     if cached:
+        logger.debug("build_profile_document_index: cache hit for %s", cache_key)
         payload = cached.get("payload") or cached
         return ProfileDocumentIndex.from_payload(payload)
 
@@ -164,6 +170,7 @@ def build_profile_document_index(subscription_id: str, profile_id: str) -> Profi
         cached_at=time.time(),
     )
     cache.set_json(cache_key, stamp_cache_payload({"payload": index.to_payload()}), feature="profile_document_index")
+    logger.debug("build_profile_document_index: built index with %d documents, %d total_points", len(document_ids), total_points)
     return index
 
 

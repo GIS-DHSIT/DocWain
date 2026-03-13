@@ -29,14 +29,13 @@ def get_domain_min_score(domain_hint: str | None = None) -> float:
         return _DOMAIN_MIN_SCORES.get(domain_hint.lower(), MIN_RERANK_SCORE)
     return MIN_RERANK_SCORE
 
-# Configurable timeout — cross-encoder on CPU needs 3-5s for 8-14 pairs,
-# but under concurrent load (multiple queries + document processing + embedding)
-# it can take 15-18s.  20s gives enough headroom for concurrent workloads.
+# Configurable timeout — cross-encoder on CPU needs 2-4s for 8-14 pairs.
+# Fail fast (6s) to avoid blocking the response; fallback to bi-encoder scores.
 try:
     from src.api.config import Config as _Cfg
-    _RERANK_TIMEOUT_S = getattr(getattr(_Cfg, "Reranker", None), "TIMEOUT_S", 20.0)
+    _RERANK_TIMEOUT_S = getattr(getattr(_Cfg, "Reranker", None), "TIMEOUT_S", 6.0)
 except Exception:
-    _RERANK_TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "20.0"))
+    _RERANK_TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "6.0"))
 
 def _tag_rerank_confidence(chunks: List[Chunk], min_score: float) -> None:
     """Tag chunks with rerank confidence signal.
@@ -139,7 +138,7 @@ def rerank_chunks(
         _n_groups = len(_seen_sections)
         _seen_sections.clear()
         # Adaptive diversity penalty consistent with cross-encoder path
-        _fb_penalty = min(0.08, 0.03 + 0.01 * max(0, _n_groups - 1))
+        _fb_penalty = min(0.05, 0.02 + 0.005 * max(0, _n_groups - 1))
         for _c in ordered:
             _meta = getattr(_c, "meta", None) or {}
             _doc = _meta.get("source_name") or _meta.get("document_name") or ""
@@ -231,6 +230,18 @@ def _try_cross_encoder(
     entity_hints: List[str] | None = None,
 ) -> List[Chunk] | None:
     """Run cross-encoder scoring with hard timeout. Returns reranked list or None on failure."""
+    # Filter out chunks with empty/whitespace-only text — cross-encoder
+    # crashes with "index out of range in self" on empty inputs.
+    valid_chunks = [c for c in ordered if c.text and c.text.strip()]
+    if not valid_chunks:
+        return None
+    if len(valid_chunks) < len(ordered):
+        logger.debug(
+            "Rerank: filtered %d empty chunks before cross-encoder",
+            len(ordered) - len(valid_chunks),
+        )
+        ordered = valid_chunks
+
     def _score():
         pairs = [[query, chunk.text] for chunk in ordered]
         if hasattr(encoder, "predict"):

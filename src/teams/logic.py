@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
@@ -15,6 +16,9 @@ except Exception:  # noqa: BLE001
     dw_newron = None
 
 logger = get_logger(__name__)
+
+# Shared thread pool for RAG pipeline calls — avoids per-call executor overhead
+_RAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="teams-rag")
 
 class TeamsChatError(Exception):
     """Raised when Teams chat handling cannot complete."""
@@ -203,13 +207,13 @@ class TeamsChatService:
             "mode": "internet",
         }
 
-    def answer_question(self, question: str, context: TeamsChatContext) -> TeamsAnswerResult:
+    async def answer_question(self, question: str, context: TeamsChatContext) -> TeamsAnswerResult:
         """
         Answer a Teams question with Teams-aware scope. Ensures the per-session
         collection exists, and if no document context is found, answers using an
         internet-enabled fallback.
         """
-        self.ensure_collection(context.subscription_id)
+        await asyncio.to_thread(self.ensure_collection, context.subscription_id)
 
         _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 300))
 
@@ -219,9 +223,10 @@ class TeamsChatService:
             else:
                 _dw_newron = dw_newron
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    _dw_newron.answer_question,
+            loop = asyncio.get_running_loop()
+            future = loop.run_in_executor(
+                _RAG_EXECUTOR,
+                lambda: _dw_newron.answer_question(
                     query=question,
                     user_id=context.user_id,
                     profile_id=context.profile_id,
@@ -229,9 +234,10 @@ class TeamsChatService:
                     model_name=context.model_name,
                     persona=context.persona,
                     session_id=context.session_id,
-                )
-                answer = future.result(timeout=_RAG_TIMEOUT_S)
-        except concurrent.futures.TimeoutError:
+                ),
+            )
+            answer = await asyncio.wait_for(future, timeout=_RAG_TIMEOUT_S)
+        except asyncio.TimeoutError:
             logger.error(
                 "RAG pipeline timed out after %.0fs for Teams query | user=%s",
                 _RAG_TIMEOUT_S,
@@ -255,7 +261,9 @@ class TeamsChatService:
                 internet_mode=False,
             )
 
-        internet_answer = self._answer_with_internet_mode(question, context)
+        internet_answer = await asyncio.to_thread(
+            self._answer_with_internet_mode, question, context,
+        )
         return TeamsAnswerResult(
             answer=internet_answer,
             subscription_id=context.subscription_id,

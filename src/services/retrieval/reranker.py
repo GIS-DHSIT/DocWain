@@ -56,7 +56,7 @@ class Reranker:
                     "score_shape": exc.score_shape,
                 }
                 details.update(describe_scores(scores))
-                logger.warning("Cross-encoder rerank shape mismatch; falling back: %s", exc, extra=details, exc_info=True)
+                logger.debug("Cross-encoder rerank shape mismatch; falling back: %s", exc, extra=details, exc_info=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Cross-encoder rerank failed: %s",
