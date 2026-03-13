@@ -51,9 +51,28 @@ def rerank_chunks(
     kw_scores = _normalize([_keyword_f1(query, c.text) for c in chunks])
 
     if cross_encoder is not None:
-        pairs = [[query, c.text] for c in chunks]
-        raw_ce = cross_encoder.predict(pairs)
-        ce_scores = _normalize(list(raw_ce))
+        # Pre-filter to top candidates by dense+keyword before expensive CE
+        # CE on CPU costs ~0.6s per pair; cap at 10 pairs max
+        _CE_MAX_PAIRS = 10
+        _MAX_CE_CHARS = 1600  # MiniLM has 512 token limit
+
+        if len(chunks) > _CE_MAX_PAIRS:
+            # Score with dense+keyword first, CE only top candidates
+            pre_scores = [0.7 * d + 0.3 * k for d, k in zip(dense_scores, kw_scores)]
+            indexed = sorted(enumerate(pre_scores), key=lambda x: x[1], reverse=True)
+            ce_indices = [idx for idx, _ in indexed[:_CE_MAX_PAIRS]]
+            ce_index_set = set(ce_indices)
+
+            pairs = [[query, chunks[i].text[:_MAX_CE_CHARS]] for i in ce_indices]
+            raw_ce = cross_encoder.predict(pairs)
+            ce_map = {ce_indices[j]: float(raw_ce[j]) for j in range(len(ce_indices))}
+            raw_ce_all = [ce_map.get(i, 0.0) for i in range(len(chunks))]
+            ce_scores = _normalize(raw_ce_all)
+        else:
+            pairs = [[query, c.text[:_MAX_CE_CHARS]] for c in chunks]
+            raw_ce = cross_encoder.predict(pairs)
+            ce_scores = _normalize(list(raw_ce))
+
         combined = [
             0.5 * d + 0.2 * k + 0.3 * ce
             for d, k, ce in zip(dense_scores, kw_scores, ce_scores)

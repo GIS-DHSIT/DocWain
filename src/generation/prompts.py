@@ -20,7 +20,8 @@ _SYSTEM_PROMPT = (
     "'Contract states $50K; Invoice shows $55K.'\n"
     "4. Answer ALL parts of the question. If asked about 3 things, cover all 3.\n"
     "5. Lead with the answer. No preamble. No 'Based on my analysis...'\n"
-    "6. Cite sources inline as [SOURCE-N]. Every factual claim needs a citation.\n"
+    "6. Cite sources inline as [SOURCE-N] after EVERY factual claim. "
+    "Example: 'The revenue was **$50M** [SOURCE-1].' NEVER omit citations.\n"
     "7. Bold key values with **value**. 2-3 bold items per paragraph max.\n\n"
     "FORMATTING:\n"
     "- Use markdown headers (## or ###) to organize multi-part answers.\n"
@@ -239,6 +240,8 @@ def build_reason_prompt(
     # Document intelligence context (orientation before evidence)
     if doc_context:
         parts.append("--- DOCUMENT INTELLIGENCE ---")
+        if doc_context.get("document_types"):
+            parts.append(f"Document types: {', '.join(doc_context['document_types'])}")
         if doc_context.get("summary"):
             parts.append(f"Overview: {doc_context['summary']}")
 

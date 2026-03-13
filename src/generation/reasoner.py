@@ -154,27 +154,51 @@ class Reasoner:
     ) -> bool:
         """Lightweight deterministic grounding check (no LLM call).
 
-        Returns *False* when the answer contains numbers that do not appear
-        anywhere in the evidence text.  Up to 20 % ungrounded numbers are
-        tolerated (they could be computed values like totals).
+        Checks both numeric values and proper nouns / key entities.
+        Returns *False* when too many claims are ungrounded.
         """
         if not evidence:
             return False
 
-        answer_numbers = set(_NUMBER_RE.findall(answer))
-        if not answer_numbers:
-            # No numeric claims → grounded by default
-            return True
-
         evidence_text = " ".join(item.get("text", "") for item in evidence)
-        evidence_numbers = set(_NUMBER_RE.findall(evidence_text))
+        evidence_lower = evidence_text.lower()
 
-        ungrounded = answer_numbers - evidence_numbers
-        if not answer_numbers:
-            return True
+        # --- Numeric grounding ---
+        answer_numbers = set(_NUMBER_RE.findall(answer))
+        if answer_numbers:
+            evidence_numbers = set(_NUMBER_RE.findall(evidence_text))
+            ungrounded_nums = answer_numbers - evidence_numbers
+            num_ratio = len(ungrounded_nums) / len(answer_numbers)
+            if num_ratio > 0.15:
+                return False
 
-        ratio = len(ungrounded) / len(answer_numbers)
-        return ratio <= 0.20
+        # --- Entity grounding (proper nouns / multi-word terms) ---
+        # Extract capitalized multi-word sequences (e.g. "John Smith", "Acme Corp")
+        # Skip common markdown/formatting headers that aren't real entities
+        entity_re = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b')
+        _HEADER_WORDS = {
+            "key findings", "current state", "proposed improvements",
+            "summary of", "overview of", "total count", "not found",
+            "critical risks", "main sections", "document structure",
+        }
+        answer_entities = set()
+        for ent in entity_re.findall(answer):
+            if ent.lower() not in _HEADER_WORDS:
+                answer_entities.add(ent)
+
+        if len(answer_entities) >= 3:
+            ungrounded_ents = 0
+            for ent in answer_entities:
+                # Check if any word from the entity appears in evidence
+                ent_words = ent.lower().split()
+                if not any(w in evidence_lower for w in ent_words if len(w) > 3):
+                    ungrounded_ents += 1
+            ent_ratio = ungrounded_ents / len(answer_entities)
+            if ent_ratio > 0.30:
+                return False
+
+        # If we got here, grounding checks pass
+        return True
 
     @staticmethod
     def _compute_token_budget(
@@ -183,10 +207,13 @@ class Reasoner:
         """Compute a max-tokens budget based on task and context."""
         base = _BASE_TOKENS.get(task_type, 512)
 
+        # Scale up for richer evidence sets
         if evidence_count > 10:
             base = int(base * 1.3)
+        elif evidence_count > 5:
+            base = int(base * 1.15)
 
         if thinking:
             base = int(base * 1.5)
 
-        return min(base, 1536)
+        return min(base, 2048)

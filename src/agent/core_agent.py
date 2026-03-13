@@ -10,7 +10,7 @@ import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from src.agent.intent import IntentAnalyzer, QueryUnderstanding
 from src.agent.subagent import DynamicSubAgent
@@ -22,6 +22,55 @@ from src.retrieval.retriever import UnifiedRetriever
 from src.agent.domain_dispatch import DomainDispatcher
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Stopwords for query expansion filtering
+# ---------------------------------------------------------------------------
+
+_STOPWORDS: Set[str] = {
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "could",
+    "should", "may", "might", "shall", "can", "must", "need", "dare",
+    "to", "of", "in", "for", "on", "with", "at", "by", "from", "as",
+    "into", "through", "during", "before", "after", "above", "below",
+    "between", "out", "off", "over", "under", "again", "further", "then",
+    "once", "and", "but", "or", "nor", "not", "so", "yet", "both",
+    "each", "few", "more", "most", "other", "some", "such", "no", "only",
+    "own", "same", "than", "too", "very", "just", "about", "up", "it",
+    "its", "this", "that", "these", "those", "i", "me", "my", "we", "our",
+    "you", "your", "he", "him", "his", "she", "her", "they", "them", "their",
+    "what", "which", "who", "whom", "when", "where", "why", "how",
+    "all", "any", "many", "much", "tell", "show", "give", "get",
+    "document", "documents", "file", "files", "please",
+}
+
+# ---------------------------------------------------------------------------
+# Query expansion synonyms by task type
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Dynamic evidence count by task type
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_TOP_K: Dict[str, int] = {
+    "lookup": 4,
+    "extract": 6,
+    "list": 8,
+    "summarize": 8,
+    "compare": 8,
+    "investigate": 8,
+    "aggregate": 6,
+}
+
+_TASK_SYNONYMS: Dict[str, List[str]] = {
+    "extract": ["extract", "find", "identify", "locate", "what is", "what are"],
+    "compare": ["compare", "contrast", "difference", "versus", "vs", "similarity"],
+    "summarize": ["summarize", "summary", "overview", "key points", "highlights"],
+    "investigate": ["investigate", "analyze", "examine", "assess", "evaluate", "risk"],
+    "lookup": ["what", "who", "when", "where", "how much"],
+    "list": ["list", "enumerate", "name", "all", "each"],
+    "aggregate": ["total", "count", "sum", "average", "how many"],
+}
 
 # ---------------------------------------------------------------------------
 # Conversational response fragments
@@ -70,6 +119,7 @@ class CoreAgent:
         embedder: Any,
         mongodb: Any,
         kg_query_service: Any = None,
+        cross_encoder: Any = None,
     ) -> None:
         self._llm = llm_gateway
         self._mongodb = mongodb
@@ -77,6 +127,7 @@ class CoreAgent:
         self._retriever = UnifiedRetriever(qdrant_client=qdrant_client, embedder=embedder)
         self._reasoner = Reasoner(llm_gateway=llm_gateway)
         self.kg_query_service = kg_query_service
+        self._cross_encoder = cross_encoder
         self._domain_dispatcher = DomainDispatcher(llm_gateway=llm_gateway)
 
     # ------------------------------------------------------------------
@@ -127,12 +178,27 @@ class CoreAgent:
                     kg_hints = {
                         "target_doc_ids": kg_result.doc_ids,
                         "target_chunk_ids": kg_result.chunk_ids,
+                        "entities": query_entities,
                     }
             except Exception as exc:
                 logger.debug("KG probe failed (non-fatal): %s", exc)
 
+        # Trim doc_intelligence for intent analysis (only needs summaries/topics, not full entities)
+        trimmed_intel = []
+        for d in doc_intelligence[:10]:  # cap at 10 docs
+            trimmed = {
+                "document_id": d.get("document_id", ""),
+                "profile_id": d.get("profile_id", ""),
+                "profile_name": d.get("profile_name", ""),
+            }
+            intel = d.get("intelligence") or {}
+            trimmed["summary"] = (intel.get("summary") or "")[:200]
+            trimmed["answerable_topics"] = (intel.get("answerable_topics") or [])[:5]
+            trimmed["document_type"] = intel.get("document_type", "")
+            trimmed_intel.append(trimmed)
+
         understanding = self._intent_analyzer.analyze(
-            query, subscription_id, profile_id, doc_intelligence, conversation_history,
+            query, subscription_id, profile_id, trimmed_intel, conversation_history,
             kg_hints=kg_hints,
         )
         timing["understand_ms"] = round((time.monotonic() - t0) * 1000, 1)
@@ -181,15 +247,51 @@ class CoreAgent:
                     if did not in existing:
                         document_ids.append(did)
 
-        retrieval_result = self._retriever.retrieve(
+        # Enhance query for better retrieval coverage
+        enhanced_query = self._enhance_query(
             understanding.resolved_query,
+            understanding.task_type,
+            doc_intelligence,
+            understanding.entities,
+        )
+
+        retrieval_result = self._retriever.retrieve(
+            enhanced_query,
             subscription_id,
             profile_ids,
             document_ids=document_ids,
         )
 
-        reranked = rerank_chunks(understanding.resolved_query, retrieval_result.chunks, top_k=6)
+        # Dynamic evidence count by task type
+        evidence_top_k = _EVIDENCE_TOP_K.get(understanding.task_type, 6)
+
+        reranked = rerank_chunks(
+            understanding.resolved_query,  # rerank against original query, not expanded
+            retrieval_result.chunks,
+            top_k=evidence_top_k,
+            cross_encoder=self._cross_encoder,
+        )
         evidence, doc_context = build_context(reranked, doc_intelligence_dict)
+
+        # Inject KG entity relationships into doc_context for richer reasoning
+        if kg_hints.get("target_doc_ids") and self.kg_query_service:
+            try:
+                kg_entities = kg_hints.get("entities", [])
+                if kg_entities:
+                    kg_context = [
+                        f"{e.get('value', '')} ({e.get('type', '')})"
+                        for e in (kg_entities if isinstance(kg_entities, list) else [])
+                        if isinstance(e, dict) and e.get("value")
+                    ]
+                    if kg_context:
+                        existing = doc_context.get("entities") or []
+                        for kc in kg_context[:5]:
+                            if kc not in existing:
+                                existing.append(kc)
+                        doc_context["entities"] = existing[:25]
+            except Exception:
+                logger.debug("KG context enrichment failed (non-fatal)")
+
         timing["retrieve_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
         # --- POST-RETRIEVAL DOMAIN DISPATCH ---
@@ -355,6 +457,69 @@ class CoreAgent:
                 if pid:
                     profile_ids.add(pid)
         return list(profile_ids)
+
+    # ------------------------------------------------------------------
+    # Query enhancement for better retrieval
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _enhance_query(
+        query: str,
+        task_type: str,
+        doc_intelligence: List[Dict[str, Any]],
+        entities: List[str],
+    ) -> str:
+        """Expand the query with task synonyms, entities, and topic keywords.
+
+        Adds relevant terms to improve dense retrieval recall without changing
+        the semantic meaning. The original query always leads.
+        """
+        expansion_terms: Set[str] = set()
+        query_lower = query.lower()
+
+        # 1. Add task-type synonyms that aren't already in the query
+        synonyms = _TASK_SYNONYMS.get(task_type, [])
+        for syn in synonyms:
+            if syn not in query_lower:
+                expansion_terms.add(syn)
+
+        # 2. Add entities from intent analysis (already extracted by LLM)
+        for entity in entities[:5]:
+            if entity.lower() not in query_lower:
+                expansion_terms.add(entity)
+
+        # 3. Mine doc_intelligence for matching topic keywords
+        query_words = set(query_lower.split()) - _STOPWORDS
+        for doc in doc_intelligence:
+            intel = doc.get("intelligence") or {}
+            topics: List[str] = intel.get("answerable_topics") or []
+            for topic in topics:
+                topic_words = set(topic.lower().split()) - _STOPWORDS
+                overlap = query_words & topic_words
+                if len(overlap) >= 2:
+                    # This topic is relevant — add non-overlapping keywords
+                    new_words = topic_words - query_words - _STOPWORDS
+                    for w in list(new_words)[:3]:
+                        if len(w) > 2:
+                            expansion_terms.add(w)
+
+            # 4. Add matching entity names from doc intelligence
+            doc_entities = intel.get("entities") or []
+            for ent in doc_entities[:10]:
+                ent_name = ent.get("name", str(ent)) if isinstance(ent, dict) else str(ent)
+                ent_lower = ent_name.lower()
+                ent_words = set(ent_lower.split()) - _STOPWORDS
+                if ent_words & query_words and ent_lower not in query_lower:
+                    expansion_terms.add(ent_name)
+
+        # Cap expansion to avoid noise
+        expansion_list = list(expansion_terms)[:8]
+        if not expansion_list:
+            return query
+
+        enhanced = f"{query} {' '.join(expansion_list)}"
+        logger.debug("Query enhanced: '%s' -> '%s'", query[:60], enhanced[:120])
+        return enhanced
 
     # ------------------------------------------------------------------
     # Document intelligence loader
