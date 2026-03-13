@@ -1,33 +1,28 @@
-"""Single source of truth for all LLM prompts in the DocWain Core Agent pipeline.
+"""Single source of truth for all LLM prompts in DocWain.
 
-Every LLM call — UNDERSTAND, REASON, sub-agent — draws its prompt from
-the functions and constants defined here.  No other module should contain
-inline prompt text.
+Every prompt the system sends to the LLM is constructed here.
+No other module should contain prompt text or LLM instructions.
 """
 
 from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
-# Core system prompt
+# System prompt — used as the system message for every generation call
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """\
-You are DocWain, an AI document intelligence assistant.
-
-GROUNDING RULES — follow these without exception:
-1. Use EXACT values from the provided evidence. Never paraphrase numbers, dates, \
-names, or identifiers — reproduce them verbatim.
-2. CITE every claim using [SOURCE-N] references. If multiple sources support a \
-claim, cite all of them.
-3. When sources CONFLICT, explicitly report the conflict and list the differing \
-values with their sources.
-4. Provide COMPLETE answers that address every part of the user's question. Do \
-not leave sub-questions unanswered.
-5. No preamble. Do not start with "Sure", "Great question", or similar filler. \
-Begin directly with the answer.
-6. If the evidence is insufficient to answer, say so clearly and state what \
-information is missing.
-"""
+_SYSTEM_PROMPT = (
+    "You are DocWain, an expert document intelligence analyst.\n\n"
+    "ABSOLUTE RULES:\n"
+    "1. Every claim must come from the provided evidence. Use exact values — "
+    "'$125,000' not 'about $125K', 'March 15, 2025' not 'mid-March'.\n"
+    "2. If evidence doesn't support an answer, say exactly what's missing.\n"
+    "3. If sources conflict, report both with attribution: "
+    "'Contract states $50K; Invoice shows $55K.'\n"
+    "4. Answer ALL parts of the question. If asked about 3 things, cover all 3.\n"
+    "5. Lead with the answer. No preamble. No 'Based on my analysis...'\n"
+    "6. Cite sources inline as [SOURCE-N]. Every factual claim needs a citation.\n"
+    "7. Bold key values with **value**. 2-3 bold items per paragraph max.\n"
+)
 
 
 def build_system_prompt() -> str:
@@ -41,36 +36,54 @@ def build_system_prompt() -> str:
 
 TASK_FORMATS: Dict[str, str] = {
     "extract": (
-        "Extract the requested values from the evidence. Return each value "
-        "exactly as it appears in the source, with its [SOURCE-N] citation."
+        "TASK: Extract the requested information precisely.\n"
+        "- Present exact values from the documents.\n"
+        "- Use a table if multiple fields are requested, key-value pairs if few.\n"
+        "- Bold the extracted values.\n"
+        "- If a requested field is not found, state: 'Not found in provided documents.'\n"
     ),
     "compare": (
-        "Compare the items across the evidence. Highlight similarities and "
-        "differences. Use a structured layout (table or side-by-side) when "
-        "there are more than two attributes to compare."
+        "TASK: Compare the subjects systematically.\n"
+        "- Start with a one-line summary naming the key difference or winner.\n"
+        "- Present comparison as a markdown table (subjects as rows, criteria as columns).\n"
+        "- Bold the better value in each column.\n"
+        "- If sources conflict on a value, report both with source attribution.\n"
+        "- End with a brief synthesis of key differences.\n"
     ),
     "summarize": (
-        "Provide a concise summary that captures the key points from the "
-        "evidence. Prioritize the most important information first."
+        "TASK: Provide a structured summary.\n"
+        "- Start with a one-line overview of what was analyzed.\n"
+        "- Present 3-6 key highlights as bullet points with specific details.\n"
+        "- Bold the most important findings.\n"
+        "- Include totals, counts, and ranges where applicable.\n"
+        "- End with a brief conclusion.\n"
     ),
     "investigate": (
-        "Investigate the question thoroughly using all available evidence. "
-        "Connect related facts, identify patterns, and draw supported "
-        "conclusions. Flag any gaps."
+        "TASK: Investigate and assess the question.\n"
+        "- Structure as: Finding → Evidence → Assessment.\n"
+        "- Flag risks, inconsistencies, or concerns explicitly.\n"
+        "- Distinguish between what the evidence shows vs. what it doesn't cover.\n"
+        "- Be precise about severity: critical vs. minor vs. informational.\n"
     ),
     "lookup": (
-        "Look up the specific fact or value requested. Return the exact "
-        "value with its source citation. If multiple values exist, list "
-        "all of them."
+        "TASK: Provide a direct factual answer.\n"
+        "- Answer in 1-3 sentences maximum.\n"
+        "- Include the exact value and its source.\n"
+        "- No decoration, no extended analysis.\n"
     ),
     "aggregate": (
-        "Aggregate the relevant data points from the evidence. When "
-        "performing calculations, show the values used and cite each. "
-        "Clearly label any derived figures."
+        "TASK: Aggregate and quantify from the evidence.\n"
+        "- Lead with totals, counts, or computed values.\n"
+        "- Show the breakdown (table if multi-item).\n"
+        "- State which documents/sources contributed to each value.\n"
+        "- Flag if any expected data is missing from the aggregation.\n"
     ),
     "list": (
-        "List the requested items from the evidence. Use a clear, "
-        "consistent format. Include source citations for each item."
+        "TASK: List the requested items.\n"
+        "- Use a numbered or bulleted list.\n"
+        "- Include relevant details for each item (not just names).\n"
+        "- Order by relevance or as requested.\n"
+        "- State the total count at the top.\n"
     ),
 }
 
@@ -79,152 +92,114 @@ TASK_FORMATS: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _OUTPUT_FORMATS: Dict[str, str] = {
-    "table": (
-        "Format the answer as a Markdown table with clear column headers."
-    ),
-    "bullets": (
-        "Format the answer as a bulleted list. Each bullet should be a "
-        "self-contained point."
-    ),
-    "sections": (
-        "Organize the answer into clearly titled sections using Markdown "
-        "headings (##)."
-    ),
-    "numbered": (
-        "Format the answer as a numbered list."
-    ),
-    "prose": (
-        "Write the answer as flowing prose paragraphs."
-    ),
+    "table": "Present results as a markdown table. All rows must have the same columns. Use 'N/A' for missing cells.",
+    "bullets": "Present as a bulleted list. Most important items first. Each bullet should be self-contained.",
+    "sections": "Organize with ## headers. Use bullets within sections. End with a synthesis.",
+    "numbered": "Use a numbered list in sequential order.",
+    "prose": "Write clear paragraphs. Lead with the answer, then supporting evidence.",
 }
 
 # ---------------------------------------------------------------------------
-# Helpers
+# UNDERSTAND prompt — analyzes user intent against document intelligence
 # ---------------------------------------------------------------------------
 
-
-def _trim_history(
-    history: Optional[List[Dict[str, str]]],
-    max_turns: int,
-) -> List[Dict[str, str]]:
-    """Return the last *max_turns* items from conversation history."""
-    if not history:
-        return []
-    return history[-max_turns:]
-
-
-def _format_history(turns: List[Dict[str, str]]) -> str:
-    """Render conversation turns into a prompt-friendly block."""
-    if not turns:
-        return ""
-    lines: List[str] = []
-    for turn in turns:
-        role = turn.get("role", "user").upper()
-        content = turn.get("content", "")
-        lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
-def _format_evidence(evidence: List[Dict[str, Any]]) -> str:
-    """Number evidence chunks as [SOURCE-N] with metadata."""
-    if not evidence:
-        return "(No evidence provided.)"
-    blocks: List[str] = []
-    for idx, item in enumerate(evidence, start=1):
-        header_parts: List[str] = [f"[SOURCE-{idx}]"]
-        if item.get("source_name"):
-            header_parts.append(f"source_name={item['source_name']}")
-        if item.get("section"):
-            header_parts.append(f"section={item['section']}")
-        if item.get("page") is not None:
-            header_parts.append(f"page={item['page']}")
-        if item.get("relevance_score") is not None:
-            header_parts.append(f"relevance={item['relevance_score']}")
-        header = " | ".join(header_parts)
-        text = item.get("text", "")
-        blocks.append(f"{header}\n{text}")
-    return "\n\n".join(blocks)
-
-
-def _format_doc_context(doc_context: Optional[Dict[str, Any]]) -> str:
-    """Render document intelligence context as key-value lines."""
-    if not doc_context:
-        return ""
-    lines: List[str] = []
-    for key, value in doc_context.items():
-        if isinstance(value, list):
-            lines.append(f"- {key}: {', '.join(str(v) for v in value)}")
-        else:
-            lines.append(f"- {key}: {value}")
-    return "\n".join(lines)
-
-
-def _format_doc_intelligence(doc_intel: Optional[Dict[str, Any]]) -> str:
-    """Render document intelligence metadata for UNDERSTAND prompt."""
-    if not doc_intel:
-        return "(No document intelligence available.)"
-    lines: List[str] = []
-    for key, value in doc_intel.items():
-        if isinstance(value, list):
-            lines.append(f"- {key}: {', '.join(str(v) for v in value)}")
-        else:
-            lines.append(f"- {key}: {value}")
-    return "\n".join(lines) if lines else "(No document intelligence available.)"
-
-
-# ---------------------------------------------------------------------------
-# UNDERSTAND prompt
-# ---------------------------------------------------------------------------
+_UNDERSTAND_SYSTEM = (
+    "You are a document intelligence query analyzer. "
+    "Given a user query, conversation history, and document metadata, "
+    "produce a JSON analysis of what the user needs.\n\n"
+    "Rules:\n"
+    "- Decompose multi-part queries into sub-intents.\n"
+    "- Resolve pronouns using conversation history.\n"
+    "- Infer output format from query semantics "
+    "(table for comparisons, bullets for lists, sections for summaries, prose for factual).\n"
+    "- Assess complexity: 'simple' if single document/fact, 'complex' if cross-document or multi-step.\n"
+    "- Identify which documents are relevant using the document intelligence metadata.\n"
+    "- If the query is conversational (greeting, thanks, meta-question), set task_type to 'conversational'.\n"
+)
 
 
 def build_understand_prompt(
     query: str,
-    doc_intelligence: Optional[Dict[str, Any]] = None,
-    conversation_history: Optional[List[Dict[str, str]]] = None,
+    doc_intelligence: List[Dict[str, Any]],
+    conversation_history: Optional[List[Dict[str, str]]],
 ) -> str:
-    """Build the UNDERSTAND prompt for intent analysis.
+    """Build the UNDERSTAND prompt that analyzes user intent.
 
-    Parameters
-    ----------
-    query:
-        The user's raw question.
-    doc_intelligence:
-        Metadata about the document corpus (topics, doc types, profiles, etc.).
-    conversation_history:
-        Prior turns of conversation; last 5 are included.
+    Args:
+        query: The user's question.
+        doc_intelligence: List of document intelligence dicts with keys:
+            document_id, profile_id, profile_name, summary, entities,
+            answerable_topics.
+        conversation_history: Recent turns as [{"query": ..., "response": ...}].
 
-    Returns
-    -------
-    str
-        The fully assembled UNDERSTAND prompt.
+    Returns:
+        Complete prompt string for the UNDERSTAND LLM call.
     """
-    history_block = _format_history(_trim_history(conversation_history, 5))
-    doc_intel_block = _format_doc_intelligence(doc_intelligence)
+    parts = [_UNDERSTAND_SYSTEM, ""]
 
-    sections: List[str] = ["## UNDERSTAND — Intent Analysis"]
+    # Conversation context
+    if conversation_history:
+        parts.append("CONVERSATION HISTORY:")
+        for turn in conversation_history[-5:]:  # last 5 turns max
+            parts.append(f"  User: {turn.get('query', '')}")
+            resp = turn.get("response", "")
+            if isinstance(resp, dict):
+                resp = resp.get("response", str(resp))
+            parts.append(f"  DocWain: {str(resp)[:300]}")
+        parts.append("")
 
-    if history_block:
-        sections.append(f"### Conversation History\n{history_block}")
+    # Document intelligence context
+    if doc_intelligence:
+        parts.append("AVAILABLE DOCUMENTS:")
+        for doc in doc_intelligence:
+            doc_id = doc.get("document_id", "unknown")
+            profile = doc.get("profile_name", doc.get("profile_id", "unknown"))
+            summary = doc.get("summary", "No summary available")
+            entities = doc.get("entities", [])
+            topics = doc.get("answerable_topics", [])
 
-    sections.append(f"### Document Intelligence\n{doc_intel_block}")
-    sections.append(
-        f"### User Query\n{query}\n\n"
-        "Analyze this query against the document intelligence above. "
-        "Determine:\n"
-        "1. The user's intent and what information they need.\n"
-        "2. The task type (extract, compare, summarize, investigate, "
-        "lookup, aggregate, list).\n"
-        "3. The optimal output format (table, bullets, sections, "
-        "numbered, prose).\n"
-        "4. Key entities, constraints, and filters to apply during "
-        "retrieval."
+            parts.append(f"  [{doc_id}] Profile: {profile}")
+            parts.append(f"    Summary: {summary}")
+            if entities:
+                entity_strs = [
+                    e.get("name", str(e)) if isinstance(e, dict) else str(e)
+                    for e in entities[:10]
+                ]
+                parts.append(f"    Entities: {', '.join(entity_strs)}")
+            if topics:
+                parts.append(f"    Topics: {', '.join(topics[:10])}")
+            parts.append("")
+    else:
+        parts.append("AVAILABLE DOCUMENTS: None found in this subscription.\n")
+
+    # Query
+    parts.append(f"USER QUERY: {query}")
+    parts.append("")
+
+    # Expected output — JSON schema
+    parts.append(
+        "Respond ONLY with JSON (no markdown fences):\n"
+        "{\n"
+        '  "task_type": "extract | compare | summarize | investigate | lookup | aggregate | list | conversational",\n'
+        '  "complexity": "simple | complex",\n'
+        '  "resolved_query": "query with pronouns resolved from conversation",\n'
+        '  "output_format": "table | bullets | sections | numbered | prose",\n'
+        '  "relevant_documents": [\n'
+        '    {"document_id": "...", "profile_id": "...", "reason": "why this doc is relevant"}\n'
+        "  ],\n"
+        '  "cross_profile": true | false,\n'
+        '  "sub_tasks": ["sub-task 1", "sub-task 2"] | null,\n'
+        '  "entities": ["entity1", "entity2"],\n'
+        '  "needs_clarification": false,\n'
+        '  "clarification_question": null\n'
+        "}"
     )
 
-    return "\n\n".join(sections)
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# REASON prompt
+# REASON prompt — generates the answer from evidence
 # ---------------------------------------------------------------------------
 
 
@@ -236,61 +211,105 @@ def build_reason_prompt(
     doc_context: Optional[Dict[str, Any]] = None,
     conversation_history: Optional[List[Dict[str, str]]] = None,
 ) -> str:
-    """Build the REASON prompt for answer generation.
+    """Build the REASON prompt that generates the final answer.
 
-    Parameters
-    ----------
-    query:
-        The user's question.
-    task_type:
-        One of the TASK_FORMATS keys.
-    output_format:
-        One of the _OUTPUT_FORMATS keys.
-    evidence:
-        Retrieved and reranked evidence chunks.
-    doc_context:
-        Document intelligence context (orientation).
-    conversation_history:
-        Prior turns; last 3 are included.
+    Args:
+        query: The resolved user query.
+        task_type: From UNDERSTAND step (extract, compare, etc.).
+        output_format: From UNDERSTAND step (table, bullets, etc.).
+        evidence: Ranked evidence chunks, each with:
+            source_name, section, page, text, score, source_index.
+        doc_context: Aggregated document intelligence context with:
+            summary, entities, key_facts (optional fields).
+        conversation_history: Recent conversation turns as
+            [{"query": ..., "response": ...}].
 
-    Returns
-    -------
-    str
-        The fully assembled REASON prompt.
+    Returns:
+        Complete prompt string for the REASON LLM call.
     """
-    history_block = _format_history(_trim_history(conversation_history, 3))
-    doc_ctx_block = _format_doc_context(doc_context)
-    evidence_block = _format_evidence(evidence)
-    task_instruction = TASK_FORMATS.get(task_type, TASK_FORMATS["extract"])
+    parts = []
+
+    # Document intelligence context (orientation before evidence)
+    if doc_context:
+        parts.append("--- DOCUMENT INTELLIGENCE ---")
+        if doc_context.get("summary"):
+            parts.append(f"Overview: {doc_context['summary']}")
+        if doc_context.get("entities"):
+            entity_strs = []
+            for e in doc_context["entities"][:15]:
+                if isinstance(e, dict):
+                    name = e.get("name", "")
+                    etype = e.get("type", "")
+                    context = e.get("context", "")
+                    entry = f"{name} ({etype})" if etype else name
+                    if context:
+                        entry += f" — {context}"
+                    entity_strs.append(entry)
+                else:
+                    entity_strs.append(str(e))
+            parts.append(f"Key entities: {'; '.join(entity_strs)}")
+        if doc_context.get("key_facts"):
+            parts.append("Key facts:")
+            for fact in doc_context["key_facts"][:10]:
+                parts.append(f"  - {fact}")
+        parts.append("--- END DOCUMENT INTELLIGENCE ---")
+        parts.append("")
+
+    # Evidence block
+    parts.append("--- EVIDENCE ---")
+    if evidence:
+        for item in evidence:
+            idx = item.get("source_index", 0)
+            name = item.get("source_name", "unknown")
+            section = item.get("section", "")
+            page = item.get("page", "")
+            score = item.get("score", 0)
+            text = item.get("text", "")
+
+            header_parts = [f"[SOURCE-{idx}]", name]
+            if section:
+                header_parts.append(f"| Section: {section}")
+            if page:
+                header_parts.append(f"| p.{page}")
+            header_parts.append(f"(relevance: {score:.2f})")
+
+            parts.append(" ".join(header_parts))
+            parts.append(text)
+            parts.append("")
+    else:
+        parts.append("No evidence found in the uploaded documents.")
+        parts.append("")
+    parts.append("--- END EVIDENCE ---")
+    parts.append("")
+
+    # Conversation context
+    if conversation_history:
+        parts.append("CONVERSATION CONTEXT:")
+        for turn in conversation_history[-3:]:
+            parts.append(f"  User: {turn.get('query', '')}")
+            resp = turn.get("response", "")
+            if isinstance(resp, dict):
+                resp = resp.get("response", str(resp))
+            parts.append(f"  DocWain: {str(resp)[:200]}")
+        parts.append("")
+
+    # Task instruction
+    task_instruction = TASK_FORMATS.get(task_type, TASK_FORMATS["lookup"])
+    parts.append(task_instruction)
+
+    # Output format
     format_instruction = _OUTPUT_FORMATS.get(output_format, _OUTPUT_FORMATS["prose"])
+    parts.append(f"FORMAT: {format_instruction}")
+    parts.append("")
 
-    sections: List[str] = ["## REASON — Answer Generation"]
+    # The question
+    parts.append(f"QUESTION: {query}")
 
-    # Task + output instructions
-    sections.append(
-        f"### Task Instructions\n{task_instruction}\n\n"
-        f"### Output Format\n{format_instruction}"
-    )
-
-    # Conversation history (if any)
-    if history_block:
-        sections.append(f"### Conversation History\n{history_block}")
-
-    # Document context BEFORE evidence (orientation first)
-    if doc_ctx_block:
-        sections.append(f"### Document Context\n{doc_ctx_block}")
-
-    # Evidence
-    sections.append(f"### Evidence\n{evidence_block}")
-
-    # Query
-    sections.append(f"### Query\n{query}")
-
-    return "\n\n".join(sections)
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Sub-agent prompt
+# Sub-agent prompt — focused task for dynamic sub-agents
 # ---------------------------------------------------------------------------
 
 
@@ -301,33 +320,44 @@ def build_subagent_prompt(
 ) -> str:
     """Build a focused prompt for a dynamic sub-agent.
 
-    Parameters
-    ----------
-    role:
-        The specialist role the sub-agent should adopt (e.g.,
-        "financial analyst", "legal reviewer").
-    evidence:
-        Evidence chunks relevant to the sub-agent's task.
-    doc_context:
-        Optional document intelligence context.
+    Args:
+        role: Description of what this sub-agent should do.
+        evidence: Evidence chunks scoped to this sub-agent's task.
+        doc_context: Document intelligence for relevant documents.
 
-    Returns
-    -------
-    str
-        The fully assembled sub-agent prompt.
+    Returns:
+        Complete prompt string for the sub-agent LLM call.
     """
-    evidence_block = _format_evidence(evidence)
-    doc_ctx_block = _format_doc_context(doc_context)
-
-    sections: List[str] = [
-        f"## Sub-Agent: {role.title()}",
-        f"You are a specialist {role.lower()}. Analyze the evidence below "
-        "from your domain expertise. Provide precise, well-cited findings.",
+    parts = [
+        "You are a document analysis sub-agent. Your specific task:",
+        f"  {role}",
+        "",
+        "Rules: Use ONLY the evidence below. Be precise. Use exact values.",
+        "If the evidence doesn't contain what's needed, say so.",
+        "",
     ]
 
-    if doc_ctx_block:
-        sections.append(f"### Document Context\n{doc_ctx_block}")
+    # Document context
+    if doc_context:
+        if doc_context.get("summary"):
+            parts.append(f"Document context: {doc_context['summary']}")
+            parts.append("")
 
-    sections.append(f"### Evidence\n{evidence_block}")
+    # Evidence
+    parts.append("--- EVIDENCE ---")
+    if evidence:
+        for item in evidence:
+            idx = item.get("source_index", 0)
+            name = item.get("source_name", "unknown")
+            score = item.get("score", 0)
+            text = item.get("text", "")
 
-    return "\n\n".join(sections)
+            parts.append(f"[SOURCE-{idx}] {name} (relevance: {score:.2f})")
+            parts.append(text)
+            parts.append("")
+    else:
+        parts.append("No evidence provided.")
+        parts.append("")
+    parts.append("--- END EVIDENCE ---")
+
+    return "\n".join(parts)
