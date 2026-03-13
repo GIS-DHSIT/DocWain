@@ -94,12 +94,15 @@ class IntentAnalyzer:
         profile_id: str,
         doc_intelligence: List[Dict[str, Any]],
         conversation_history: Optional[List[Dict[str, str]]],
+        kg_hints: Optional[Dict[str, Any]] = None,
     ) -> QueryUnderstanding:
         """Analyze user intent and return a structured QueryUnderstanding.
 
         Fast-paths greetings/farewells/meta questions without an LLM call.
         For real queries, builds a prompt via ``build_understand_prompt`` and
-        parses the LLM's JSON response.
+        parses the LLM's JSON response.  After parsing, enriches
+        ``relevant_documents`` using answerable_topics overlap and optional
+        KG entity hints.
         """
         # Fast-path: conversational queries need no LLM call
         if self._is_conversational(query):
@@ -124,9 +127,73 @@ class IntentAnalyzer:
             )
         except Exception:
             logger.exception("LLM call failed for intent analysis")
-            return self._safe_defaults(query)
+            result = self._safe_defaults(query)
+            self._enrich_relevant_documents(result, query, doc_intelligence, kg_hints)
+            return result
 
-        return self._parse_response(raw, query)
+        result = self._parse_response(raw, query)
+        self._enrich_relevant_documents(result, query, doc_intelligence, kg_hints)
+        return result
+
+    # -- enrichment ---------------------------------------------------------
+
+    @staticmethod
+    def _match_topics(
+        query: str,
+        doc_intelligence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Score documents by word overlap between query and answerable_topics.
+
+        Returns list of ``{"document_id": str, "topic_score": int}`` sorted
+        by score descending, only including documents with score > 0.
+        """
+        query_words = set(query.lower().split())
+        results: List[Dict[str, Any]] = []
+
+        for doc in doc_intelligence:
+            doc_id = doc.get("document_id")
+            if not doc_id:
+                continue
+            intel = doc.get("intelligence") or {}
+            topics: List[str] = intel.get("answerable_topics") or []
+            if not topics:
+                continue
+
+            best_score = 0
+            for topic in topics:
+                topic_words = set(topic.lower().split())
+                overlap = len(query_words & topic_words)
+                if overlap > best_score:
+                    best_score = overlap
+
+            if best_score > 0:
+                results.append({"document_id": doc_id, "topic_score": best_score})
+
+        results.sort(key=lambda x: x["topic_score"], reverse=True)
+        return results
+
+    @staticmethod
+    def _enrich_relevant_documents(
+        result: QueryUnderstanding,
+        query: str,
+        doc_intelligence: List[Dict[str, Any]],
+        kg_hints: Optional[Dict[str, Any]],
+    ) -> None:
+        """Enrich relevant_documents with topic matches and KG hints."""
+        existing_ids = {d.get("document_id") for d in result.relevant_documents}
+
+        # Add topic-matched documents
+        for match in IntentAnalyzer._match_topics(query, doc_intelligence):
+            if match["document_id"] not in existing_ids:
+                result.relevant_documents.append(match)
+                existing_ids.add(match["document_id"])
+
+        # Add KG-hinted documents
+        if kg_hints:
+            for doc_id in kg_hints.get("target_doc_ids", []):
+                if doc_id not in existing_ids:
+                    result.relevant_documents.append({"document_id": doc_id, "source": "kg"})
+                    existing_ids.add(doc_id)
 
     # -- internals ----------------------------------------------------------
 
