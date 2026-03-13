@@ -27,19 +27,25 @@ def _get_core_agent():
 
         llm = get_llm_gateway()
         qdrant = QdrantClient(
-            host=Config.Qdrant.HOST,
-            port=Config.Qdrant.PORT,
-            api_key=getattr(Config.Qdrant, "API_KEY", None),
+            url=Config.Qdrant.URL,
+            api_key=Config.Qdrant.API,
         )
         embedder = embed_request_context()
         mongo_client = MongoClient(Config.MongoDB.URI)
         mongodb = mongo_client[Config.MongoDB.DB][Config.MongoDB.DOCUMENTS]
+
+        try:
+            from src.intelligence.kg_query import KGQueryService
+            kg_service = KGQueryService()
+        except Exception:
+            kg_service = None
 
         _core_agent = CoreAgent(
             llm_gateway=llm,
             qdrant_client=qdrant,
             embedder=embedder,
             mongodb=mongodb,
+            kg_query_service=kg_service,
         )
     return _core_agent
 

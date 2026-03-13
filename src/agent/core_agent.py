@@ -68,12 +68,14 @@ class CoreAgent:
         qdrant_client: Any,
         embedder: Any,
         mongodb: Any,
+        kg_query_service: Any = None,
     ) -> None:
         self._llm = llm_gateway
         self._mongodb = mongodb
         self._intent_analyzer = IntentAnalyzer(llm_gateway=llm_gateway)
         self._retriever = UnifiedRetriever(qdrant_client=qdrant_client, embedder=embedder)
         self._reasoner = Reasoner(llm_gateway=llm_gateway)
+        self.kg_query_service = kg_query_service
 
     # ------------------------------------------------------------------
     # Public API
@@ -108,8 +110,28 @@ class CoreAgent:
             for d in doc_intelligence
         }
 
+        # KG probe — extract entities from query and find related docs/chunks
+        kg_hints: Dict[str, Any] = {}
+        if self.kg_query_service:
+            try:
+                query_entities = self.kg_query_service.extract_entities(query)
+                if query_entities:
+                    kg_result = self.kg_query_service.query(
+                        subscription_id=subscription_id,
+                        profile_id=profile_id,
+                        domain_hint=None,
+                        entities=query_entities,
+                    )
+                    kg_hints = {
+                        "target_doc_ids": kg_result.doc_ids,
+                        "target_chunk_ids": kg_result.chunk_ids,
+                    }
+            except Exception as exc:
+                logger.debug("KG probe failed (non-fatal): %s", exc)
+
         understanding = self._intent_analyzer.analyze(
             query, subscription_id, profile_id, doc_intelligence, conversation_history,
+            kg_hints=kg_hints,
         )
         timing["understand_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
@@ -130,6 +152,17 @@ class CoreAgent:
             ]
             if doc_ids:
                 document_ids = doc_ids
+
+        # Merge KG-hinted doc IDs into retrieval scope
+        kg_doc_ids = kg_hints.get("target_doc_ids", [])
+        if kg_doc_ids:
+            if document_ids is None:
+                document_ids = list(kg_doc_ids)
+            else:
+                existing = set(document_ids)
+                for did in kg_doc_ids:
+                    if did not in existing:
+                        document_ids.append(did)
 
         retrieval_result = self._retriever.retrieve(
             understanding.resolved_query,
