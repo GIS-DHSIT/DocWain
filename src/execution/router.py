@@ -40,12 +40,23 @@ def _get_core_agent():
         except Exception:
             kg_service = None
 
+        # Get cross-encoder from app state (loaded at startup on CPU)
+        ce = None
+        try:
+            from src.api.rag_state import get_app_state
+            app_state = get_app_state()
+            if app_state:
+                ce = getattr(app_state, "reranker", None)
+        except Exception:
+            pass
+
         _core_agent = CoreAgent(
             llm_gateway=llm,
             qdrant_client=qdrant,
             embedder=embedder,
             mongodb=mongodb,
             kg_query_service=kg_service,
+            cross_encoder=ce,
         )
     return _core_agent
 

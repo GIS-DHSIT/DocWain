@@ -116,6 +116,13 @@ class IntentAnalyzer:
                 cross_profile=False,
             )
 
+        # Fast-path: simple queries with clear intent patterns (skip LLM call)
+        heuristic = self._heuristic_classify(query, conversation_history)
+        if heuristic is not None:
+            logger.debug("Fast-path heuristic: %s -> %s", query[:60], heuristic.task_type)
+            self._enrich_relevant_documents(heuristic, query, doc_intelligence, kg_hints)
+            return heuristic
+
         # Build prompt and call LLM
         prompt = build_understand_prompt(query, doc_intelligence, conversation_history)
         try:
@@ -196,6 +203,61 @@ class IntentAnalyzer:
                     existing_ids.add(doc_id)
 
     # -- internals ----------------------------------------------------------
+
+    @staticmethod
+    def _heuristic_classify(
+        query: str,
+        conversation_history: Optional[List[Dict[str, str]]],
+    ) -> Optional[QueryUnderstanding]:
+        """Fast heuristic classification for unambiguous query patterns.
+
+        Returns None if the query is ambiguous and needs LLM analysis.
+        Only fires for simple, single-turn queries without pronoun references.
+        """
+        q = query.strip().lower()
+
+        # Skip heuristic if query likely references conversation context
+        if conversation_history and any(w in q for w in ["it", "that", "this", "those", "them", "the same"]):
+            return None
+
+        # Skip very short or very long queries (ambiguous or complex)
+        if len(q) < 10 or len(q) > 300:
+            return None
+
+        # Pattern matching for clear intent signals
+        task_type: Optional[str] = None
+        output_format = "prose"
+
+        if any(q.startswith(w) for w in ["list ", "list all ", "enumerate ", "name all "]):
+            task_type = "list"
+            output_format = "bullets"
+        elif any(q.startswith(w) for w in ["compare ", "contrast "]) or " vs " in q or " versus " in q:
+            task_type = "compare"
+            output_format = "table"
+        elif any(q.startswith(w) for w in ["summarize ", "summary of ", "give me a summary", "overview of "]):
+            task_type = "summarize"
+            output_format = "sections"
+        elif any(q.startswith(w) for w in ["extract ", "what is the ", "what are the "]):
+            task_type = "extract"
+            output_format = "prose"
+        elif any(w in q for w in ["how many", "total ", "count ", "sum of"]):
+            task_type = "aggregate"
+            output_format = "prose"
+        elif any(w in q for w in ["risk", "concern", "issue", "problem", "investigate", "analyze "]):
+            task_type = "investigate"
+            output_format = "sections"
+
+        if task_type is None:
+            return None
+
+        return QueryUnderstanding(
+            task_type=task_type,
+            complexity="simple",
+            resolved_query=query,
+            output_format=output_format,
+            relevant_documents=[],
+            cross_profile=False,
+        )
 
     @staticmethod
     def _is_conversational(query: str) -> bool:
