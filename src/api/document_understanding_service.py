@@ -8,7 +8,7 @@ from src.api.content_store import load_extracted_pickle
 from src.api.document_status import set_error, update_document_fields, update_stage
 from src.api.embedding_service import embed_documents
 from src.api.extraction_service import extract_uploaded_document
-from src.doc_understanding import build_content_map, identify_document, understand_document
+from src.doc_understanding import build_content_map, identify_document
 from src.metadata.normalizer import MetadataNormalizationError, normalize_document_metadata
 from src.profiles.profile_store import resolve_profile_name
 
@@ -88,17 +88,45 @@ def run_document_understanding(
     content_map = build_content_map(extracted)
     update_document_fields(document_id, {"content_map": content_map})
 
-    understanding = understand_document(extracted=extracted, doc_type=identification.document_type, model_name=model_name)
+    # Deep intelligence analysis (replaces legacy understand_document)
+    from src.intelligence_v2.analyzer import DocumentAnalyzer
+    from src.llm.gateway import get_llm_gateway
+    from src.api.config import Config
+    from pymongo import MongoClient
 
-    understanding_update = {
-        "document_summary": understanding.get("document_summary"),
-        "section_summaries": understanding.get("section_summaries"),
-        "key_entities": understanding.get("key_entities"),
-        "key_facts": understanding.get("key_facts"),
-        "doc_intent_tags": understanding.get("intent_tags"),
-        "understanding_json": understanding,
-    }
-    update_document_fields(document_id, understanding_update)
+    llm = get_llm_gateway()
+    mongo_client = MongoClient(Config.MongoDB.URI)
+    mongodb = mongo_client[Config.MongoDB.DB][Config.MongoDB.DOCUMENTS]
+
+    try:
+        from src.kg.neo4j_store import Neo4jStore
+        neo4j = Neo4jStore()
+    except Exception:
+        neo4j = None
+
+    if neo4j is not None:
+        analyzer = DocumentAnalyzer(llm_gateway=llm, neo4j_store=neo4j, mongodb=mongodb)
+        intel_result = analyzer.analyze(
+            document_id=document_id,
+            extracted=extracted,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            filename=filename,
+            doc_type=identification.document_type,
+        )
+        understanding = intel_result["intelligence"]
+    else:
+        # Fallback: LLM analysis without KG
+        from src.intelligence_v2.summarizer import DocumentSummarizer
+        from src.intelligence_v2.analyzer import _get_text
+        summarizer = DocumentSummarizer(llm_gateway=llm)
+        text = _get_text(extracted)
+        analysis = summarizer.analyze(text=text, filename=filename, doc_type=identification.document_type)
+        understanding = analysis.to_dict()
+        mongodb.update_one(
+            {"document_id": document_id},
+            {"$set": {"intelligence": understanding, "intelligence_ready": True}},
+        )
 
     update_stage(
         document_id,
