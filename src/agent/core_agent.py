@@ -191,6 +191,21 @@ class CoreAgent:
         evidence, doc_context = build_context(reranked, doc_intelligence_dict)
         timing["retrieve_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
+        # --- POST-RETRIEVAL DOMAIN DISPATCH ---
+        if agent_name:
+            post_domain_result = self._domain_dispatcher.try_handle(
+                query=understanding.resolved_query,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                evidence=evidence,
+                doc_context=doc_context,
+                agent_name=agent_name,
+                document_id=document_id,
+            )
+            if post_domain_result is not None:
+                post_domain_result.setdefault("metadata", {})["timing"] = timing
+                return post_domain_result
+
         # --- REASON ---
         t0 = time.monotonic()
         use_thinking = understanding.complexity == "complex"
