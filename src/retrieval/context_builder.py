@@ -57,7 +57,7 @@ def build_context(
         for e in intel.get("entities", []):
             if e not in entities:
                 entities.append(e)
-        for f in intel.get("key_facts", []):
+        for f in intel.get("key_facts") or intel.get("facts") or []:
             if f not in key_facts:
                 key_facts.append(f)
 
@@ -65,8 +65,8 @@ def build_context(
     if summaries:
         doc_context["summary"] = " ".join(summaries)
     if entities:
-        doc_context["entities"] = entities
+        doc_context["entities"] = entities[:20]
     if key_facts:
-        doc_context["key_facts"] = key_facts
+        doc_context["key_facts"] = key_facts[:15]
 
     return evidence, doc_context
