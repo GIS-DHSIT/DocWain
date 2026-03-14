@@ -1,10 +1,13 @@
 """
 LLM Gateway - unified interface to language model backends.
 
-Primary: Azure GPT-4o via OpenAIClient
-Fallback: Ollama (cloud or local) via OllamaClient
+Response generation:
+    Primary: Ollama Cloud qwen3.5:397b (high-quality reasoning)
+    Fallback: Azure GPT-4o
 
-Public API (unchanged):
+Document processing uses get_local_client() → local qwen3:14b (fast).
+
+Public API:
     create_llm_gateway() -> LLMGateway
     get_llm_gateway()    -> LLMGateway
     set_llm_gateway(gw)  -> None
@@ -12,6 +15,7 @@ Public API (unchanged):
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import threading
@@ -108,10 +112,25 @@ class LLMGateway:
     def _init_clients(self) -> None:
         """Create backend clients based on configuration.
 
-        Primary: Azure GPT-4o (paid, high-quality reasoning)
-        Fallback: Ollama Cloud (for when Azure is unavailable)
+        Primary: Ollama Cloud qwen3.5:397b (high-quality response generation)
+        Fallback: Azure GPT-4o (for when Ollama Cloud is unavailable)
+
+        Document processing uses a separate local qwen3:14b client
+        via get_local_client() — not this gateway.
         """
-        # --- Azure GPT-4o (primary) ---
+        # --- Ollama Cloud (primary — response generation) ---
+        cloud_model = os.getenv("OLLAMA_CLOUD_MODEL", "qwen3.5:397b")
+        try:
+            from src.llm.clients import OllamaClient
+            self._primary = OllamaClient(model_name=cloud_model)
+            self.backend = "ollama"
+            self.model_name = self._primary.model_name
+            logger.info("Ollama Cloud primary client initialised (model=%s)", self.model_name)
+        except Exception as exc:
+            logger.warning("Failed to create Ollama Cloud client: %s — falling back to Azure GPT-4o", exc)
+            self._primary = None
+
+        # --- Azure GPT-4o (fallback) ---
         try:
             from src.llm.clients import OpenAIClient
             endpoint = Config.AzureGpt4o.AZUREGPT4O_ENDPOINT
@@ -120,39 +139,29 @@ class LLMGateway:
             api_version = Config.AzureGpt4o.AZUREGPT4O_Version
             if not endpoint or not api_key:
                 raise ValueError("AZUREGPT4O_ENDPOINT or AZUREGPT4O_API_KEY not configured")
-            self._primary = OpenAIClient(
+            fallback_client = OpenAIClient(
                 endpoint=endpoint,
                 api_key=api_key,
                 deployment=deployment,
                 api_version=api_version,
             )
-            self.backend = "azure_openai"
-            self.model_name = self._primary.model_name
-            logger.info("Azure GPT-4o primary client initialised (model=%s)", self.model_name)
-        except Exception as exc:
-            logger.warning("Failed to create Azure GPT-4o client: %s — falling back to Ollama", exc)
-            self._primary = None
-
-        # --- Ollama (fallback) ---
-        try:
-            from src.llm.clients import OllamaClient
-            self._fallback = OllamaClient()
             if self._primary is None:
-                self._primary = self._fallback
+                self._primary = fallback_client
                 self._fallback = None
-                self.backend = "ollama"
+                self.backend = "azure_openai"
                 self.model_name = self._primary.model_name
-                logger.info("Ollama fallback promoted to primary (model=%s)", self.model_name)
+                logger.info("Azure GPT-4o promoted to primary (model=%s)", self.model_name)
             else:
-                logger.info("Ollama fallback client ready (model=%s)", self._fallback.model_name)
+                self._fallback = fallback_client
+                logger.info("Azure GPT-4o fallback client ready (model=%s)", fallback_client.model_name)
         except Exception as exc:
-            logger.warning("Failed to create Ollama fallback: %s", exc)
+            logger.warning("Failed to create Azure GPT-4o fallback: %s", exc)
 
         if self._primary is None:
             logger.error("No LLM backend available - all calls will fail")
 
     def _pick_client(self):
-        """Return the best available client (Azure GPT-4o primary, Ollama fallback)."""
+        """Return the best available client (Ollama Cloud primary, Azure GPT-4o fallback)."""
         if self._primary is not None:
             # If primary is in cooldown, try fallback
             if hasattr(self._primary, "in_cooldown") and self._primary.in_cooldown():
