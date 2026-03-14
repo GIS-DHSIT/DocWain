@@ -1,4 +1,4 @@
-# Lightweight CI dependencies — excludes GPU/ML packages that need CUDA
+# Lightweight CI dependencies — installs torch CPU-only separately in workflow
 botbuilder==0.0.1
 botbuilder_core==4.17.0
 botbuilder_schema==4.17.0
@@ -28,6 +28,7 @@ qdrant_client
 redis
 Requests
 scikit_learn
+datasets
 sentence_transformers
 transformers
 uvicorn
