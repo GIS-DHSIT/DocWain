@@ -23,7 +23,9 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements-ci.txt pytest pytest-asyncio pytest-timeout httpx
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-ci.txt pytest pytest-asyncio pytest-timeout httpx
 
       - name: Run tests
         run: |

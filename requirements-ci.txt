@@ -29,7 +29,7 @@ redis
 Requests
 scikit_learn
 sentence_transformers
-spacy
+transformers
 uvicorn
 
 # Azure SDKs
