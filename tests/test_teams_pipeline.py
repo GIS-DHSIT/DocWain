@@ -43,6 +43,10 @@ class TestTeamsDocumentStorage(unittest.TestCase):
         self.assertEqual(record["subscription_id"], "sub-1")
         self.assertEqual(record["profile_id"], "prof-1")
         self.assertEqual(record["status"], STATUS_EXTRACTING)
+        self.assertEqual(record["source"], "teams")
+        self.assertEqual(record["extraction"]["status"], "IN_PROGRESS")
+        self.assertEqual(record["screening"]["status"], "PENDING")
+        self.assertEqual(record["embedding"]["status"], "PENDING")
 
     # ── update_status ───────────────────────────────────────────────
 
@@ -150,6 +154,96 @@ class TestTeamsDocumentStorage(unittest.TestCase):
         self.storage._collection = None
         result = self.storage.get_document("doc-1")
         self.assertIsNone(result)
+
+
+class TestPipelineCards(unittest.TestCase):
+    """Tests for pipeline-specific Adaptive Card templates."""
+
+    def test_identification_card_renders(self):
+        import json
+        from src.teams.cards import build_card
+
+        card = build_card(
+            "identification_card",
+            doc_type="Invoice",
+            confidence="95%",
+            summary="Monthly invoice for cloud services.",
+            entities_text="- Acme Corp\n- $5,000",
+            intent_text="billing",
+            action1_title="View line items",
+            action1_query="What are the line items?",
+            action2_title="Check total",
+            action2_query="What is the total amount?",
+        )
+        rendered = json.dumps(card)
+        assert "Invoice" in rendered
+        assert "95%" in rendered
+        assert "Monthly invoice for cloud services." in rendered
+        assert "Acme Corp" in rendered
+        assert "billing" in rendered
+        assert "Document Identified" in rendered
+        assert "domain_query" in rendered
+
+    def test_screening_consent_card_renders(self):
+        import json
+        from src.teams.cards import build_card
+
+        card = build_card(
+            "screening_consent_card",
+            risk_level="HIGH",
+            risk_score="72/100",
+            findings_text="- PII detected\n- Sensitive financial data",
+            document_id="doc-123",
+        )
+        rendered = json.dumps(card)
+        assert "HIGH" in rendered
+        assert "72/100" in rendered
+        assert "Proceed Anyway" in rendered
+        assert "Cancel Embedding" in rendered
+        assert "doc-123" in rendered
+        assert "pipeline_consent_proceed" in rendered
+        assert "pipeline_consent_reject" in rendered
+        assert "ATTENTION" in rendered
+
+    def test_screening_passed_card_renders(self):
+        import json
+        from src.teams.cards import build_card
+
+        card = build_card(
+            "screening_passed_card",
+            risk_level="LOW",
+            risk_score="8/100",
+        )
+        rendered = json.dumps(card)
+        assert "PASSED" in rendered
+        assert "LOW" in rendered
+        assert "No significant findings" in rendered
+
+    def test_embedding_complete_card_renders(self):
+        import json
+        from src.teams.cards import build_card
+
+        card = build_card(
+            "embedding_complete_card",
+            filename="report.pdf",
+            chunks_count="42",
+            quality_text="A (Excellent)",
+            question1="What is the main topic?",
+            question2="Summarize the key findings",
+            question3="What are the recommendations?",
+            action1_title="Ask a question",
+            action1_query="What is this document about?",
+        )
+        rendered = json.dumps(card)
+        assert "report.pdf" in rendered
+        assert "42" in rendered
+        assert "A (Excellent)" in rendered
+        assert "What is the main topic?" in rendered
+        assert "Summarize the key findings" in rendered
+        assert "What are the recommendations?" in rendered
+        assert "Document Ready" in rendered
+        assert "Summarize" in rendered
+        assert "summarize_recent" in rendered
 
 
 if __name__ == "__main__":

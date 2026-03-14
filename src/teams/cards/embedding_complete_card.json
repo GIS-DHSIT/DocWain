@@ -1,0 +1,82 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Document Ready",
+      "weight": "Bolder",
+      "size": "Medium",
+      "color": "Good"
+    },
+    {
+      "type": "TextBlock",
+      "text": "\"{filename}\" is now ready for questions.",
+      "wrap": true,
+      "spacing": "Small"
+    },
+    {
+      "type": "ColumnSet",
+      "spacing": "Small",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Chunks: {chunks_count}",
+              "size": "Small",
+              "isSubtle": true
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Quality: {quality_text}",
+              "size": "Small",
+              "isSubtle": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Medium",
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "Try asking:",
+          "weight": "Bolder",
+          "size": "Small",
+          "color": "Accent"
+        },
+        {
+          "type": "TextBlock",
+          "text": "- {question1}\n- {question2}\n- {question3}",
+          "wrap": true,
+          "size": "Small"
+        }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.Submit",
+      "title": "{action1_title}",
+      "data": { "action": "domain_query", "query": "{action1_query}" }
+    },
+    {
+      "type": "Action.Submit",
+      "title": "Summarize",
+      "data": { "action": "summarize_recent" }
+    }
+  ]
+}
