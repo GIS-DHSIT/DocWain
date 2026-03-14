@@ -24,10 +24,15 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio httpx
+          pip install pytest pytest-asyncio pytest-timeout httpx
 
-      - name: Run tests
-        run: python -m pytest tests/ -v --tb=short -q
+      - name: Run tests (unit tests only — no external services needed)
+        run: |
+          python -m pytest \
+            tests/test_teams_pipeline.py \
+            tests/test_teams_pipeline_e2e.py \
+            tests/test_enhanced_embedding_simple.py \
+            -v --tb=short -q --timeout=60
         env:
           MICROSOFT_APP_ID: "test-app-id"
           MICROSOFT_APP_PASSWORD: "test-password"
