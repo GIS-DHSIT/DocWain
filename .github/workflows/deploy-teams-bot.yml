@@ -1,20 +1,11 @@
-name: Deploy DocWain Teams Bot
+name: Deploy DocWain
 
 on:
   push:
-    branches: [main, release/*]
-    paths:
-      - 'src/**'
-      - 'teams-app/**'
-      - 'Dockerfile'
-      - 'requirements.txt'
-      - '.github/workflows/deploy-teams-bot.yml'
+    branches: [main]
   workflow_dispatch:
 
 env:
-  AZURE_RESOURCE_GROUP: rg-docwain-dev
-  AZURE_BOT_NAME: dhs-docwain-bot
-  AZURE_WEBAPP_NAME: docwain-api
   ACR_LOGIN_SERVER: dhsaiacr.azurecr.io
   IMAGE_NAME: docwain-api
 
@@ -36,79 +27,31 @@ jobs:
           pip install pytest pytest-asyncio httpx
 
       - name: Run tests
-        run: |
-          python -m pytest tests/ -v --tb=short -q
+        run: python -m pytest tests/ -v --tb=short -q
         env:
           MICROSOFT_APP_ID: "test-app-id"
           MICROSOFT_APP_PASSWORD: "test-password"
           MICROSOFT_APP_TENANT_ID: "test-tenant-id"
           MICROSOFT_APP_TYPE: "SingleTenant"
 
-  build-and-push:
+  build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
-    outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Log in to Azure Container Registry
+      - name: Log in to ACR
         uses: azure/docker-login@v2
         with:
           login-server: ${{ env.ACR_LOGIN_SERVER }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Build and push Docker image
-        id: meta
+      - name: Build and push image
         run: |
-          TAG="${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
-          LATEST="${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
-          docker build -t "$TAG" -t "$LATEST" .
-          docker push "$TAG"
-          docker push "$LATEST"
-          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
-
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Deploy container to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          publish-profile: ${{ secrets.AZURE_PUBLISH_PROFILE }}
-          images: ${{ needs.build-and-push.outputs.image_tag }}
-
-      - name: Health Check
-        run: |
-          echo "Waiting 45s for container to start..."
-          sleep 45
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://docwain-api.azurewebsites.net/ || echo "000")
-          if [ "$STATUS" -eq 200 ] || [ "$STATUS" -eq 404 ]; then
-            echo "Web app is responding (HTTP $STATUS)"
-          else
-            echo "::warning::Web app returned HTTP $STATUS — may still be starting"
-          fi
-
-  package-manifest:
-    needs: deploy
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Package Teams app
-        run: |
-          mkdir -p dist
-          cd teams-app && zip -r ../dist/docwain-teams.zip manifest.json color.png outline.png
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docwain-teams-manifest
-          path: dist/docwain-teams.zip
-          retention-days: 30
+          docker build \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest .
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+          # ACR webhook auto-triggers Azure Web App to pull :latest
