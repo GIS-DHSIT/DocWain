@@ -8,9 +8,9 @@ if str(ROOT_DIR) not in sys.path:
 
 import src.api.dw_newron as dw_newron
 
-HOST = "docwain-rediscache.redis.cache.windows.net"
-PORT = 6380
-PASSWORD = "2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo="
+HOST = os.getenv("REDIS_HOST", "localhost")
+PORT = int(os.getenv("REDIS_PORT", "6380"))
+PASSWORD = os.getenv("REDIS_PASSWORD", "")
 
 
 def _reset_cached_client():

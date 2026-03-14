@@ -3,7 +3,7 @@
 # def qudrantTest():
 #     qdrant_client = QdrantClient(
 #         url="https://0a25c9cf-4685-49c7-9382-4c3510754343.europe-west3-0.gcp.cloud.qdrant.io:6333",
-#         api_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.Ki8Uux4HtKDYj6ebqH9nzu3qg7QVmXTvxT6UkLNwTc4",
+#         api_key=os.getenv("QDRANT_API_KEY", ""),
 #     )
 #
 #     print(qdrant_client.get_collection('documents'))
@@ -24,7 +24,7 @@
 # from openai import AzureOpenAI
 #
 # # Set up environment variables and API details
-# api_key ='6JSK5oHMv76xL6IAtFwVfgCRykf24MWdvp6oRpxawBk9sGyqXuQYJQQJ99BCACmepeSXJ3w3AAABACOGjB0M'
+# api_key = os.getenv("AZUREGPT4O_API_KEY", "")
 # endpoint = os.getenv("ENDPOINT_URL", "https://dw-openai-dev.openai.azure.com/")
 # deployment = os.getenv("DEPLOYMENT_NAME", "dw-dev1-gpt-4o")
 # subscription_key = os.getenv("AZURE_OPENAI_API_KEY", api_key)
