@@ -480,9 +480,12 @@ class GeminiClient:
         self, prompt: str, max_retries: int = 3, backoff: float = 1.0, options: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
+        # Extract system_instruction from kwargs (passed by gateway)
+        system_instruction = kwargs.pop("system_instruction", None)
+
         # Apply per-call overrides to generation_config
+        saved = dict(self.generation_config) if options else None
         if options:
-            saved = dict(self.generation_config)
             if "temperature" in options:
                 self.generation_config["temperature"] = options["temperature"]
             if "max_tokens" in options:
@@ -490,9 +493,10 @@ class GeminiClient:
             if "top_p" in options:
                 self.generation_config["top_p"] = options["top_p"]
         try:
-            text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
+            text = self.generate(prompt, max_retries=max_retries, backoff=backoff,
+                                 system_instruction=system_instruction)
         finally:
-            if options:
+            if saved is not None:
                 self.generation_config = saved
         return text, {"response": text, "backend": "gemini", "model": self.model_name}
 
@@ -604,10 +608,13 @@ class GeminiClient:
             pass
         return None
 
-    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5) -> str:
+    def generate(self, prompt: str, max_retries: int = 1, backoff: float = 0.5,
+                 system_instruction: Optional[str] = None) -> str:
         metrics_store = _get_metrics_store()
         request_started = time.time()
-        cache_key = hashlib.sha256((prompt or "").encode("utf-8")).hexdigest()
+        cache_key = hashlib.sha256(
+            ((system_instruction or "") + (prompt or "")).encode("utf-8")
+        ).hexdigest()
         cached = self._cache.get(cache_key)
         if cached:
             ts, text = cached
@@ -636,6 +643,7 @@ class GeminiClient:
                     model=self.model_name,
                     prompt=prompt,
                     generation_config=self.generation_config,
+                    system_instruction=system_instruction,
                 )
                 if text:
                     if metrics_store.available:

@@ -110,7 +110,7 @@ class Reasoner:
                 user_msg,
                 system=system_msg,
                 think=use_thinking,
-                temperature=0.2,
+                temperature=0.4,
                 max_tokens=max_tokens,
             )
         except Exception:
@@ -229,4 +229,4 @@ class Reasoner:
         if thinking:
             base = int(base * 1.5)
 
-        return min(base, 2048)
+        return min(base, 4096)

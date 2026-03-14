@@ -1,9 +1,8 @@
 {
-  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
-  "manifestVersion": "1.16",
-  "version": "1.2.1",
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.17/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.17",
+  "version": "2.9.0",
   "id": "384893f8-3cd6-4b9d-bdfe-038c64387a43",
-  "packageName": "ai.docwain.app",
   "developer": {
     "name": "DocWain",
     "websiteUrl": "https://www.docwain.ai",
@@ -16,7 +15,7 @@
   },
   "description": {
     "short": "Ask questions and upload documents to DocWain directly from Teams.",
-    "full": "DocWain connects your Teams workspace to DocWain's document AI so you can upload files, train them, and ask questions in personal, group, or team chats. Use tools to summarize, extract fields, generate content, or switch models."
+    "full": "DocWain connects your Teams workspace to DocWain's document AI so you can upload files, train them, and ask questions in personal, group, or team chats."
   },
   "icons": {
     "color": "color.png",
@@ -28,8 +27,7 @@
       "botId": "384893f8-3cd6-4b9d-bdfe-038c64387a43",
       "scopes": [
         "personal",
-        "team",
-        "groupchat"
+        "team"
       ],
       "supportsFiles": true,
       "isNotificationOnly": false,
@@ -37,8 +35,7 @@
         {
           "scopes": [
             "personal",
-            "team",
-            "groupchat"
+            "team"
           ],
           "commands": [
             {
@@ -52,43 +49,14 @@
             {
               "title": "Help",
               "description": "Get usage tips and available commands."
-            },
-            {
-              "title": "Tools",
-              "description": "Show DocWain tool actions."
-            },
-            {
-              "title": "Generate",
-              "description": "Generate content from your documents."
             }
           ]
         }
       ]
     }
   ],
-  "staticTabs": [
-    {
-      "entityId": "docwain-web",
-      "name": "DocWain",
-      "contentUrl": "https://www.docwain.ai",
-      "websiteUrl": "https://www.docwain.ai",
-      "scopes": [
-        "personal"
-      ]
-    }
-  ],
-  "permissions": [
-    "identity",
-    "messageTeamMembers"
-  ],
   "validDomains": [
     "www.docwain.ai",
-    "docwain.ai",
-    "dhs-docwain-api.azure-api.net",
-    "dhs-docwain-api-uksouth-01.regional.azure-api.net"
-  ],
-  "webApplicationInfo": {
-    "id": "384893f8-3cd6-4b9d-bdfe-038c64387a43",
-    "resource": "api://botid-384893f8-3cd6-4b9d-bdfe-038c64387a43"
-  }
+    "dhs-docwain-api.azure-api.net"
+  ]
 }

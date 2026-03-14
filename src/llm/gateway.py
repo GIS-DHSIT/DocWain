@@ -338,14 +338,22 @@ class LLMGateway:
 
         self._record_request()
 
-        full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
         opts = {"temperature": temperature, "max_tokens": max_tokens}
         if extra_options:
             opts.update(extra_options)
 
-        raw, usage_meta = client.generate_with_metadata(
-            full_prompt, options=opts, thinking=think, **kwargs,
-        )
+        # Pass system prompt natively for backends that support it (Gemini),
+        # fall back to concatenation for others (Ollama/vLLM)
+        if system and getattr(client, "backend", "") == "gemini":
+            kwargs["system_instruction"] = system
+            raw, usage_meta = client.generate_with_metadata(
+                prompt, options=opts, thinking=think, **kwargs,
+            )
+        else:
+            full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
+            raw, usage_meta = client.generate_with_metadata(
+                full_prompt, options=opts, thinking=think, **kwargs,
+            )
 
         answer, thinking = _split_thinking(raw)
         return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)

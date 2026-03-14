@@ -244,19 +244,17 @@ class IntentAnalyzer:
         elif any(q.startswith(w) for w in ["summarize ", "summary of ", "give me a summary"]):
             task_type = "summarize"
             output_format = "sections"
-        elif any(q.startswith(w) for w in ["extract ", "what is the ", "what are the "]):
+        elif any(q.startswith(w) for w in ["extract "]):
             task_type = "extract"
             output_format = "prose"
-        elif any(w in q for w in ["step by step", "steps to", "procedure for", "how to "]):
+        elif any(w in q for w in ["step by step", "steps to", "procedure for"]):
             task_type = "extract"
             output_format = "numbered"
         elif any(w in q for w in ["how many", "total ", "count ", "sum of"]):
             task_type = "aggregate"
             output_format = "prose"
-        elif any(w in q for w in ["risk", "concern", "issue", "problem", "investigate", "analyze "]):
-            task_type = "investigate"
-            output_format = "sections"
 
+        # Let all other queries go through LLM analysis for better classification
         if task_type is None:
             return None
 
@@ -328,12 +326,16 @@ class IntentAnalyzer:
 
     @staticmethod
     def _safe_defaults(query: str) -> QueryUnderstanding:
-        """Return a safe-default QueryUnderstanding when parsing fails."""
+        """Return a safe-default QueryUnderstanding when parsing fails.
+
+        Defaults to 'summarize' with 'sections' format to produce structured,
+        detailed responses rather than the minimal 1-3 sentence 'lookup' style.
+        """
         return QueryUnderstanding(
-            task_type="lookup",
+            task_type="summarize",
             complexity="simple",
             resolved_query=query,
-            output_format="prose",
+            output_format="sections",
             relevant_documents=[],
             cross_profile=False,
         )
