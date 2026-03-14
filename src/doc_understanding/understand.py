@@ -127,12 +127,13 @@ def understand_document(
     doc_type: str,
     model_name: Optional[str] = None,
     use_thinking: bool = False,
+    llm_client=None,
 ) -> Dict[str, Any]:
     full_text = _get(extracted, "full_text", "") or ""
     if not full_text and _get(extracted, "sections"):
         full_text = "\n".join([_get(s, "text", "") for s in _get(extracted, "sections", []) if _get(s, "text")])
 
-    llm_payload = _ollama_understand(full_text, doc_type, model_name=model_name, use_thinking=use_thinking)
+    llm_payload = _ollama_understand(full_text, doc_type, model_name=model_name, llm_client=llm_client, use_thinking=use_thinking)
 
     if llm_payload:
         doc_summary = str(llm_payload.get("doc_summary") or "").strip()

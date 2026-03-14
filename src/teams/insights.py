@@ -201,8 +201,8 @@ Respond ONLY with valid JSON:
     )
 
     try:
-        from src.llm.clients import get_default_client
-        client = get_default_client()
+        from src.llm.gateway import get_llm_gateway
+        client = get_llm_gateway()
         if client is None:
             logger.debug("No LLM client available for proactive insights")
             return _fallback_insights(result, doc_type, key_entities, key_facts)

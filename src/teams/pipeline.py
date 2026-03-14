@@ -94,11 +94,16 @@ class TeamsDocumentPipeline:
         extracted_text = "\n\n".join(all_text_parts)
 
         # Run DI pipeline: identify -> content_map -> understand
+        # Teams always uses cloud models for document processing
         from src.doc_understanding.identify import identify_document
         from src.doc_understanding.content_map import build_content_map
         from src.doc_understanding.understand import understand_document
+        from src.llm.gateway import get_llm_gateway
+        cloud_llm = get_llm_gateway()
 
-        id_result = await asyncio.to_thread(identify_document, first_extracted, filename)
+        id_result = await asyncio.to_thread(
+            identify_document, extracted=first_extracted, filename=filename, llm_client=cloud_llm,
+        )
         doc_type = "other"
         confidence = 0.0
         if isinstance(id_result, dict):
@@ -110,7 +115,9 @@ class TeamsDocumentPipeline:
 
         await asyncio.to_thread(build_content_map, first_extracted)
 
-        understanding = await asyncio.to_thread(understand_document, first_extracted, doc_type)
+        understanding = await asyncio.to_thread(
+            understand_document, extracted=first_extracted, doc_type=doc_type, llm_client=cloud_llm,
+        )
         summary = ""
         key_entities: List[str] = []
         key_facts: List[str] = []
