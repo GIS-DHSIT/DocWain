@@ -76,14 +76,21 @@ def generate_text(
     api_key: str,
     model: str,
     prompt: str,
-    generation_config: Optional[dict] = None
+    generation_config: Optional[dict] = None,
+    system_instruction: Optional[str] = None,
 ) -> Tuple[str, Any]:
     """
     Generate text with Gemini, handling both the new google.genai and legacy
     google.generativeai packages. Returns (text, raw_response).
     """
     client = get_genai_client(api_key)
-    gen_config = _coerce_generation_config(generation_config)
+
+    # Inject system_instruction into generation config for the new SDK
+    config_dict = dict(generation_config or {})
+    if system_instruction:
+        config_dict["system_instruction"] = system_instruction
+
+    gen_config = _coerce_generation_config(config_dict) if config_dict else None
 
     if hasattr(client, "models"):  # google.genai
         if gen_config is None:
@@ -108,7 +115,10 @@ def generate_text(
                 else:
                     raise
     else:  # google.generativeai
-        model_client = client.GenerativeModel(model)
+        kwargs = {}
+        if system_instruction:
+            kwargs["system_instruction"] = system_instruction
+        model_client = client.GenerativeModel(model, **kwargs)
         response = model_client.generate_content(prompt, generation_config=gen_config)
 
     return _extract_response_text(response), response

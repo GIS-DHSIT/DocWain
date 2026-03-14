@@ -108,31 +108,52 @@ class LLMGateway:
     def _init_clients(self) -> None:
         """Create backend clients based on configuration.
 
-        Uses Ollama as the sole backend (GPU-efficient, single-server).
-        vLLM support removed to eliminate dual-backend complexity.
+        Primary: Gemini 2.5 Flash (fast, high-quality reasoning)
+        Fallback: Ollama/Qwen3 (local, for when Gemini is unavailable)
         """
-        # --- Ollama (primary) ---
+        # --- Gemini (primary) ---
+        try:
+            from src.llm.clients import GeminiClient
+            self._primary = GeminiClient()
+            self.backend = "gemini"
+            self.model_name = self._primary.model_name
+            logger.info("Gemini primary client initialised (model=%s)", self.model_name)
+        except Exception as exc:
+            logger.warning("Failed to create Gemini client: %s — falling back to Ollama", exc)
+            self._primary = None
+
+        # --- Ollama (fallback) ---
         try:
             from src.llm.clients import OllamaClient
-            self._primary = OllamaClient()
-            self.backend = "ollama"
-            self.model_name = self._primary.model_name
-            logger.info("Ollama primary client initialised (model=%s)", self.model_name)
+            self._fallback = OllamaClient()
+            if self._primary is None:
+                self._primary = self._fallback
+                self._fallback = None
+                self.backend = "ollama"
+                self.model_name = self._primary.model_name
+                logger.info("Ollama fallback promoted to primary (model=%s)", self.model_name)
+            else:
+                logger.info("Ollama fallback client ready (model=%s)", self._fallback.model_name)
         except Exception as exc:
-            logger.error("Failed to create Ollama client: %s", exc)
-            self._primary = None
+            logger.warning("Failed to create Ollama fallback: %s", exc)
 
         if self._primary is None:
             logger.error("No LLM backend available - all calls will fail")
 
     def _pick_client(self):
-        """Return the primary Ollama client."""
+        """Return the best available client (Gemini primary, Ollama fallback)."""
         if self._primary is not None:
+            # If primary is Gemini and in cooldown, try fallback
+            if hasattr(self._primary, "in_cooldown") and self._primary.in_cooldown():
+                if self._fallback is not None:
+                    self._record_fallback()
+                    logger.info("Gemini in cooldown — using Ollama fallback")
+                    return self._fallback
             return self._primary
 
-        # Last resort: return primary even if unhealthy so caller gets a real error
-        if self._primary is not None:
-            return self._primary
+        if self._fallback is not None:
+            self._record_fallback()
+            return self._fallback
 
         raise RuntimeError("No LLM backend configured")
 
@@ -234,7 +255,7 @@ class LLMGateway:
 
         meta: Dict[str, Any] = {
             "usage": usage_meta,
-            "backend": "ollama",
+            "backend": self._active_backend_name(),
         }
         if thinking:
             meta["thinking"] = thinking
@@ -269,6 +290,11 @@ class LLMGateway:
                 "available": self._primary is not None,
                 "backend": getattr(self._primary, "backend", None),
                 "model": getattr(self._primary, "model_name", None),
+            },
+            "fallback": {
+                "available": self._fallback is not None,
+                "backend": getattr(self._fallback, "backend", None),
+                "model": getattr(self._fallback, "model_name", None),
             },
         }
 
@@ -312,14 +338,22 @@ class LLMGateway:
 
         self._record_request()
 
-        full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
         opts = {"temperature": temperature, "max_tokens": max_tokens}
         if extra_options:
             opts.update(extra_options)
 
-        raw, usage_meta = client.generate_with_metadata(
-            full_prompt, options=opts, thinking=think, **kwargs,
-        )
+        # Pass system prompt natively for backends that support it (Gemini),
+        # fall back to concatenation for others (Ollama/vLLM)
+        if system and getattr(client, "backend", "") == "gemini":
+            kwargs["system_instruction"] = system
+            raw, usage_meta = client.generate_with_metadata(
+                prompt, options=opts, thinking=think, **kwargs,
+            )
+        else:
+            full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
+            raw, usage_meta = client.generate_with_metadata(
+                full_prompt, options=opts, thinking=think, **kwargs,
+            )
 
         answer, thinking = _split_thinking(raw)
         return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)

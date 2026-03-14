@@ -369,9 +369,9 @@ class CoreAgent:
 
         # --- REASON ---
         t0 = time.monotonic()
-        # Thinking mode disabled: on T4 GPU, Qwen3 thinking tokens add
-        # 10-20s latency per call with minimal quality gain.
-        use_thinking = False
+        # Enable thinking for API-based backends (Gemini) — adds depth
+        # with negligible latency. Only disable for local models.
+        use_thinking = self._llm.backend in ("gemini", "openai", "azure")
 
         # Single-GPU: skip sub-agent decomposition — parallel LLM calls
         # serialize on Ollama, causing timeouts. Use the reasoner directly.

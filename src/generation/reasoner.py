@@ -35,14 +35,14 @@ class ReasonerResult:
 # ---------------------------------------------------------------------------
 
 _BASE_TOKENS: Dict[str, int] = {
-    "lookup": 256,
-    "extract": 512,
-    "list": 768,
-    "summarize": 1024,
-    "overview": 1536,
-    "compare": 1024,
-    "investigate": 1024,
-    "aggregate": 768,
+    "lookup": 512,
+    "extract": 1024,
+    "list": 1024,
+    "summarize": 2048,
+    "overview": 3072,
+    "compare": 2048,
+    "investigate": 2048,
+    "aggregate": 1024,
 }
 
 # ---------------------------------------------------------------------------
@@ -110,7 +110,7 @@ class Reasoner:
                 user_msg,
                 system=system_msg,
                 think=use_thinking,
-                temperature=0.2,
+                temperature=0.4,
                 max_tokens=max_tokens,
             )
         except Exception:
@@ -229,4 +229,4 @@ class Reasoner:
         if thinking:
             base = int(base * 1.5)
 
-        return min(base, 2048)
+        return min(base, 4096)
