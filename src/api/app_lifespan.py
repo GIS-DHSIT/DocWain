@@ -155,6 +155,34 @@ def initialize_app_state(app: FastAPI) -> AppState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Zombie document recovery skipped: %s", exc)
 
+    # Recover documents stuck in extraction IN_PROGRESS (server killed during extraction)
+    try:
+        from src.api.document_status import recover_zombie_extractions
+        extraction_recovered = recover_zombie_extractions()
+        if extraction_recovered:
+            logger.info("Reset %d zombie extraction documents at startup", extraction_recovered)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Zombie extraction recovery skipped: %s", exc)
+
+    # Auto-retry extraction for UNDER_REVIEW documents (background thread, non-blocking)
+    def _startup_extraction():
+        try:
+            from src.api.extraction_service import extract_documents
+            result = extract_documents()
+            status = result.get("status", "unknown")
+            if status == "completed":
+                results = result.get("results", {})
+                successful = len(results.get("successful", []))
+                failed = len(results.get("failed", []))
+                if successful or failed:
+                    logger.info("Startup extraction: %d succeeded, %d failed", successful, failed)
+            elif status != "no_documents":
+                logger.warning("Startup extraction: %s", result.get("message", status))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Startup extraction failed: %s", exc)
+
+    threading.Thread(target=_startup_extraction, daemon=True, name="startup-extraction").start()
+
     # Legacy task-aware routing disabled — single vLLM model handles all tasks.
     # ModelRegistry, TaskRouter, TaskAwareGateway are no longer used.
     # vLLM pre-loads the model at server start, no GPU pinning needed.
