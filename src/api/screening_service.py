@@ -27,6 +27,7 @@ DONT_DOWNGRADE_STATUSES = {
 }
 
 SCREENING_ELIGIBLE_STATUSES = {
+    STATUS_UNDER_REVIEW,
     STATUS_EXTRACTION_COMPLETED,
     STATUS_SCREENING_COMPLETED,
 }
@@ -76,10 +77,15 @@ def promote_to_screening_completed(document_id: str) -> None:
     if current_status in SCREENING_ELIGIBLE_STATUSES:
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
         update_stage(document_id, "screening", {"status": "COMPLETED", "completed_at": time.time(), "error": None})
-    else:
-        logger.debug(
-            "Skipping status promotion for %s; status %s not eligible",
+        logger.info(
+            "Document %s promoted from %s to SCREENING_COMPLETED",
             document_id, current_status,
+        )
+    else:
+        logger.warning(
+            "Cannot promote document %s to SCREENING_COMPLETED; current status '%s' is not eligible. "
+            "Eligible statuses: %s",
+            document_id, current_status, SCREENING_ELIGIBLE_STATUSES,
         )
 
 def _set_document_status(
@@ -144,12 +150,11 @@ def apply_security_result(document_id: str, report: Dict[str, Any]) -> None:
             )
             return
         if current_status not in SCREENING_ELIGIBLE_STATUSES:
-            logger.info(
-                "Security screening passed for %s; keeping non-eligible status %s",
-                document_id,
-                current_status,
+            logger.warning(
+                "Security screening passed for %s but status '%s' is not eligible for promotion. "
+                "Forcing promotion to SCREENING_COMPLETED. Eligible: %s",
+                document_id, current_status, SCREENING_ELIGIBLE_STATUSES,
             )
-            return
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
         # HITL: Screening only sets SCREENING_COMPLETED.
         # User must manually trigger embedding (POST /api/documents/embed).

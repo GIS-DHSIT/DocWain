@@ -181,15 +181,24 @@ def init_document_record(
         update["content_size"] = int(size)
 
     collection = get_documents_collection()
-    return collection.find_one_and_update(
-        _doc_filter(document_id),
-        {
-            "$set": update,
-            "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id), "status": STATUS_UNDER_REVIEW},
-        },
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
+    # Two-step: find existing doc first, then update with exact _id filter.
+    existing = collection.find_one(_doc_filter(document_id), {"_id": 1})
+    if existing:
+        return collection.find_one_and_update(
+            {"_id": existing["_id"]},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+    else:
+        return collection.find_one_and_update(
+            {"_id": _doc_id_value(document_id)},
+            {
+                "$set": update,
+                "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id), "status": STATUS_UNDER_REVIEW},
+            },
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
 
 def _flatten(prefix: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     flat: Dict[str, Any] = {}
@@ -235,12 +244,38 @@ def update_document_fields(document_id: str, fields: Dict[str, Any]):
     }
     if unset_fields:
         update_ops["$unset"] = unset_fields
-    return collection.find_one_and_update(
-        _doc_filter(document_id),
-        update_ops,
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
+
+    # Two-step: find existing doc first, then update with exact _id filter.
+    # Avoids $or + upsert which can create duplicates or silently fail on CosmosDB.
+    existing = collection.find_one(_doc_filter(document_id), {"_id": 1})
+    if existing:
+        exact_filter = {"_id": existing["_id"]}
+        # No upsert needed — document exists.
+        update_ops.pop("$setOnInsert", None)
+        result = collection.find_one_and_update(
+            exact_filter,
+            update_ops,
+            return_document=ReturnDocument.AFTER,
+        )
+    else:
+        # Document doesn't exist yet — insert with simple _id filter (no $or).
+        simple_filter = {"_id": _doc_id_value(document_id)}
+        result = collection.find_one_and_update(
+            simple_filter,
+            update_ops,
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+
+    if result:
+        new_status = result.get("status")
+        result_id = result.get("_id")
+        logger.info(
+            "[STATUS_UPDATE] doc=%s _id=%s set_status=%s confirmed_status=%s",
+            document_id, result_id,
+            update.get("status", "N/A"), new_status,
+        )
+    return result
 
 def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
     now = time.time()
@@ -267,12 +302,25 @@ def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
     }
     if unset_error:
         update_ops["$unset"] = unset_error
-    return collection.find_one_and_update(
-        _doc_filter(document_id),
-        update_ops,
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
+
+    # Two-step: find existing doc first, then update with exact _id filter.
+    existing = collection.find_one(_doc_filter(document_id), {"_id": 1})
+    if existing:
+        exact_filter = {"_id": existing["_id"]}
+        update_ops.pop("$setOnInsert", None)
+        return collection.find_one_and_update(
+            exact_filter,
+            update_ops,
+            return_document=ReturnDocument.AFTER,
+        )
+    else:
+        simple_filter = {"_id": _doc_id_value(document_id)}
+        return collection.find_one_and_update(
+            simple_filter,
+            update_ops,
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
 
 def set_error(document_id: str, stage: str, exc: Exception):
     message = str(exc)

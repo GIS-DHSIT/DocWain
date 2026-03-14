@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import contextlib
+import warnings
 from src.utils.logging_utils import get_logger
 import os
 import threading
 from typing import Any, Dict, Optional, Tuple
+
+# Suppress SentenceTransformer._target_device deprecation warning.
+# This is a library-internal deprecation (replaced by .device) that
+# fires on model instantiation — no action needed on our side.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*_target_device.*has been deprecated",
+    category=FutureWarning,
+)
 
 # Suppress tqdm progress bars globally — they spam logs with
 # "Batches: 1/1" for every encode call in sentence-transformers and

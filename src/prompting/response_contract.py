@@ -186,22 +186,16 @@ def format_docwain_response(
     grounded: Optional[bool] = None,
     documents_searched: Optional[List[str]] = None,
 ) -> str:
+    """Format the response for the UI.
+
+    Returns clean expert prose — no template wrapper. Error states
+    (missing scope, retrieval failures, no evidence) are handled with
+    clear, professional messages.
+    """
     text = (response_text or "").strip()
     meta = metadata or {}
-    if meta.get("rag_v3"):
-        return format_rag_v3_response(response_text=text, sources=sources)
-    if _already_formatted(text):
-        return text
 
-    task_type = _detect_task_type(query, meta)
-    domain = _infer_domain(meta, text, sources or [])
-    domain_label = _DOMAIN_LABELS.get(domain, "Document")
-
-    files_used = _format_sources(sources or [])
-    searched_files = _extract_documents_searched(meta, documents_searched)
-    if not searched_files and files_used:
-        searched_files = _format_file_list([f.split(" (p.", 1)[0] for f in files_used])
-
+    # Check for error states that need specific messaging
     error_code = None
     err = meta.get("error") or {}
     if err.get("code"):
@@ -209,91 +203,30 @@ def format_docwain_response(
     elif meta.get("error_code"):
         error_code = str(meta.get("error_code"))
 
+    if error_code in _MISSING_SCOPE_CODES:
+        return "A profile must be selected to answer this question."
+
+    if error_code in _RETRIEVAL_FAILURE_CODES:
+        return "Unable to retrieve evidence due to a system issue. Please try again."
+
+    # No evidence found
+    ctx_found = bool(context_found) if context_found is not None else bool(sources)
+    task_type = _detect_task_type(query, meta)
     is_greeting = task_type == "greet"
     is_meta = task_type in {"info", "meta"}
-    if is_greeting or is_meta:
-        domain_label = "DocWain"
-    has_sources = bool(files_used)
-    ctx_found = bool(context_found) if context_found is not None else has_sources
 
-    missing_scope = error_code in _MISSING_SCOPE_CODES
-    retrieval_failure = error_code in _RETRIEVAL_FAILURE_CODES
-    missing_evidence = (not ctx_found and not is_greeting and not is_meta and not missing_scope and not retrieval_failure)
+    if not ctx_found and not is_greeting and not is_meta:
+        searched = _extract_documents_searched(meta, documents_searched)
+        if searched:
+            files_text = ", ".join(searched)
+            return f"I couldn't find relevant information for this query. Documents searched: {files_text}."
+        return "I couldn't find relevant information for this query in the current profile documents."
 
-    if missing_scope:
-        answer_body = "Profile scope is required to answer this request."
-    elif retrieval_failure:
-        answer_body = "Unable to retrieve evidence due to an indexing or retrieval issue."
-    elif missing_evidence:
-        answer_body = "Not found in the current profile documents."
-    else:
-        answer_body = text or "No answer available from the current profile documents."
-        answer_body = re.sub(r"(?im)^\s*(items|amounts|terms)\s*:\s*", "Details: ", answer_body)
+    # Normal response — return the text as-is (clean expert prose from the LLM)
+    if not text:
+        return "No answer available from the current profile documents."
 
-    scope_text = "current profile (all documents)"
-    route_plan = meta.get("route_plan") or {}
-    if route_plan.get("scope") == "current_document":
-        if len(searched_files) == 1:
-            scope_text = f"specific document ({searched_files[0]})"
-        else:
-            scope_text = "specific document in the current profile"
-    elif route_plan.get("target_person"):
-        scope_text = "documents containing the requested name within the current profile"
-    elif meta.get("person_name") or (meta.get("preprocessing") or {}).get("person_name") or meta.get("target_document_ids"):
-        scope_text = "documents containing the requested name within the current profile"
-
-    if is_greeting or is_meta:
-        scope_text = "no document retrieval"
-    files_used_text = ", ".join(files_used) if files_used else "none"
-    intent_label = _TASK_LABELS.get(task_type, "answer")
-    understanding = (
-        "Understanding & Scope: "
-        f"Intent: {intent_label}. "
-        f"Scope: {scope_text}. "
-        f"Files used: {files_used_text}."
-    )
-
-    answer_section = f"Answer:\n{domain_label} Summary:\n{answer_body}"
-
-    if is_greeting or is_meta:
-        evidence_line = "Evidence & Gaps: No document retrieval performed. Files searched: none."
-    elif missing_evidence:
-        files_searched_text = ", ".join(searched_files) if searched_files else "none"
-        evidence_line = (
-            "Evidence & Gaps: Not found in the current profile documents. "
-            f"Files searched: {files_searched_text}."
-        )
-    elif missing_scope:
-        files_searched_text = ", ".join(searched_files) if searched_files else "none"
-        evidence_line = (
-            "Evidence & Gaps: Profile scope missing; no evidence retrieved. "
-            f"Files searched: {files_searched_text}."
-        )
-    elif retrieval_failure:
-        files_searched_text = ", ".join(searched_files) if searched_files else "none"
-        evidence_line = (
-            "Evidence & Gaps: Retrieval failed; no evidence retrieved. "
-            f"Files searched: {files_searched_text}."
-        )
-    else:
-        files_searched_text = ", ".join(searched_files) if searched_files else files_used_text
-        gaps_text = "None noted in the current profile documents."
-        if re.search(r"\b(not found|not available|missing)\b", answer_body, flags=re.IGNORECASE):
-            gaps_text = "As noted in the answer."
-        evidence_line = (
-            "Evidence & Gaps: "
-            f"Files searched: {files_searched_text}. "
-            f"Gaps: {gaps_text}"
-        )
-
-    next_step = ""
-    if missing_evidence or missing_scope or retrieval_failure:
-        next_step = "Next step: Provide a specific document name or section to focus the search."
-
-    parts = [understanding, answer_section, evidence_line]
-    if next_step:
-        parts.append(next_step)
-    return "\n\n".join(parts).strip()
+    return text
 
 
 __all__ = ["format_docwain_response"]

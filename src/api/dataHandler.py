@@ -20,6 +20,8 @@ from Crypto.Cipher import AES
 from bson.objectid import ObjectId
 from pymongo import MongoClient, errors
 from qdrant_client import QdrantClient
+import warnings
+warnings.filterwarnings("ignore", message=r".*_target_device.*has been deprecated", category=FutureWarning)
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import HashingVectorizer
 from urllib.parse import urlparse
@@ -375,7 +377,7 @@ def get_model(*, reload: bool = False, device: Optional[str] = None):
     global _MODEL, _MODEL_DEVICE
     model, _dim = get_embedding_model(reload=reload, device=device)
     _MODEL = model
-    _MODEL_DEVICE = getattr(model, "_target_device", None) or _MODEL_DEVICE
+    _MODEL_DEVICE = getattr(model, "device", None) or getattr(model, "_target_device", None) or _MODEL_DEVICE
     return model
 
 def _embedding_batch_size(default: int = 32) -> int:
@@ -3602,18 +3604,18 @@ def process_document_pipeline(
         "errors": errors,
     }
 
-def trainData():
+def trainData(subscription_id: str = None):
     """Extraction-only pipeline for documents eligible for processing."""
     try:
         from src.api.extraction_service import extract_documents
 
         logger.info("=" * 80)
-        logger.info("Starting extraction process")
+        logger.info("Starting extraction process (subscription=%s)", subscription_id)
         logger.info("=" * 80)
-        return extract_documents()
+        return extract_documents(subscription_id=subscription_id)
     except Exception as e:
         logger.error(f"Critical error in extraction data: {e}", exc_info=True)
-        return {"status": "error", "message": str(e), "results": None}
+        return {"status": "error", "message": str(e), "documents": []}
 
 # New function: train_single_document
 def train_single_document(doc_id: str):

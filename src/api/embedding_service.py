@@ -1620,12 +1620,39 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                     if not texts or not any(t.strip() for t in texts if isinstance(t, str)):
                         texts = [full_text]
 
+                    # Include translated English text alongside original for non-English docs
+                    translated_text = content.get("translated_text")
+                    if translated_text and content.get("detected_language", "en") != "en":
+                        # Append translated version of each section for bilingual embedding
+                        sections = content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}])
+                        translated_sections = []
+                        translated_texts = []
+                        for sec in sections:
+                            if isinstance(sec, dict):
+                                sec_translated = sec.get("translated_text")
+                                if sec_translated:
+                                    translated_sections.append({
+                                        **sec,
+                                        "text": sec_translated,
+                                        "chunk_type": "translated",
+                                    })
+                                    translated_texts.append(sec_translated)
+                        if not translated_texts and translated_text:
+                            translated_sections = [{"text": translated_text, "start_page": 1, "end_page": 1, "chunk_type": "translated"}]
+                            translated_texts = [translated_text]
+                        all_texts = texts + translated_texts
+                        all_sections = list(sections) + translated_sections
+                    else:
+                        all_texts = texts
+                        all_sections = content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}])
+
                     normalized[name] = {
                         "full_text": full_text,
-                        "texts": texts,
-                        "sections": content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}]),
+                        "texts": all_texts,
+                        "sections": all_sections,
                         "chunk_metadata": content.get("chunk_metadata", []),
                         "doc_type": content.get("doc_type"),
+                        "detected_language": content.get("detected_language"),
                     }
             elif isinstance(content, str) and content.strip():
                 normalized[name] = {
@@ -2658,15 +2685,19 @@ def _process_blob(
         except Exception as exc:
             logger.debug("Cross-doc intelligence setup failed (purely additive, never blocks pipeline)", exc_info=True)
 
+        # Purge pickle after successful embedding — content now lives in vector DB.
         deleted = False
-        # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            logger.info("Skipping pickle deletion for %s (preserve enabled)", doc_id)
-            if telemetry:
-                telemetry.increment("embed_pickles_retained_total")
-            deleted = False
-            if not deleted:
-                cleanup_error = {"message": "pickle_retained"}
+            try:
+                from src.api.content_store import delete_extracted_pickle
+                deleted = delete_extracted_pickle(doc_id)
+                if deleted:
+                    logger.info("Pickle purged for %s after successful embedding", doc_id)
+                else:
+                    logger.info("Pickle not found for deletion for %s (may already be purged)", doc_id)
+            except Exception as del_exc:  # noqa: BLE001
+                logger.warning("Pickle purge failed for %s: %s", doc_id, del_exc)
+                cleanup_error = {"message": f"purge_failed: {del_exc}"}
         cleanup_payload = None
         if not deleted:
             cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
@@ -3301,15 +3332,19 @@ def _process_local_document(
         except Exception as exc:
             logger.debug("Cross-doc intelligence setup failed (purely additive, never blocks pipeline)", exc_info=True)
 
+        # Purge pickle after successful embedding — content now lives in vector DB.
         deleted = False
-        # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            logger.info("Skipping pickle deletion for %s (preserve enabled)", document_id)
-            if telemetry:
-                telemetry.increment("embed_pickles_retained_total")
-            deleted = False
-            if not deleted:
-                cleanup_error = {"message": "pickle_retained"}
+            try:
+                from src.api.content_store import delete_extracted_pickle
+                deleted = delete_extracted_pickle(document_id)
+                if deleted:
+                    logger.info("Pickle purged for %s after successful embedding", document_id)
+                else:
+                    logger.info("Pickle not found for deletion for %s (may already be purged)", document_id)
+            except Exception as del_exc:  # noqa: BLE001
+                logger.warning("Pickle purge failed for %s: %s", document_id, del_exc)
+                cleanup_error = {"message": f"purge_failed: {del_exc}"}
         cleanup_payload = None
         if not deleted:
             cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
@@ -3530,7 +3565,21 @@ def embed_documents(
         telemetry.increment("embed_pickles_listed_total", amount=len(blob_candidates))
 
     if not blob_candidates:
-        return _build_embed_summary([])
+        # Blob storage is configured but no pickles found in blob.
+        # Extraction may have fallen back to local storage — try local pickles.
+        logger.info(
+            "embed_request_id=%s no blob candidates found; falling back to local pickles",
+            embed_request_id,
+        )
+        return _embed_from_local_pickles(
+            document_id=document_id,
+            document_ids=document_ids,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            doc_type=doc_type,
+            max_blobs=max_blobs,
+            embed_request_id=embed_request_id,
+        )
 
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(blob_candidates))
