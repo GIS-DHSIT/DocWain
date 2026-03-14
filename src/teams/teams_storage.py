@@ -13,15 +13,15 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 # ── Status constants ────────────────────────────────────────────────
-STATUS_EXTRACTING = "extracting"
-STATUS_EXTRACTION_COMPLETED = "extraction_completed"
-STATUS_SCREENING = "screening"
-STATUS_SCREENING_COMPLETED = "screening_completed"
-STATUS_SCREENING_PENDING_CONSENT = "screening_pending_consent"
-STATUS_SCREENING_REJECTED = "screening_rejected"
-STATUS_EMBEDDING = "embedding"
-STATUS_EMBEDDING_COMPLETED = "embedding_completed"
-STATUS_EMBEDDING_FAILED = "embedding_failed"
+STATUS_EXTRACTING = "EXTRACTING"
+STATUS_EXTRACTION_COMPLETED = "EXTRACTION_COMPLETED"
+STATUS_SCREENING = "SCREENING"
+STATUS_SCREENING_COMPLETED = "SCREENING_COMPLETED"
+STATUS_SCREENING_PENDING_CONSENT = "SCREENING_PENDING_CONSENT"
+STATUS_SCREENING_REJECTED = "SCREENING_REJECTED"
+STATUS_EMBEDDING = "EMBEDDING"
+STATUS_EMBEDDING_COMPLETED = "EMBEDDING_COMPLETED"
+STATUS_EMBEDDING_FAILED = "EMBEDDING_FAILED"
 
 CONSENT_REQUIRED_RISKS = {"MEDIUM", "HIGH", "CRITICAL"}
 
@@ -69,9 +69,10 @@ class TeamsDocumentStorage:
             "content_type": content_type,
             "content_size": content_size,
             "status": STATUS_EXTRACTING,
-            "extraction": {},
-            "screening": {},
-            "embedding": {},
+            "source": "teams",
+            "extraction": {"status": "IN_PROGRESS", "started_at": now},
+            "screening": {"status": "PENDING"},
+            "embedding": {"status": "PENDING"},
             "created_at": now,
             "updated_at": now,
         }
