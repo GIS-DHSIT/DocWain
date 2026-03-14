@@ -94,10 +94,20 @@ class OllamaClient:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         self.backend = "ollama"
         # Create a client with bounded HTTP timeout to prevent zombie requests
+        # Support Ollama Cloud via OLLAMA_HOST + OLLAMA_API env vars
         try:
             import ollama as _ollama
             import httpx as _httpx
-            self._client = _ollama.Client(timeout=_httpx.Timeout(self._OLLAMA_HTTP_TIMEOUT_S))
+            ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+            ollama_api_key = os.getenv("OLLAMA_API", "")
+            client_kwargs: Dict[str, Any] = {
+                "host": ollama_host,
+                "timeout": _httpx.Timeout(self._OLLAMA_HTTP_TIMEOUT_S),
+            }
+            if ollama_api_key:
+                client_kwargs["headers"] = {"Authorization": f"Bearer {ollama_api_key}"}
+                logger.info("Ollama Cloud mode enabled (host=%s)", ollama_host)
+            self._client = _ollama.Client(**client_kwargs)
         except Exception:
             self._client = None
         logger.info("Initialized OllamaClient with model: %s", self.model_name)
@@ -1002,10 +1012,11 @@ class OpenAIClient:
             raise ValueError("Azure OpenAI endpoint/key not configured")
 
         url = f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions?api-version={self.api_version}"
+        opts = options or {}
         payload = {
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": (options or {}).get("temperature", 0.3),
-            "max_tokens": (options or {}).get("num_predict", 2048),
+            "temperature": opts.get("temperature", 0.3),
+            "max_tokens": opts.get("max_tokens", opts.get("num_predict", 4096)),
         }
         data = json.dumps(payload).encode("utf-8")
         headers = {
@@ -1050,10 +1061,11 @@ class OpenAIClient:
             raise ValueError("Azure OpenAI endpoint/key not configured")
 
         url = f"{self.endpoint}/openai/deployments/{self.deployment}/chat/completions?api-version={self.api_version}"
+        opts = options or {}
         payload = {
             "messages": messages,
-            "temperature": (options or {}).get("temperature", 0.3),
-            "max_tokens": (options or {}).get("num_predict", 2048),
+            "temperature": opts.get("temperature", 0.3),
+            "max_tokens": opts.get("max_tokens", opts.get("num_predict", 4096)),
         }
         data = json.dumps(payload).encode("utf-8")
         headers = {

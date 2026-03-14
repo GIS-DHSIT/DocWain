@@ -1,8 +1,8 @@
 """
 LLM Gateway - unified interface to language model backends.
 
-Primary: vLLM via OpenAICompatibleClient
-Fallback (dev only): Ollama via OllamaClient
+Primary: Azure GPT-4o via OpenAIClient
+Fallback: Ollama (cloud or local) via OllamaClient
 
 Public API (unchanged):
     create_llm_gateway() -> LLMGateway
@@ -108,18 +108,29 @@ class LLMGateway:
     def _init_clients(self) -> None:
         """Create backend clients based on configuration.
 
-        Primary: Gemini 2.5 Flash (fast, high-quality reasoning)
-        Fallback: Ollama/Qwen3 (local, for when Gemini is unavailable)
+        Primary: Azure GPT-4o (paid, high-quality reasoning)
+        Fallback: Ollama Cloud (for when Azure is unavailable)
         """
-        # --- Gemini (primary) ---
+        # --- Azure GPT-4o (primary) ---
         try:
-            from src.llm.clients import GeminiClient
-            self._primary = GeminiClient()
-            self.backend = "gemini"
+            from src.llm.clients import OpenAIClient
+            endpoint = Config.AzureGpt4o.AZUREGPT4O_ENDPOINT
+            api_key = Config.AzureGpt4o.AZUREGPT4O_API_KEY
+            deployment = Config.AzureGpt4o.AZUREGPT4O_DEPLOYMENT
+            api_version = Config.AzureGpt4o.AZUREGPT4O_Version
+            if not endpoint or not api_key:
+                raise ValueError("AZUREGPT4O_ENDPOINT or AZUREGPT4O_API_KEY not configured")
+            self._primary = OpenAIClient(
+                endpoint=endpoint,
+                api_key=api_key,
+                deployment=deployment,
+                api_version=api_version,
+            )
+            self.backend = "azure_openai"
             self.model_name = self._primary.model_name
-            logger.info("Gemini primary client initialised (model=%s)", self.model_name)
+            logger.info("Azure GPT-4o primary client initialised (model=%s)", self.model_name)
         except Exception as exc:
-            logger.warning("Failed to create Gemini client: %s — falling back to Ollama", exc)
+            logger.warning("Failed to create Azure GPT-4o client: %s — falling back to Ollama", exc)
             self._primary = None
 
         # --- Ollama (fallback) ---
@@ -141,13 +152,13 @@ class LLMGateway:
             logger.error("No LLM backend available - all calls will fail")
 
     def _pick_client(self):
-        """Return the best available client (Gemini primary, Ollama fallback)."""
+        """Return the best available client (Azure GPT-4o primary, Ollama fallback)."""
         if self._primary is not None:
-            # If primary is Gemini and in cooldown, try fallback
+            # If primary is in cooldown, try fallback
             if hasattr(self._primary, "in_cooldown") and self._primary.in_cooldown():
                 if self._fallback is not None:
                     self._record_fallback()
-                    logger.info("Gemini in cooldown — using Ollama fallback")
+                    logger.info("Primary LLM in cooldown — using Ollama fallback")
                     return self._fallback
             return self._primary
 
@@ -342,12 +353,22 @@ class LLMGateway:
         if extra_options:
             opts.update(extra_options)
 
-        # Pass system prompt natively for backends that support it (Gemini),
+        # Pass system prompt natively for backends that support it,
         # fall back to concatenation for others (Ollama/vLLM)
-        if system and getattr(client, "backend", "") == "gemini":
+        backend_name = getattr(client, "backend", "")
+        if system and backend_name == "gemini":
             kwargs["system_instruction"] = system
             raw, usage_meta = client.generate_with_metadata(
                 prompt, options=opts, thinking=think, **kwargs,
+            )
+        elif system and backend_name == "azure_openai" and hasattr(client, "chat_with_metadata"):
+            # Azure OpenAI supports system messages natively via chat API
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ]
+            raw, usage_meta = client.chat_with_metadata(
+                messages, options=opts, **kwargs,
             )
         else:
             full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
