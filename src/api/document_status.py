@@ -58,6 +58,7 @@ def get_training_progress(document_id: str) -> Optional[dict]:
         return None
 
 _ZOMBIE_TIMEOUT_SECONDS = 1800  # 30 minutes
+_EXTRACTION_ZOMBIE_TIMEOUT_SECONDS = 600  # 10 minutes
 
 def recover_zombie_documents(timeout_seconds: int = _ZOMBIE_TIMEOUT_SECONDS) -> int:
     """Auto-fail documents stuck in TRAINING_STARTED beyond timeout."""
@@ -88,6 +89,43 @@ def recover_zombie_documents(timeout_seconds: int = _ZOMBIE_TIMEOUT_SECONDS) -> 
             logger.info("Recovered zombie document %s (stuck %.1fh)", doc_id, hours)
         except Exception:
             logger.warning("Failed to recover zombie %s", doc_id, exc_info=True)
+    return recovered
+
+
+def recover_zombie_extractions(timeout_seconds: int = _EXTRACTION_ZOMBIE_TIMEOUT_SECONDS) -> int:
+    """Reset documents stuck in extraction IN_PROGRESS back to UNDER_REVIEW.
+
+    When the server is killed during extraction, documents are left with
+    ``status=UNDER_REVIEW`` and ``extraction.status=IN_PROGRESS`` forever.
+    This function detects those zombies and resets extraction state so the
+    next ``extract_documents()`` call will retry them.
+    """
+    collection = get_documents_collection()
+    cutoff = time.time() - timeout_seconds
+    zombies = list(collection.find(
+        {
+            "status": STATUS_UNDER_REVIEW,
+            "extraction.status": "IN_PROGRESS",
+            "extraction.started_at": {"$lt": cutoff},
+        },
+        {"_id": 1, "document_id": 1, "extraction.started_at": 1},
+    ))
+    recovered = 0
+    for doc in zombies:
+        doc_id = str(doc.get("document_id") or doc.get("_id"))
+        started = (doc.get("extraction") or {}).get("started_at", 0)
+        minutes = (time.time() - started) / 60 if started else 0
+        try:
+            update_stage(doc_id, "extraction", {
+                "status": "PENDING",
+                "completed_at": None,
+                "error": None,
+                "recovery_reason": f"zombie_reset: stuck in IN_PROGRESS for {minutes:.0f}min",
+            })
+            recovered += 1
+            logger.info("Reset zombie extraction %s (stuck %.0fmin)", doc_id, minutes)
+        except Exception:
+            logger.warning("Failed to reset zombie extraction %s", doc_id, exc_info=True)
     return recovered
 
 _MISSING = object()

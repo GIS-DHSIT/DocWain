@@ -235,14 +235,11 @@ async def extract_document_endpoint(
             except Exception as exc:
                 logger.warning("MongoDB storage failed: %s", exc)
 
-        # Qdrant storage (trigger embedding)
+        # HITL: Embedding requires screening first. Do not auto-embed.
+        # User must manually trigger screening (POST /api/gateway/screen)
+        # then embedding (POST /api/documents/embed) after verification.
         if target_db in ("qdrant", "all"):
-            try:
-                from src.api.embedding_service import embed_documents
-                embed_documents(document_id=doc_id, subscription_id=subscription_id, profile_id=profile_id)
-                storage_targets.append("qdrant")
-            except Exception as exc:
-                logger.warning("Qdrant embedding trigger failed: %s", exc)
+            logger.info("HITL: skipping auto-embed for %s; user must trigger screening then embedding", doc_id)
 
         # Profile domain refresh
         try:

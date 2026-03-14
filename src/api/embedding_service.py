@@ -325,7 +325,7 @@ def _fetch_document_ids_by_filters(
     if collection is None:
         raise ValueError("Document store is not accessible")
 
-    filters: List[Dict[str, Any]] = [{"status": {"$in": [STATUS_EXTRACTION_COMPLETED, STATUS_SCREENING_COMPLETED]}}]
+    filters: List[Dict[str, Any]] = [{"status": {"$in": [STATUS_SCREENING_COMPLETED]}}]
     if subscription_id:
         filters.append(
             {
@@ -1961,7 +1961,7 @@ def _process_blob(
             result["failed_reason"] = None
             return result
         # HITL gate: only screened or retryable docs can be embedded
-        _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_EXTRACTION_COMPLETED, STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED, STATUS_TRAINING_STARTED}
+        _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED, STATUS_TRAINING_STARTED}
         if current_status not in _EMBEDDING_ELIGIBLE_STATUSES:
             result["status"] = "SKIPPED"
             if current_status == STATUS_EXTRACTION_COMPLETED:
