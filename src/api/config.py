@@ -4,7 +4,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DEFAULT_REDIS_CONNECTION_STRING = "docwain-rediscache.redis.cache.windows.net:6380,password=2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo=,ssl=True,abortConnect=False"
+DEFAULT_REDIS_CONNECTION_STRING = os.getenv(
+    "REDIS_CONNECTION_STRING",
+    "",
+)
 
 
 class Config:
@@ -53,13 +56,13 @@ class Config:
         }
 
     class Qdrant:
-        URL = os.getenv("QDRANT_URL", 'https://89f776c3-76fb-493f-8509-c583d9579329.europe-west3-0.gcp.cloud.qdrant.io')
-        API = os.getenv("QDRANT_API_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.-cJ2HVTYcH3u5KNuZuxZRNJhhTFfZwqkoVacNCKBYkY")
+        URL = os.getenv("QDRANT_URL", "")
+        API = os.getenv("QDRANT_API_KEY", "")
 
     class Neo4j:
         URI = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
         USER = os.getenv("NEO4J_USER", "neo4j")
-        PASSWORD = os.getenv("NEO4J_PASSWORD", "dhs@welcome01")
+        PASSWORD = os.getenv("NEO4J_PASSWORD", "")
         DATABASE = os.getenv("NEO4J_DATABASE", "neo4j")
 
     class KnowledgeGraph:
@@ -87,7 +90,7 @@ class Config:
         VERIFY_CONFIDENCE_THRESHOLD = float(os.getenv("DWX_VERIFY_CONFIDENCE_THRESHOLD", "0.8"))
 
     class Gemini:
-        GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
+        GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta
 
     class Model:
@@ -107,7 +110,7 @@ class Config:
         AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "")
         AZURE_VERSION = os.getenv("AZURE_OPENAI_VERSION", "")
         # ✅ Gemini 2.5 Flash configs
-        GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
+        GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
         # GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta/openai"
         GEMINI_MODEL_NAME = "gemini-2.5-flash"
         HF_HUB_READ_TIMEOUT = int(os.getenv("HF_HUB_READ_TIMEOUT", "30"))
@@ -127,22 +130,21 @@ class Config:
         OCR_CONTENT_IMAGES = os.getenv("VISION_OCR_CONTENT_IMAGES", "true").lower() in {"1", "true", "yes", "on"}
 
     class Azure:
-        AZURE_SUBSCRIPTION_ID = "249bb11f-9b6e-4c0e-a844-500d627b80b3"
-        AZURE_RESOURCE_GROUP = "rg-docwain-dev"
-        AZURE_PROJECT_NAME = "dhs-ai-competency"
-        AZURE_AI_ENDPOINT = "https://dhs-ai-competency-resource.services.ai.azure.com/api/projects/dhs-ai-competency"
-        AZURE_AI_KEY = "CpQaDiSSIBQBXcIysi5DpdoalYW8ghtDLwU8nGOsagVlkulbKvCsJQQJ99CAAC77bzfXJ3w3AAAAACOGG3Yu"
+        AZURE_SUBSCRIPTION_ID = os.getenv("AZURE_SUBSCRIPTION_ID", "")
+        AZURE_RESOURCE_GROUP = os.getenv("AZURE_RESOURCE_GROUP", "rg-docwain-dev")
+        AZURE_PROJECT_NAME = os.getenv("AZURE_PROJECT_NAME", "dhs-ai-competency")
+        AZURE_AI_ENDPOINT = os.getenv("AZURE_AI_ENDPOINT", "")
+        AZURE_AI_KEY = os.getenv("AZURE_AI_KEY", "")
 
     class AzureGpt4o:
-        AZUREGPT4O_ENDPOINT = "https://dw-openai-dev.openai.azure.com/"
-        AZUREGPT4O_DEPLOYMENT = "dw-dev1-gpt-4o"
-        AZUREGPT4O_API_KEY = '6JSK5oHMv76xL6IAtFwVfgCRykf24MWdvp6oRpxawBk9sGyqXuQYJQQJ99BCACmepeSXJ3w3AAABACOGjB0M'
-        AZUREGPT4O_Version = "2024-05-01-preview"
+        AZUREGPT4O_ENDPOINT = os.getenv("AZUREGPT4O_ENDPOINT", "")
+        AZUREGPT4O_DEPLOYMENT = os.getenv("AZUREGPT4O_DEPLOYMENT", "dw-dev1-gpt-4o")
+        AZUREGPT4O_API_KEY = os.getenv("AZUREGPT4O_API_KEY", "")
+        AZUREGPT4O_Version = os.getenv("AZUREGPT4O_VERSION", "2024-05-01-preview")
 
     class MongoDB:
-        # Allow overriding the Mongo connection string via env; fall back to a localhost URI
-        DEFAULT_URI = 'mongodb+srv://dhsdbadmin:d%21p%40s5w0rd@dw-dev-mongodb.global.mongocluster.cosmos.azure.com/?tls=true&authMechanism=SCRAM-SHA-256&retrywrites=false&maxIdleTimeMS=120000'
-        URI = os.getenv("MONGODB_URI", DEFAULT_URI)
+        DEFAULT_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        URI = DEFAULT_URI
         FALLBACK_URI = os.getenv("MONGODB_FALLBACK_URI", "mongodb://localhost:27017")
         DB = os.getenv("MONGODB_DB", 'docwain')
         CONNECTOR = os.getenv("MONGODB_CONNECTORS", 'connectors')
@@ -153,21 +155,21 @@ class Config:
         SUBSCRIPTIONS = os.getenv("MONGODB_SUBSCRIPTIONS_COLLECTION", "subscriptions")
 
     class Encryption:
-        ENCRYPTION_KEY = 'J9cuHrESAz'
+        ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "")
 
     class AWS:
-        PROFILE = 'DHS'
-        ACCESS_KEY = 'AKIA2UC3EV7PWOLLH4GI'
-        SECRET_KEY = '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'
-        REGION = 'eu-west-2'
-        BUCKET_NAME = 'docwain-chat-history'
+        PROFILE = os.getenv("AWS_PROFILE", "DHS")
+        ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
+        SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
+        REGION = os.getenv("AWS_REGION", "eu-west-2")
+        BUCKET_NAME = os.getenv("AWS_BUCKET_NAME", "docwain-chat-history")
 
     class AzureBlob:
-        CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=docwainuploads;AccountKey=+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA==;EndpointSuffix=core.windows.net"
-        AZURE_BLOB_KEY = "+mxYrAnMSQeGjclw7ATpu7/Q6sT/I7twHka6JD4toKGFRlGW0HbX4OcyoproS6TeQ0q6CLSK1Dk6+AStJp0qYA=="
-        AZURE_BLOB_ACCOUNT_NAME = "docwainuploads"
-        CONTAINER_NAME = "chat-history"
-        DOCUMENT_CONTAINER_NAME = "document-content"
+        CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "")
+        AZURE_BLOB_KEY = os.getenv("AZURE_BLOB_KEY", "")
+        AZURE_BLOB_ACCOUNT_NAME = os.getenv("AZURE_BLOB_ACCOUNT_NAME", "docwainuploads")
+        CONTAINER_NAME = os.getenv("AZURE_BLOB_CONTAINER_NAME", "chat-history")
+        DOCUMENT_CONTAINER_NAME = os.getenv("AZURE_BLOB_DOCUMENT_CONTAINER", "document-content")
 
         @classmethod
         def validate(cls) -> None:
@@ -179,11 +181,11 @@ class Config:
 
     class Redis:
         CONNECTION_STRING = DEFAULT_REDIS_CONNECTION_STRING
-        HOST = "docwain-rediscache.redis.cache.windows.net"
-        PORT = 6380
-        PASSWORD = "2kwDGVV5OuaOo3YCUD5tGkM5RXgWFU4ROAzCaB5RoFo="
-        DB = 0
-        SSL = True
+        HOST = os.getenv("REDIS_HOST", "localhost")
+        PORT = int(os.getenv("REDIS_PORT", "6380"))
+        PASSWORD = os.getenv("REDIS_PASSWORD", "")
+        DB = int(os.getenv("REDIS_DB", "0"))
+        SSL = os.getenv("REDIS_SSL", "true").lower() in {"1", "true", "yes", "on"}
         ABORT_CONNECT = False
         CLEAR_UNSAFE_ON_STARTUP = os.getenv("REDIS_CLEAR_UNSAFE_ON_STARTUP", "true").lower() in {"1", "true", "yes", "on"}
         UNSAFE_KEY_PATTERNS = os.getenv("REDIS_UNSAFE_KEY_PATTERNS", "dw:plan:*,rag:*").strip()
@@ -431,7 +433,7 @@ class Config:
         AGENT_TIMEOUT_S = int(os.getenv("FINETUNE_AGENT_TIMEOUT_S", "900"))
         AGENT_FALLBACK_TO_LEGACY = os.getenv("FINETUNE_AGENT_FALLBACK_TO_LEGACY", "true").lower() == "true"
         OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-        OLLAMA_API = os.getenv("OLLAMA_API", "455d65a864a84e3bba92c0faea74f027.t3cJBT6-bjULKiySSIZQx4Dg")
+        OLLAMA_API = os.getenv("OLLAMA_API", "")
 
     class FollowUp:
         ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
