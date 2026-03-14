@@ -76,13 +76,95 @@ _DOC_PROCESSING_SEMAPHORE = threading.Semaphore(
 )
 
 def _mark_intelligence_ready(document_id: str) -> None:
-    """Set intelligence_ready=true in MongoDB after understanding + deep analysis complete."""
+    """Set intelligence_ready=true and persist intelligence subdocument to MongoDB.
+
+    The Core Agent reads ``intelligence.summary``, ``intelligence.entities``,
+    ``intelligence.answerable_topics``, ``intelligence.key_facts``, and
+    ``intelligence.document_type`` from MongoDB.  This function builds that
+    subdocument from the extraction pickle so the agent has what it needs.
+    """
     try:
         from src.api.document_status import update_document_fields
-        update_document_fields(document_id, {
+        fields: Dict[str, Any] = {
             "intelligence_ready": True,
             "intelligence_completed_at": time.time(),
-        })
+        }
+
+        # Build intelligence subdocument from pickle for Core Agent consumption
+        try:
+            from src.api.content_store import load_extracted_pickle
+            pkl = load_extracted_pickle(document_id)
+            if isinstance(pkl, dict):
+                understanding = pkl.get("understanding") or {}
+                intel_raw = pkl.get("intelligence") or {}
+                deep = pkl.get("deep_analysis") or {}
+                classification = pkl.get("document_classification") or {}
+                domain_info = pkl.get("document_domain") or {}
+
+                # Build summary from understanding
+                summary = understanding.get("document_summary", "")
+
+                # Build document type
+                doc_type = (
+                    understanding.get("document_type")
+                    or classification.get("document_type")
+                    or ""
+                )
+
+                # Build entities list (flatten from structured format)
+                entities: List[str] = []
+                raw_entities = intel_raw.get("entities") or {}
+                if isinstance(raw_entities, dict):
+                    for category, items in raw_entities.items():
+                        if isinstance(items, list):
+                            for item in items[:20]:
+                                name = item.get("value") or item.get("name") or str(item) if isinstance(item, dict) else str(item)
+                                if name and len(name) < 100:
+                                    entities.append(name)
+                elif isinstance(raw_entities, list):
+                    for item in raw_entities[:50]:
+                        name = item.get("value") or item.get("name") or str(item) if isinstance(item, dict) else str(item)
+                        if name and len(name) < 100:
+                            entities.append(name)
+                # Also include key_entities from understanding
+                for ent in understanding.get("key_entities") or []:
+                    text = ent.get("text", "") if isinstance(ent, dict) else str(ent)
+                    if text and text not in entities and len(text) < 100:
+                        entities.append(text)
+
+                # Build key_facts
+                key_facts = understanding.get("key_facts") or []
+
+                # Build answerable_topics from section summaries and intent tags
+                answerable_topics: List[str] = []
+                section_summaries = understanding.get("section_summaries") or {}
+                if isinstance(section_summaries, dict):
+                    for title, _summ in section_summaries.items():
+                        if title and len(title) < 200:
+                            answerable_topics.append(title)
+                for tag in understanding.get("intent_tags") or []:
+                    if tag and tag not in answerable_topics:
+                        answerable_topics.append(tag)
+
+                # Build domain
+                domain = domain_info.get("domain", "") if isinstance(domain_info, dict) else ""
+
+                intelligence = {
+                    "summary": str(summary)[:3000] if summary else "",
+                    "document_type": doc_type,
+                    "entities": entities[:100],
+                    "key_facts": key_facts[:50],
+                    "answerable_topics": answerable_topics[:30],
+                    "domain": domain,
+                    "quality_grade": deep.get("quality_grade"),
+                    "quality_score": deep.get("quality_score"),
+                }
+                fields["intelligence"] = intelligence
+                fields["doc_type"] = doc_type
+        except Exception as exc:
+            logger.warning("Failed to build intelligence subdocument for %s: %s", document_id, exc)
+
+        update_document_fields(document_id, fields)
         logger.info("Document %s marked intelligence_ready", document_id)
     except Exception as exc:
         logger.warning("Failed to mark intelligence_ready for %s: %s", document_id, exc)
