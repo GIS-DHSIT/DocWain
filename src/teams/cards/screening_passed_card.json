@@ -1,0 +1,48 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": "Security Screening: PASSED",
+      "weight": "Bolder",
+      "size": "Medium",
+      "color": "Good"
+    },
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Risk: {risk_level}",
+              "weight": "Bolder",
+              "color": "Good"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "({risk_score})",
+              "isSubtle": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "No significant findings. Proceeding to embedding...",
+      "wrap": true,
+      "spacing": "Medium"
+    }
+  ]
+}
