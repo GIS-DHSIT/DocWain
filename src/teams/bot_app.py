@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 from typing import Any, Dict, Optional
@@ -23,6 +24,8 @@ except ImportError:
 from src.api.config import Config
 from src.teams import adapter as legacy_adapter
 from src.teams.attachments import ingest_attachments, DocumentIntelligence, ScreeningSummary
+from src.teams.attachments import _resolve_auth_token
+from src.teams.pipeline import TeamsDocumentPipeline
 from src.teams.cards import build_card
 from src.teams.insights import generate_proactive_insights, get_domain_actions
 from src.teams.logic import TeamsChatService
@@ -402,9 +405,9 @@ class DocWainTeamsBot(TeamsActivityHandler):
                     _file_attachment_dicts.append(att_dict)
 
         if _file_attachment_dicts:
-            log.info("Detected %d file attachment(s) for ingestion", len(_file_attachment_dicts))
+            log.info("Detected %d file attachment(s) — routing to autonomous pipeline", len(_file_attachment_dicts))
 
-            # Send immediate progress indicator so user knows upload is being processed
+            # Send immediate processing indicator
             _file_names_preview = ", ".join(
                 a.get("name") or "file" for a in _file_attachment_dicts[:3]
             )
@@ -414,57 +417,35 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 "processing_card",
                 status_message=f"Processing {len(_file_attachment_dicts)} file(s): {_file_names_preview}",
             )
-            _progress_id = None
             try:
-                _progress_response = await turn_context.send_activity(
+                await turn_context.send_activity(
                     _as_activity(_card_activity(_progress_card, text="Processing your upload..."))
                 )
-                _progress_id = getattr(_progress_response, "id", None)
             except Exception:  # noqa: BLE001
-                pass  # Best-effort progress indication
+                pass
 
-            # Build an activity dict with only file attachments for ingest_attachments()
-            _ingest_activity = dict(activity_dict)
-            _ingest_activity["attachments"] = _file_attachment_dicts
-            try:
-                ingestion = await ingest_attachments(
-                    _ingest_activity,
-                    turn_context,
-                    context,
-                    correlation_id,
-                    state_store=self.state_store,
-                )
+            # Resolve auth token once
+            token = await _resolve_auth_token(turn_context, None)
 
-                # Build DI report card (rich domain-aware) or fall back to generic success card
-                di_card = _build_di_report_card(ingestion, log)
-                if di_card:
-                    final_activity = _as_activity(_card_activity(di_card, text="Document analyzed"))
-                else:
-                    success_card = build_card(
-                        "upload_success_card",
-                        message="Files ingested. You can start chatting now.",
-                        filenames=", ".join(ingestion.filenames),
-                        documents_created=str(ingestion.documents_created),
+            # Run pipeline for each file independently
+            pipeline = TeamsDocumentPipeline(state_store=self.state_store)
+
+            async def _run_pipeline_for(att):
+                try:
+                    await pipeline.run_full_pipeline(
+                        attachment=att,
+                        context=context,
+                        turn_context=turn_context,
+                        correlation_id=correlation_id,
+                        auth_token=token or "",
                     )
-                    final_activity = _as_activity(_card_activity(success_card, text="Upload complete"))
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Pipeline failed for %s: %s", att.get("name", "unknown"), exc, exc_info=True)
+                    error_card = build_card("error_card", message=f"Failed to process '{att.get('name', 'file')}'. Please try again.")
+                    await self._send_safe(turn_context, _as_activity(_card_activity(error_card, text="Upload failed")), log)
 
-                # Replace the progress card in-place (prevents duplicates)
-                await self._update_or_replace(turn_context, _progress_id, final_activity, log)
-
-                # Show screening summary only when no DI card (DI card already includes security)
-                if not di_card and ingestion.screening_results:
-                    screening_card = _build_screening_card(ingestion.filenames, ingestion.screening_results)
-                    if screening_card:
-                        await self._send_safe(turn_context, _as_activity(_card_activity(screening_card, text="Security screening complete")), log)
-                return
-            except Exception as exc:  # noqa: BLE001
-                log.error("Attachment ingest failed: %s", exc, exc_info=True)
-                error_card = build_card("error_card", message="Could not ingest your file. Please try again.")
-                await self._update_or_replace(
-                    turn_context, _progress_id,
-                    _as_activity(_card_activity(error_card, text="Upload failed")), log,
-                )
-                return
+            await asyncio.gather(*[_run_pipeline_for(att) for att in _file_attachment_dicts])
+            return
 
         # Handle Adaptive Card Submit actions
         if isinstance(turn_context.activity.value, dict) and turn_context.activity.value:
