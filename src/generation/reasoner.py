@@ -35,14 +35,14 @@ class ReasonerResult:
 # ---------------------------------------------------------------------------
 
 _BASE_TOKENS: Dict[str, int] = {
-    "lookup": 256,
-    "extract": 512,
-    "list": 768,
-    "summarize": 1024,
-    "overview": 1536,
-    "compare": 1024,
-    "investigate": 1024,
-    "aggregate": 768,
+    "lookup": 512,
+    "extract": 1024,
+    "list": 1024,
+    "summarize": 2048,
+    "overview": 3072,
+    "compare": 2048,
+    "investigate": 2048,
+    "aggregate": 1024,
 }
 
 # ---------------------------------------------------------------------------

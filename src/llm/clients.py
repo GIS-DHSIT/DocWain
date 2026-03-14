@@ -480,8 +480,21 @@ class GeminiClient:
         self, prompt: str, max_retries: int = 3, backoff: float = 1.0, options: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> Tuple[str, Dict[str, Any]]:
-        text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
-        return text, {"response": text}
+        # Apply per-call overrides to generation_config
+        if options:
+            saved = dict(self.generation_config)
+            if "temperature" in options:
+                self.generation_config["temperature"] = options["temperature"]
+            if "max_tokens" in options:
+                self.generation_config["max_output_tokens"] = options["max_tokens"]
+            if "top_p" in options:
+                self.generation_config["top_p"] = options["top_p"]
+        try:
+            text = self.generate(prompt, max_retries=max_retries, backoff=backoff)
+        finally:
+            if options:
+                self.generation_config = saved
+        return text, {"response": text, "backend": "gemini", "model": self.model_name}
 
     def _get_redis_client_inner(self):
         if self._redis_client is None:
