@@ -28,6 +28,8 @@ qdrant_client
 redis
 Requests
 scikit_learn
+sentence_transformers
+spacy
 uvicorn
 
 # Azure SDKs
