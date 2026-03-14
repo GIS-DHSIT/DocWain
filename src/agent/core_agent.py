@@ -529,10 +529,18 @@ class CoreAgent:
         """Load document intelligence metadata from MongoDB."""
         try:
             cursor = self._mongodb.find(
-                {"subscription_id": subscription_id, "intelligence": {"$exists": True}},
+                {
+                    "$or": [
+                        {"subscription_id": subscription_id},
+                        {"subscription": subscription_id},
+                        {"subscriptionId": subscription_id},
+                    ],
+                    "intelligence": {"$exists": True, "$ne": None},
+                },
                 {
                     "document_id": 1,
                     "profile_id": 1,
+                    "profile": 1,
                     "profile_name": 1,
                     "intelligence.summary": 1,
                     "intelligence.entities": 1,
@@ -541,7 +549,13 @@ class CoreAgent:
                     "intelligence.document_type": 1,
                 },
             )
-            return list(cursor)
+            results = []
+            for doc in cursor:
+                # Normalize field names for connector docs
+                if "profile" in doc and "profile_id" not in doc:
+                    doc["profile_id"] = doc["profile"]
+                results.append(doc)
+            return results
         except Exception:
             logger.exception("Failed to load doc intelligence for subscription=%s", subscription_id)
             return []
