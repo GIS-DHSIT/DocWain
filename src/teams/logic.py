@@ -8,7 +8,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from src.api.config import Config
-from src.api.vector_store import QdrantVectorStore, build_collection_name
+from src.api.vector_store import QdrantVectorStore
+from src.teams.pipeline import _build_teams_collection_name
 
 try:
     from src.api import dw_newron
@@ -95,9 +96,9 @@ class TeamsChatService:
             persona=effective_persona,
         )
 
-    def ensure_collection(self, subscription_id: str) -> None:
+    def ensure_collection(self, subscription_id: str, profile_id: str = "") -> None:
         """Create or validate the Teams collection for the given subscription/session."""
-        collection_name = build_collection_name(subscription_id)
+        collection_name = _build_teams_collection_name(subscription_id, profile_id)
         try:
             self.vector_store.ensure_collection(collection_name, self.vector_size)
         except UnexpectedResponse as exc:
@@ -125,7 +126,7 @@ class TeamsChatService:
         """
         from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
-        collection_name = build_collection_name(subscription_id)
+        collection_name = _build_teams_collection_name(subscription_id, profile_id)
         try:
             # Count points before deletion
             count_filter = Filter(must=[
@@ -213,7 +214,7 @@ class TeamsChatService:
         collection exists, and if no document context is found, answers using an
         internet-enabled fallback.
         """
-        await asyncio.to_thread(self.ensure_collection, context.subscription_id)
+        await asyncio.to_thread(self.ensure_collection, context.subscription_id, context.profile_id)
 
         _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 300))
 
@@ -224,13 +225,14 @@ class TeamsChatService:
                 _dw_newron = dw_newron
 
             loop = asyncio.get_running_loop()
+            _teams_collection = _build_teams_collection_name(context.subscription_id, context.profile_id)
             future = loop.run_in_executor(
                 _RAG_EXECUTOR,
                 lambda: _dw_newron.answer_question(
                     query=question,
                     user_id=context.user_id,
                     profile_id=context.profile_id,
-                    subscription_id=context.subscription_id,
+                    subscription_id=_teams_collection,
                     model_name=context.model_name,
                     persona=context.persona,
                     session_id=context.session_id,
