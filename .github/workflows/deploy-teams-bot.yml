@@ -12,6 +12,7 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -22,11 +23,9 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install pytest pytest-asyncio pytest-timeout httpx
+        run: pip install -r requirements-ci.txt pytest pytest-asyncio pytest-timeout httpx
 
-      - name: Run tests (unit tests only — no external services needed)
+      - name: Run tests
         run: |
           python -m pytest \
             tests/test_teams_pipeline.py \
@@ -42,6 +41,7 @@ jobs:
   build-and-deploy:
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 

@@ -1,0 +1,42 @@
+# Lightweight CI dependencies — excludes GPU/ML packages that need CUDA
+botbuilder==0.0.1
+botbuilder_core==4.17.0
+botbuilder_schema==4.17.0
+botframework_connector==4.17.0
+botframework_streaming==4.17.0
+boto3==1.42.15
+fastapi
+httpx
+neo4j
+numpy
+ollama
+openai
+rank_bm25
+rapidfuzz>=3.0
+pandas
+pdfplumber
+pymupdf
+Pillow
+pycryptodome
+pydantic
+pymongo
+python-dotenv
+python_docx
+python_pptx
+PyYAML
+qdrant_client
+redis
+Requests
+scikit_learn
+uvicorn
+
+# Azure SDKs
+azure-storage-blob
+azure-core
+azure-identity
+azure-mgmt-botservice
+azure-mgmt-resource
+
+# Google GenAI
+google-genai
+google-generativeai
