@@ -185,54 +185,11 @@ def _inject_confidence_narrative(
     text: str, confidence: Optional[float], domain: Optional[str],
     intent: Optional[str] = None,
 ) -> str:
-    """Prepend a confidence-appropriate narrative prefix."""
-    if not text or len(text) < 50 or confidence is None:
-        return text
+    """Return text as-is — expert SME responses don't need confidence caveats.
 
-    # Never prefix refusal / fallback messages
-    lower = text.lower()
-    if any(p in lower for p in _REFUSAL_PHRASES):
-        return text
-
-    # Skip if response already has a caveat opener
-    first_line = text.split("\n", 1)[0].lower()
-    if any(c in first_line for c in (
-        "based on", "from the", "according to", "limited",
-    )):
-        return text
-
-    threshold = _get_confidence_threshold(domain, intent=intent)
-
-    # High confidence — no prefix needed
-    if confidence > 0.8:
-        return text
-
-    # Determine if response starts with structured content (table/list/heading/bold/numbered)
-    _first_stripped = text.lstrip()
-    _preview = _first_stripped[:100]
-    _is_structured_start = bool(
-        re.search(r"[|]", _preview)
-        or re.search(r"^#{2,3}\s", _preview, re.MULTILINE)
-        or re.search(r"^\s*[-*]\s", _preview, re.MULTILINE)
-        or re.search(r"^\s*\d+\.\s", _preview, re.MULTILINE)
-        or _first_stripped[:2] == "**"
-    )
-
-    # Very low confidence — strong caveat (prefix only for non-structured)
-    if confidence < 0.3:
-        if _is_structured_start:
-            return f"{text}\n\n*Note: The documents contain very limited information relevant to this query.*"
-        return f"The documents contain very limited information relevant to this query:\n\n{text}"
-
-    # Medium confidence (0.3-0.8) — ALWAYS use footer note style
-    if confidence < 0.55:
-        return f"{text}\n\n*Note: Based on limited evidence; some information may be incomplete.*"
-
-    if confidence < threshold:
-        return f"{text}\n\n*Note: Some details may be missing from the available documents.*"
-
-    # Medium-high confidence (threshold to 0.8) — no prefix needed
-    # Well-grounded responses should be returned cleanly without meta-commentary
+    An expert analyst delivers findings directly. Confidence is tracked
+    in structured metadata, not injected into the prose.
+    """
     return text
 
 
@@ -253,7 +210,7 @@ def _ensure_response_structure(text: str, intent: Optional[str] = None) -> str:
     text = _METHODOLOGY_PATTERNS.sub("", text, count=1).lstrip()
 
     # Intents where prose is the correct format — don't auto-bullet
-    _PROSE_INTENTS = frozenset({"factual", "contact", "extract", "extraction", "qa", "detail", "reasoning", "summary"})
+    _PROSE_INTENTS = frozenset({"factual", "contact", "extract", "extraction", "qa", "detail", "reasoning"})
     if intent and intent.lower() in _PROSE_INTENTS:
         # Still apply table/structure repair even for prose intents
         if _HAS_STRUCTURE_RE.search(text):
@@ -282,6 +239,11 @@ def _ensure_response_structure(text: str, intent: Optional[str] = None) -> str:
         restructured = _detect_prose_entity_sections(text)
         if restructured:
             return restructured
+
+    # Overview/summary intents with 5+ sentences should get section structure
+    _SECTION_INTENTS = frozenset({"overview", "summary", "summarize"})
+    if intent and intent.lower() in _SECTION_INTENTS and len(sentences) >= 4 and len(text) > 400:
+        return _auto_section_structure(sentences)
 
     # For very long responses (5+ sentences, >600 chars), group into sections
     if len(sentences) >= 5 and len(text) > 600:

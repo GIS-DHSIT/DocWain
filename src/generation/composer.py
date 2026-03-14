@@ -73,21 +73,39 @@ def compose_response(
 
 
 def _clean_response(text: str) -> str:
-    """Remove common preambles and merge adjacent citations."""
+    """Clean LLM output for human-like expert presentation.
+
+    Removes:
+    - Common LLM preambles ('Based on my analysis...')
+    - Inline [SOURCE-N] citation tags (sources travel as structured metadata)
+    - Adjacent citation clusters
+    """
     cleaned = _PREAMBLE_RE.sub("", text).lstrip()
 
     # Capitalise after preamble removal if needed
     if cleaned and cleaned[0].islower():
         cleaned = cleaned[0].upper() + cleaned[1:]
 
-    # Merge adjacent citations
-    def _merge_cites(m: re.Match) -> str:
-        nums = re.findall(r"SOURCE-(\d+)", m.group(0))
-        labels = ", ".join(f"SOURCE-{n}" for n in nums)
-        return f"[{labels}]"
+    # Remove [SOURCE-N] inline citations — sources are structured metadata now
+    cleaned = re.sub(r'\s*\[SOURCE-\d+(?:,\s*SOURCE-\d+)*\]', '', cleaned)
 
-    cleaned = _ADJACENT_CITE_RE.sub(_merge_cites, cleaned)
-    return cleaned
+    # Remove any remaining citation-like patterns the LLM might generate
+    cleaned = re.sub(r'\s*\[(?:Source|Ref|Citation)[:\s]*\d+\]', '', cleaned, flags=re.IGNORECASE)
+
+    # Strip leaked internal metadata from table cells and text
+    # Relevance scores like (relevance: 0.73) or **0.73**
+    cleaned = re.sub(r'\(relevance:\s*[\d.]+\)', '', cleaned)
+    cleaned = re.sub(r'\|\s*\*?\*?[\d.]{3,4}\*?\*?\s*\|', '|', cleaned)
+    # Remove "Source Relevance" columns from tables
+    cleaned = re.sub(r'\|\s*Source Relevance\s*', '|', cleaned)
+    cleaned = re.sub(r'\|\s*Relevance\s*Score\s*', '|', cleaned)
+    # Remove "Image Content" columns that just describe screenshots/OCR artifacts
+    cleaned = re.sub(r'\|\s*Image Content\s*', '|', cleaned)
+
+    # Clean up double spaces left by citation removal
+    cleaned = re.sub(r'  +', ' ', cleaned)
+
+    return cleaned.strip()
 
 
 def _build_sources(evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

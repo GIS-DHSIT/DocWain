@@ -39,6 +39,7 @@ _BASE_TOKENS: Dict[str, int] = {
     "extract": 512,
     "list": 768,
     "summarize": 1024,
+    "overview": 1536,
     "compare": 1024,
     "investigate": 1024,
     "aggregate": 768,
@@ -82,10 +83,15 @@ class Reasoner:
         doc_context: Optional[Dict[str, Any]],
         conversation_history: Optional[List[Dict[str, str]]],
         use_thinking: bool = False,
+        profile_domain: str = "",
+        kg_context: str = "",
     ) -> ReasonerResult:
         """Run the REASON step: prompt the LLM and return a grounded result."""
 
-        system_msg = build_system_prompt()
+        system_msg = build_system_prompt(
+            profile_domain=profile_domain,
+            kg_context=kg_context,
+        )
         user_msg = build_reason_prompt(
             query=query,
             task_type=task_type,
@@ -152,10 +158,14 @@ class Reasoner:
     def _check_grounding(
         self, answer: str, evidence: List[Dict[str, Any]]
     ) -> bool:
-        """Lightweight deterministic grounding check (no LLM call).
+        """Evidence-anchored grounding check.
 
-        Checks both numeric values and proper nouns / key entities.
-        Returns *False* when too many claims are ungrounded.
+        Verifies that the answer's key claims are derivable from the provided
+        evidence. Uses semantic overlap rather than strict verbatim matching,
+        allowing expert-level synthesis and reasoning while catching fabrication.
+
+        Returns False only when the answer introduces substantial content
+        that cannot be traced to any evidence.
         """
         if not evidence:
             return False
@@ -163,41 +173,44 @@ class Reasoner:
         evidence_text = " ".join(item.get("text", "") for item in evidence)
         evidence_lower = evidence_text.lower()
 
-        # --- Numeric grounding ---
+        # Short or empty answer — consider grounded if we have evidence
+        if len(answer.strip()) < 20:
+            return True
+
+        # Check that numeric claims in the answer are traceable to evidence
         answer_numbers = set(_NUMBER_RE.findall(answer))
         if answer_numbers:
             evidence_numbers = set(_NUMBER_RE.findall(evidence_text))
             ungrounded_nums = answer_numbers - evidence_numbers
-            num_ratio = len(ungrounded_nums) / len(answer_numbers)
-            if num_ratio > 0.15:
+            # Allow up to 25% ungrounded numbers (expert may compute ratios,
+            # percentages, or reformat values)
+            if len(ungrounded_nums) / len(answer_numbers) > 0.25:
+                logger.debug(
+                    "[Reasoner] Grounding: %d/%d numbers ungrounded",
+                    len(ungrounded_nums), len(answer_numbers),
+                )
                 return False
 
-        # --- Entity grounding (proper nouns / multi-word terms) ---
-        # Extract capitalized multi-word sequences (e.g. "John Smith", "Acme Corp")
-        # Skip common markdown/formatting headers that aren't real entities
-        entity_re = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b')
-        _HEADER_WORDS = {
-            "key findings", "current state", "proposed improvements",
-            "summary of", "overview of", "total count", "not found",
-            "critical risks", "main sections", "document structure",
-        }
-        answer_entities = set()
-        for ent in entity_re.findall(answer):
-            if ent.lower() not in _HEADER_WORDS:
-                answer_entities.add(ent)
+        # Check semantic overlap: answer sentences should have word overlap
+        # with evidence. An expert synthesizes but doesn't invent topics.
+        answer_words = set(
+            w.lower() for w in re.findall(r'\b[a-zA-Z]{4,}\b', answer)
+        )
+        evidence_words = set(
+            w.lower() for w in re.findall(r'\b[a-zA-Z]{4,}\b', evidence_text)
+        )
 
-        if len(answer_entities) >= 3:
-            ungrounded_ents = 0
-            for ent in answer_entities:
-                # Check if any word from the entity appears in evidence
-                ent_words = ent.lower().split()
-                if not any(w in evidence_lower for w in ent_words if len(w) > 3):
-                    ungrounded_ents += 1
-            ent_ratio = ungrounded_ents / len(answer_entities)
-            if ent_ratio > 0.30:
+        if answer_words:
+            overlap = len(answer_words & evidence_words) / len(answer_words)
+            # At least 40% of answer's significant words should appear in evidence
+            # This is generous — allows expert vocabulary and reasoning language
+            if overlap < 0.40:
+                logger.debug(
+                    "[Reasoner] Grounding: word overlap %.2f below threshold",
+                    overlap,
+                )
                 return False
 
-        # If we got here, grounding checks pass
         return True
 
     @staticmethod

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _VALID_TASK_TYPES = frozenset(
-    {"extract", "compare", "summarize", "investigate", "lookup", "aggregate", "list", "conversational"}
+    {"extract", "compare", "summarize", "overview", "investigate", "lookup", "aggregate", "list", "conversational"}
 )
 _VALID_OUTPUT_FORMATS = frozenset({"table", "bullets", "sections", "numbered", "prose"})
 _VALID_COMPLEXITIES = frozenset({"simple", "complex"})
@@ -234,12 +234,22 @@ class IntentAnalyzer:
         elif any(q.startswith(w) for w in ["compare ", "contrast "]) or " vs " in q or " versus " in q:
             task_type = "compare"
             output_format = "table"
-        elif any(q.startswith(w) for w in ["summarize ", "summary of ", "give me a summary", "overview of "]):
+        elif any(w in q for w in [
+            "tell me about the documents", "tell me about all", "what do we have",
+            "give me an overview", "overview of all", "describe the documents",
+            "what documents", "about the documents", "about the collection",
+        ]):
+            task_type = "overview"
+            output_format = "sections"
+        elif any(q.startswith(w) for w in ["summarize ", "summary of ", "give me a summary"]):
             task_type = "summarize"
             output_format = "sections"
         elif any(q.startswith(w) for w in ["extract ", "what is the ", "what are the "]):
             task_type = "extract"
             output_format = "prose"
+        elif any(w in q for w in ["step by step", "steps to", "procedure for", "how to "]):
+            task_type = "extract"
+            output_format = "numbered"
         elif any(w in q for w in ["how many", "total ", "count ", "sum of"]):
             task_type = "aggregate"
             output_format = "prose"

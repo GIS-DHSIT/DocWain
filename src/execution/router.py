@@ -99,9 +99,22 @@ def execute_request(
 
     debug_info = answer.get("metadata", {}) if debug else {}
 
+    # When streaming is requested, convert the completed answer to a text stream
+    # so the UI receives chunked content instead of an empty response.
+    stream_iter = None
+    if stream:
+        from src.execution.common import chunk_text_stream_with_metadata
+        response_text = answer.get("response", "")
+        metadata = {
+            "grounded": answer.get("grounded", False),
+            "context_found": answer.get("context_found", False),
+            "sources": answer.get("sources", []),
+        }
+        stream_iter = chunk_text_stream_with_metadata(response_text, metadata=metadata)
+
     return ExecutionResult(
         answer=answer,
         mode=ExecutionMode.AGENT,
         debug=debug_info,
-        stream=None,
+        stream=stream_iter,
     )

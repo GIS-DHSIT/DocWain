@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import ollama
 import uvicorn
 from bson.objectid import ObjectId
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, constr, field_validator
@@ -51,6 +51,8 @@ from src.api.dw_chat import (
     get_chat_history,
     get_session_by_id,
     get_session_list,
+    search_sessions,
+    get_session_summary,
 )
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
@@ -65,6 +67,12 @@ try:
 except ImportError:
     _EXTRACTION_ROUTER_AVAILABLE = False
     extraction_router = None
+try:
+    from src.api.intelligence_api import router as intelligence_router
+    _INTELLIGENCE_ROUTER_AVAILABLE = True
+except ImportError:
+    _INTELLIGENCE_ROUTER_AVAILABLE = False
+    intelligence_router = None
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
@@ -189,6 +197,8 @@ def list_available_tools():
 api_router.include_router(agents_router, tags=["Agents"])
 if _EXTRACTION_ROUTER_AVAILABLE and extraction_router:
     api_router.include_router(extraction_router, tags=["Extraction Pipeline"])
+if _INTELLIGENCE_ROUTER_AVAILABLE and intelligence_router:
+    api_router.include_router(intelligence_router, tags=["Intelligence"])
 
 class FeedbackRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -1011,27 +1021,85 @@ def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
         logging.error(f"Single extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Single document extraction failed")
 
-@api_router.post("/train/{doc_id}", tags=["Default"], deprecated=True)
+@api_router.post("/train/{doc_id}", tags=["Default"])
 def trigger_single_training(doc_id: str, subscription_id: str = "default"):
-    """Deprecated alias for /extract/{doc_id}. Performs extraction only."""
-    return trigger_single_extraction(doc_id=doc_id, subscription_id=subscription_id)
+    """Train (embed) a single document by ID.
+
+    Called by the UI to trigger embedding for one document.
+    """
+    from src.api.embedding_service import embed_documents
+    from src.security.response_sanitizer import sanitize_user_payload
+
+    try:
+        logging.info("Train (embed) single document: doc=%s subscription=%s", doc_id, subscription_id)
+        result = embed_documents(
+            document_id=doc_id,
+            subscription_id=subscription_id if subscription_id != "default" else None,
+        )
+        return sanitize_user_payload(result)
+    except Exception as exc:
+        logging.error("Single train (embed) API error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Training failed: {exc}")
 
 @api_router.get("/extract", tags=["Default"])
 def trigger_extraction(subscription_id: str = "default"):
-    """API endpoint to trigger document extraction."""
+    """API endpoint to trigger document extraction.
+
+    This endpoint processes all eligible documents synchronously.
+    Extraction can take several minutes per document depending on
+    document size and complexity. The response includes per-document
+    timing so the caller knows exactly what happened.
+    """
     try:
         logging.info(f"Received extraction request (subscription: {subscription_id})")
-        status_response = trainData()
-        logging.info(status_response)
-        return {"status": "success", "message": status_response, "response": "Executed"}
+        result = trainData(subscription_id=subscription_id)
+        logging.info("Extraction result: status=%s", result.get("status"))
+        return result
     except Exception as e:
         logging.error(f"Extraction API error: {e}")
-        raise HTTPException(status_code=500, detail="Extraction process failed")
+        raise HTTPException(status_code=500, detail=f"Extraction process failed: {e}")
 
 @api_router.get("/train", tags=["Default"], deprecated=True)
 def trigger_training(subscription_id: str = "default"):
     """Deprecated alias for /extract. Performs extraction only."""
     return trigger_extraction(subscription_id=subscription_id)
+
+
+class TrainDocumentsRequest(BaseModel):
+    doc_ids: List[str] = Field(default_factory=list, description="Document IDs to train (embed)")
+    subscription_id: Optional[str] = Field(None, description="Subscription ID")
+    profile_id: Optional[str] = Field(None, description="Profile ID")
+
+
+@api_router.post("/train", tags=["Default"])
+def train_documents_batch(request: TrainDocumentsRequest = Body(...)):
+    """Train (embed) documents by IDs.
+
+    Called by the UI Tag-and-Train tab after screening completes.
+    This triggers the embedding pipeline which stores document content
+    into the vector database.
+    """
+    from src.api.embedding_service import embed_documents
+    from src.security.response_sanitizer import sanitize_user_payload
+
+    if not request.doc_ids:
+        raise HTTPException(status_code=400, detail="doc_ids is required and must not be empty")
+
+    try:
+        logging.info(
+            "Train (embed) request: %d documents, subscription=%s, profile=%s",
+            len(request.doc_ids), request.subscription_id, request.profile_id,
+        )
+        result = embed_documents(
+            document_ids=request.doc_ids,
+            subscription_id=request.subscription_id,
+            profile_id=request.profile_id,
+        )
+        return sanitize_user_payload(result)
+    except Exception as exc:
+        logging.error("Train (embed) API error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Training failed: {exc}")
+
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])
 def finetune_single_profile(request: FinetuneRequest):
@@ -1677,6 +1745,34 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
     except Exception as e:
         logging.error(f"Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
+
+@api_router.get("/sessions/{user_id}/search", tags=["Default"])
+def search_sessions_api(
+    user_id: str,
+    q: str = Query(..., min_length=1, description="Search query"),
+    profile_id: Optional[str] = None,
+):
+    """Search sessions by query text with optional profile scope."""
+    try:
+        results = search_sessions(user_id, q, profile_id=profile_id)
+        return {"user_id": user_id, "query": q, "results": results}
+    except Exception as e:
+        logging.error(f"Failed to search sessions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to search sessions")
+
+@api_router.get("/session/{user_id}/{session_id}/summary", tags=["Default"])
+def get_session_summary_api(user_id: str, session_id: str):
+    """Get a progressive summary of a session's conversation."""
+    try:
+        summary = get_session_summary(user_id, session_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"user_id": user_id, "session_id": session_id, "summary": summary}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to generate session summary: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate summary")
 
 '''
 @api_router.get("/pii/{doc_id}")

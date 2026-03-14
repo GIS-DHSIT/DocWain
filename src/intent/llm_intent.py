@@ -275,6 +275,8 @@ def _get_standalone_embedder():
             return None
         _standalone_embedder_attempted = True
         try:
+            import warnings
+            warnings.filterwarnings("ignore", message=r".*_target_device.*has been deprecated", category=FutureWarning)
             from sentence_transformers import SentenceTransformer
             _standalone_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
             logger.info("Loaded standalone sentence-transformer for intent classification")

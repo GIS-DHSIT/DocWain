@@ -19,6 +19,8 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 from fastapi import HTTPException, status
 from qdrant_client.models import Distance, PointStruct, SparseVector, Range
+import warnings
+warnings.filterwarnings("ignore", message=r".*_target_device.*has been deprecated", category=FutureWarning)
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import ollama
 import os

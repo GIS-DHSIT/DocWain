@@ -397,6 +397,88 @@ def get_session_by_id(user_id: str, session_id: str) -> Optional[Dict[str, Any]]
             return session
     return None
 
+def search_sessions(
+    user_id: str,
+    query: str,
+    profile_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Search sessions by query text and optional profile scope.
+
+    Returns matching sessions with the matching message highlighted.
+    """
+    if not query or not query.strip():
+        return []
+
+    history = get_chat_history(user_id)
+    sessions = history.get("sessions", [])
+    query_lower = query.strip().lower()
+    results: List[Dict[str, Any]] = []
+
+    for session in sessions:
+        # Profile filter if specified
+        if profile_id and session.get("profile_id") and session["profile_id"] != profile_id:
+            continue
+
+        for msg in session.get("messages", []):
+            msg_query = (msg.get("query") or "").lower()
+            msg_response = ""
+            resp = msg.get("response")
+            if isinstance(resp, dict):
+                msg_response = (resp.get("response") or "").lower()
+            elif isinstance(resp, str):
+                msg_response = resp.lower()
+
+            if query_lower in msg_query or query_lower in msg_response:
+                results.append({
+                    "session_id": session.get("session_id"),
+                    "title": session.get("title"),
+                    "matched_query": msg.get("query"),
+                    "timestamp": msg.get("timestamp"),
+                })
+                break  # One match per session is enough
+
+    return results
+
+
+def get_session_summary(user_id: str, session_id: str) -> Optional[str]:
+    """Get a progressive summary of a session's conversation.
+
+    Returns a ~200-token running summary of the session's key topics
+    and findings, useful for context injection without sending full history.
+    """
+    session = get_session_by_id(user_id, session_id)
+    if not session:
+        return None
+
+    messages = session.get("messages", [])
+    if not messages:
+        return None
+
+    # Build a compact representation for summarization
+    exchange_lines: List[str] = []
+    for msg in messages[-10:]:  # Last 10 messages max
+        q = _trim_text(msg.get("query", ""), max_chars=200)
+        r = _response_text(msg.get("response"))[:200]
+        exchange_lines.append(f"Q: {q}\nA: {r}")
+
+    exchanges = "\n---\n".join(exchange_lines)
+
+    try:
+        prompt = (
+            f"Summarize this conversation in 2-3 sentences, focusing on "
+            f"the key topics discussed and findings:\n\n{exchanges}"
+        )
+        text, _ = generate_text(
+            api_key=Config.Gemini.GEMINI_API_KEY,
+            model="gemini-2.5-flash",
+            prompt=prompt,
+        )
+        return text if text else None
+    except Exception as exc:
+        logger.error("Error generating session summary: %s", exc)
+        return None
+
+
 def generate_follow_up_questions(retrieved_text: str, num_questions: int = 3):
     """Generates follow-up questions using Gemini 2.5 Flash based on retrieved content."""
     try:
