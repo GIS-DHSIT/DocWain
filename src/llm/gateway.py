@@ -267,9 +267,30 @@ class LLMGateway:
 
         self._record_request()
 
-        raw, usage_meta = client.chat_with_metadata(
-            messages, options=opts, thinking=think, **kwargs,
-        )
+        try:
+            raw, usage_meta = client.chat_with_metadata(
+                messages, options=opts, thinking=think, **kwargs,
+            )
+        except Exception as primary_exc:
+            self._record_failure(primary_exc)
+            if self._fallback is not None and client is not self._fallback:
+                logger.warning(
+                    "Primary chat LLM (%s) failed: %s — retrying with fallback",
+                    getattr(client, "backend", "unknown"), primary_exc,
+                )
+                self._record_fallback()
+                # Fallback may not support chat; flatten to prompt
+                if hasattr(self._fallback, "chat_with_metadata"):
+                    raw, usage_meta = self._fallback.chat_with_metadata(
+                        messages, options=opts, thinking=think, **kwargs,
+                    )
+                else:
+                    flat = self._messages_to_prompt(messages)
+                    raw, usage_meta = self._fallback.generate_with_metadata(
+                        flat, options=opts, thinking=think, **kwargs,
+                    )
+            else:
+                raise
 
         answer, thinking = _split_thinking(raw)
 
@@ -347,7 +368,11 @@ class LLMGateway:
         max_tokens: Optional[int] = None,
         **kwargs: Any,
     ) -> LLMResponse:
-        """Unified generation logic shared by generate() and generate_with_metadata()."""
+        """Unified generation logic with automatic fallback.
+
+        If the primary client fails, automatically retries with the fallback
+        client instead of propagating the error.
+        """
         client = self._pick_client()
 
         temperature = temperature if temperature is not None else Config.LLM.TEMPERATURE
@@ -362,31 +387,66 @@ class LLMGateway:
         if extra_options:
             opts.update(extra_options)
 
-        # Pass system prompt natively for backends that support it,
-        # fall back to concatenation for others (Ollama/vLLM)
+        try:
+            raw, usage_meta = self._call_client(
+                client, prompt, system=system, think=think,
+                opts=opts, **kwargs,
+            )
+        except Exception as primary_exc:
+            self._record_failure(primary_exc)
+            # If we have a fallback and didn't already use it, try fallback
+            if self._fallback is not None and client is not self._fallback:
+                logger.warning(
+                    "Primary LLM (%s) failed: %s — retrying with fallback (%s)",
+                    getattr(client, "backend", "unknown"),
+                    primary_exc,
+                    getattr(self._fallback, "backend", "unknown"),
+                )
+                self._record_fallback()
+                try:
+                    raw, usage_meta = self._call_client(
+                        self._fallback, prompt, system=system, think=think,
+                        opts=opts, **kwargs,
+                    )
+                except Exception:
+                    logger.exception("Fallback LLM also failed")
+                    raise
+            else:
+                raise
+
+        answer, thinking = _split_thinking(raw)
+        return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)
+
+    def _call_client(
+        self,
+        client: Any,
+        prompt: str,
+        *,
+        system: str = "",
+        think: bool = False,
+        opts: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Dispatch a generation call to a specific client."""
         backend_name = getattr(client, "backend", "")
         if system and backend_name == "gemini":
             kwargs["system_instruction"] = system
-            raw, usage_meta = client.generate_with_metadata(
+            return client.generate_with_metadata(
                 prompt, options=opts, thinking=think, **kwargs,
             )
         elif system and backend_name == "azure_openai" and hasattr(client, "chat_with_metadata"):
-            # Azure OpenAI supports system messages natively via chat API
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": prompt},
             ]
-            raw, usage_meta = client.chat_with_metadata(
+            return client.chat_with_metadata(
                 messages, options=opts, **kwargs,
             )
         else:
             full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
-            raw, usage_meta = client.generate_with_metadata(
+            return client.generate_with_metadata(
                 full_prompt, options=opts, thinking=think, **kwargs,
             )
-
-        answer, thinking = _split_thinking(raw)
-        return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)
 
     def _vllm_chat(
         self,

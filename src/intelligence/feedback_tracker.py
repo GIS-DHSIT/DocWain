@@ -78,7 +78,7 @@ class FeedbackTracker:
             pipe.expire(k_task_types, _TTL_SECONDS)
 
             # Low-confidence queries
-            if confidence < _LOW_CONFIDENCE_THRESHOLD:
+            if confidence is not None and confidence < _LOW_CONFIDENCE_THRESHOLD:
                 k_low = _key(profile_id, "low_confidence_queries")
                 entry = json.dumps({
                     "query": query,
