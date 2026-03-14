@@ -369,9 +369,9 @@ class CoreAgent:
 
         # --- REASON ---
         t0 = time.monotonic()
-        # Enable thinking for API-based backends — adds depth
-        # with negligible latency. Only disable for local models.
-        use_thinking = self._llm.backend in ("gemini", "openai", "azure", "azure_openai")
+        # Enable thinking for cloud backends — adds reasoning depth.
+        # Ollama Cloud qwen3.5:397b and Azure GPT-4o both support it.
+        use_thinking = self._llm.backend in ("gemini", "openai", "azure", "azure_openai", "ollama")
 
         # Single-GPU: skip sub-agent decomposition — parallel LLM calls
         # serialize on Ollama, causing timeouts. Use the reasoner directly.

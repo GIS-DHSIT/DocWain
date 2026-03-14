@@ -121,11 +121,9 @@ def _ollama_classify(text: str, tables: str, filename: str, model_name: Optional
         if llm_client is not None:
             content = llm_client.generate(prompt)
         else:
-            from src.llm.gateway import get_llm_gateway
-            gw = get_llm_gateway()
-            if gw is None:
-                return None
-            content = gw.generate(prompt)
+            from src.llm.clients import get_local_client
+            client = get_local_client()
+            content = client.generate(prompt)
         content = (content or "").strip()
         # Extract JSON from possible markdown code block
         if "```" in content:

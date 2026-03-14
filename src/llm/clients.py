@@ -66,13 +66,44 @@ _default_client = None
 _default_client_lock = threading.Lock()
 
 def get_default_client():
-    """Return (or create) a singleton OllamaClient with the default model."""
-    global _default_client
-    if _default_client is None:
-        with _default_client_lock:
-            if _default_client is None:
-                _default_client = OllamaClient()
-    return _default_client
+    """Return the local document processing client.
+
+    Document processing (classification, entity extraction, summarisation)
+    always uses the fast local model to avoid burning cloud API quota.
+    """
+    return get_local_client()
+
+
+# ── Local client for document processing ──────────────────────────
+
+_local_client = None
+_local_client_lock = threading.Lock()
+
+def get_local_client():
+    """Return a local Ollama client for document processing (qwen3:14b).
+
+    This client always talks to the LOCAL Ollama instance (no cloud),
+    using a lightweight model optimised for fast extraction, classification,
+    summarisation and entity extraction during document ingestion.
+    """
+    global _local_client
+    if _local_client is None:
+        with _local_client_lock:
+            if _local_client is None:
+                local_model = os.getenv("OLLAMA_LOCAL_MODEL", "qwen3:14b")
+                _local_client = OllamaClient(model_name=local_model)
+                # Override to ensure local-only (no cloud auth headers)
+                try:
+                    import ollama as _ollama
+                    import httpx as _httpx
+                    _local_client._client = _ollama.Client(
+                        host=os.getenv("OLLAMA_LOCAL_HOST", "http://localhost:11434"),
+                        timeout=_httpx.Timeout(OllamaClient._OLLAMA_HTTP_TIMEOUT_S),
+                    )
+                except Exception:
+                    pass
+                logger.info("Local document processing client ready (model=%s)", local_model)
+    return _local_client
 
 # ── OllamaClient ───────────────────────────────────────────────────
 

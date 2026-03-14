@@ -72,12 +72,12 @@ def _ollama_understand(
             else:
                 content = llm_client.generate(prompt)
         else:
-            from src.llm.gateway import get_llm_gateway
-            gw = get_llm_gateway()
-            if hasattr(gw, "generate_with_metadata"):
-                content, _meta = gw.generate_with_metadata(prompt, options=_options)
+            from src.llm.clients import get_local_client
+            client = get_local_client()
+            if hasattr(client, "generate_with_metadata"):
+                content, _meta = client.generate_with_metadata(prompt, options=_options)
             else:
-                content = gw.generate(prompt)
+                content = client.generate(prompt)
         content = (content or "").strip()
         return json.loads(content)
     except Exception as exc:  # noqa: BLE001
