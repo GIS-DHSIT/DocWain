@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import re
 from typing import Any, Dict, List, Optional
@@ -10,7 +10,7 @@ from src.api.config import Config
 from src.intelligence.domain_indexer import infer_domain
 from src.prompting.retrieval_planner import build_retrieval_planner_prompt
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _INTENTS = {"greet", "extract", "summarize", "compare", "rank", "generate", "list_filter"}
 _DOMAINS = {
@@ -37,7 +37,6 @@ _INTERNAL_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12})\b"
 )
 
-
 def _extract_json(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
@@ -55,14 +54,12 @@ def _extract_json(raw: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-
 def _normalize_domain(value: Optional[str]) -> str:
     if not value:
         return "generic"
     cleaned = str(value).strip().lower().replace(" ", "_")
     cleaned = _DOMAIN_ALIASES.get(cleaned, cleaned)
     return cleaned if cleaned in _DOMAINS else "generic"
-
 
 def _normalize_intent(value: Optional[str]) -> str:
     if not value:
@@ -84,7 +81,6 @@ def _normalize_intent(value: Optional[str]) -> str:
         return "extract"
     return "extract" if cleaned not in _INTENTS else cleaned
 
-
 def _detect_intent(query: str) -> str:
     lowered = (query or "").lower()
     if re.match(r"^\s*(hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening)\b", lowered):
@@ -103,7 +99,6 @@ def _detect_intent(query: str) -> str:
         return "extract"
     return "extract"
 
-
 def _extract_person_name(query: str) -> Optional[str]:
     if not query:
         return None
@@ -119,7 +114,6 @@ def _extract_person_name(query: str) -> Optional[str]:
         if match:
             return match.group(1).strip()
     return None
-
 
 def _preferred_sections(domain: str, intent: str) -> List[str]:
     if domain == "resume":
@@ -180,7 +174,6 @@ def _preferred_sections(domain: str, intent: str) -> List[str]:
     if intent in {"compare", "rank"} and "comparison" not in sections:
         sections.append("comparison")
     return sections
-
 
 def _response_sections(domain: str, intent: str) -> List[str]:
     if domain == "resume":
@@ -252,7 +245,6 @@ def _response_sections(domain: str, intent: str) -> List[str]:
         sections.append("Comparison/Ranking")
     return sections
 
-
 def _sanitize_file_name(value: str) -> Optional[str]:
     if not value:
         return None
@@ -262,7 +254,6 @@ def _sanitize_file_name(value: str) -> Optional[str]:
     if _INTERNAL_ID_RE.search(base):
         return None
     return base
-
 
 def _build_evidence_requests(
     *,
@@ -286,7 +277,6 @@ def _build_evidence_requests(
             }
         )
     return requests
-
 
 def _build_default_plan(
     *,
@@ -348,7 +338,6 @@ def _build_default_plan(
             "optional_next_hint": True,
         },
     }
-
 
 def _coerce_plan(
     payload: Dict[str, Any],
@@ -461,7 +450,6 @@ def _coerce_plan(
         },
     }
 
-
 class RetrievalPlanner:
     def __init__(self, llm_client: Optional[Any] = None, *, enabled: Optional[bool] = None) -> None:
         self.llm_client = llm_client
@@ -529,6 +517,5 @@ class RetrievalPlanner:
             target_document_name=target_document_name,
             available_documents=available_documents,
         )
-
 
 __all__ = ["RetrievalPlanner"]

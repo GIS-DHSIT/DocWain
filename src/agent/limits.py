@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -8,8 +8,7 @@ from typing import Any, Optional
 
 from src.api.dw_newron import get_redis_client
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class LimitResult:
@@ -18,14 +17,11 @@ class LimitResult:
     reason: str
     meta: Optional[dict] = None
 
-
 def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
-
 def _today_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d")
-
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -36,7 +32,6 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         return default
 
-
 def _settings() -> dict:
     return {
         "enabled": _truthy(os.getenv("AGENT_MODE_ENABLED", "true")),
@@ -45,12 +40,10 @@ def _settings() -> dict:
         "max_sub_daily": _env_int("AGENT_MODE_MAX_PROMPTS_PER_SUBSCRIPTION_PER_DAY", 100),
     }
 
-
 def _audit_collection():
     from src.api.dataHandler import db
 
     return db["agent_audit"]
-
 
 def check_and_count(
     *,
@@ -162,6 +155,5 @@ def check_and_count(
         logger.warning("Agent audit insert failed: %s", exc, exc_info=True)
 
     return LimitResult(allowed=True, reason="ok", message="ok")
-
 
 __all__ = ["check_and_count", "LimitResult"]

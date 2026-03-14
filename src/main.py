@@ -1,6 +1,8 @@
 import hashlib
 import json
 import logging
+
+from src.utils.logging_utils import get_logger
 import datetime as dt
 import os
 import re
@@ -12,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import ollama
 import uvicorn
 from bson.objectid import ObjectId
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, constr, field_validator
@@ -49,6 +51,8 @@ from src.api.dw_chat import (
     get_chat_history,
     get_session_by_id,
     get_session_list,
+    search_sessions,
+    get_session_summary,
 )
 from src.api.schemas import ModelInfo, ModelsResponse
 from src.api.documents_api import documents_router
@@ -63,6 +67,12 @@ try:
 except ImportError:
     _EXTRACTION_ROUTER_AVAILABLE = False
     extraction_router = None
+try:
+    from src.api.intelligence_api import router as intelligence_router
+    _INTELLIGENCE_ROUTER_AVAILABLE = True
+except ImportError:
+    _INTELLIGENCE_ROUTER_AVAILABLE = False
+    intelligence_router = None
 from src.finetune import get_finetune_manager, list_models
 from src.finetune.agentic_orchestrator import AgenticFinetuneOrchestrator, OllamaModelMissing, OllamaUnavailable
 from src.finetune.dataset_builder import build_dataset_from_qdrant
@@ -124,19 +134,18 @@ import src.tools.web_search  # noqa: F401, E401
 import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
 import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
 from src.gateway.api import gateway_router
+from src.screening.api import screening_router
 from src.tools.router import tools_router
 from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.runtime.request_context import RequestContext
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-
 def _error(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details or {}}}
-
 
 def _get_dw_newron():
     """
@@ -146,7 +155,6 @@ def _get_dw_newron():
     """
     from src.api import dw_newron  # local import to defer heavy deps
     return dw_newron
-
 
 app = FastAPI(title="DocWain API", lifespan=lifespan)
 api_router = APIRouter(prefix="/api")
@@ -166,17 +174,16 @@ api_router.include_router(documents_router, tags=["Documents"])
 api_router.include_router(profiles_router)
 api_router.include_router(profile_docs_router)
 api_router.include_router(gateway_router, tags=["Gateway"])
+api_router.include_router(screening_router)
 api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
 api_router.include_router(tools_router, tags=["Agents"])
-
 
 @api_router.get("/agents/capabilities", tags=["Agents"])
 def list_available_agents_with_capabilities():
     """List all available agents with their intelligence profiles and capabilities."""
     from src.tools.intelligence import list_agents_with_capabilities
     return list_agents_with_capabilities()
-
 
 @api_router.get("/tools", tags=["Agents"], deprecated=True)
 def list_available_tools():
@@ -187,11 +194,11 @@ def list_available_tools():
     """
     return list_available_agents_with_capabilities()
 
-
 api_router.include_router(agents_router, tags=["Agents"])
 if _EXTRACTION_ROUTER_AVAILABLE and extraction_router:
     api_router.include_router(extraction_router, tags=["Extraction Pipeline"])
-
+if _INTELLIGENCE_ROUTER_AVAILABLE and intelligence_router:
+    api_router.include_router(intelligence_router, tags=["Intelligence"])
 
 class FeedbackRequest(BaseModel):
     query: str = Field(..., min_length=1)
@@ -202,9 +209,7 @@ class FeedbackRequest(BaseModel):
 
 session_state_store = SessionStateStore()
 
-
 ## Startup checks migrated to lifespan handler in src/api/app_lifespan.py
-
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -214,7 +219,6 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
     return JSONResponse(status_code=exc.status_code, content=payload)
 
-
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled error for %s %s", request.method, request.url, exc_info=True)
@@ -222,7 +226,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content=_error("internal_error", "Unexpected error occurred", {"reason": str(exc)}),
     )
-
 
 class QuestionRequest(BaseModel):
     query: constr(min_length=1)
@@ -257,26 +260,23 @@ class QuestionRequest(BaseModel):
     agent_name: Optional[str] = Field(default=None, description="Domain agent to invoke (e.g. 'hr', 'medical', 'legal', 'content')")
     agent_task: Optional[str] = Field(default=None, description="Specific agent task (e.g. 'generate_interview_questions')")
 
-
 class AnswerPayload(BaseModel):
     response: Any
     sources: List[Any] = Field(default_factory=list)
     grounded: bool = False
     context_found: bool = False
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    media: Optional[List[Dict[str, Any]]] = None  # charts/images as {type, title, data}
     ok: bool = True
-
 
 class AskResponse(BaseModel):
     answer: AnswerPayload
     current_session_id: Optional[str]
     debug: Dict[str, Any] = Field(default_factory=dict)
 
-
 class AskLiteResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]] = Field(default_factory=list)
-
 
 def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
     """
@@ -290,7 +290,6 @@ def _resolve_session_id(request: QuestionRequest) -> Optional[str]:
     if request.new_session:
         return str(uuid.uuid4())
     return None
-
 
 def _latest_profile_from_catalog(cache: RedisIntelCache, subscription_id: str) -> Optional[str]:
     prefix = f"{cache.prefix}:catalog:{subscription_id}:"
@@ -312,7 +311,6 @@ def _latest_profile_from_catalog(cache: RedisIntelCache, subscription_id: str) -
             best_profile = str(profile_id)
     return best_profile
 
-
 def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Optional[str]) -> Tuple[Optional[str], str]:
     explicit = (request.profile_id or "").strip()
     if explicit:
@@ -325,7 +323,8 @@ def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Option
         from src.api.dw_newron import get_redis_client
 
         redis_client = get_redis_client()
-    except Exception:
+    except Exception as exc:
+        logging.debug("Failed to get Redis client for profile resolution", exc_info=True)
         redis_client = None
 
     cache = RedisIntelCache(redis_client)
@@ -333,18 +332,17 @@ def _resolve_profile_id_for_request(request: QuestionRequest, session_id: Option
         state = cache.get_session_state(subscription_id, session_key)
         if state.active_profile_id:
             return str(state.active_profile_id), "session"
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Failed to get active profile from session state", exc_info=True)
 
     try:
         latest = _latest_profile_from_catalog(cache, subscription_id)
         if latest:
             return latest, "catalog"
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Failed to resolve latest profile from catalog", exc_info=True)
 
     return None, "missing"
-
 
 def _history_response_text(value: Any) -> str:
     """Extract plain-text assistant response from stored history payloads."""
@@ -358,7 +356,6 @@ def _history_response_text(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     return str(value or "").strip()
-
 
 def _hydrate_runtime_session_context(
     *,
@@ -386,7 +383,8 @@ def _hydrate_runtime_session_context(
 
     try:
         from src.api.dw_newron import _build_namespace
-    except Exception:
+    except Exception as exc:
+        logging.debug("Failed to import _build_namespace for conversation hydration", exc_info=True)
         return
 
     namespace = _build_namespace(
@@ -401,8 +399,8 @@ def _hydrate_runtime_session_context(
             existing = conversation_history.get_context(namespace, user_id, max_turns=1)
             if existing:
                 return
-    except Exception:
-        pass
+    except Exception as exc:
+        logging.debug("Failed to check existing conversation context", exc_info=True)
 
     archived_session = get_session_by_id(user_id, session_id)
     if not archived_session:
@@ -429,7 +427,8 @@ def _hydrate_runtime_session_context(
             else:
                 break
             restored += 1
-        except Exception:
+        except Exception as exc:
+            logging.debug("Failed to restore conversation turn during hydration", exc_info=True)
             continue
 
     if restored:
@@ -439,7 +438,6 @@ def _hydrate_runtime_session_context(
             session_id,
             restored,
         )
-
 
 def _persist_chat_turn(
     *,
@@ -465,11 +463,9 @@ def _persist_chat_turn(
         logger.debug("Chat history persistence skipped: %s", exc)
         return session_id
 
-
 def _normalize_answer(answer):
     """Backward-compatible wrapper around the shared normalizer."""
     return normalize_answer(answer)
-
 
 def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
     if not value:
@@ -477,7 +473,6 @@ def _safe_snippet(value: Optional[str], limit: int = 120) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "…"
-
 
 def _minimize_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     minimal: List[Dict[str, Any]] = []
@@ -495,7 +490,6 @@ def _minimize_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             minimal.append(entry)
     return minimal
 
-
 def _resolve_output_root(path_str: str) -> Path:
     """Resolve user-provided output_dir to an absolute path within APP_HOME when relative."""
     root = Path(path_str)
@@ -503,12 +497,10 @@ def _resolve_output_root(path_str: str) -> Path:
         root = Path(Config.Path.APP_HOME) / root
     return root
 
-
 def _training_runs_dir(output_dir: str) -> Path:
     run_dir = _resolve_output_root(output_dir) / "training_runs"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
-
 
 def _load_training_run_records(run_dir: Path) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
@@ -522,7 +514,6 @@ def _load_training_run_records(run_dir: Path) -> List[Dict[str, Any]]:
             logger.warning("Unable to read training run record %s: %s", path, exc)
     return records
 
-
 def _persist_training_run_record(run_dir: Path, record: Dict[str, Any]) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     path = run_dir / f"{record['training_run_id']}.json"
@@ -531,7 +522,6 @@ def _persist_training_run_record(run_dir: Path, record: Dict[str, Any]) -> Path:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to persist training run record %s: %s", path, exc)
     return path
-
 
 def _collection_config_hash(request: CollectionOnlyFinetuneRequest) -> str:
     """
@@ -558,7 +548,6 @@ def _collection_config_hash(request: CollectionOnlyFinetuneRequest) -> str:
     encoded = json.dumps(config, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
-
 def _map_status(status: Optional[str]) -> str:
     if status == "completed":
         return "succeeded"
@@ -567,7 +556,6 @@ def _map_status(status: Optional[str]) -> str:
     if status == "running":
         return "running"
     return "scheduled"
-
 
 def _derive_overall_status(record: Dict[str, Any]) -> str:
     profiles = record.get("profiles") or []
@@ -583,7 +571,6 @@ def _derive_overall_status(record: Dict[str, Any]) -> str:
     if statuses.issubset({"scheduled", "queued", "running"}):
         return "in_progress"
     return "partial"
-
 
 def _refresh_training_run_record(record: Dict[str, Any], manager) -> bool:
     """Refresh per-profile statuses from the finetune manager when possible."""
@@ -625,7 +612,6 @@ def _refresh_training_run_record(record: Dict[str, Any], manager) -> bool:
         updated = True
     return updated
 
-
 def _find_successful_training_run(
         run_dir: Path,
         collection_name: str,
@@ -651,7 +637,6 @@ def _find_successful_training_run(
         ):
             return record
     return None
-
 
 def _build_training_summary(
         record: Dict[str, Any],
@@ -684,7 +669,6 @@ def _build_training_summary(
         "failures": failures,
     }
 
-
 def _is_botframework_jwt(auth_header: str) -> bool:
     """Determine if the Authorization header contains a Bot Framework JWT."""
     if not auth_header:
@@ -694,12 +678,12 @@ def _is_botframework_jwt(auth_header: str) -> bool:
     token = auth_header[7:].strip()
     return token.count(".") == 2
 
-
 def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> Dict[str, Any] | None:
     """Construct a minimal Teams-like activity from a plain text payload."""
     try:
         text = raw_body.decode("utf-8", errors="ignore").strip()
-    except Exception:
+    except Exception as exc:
+        logging.debug("Failed to decode raw body for text fallback activity", exc_info=True)
         return None
     if not text:
         return None
@@ -717,7 +701,6 @@ def _build_text_fallback_activity(raw_body: bytes, headers: Dict[str, str]) -> D
         "conversation": {"id": convo_id},
         "from": {"id": user_id},
     }
-
 
 async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None, bytes]:
     """
@@ -759,7 +742,6 @@ async def _parse_teams_activity(request: Request) -> tuple[Dict[str, Any] | None
         return None, raw_body
 
     return activity, raw_body
-
 
 @api_router.post("/teams/messages", tags=["Teams"])
 async def handle_teams_messages(request: Request):
@@ -902,7 +884,6 @@ async def handle_teams_messages(request: Request):
     except teams_adapter.TeamsAuthError as exc:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_error("unauthorized", str(exc)))
 
-
 def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool]):
     """
     Resolve session + mode and build a shared RequestContext for both streaming and JSON responses.
@@ -930,7 +911,6 @@ def _prepare_execution(request: QuestionRequest, agent_mode_query: Optional[bool
         enable_internet=bool(getattr(request, "enable_internet", False)),
     )
     return session_id, session_state, mode, ctx
-
 
 @api_router.post("/ask", tags=["Default"], response_model=AskResponse)
 def ask_question_api(
@@ -984,67 +964,6 @@ def ask_question_api(
             )
             return AskResponse(answer=answer_payload, current_session_id=persisted_session_id, debug={})
 
-    # ── Agent dispatch: explicit agent_name routes directly to domain agent ──
-    _agent_name = getattr(request, "agent_name", None)
-    if _agent_name:
-        try:
-            from src.agentic.domain_agents import get_domain_agent, detect_agent_task
-            _agent = get_domain_agent(_agent_name)
-            if _agent:
-                # Determine task type: explicit, auto-detected, or default
-                _task = getattr(request, "agent_task", None)
-                if not _task:
-                    _det = detect_agent_task(request.query, domain=_agent.domain)
-                    _task = _det["task_type"] if _det else _agent.get_capabilities()[0]
-
-                # Retrieve RAG context for the agent
-                _agent_ctx: Dict[str, Any] = {"query": request.query}
-                try:
-                    from src.agentic.api_router import _retrieve_rag_context
-                    _rag_text = _retrieve_rag_context(
-                        query=request.query,
-                        subscription_id=request.subscription_id,
-                        profile_id=request.profile_id,
-                    )
-                    if _rag_text:
-                        _agent_ctx["text"] = _rag_text
-                except Exception:
-                    pass
-
-                # Add tool_inputs if provided
-                if request.tool_inputs:
-                    _agent_ctx.update(request.tool_inputs)
-
-                _agent_result = _agent.execute(_task, _agent_ctx)
-                if _agent_result.success and _agent_result.output:
-                    _agent_answer = {
-                        "response": _agent_result.output,
-                        "sources": _agent_result.sources,
-                        "grounded": True,
-                        "context_found": bool(_agent_ctx.get("text")),
-                        "metadata": {
-                            "agent": _agent_name,
-                            "agent_task": _task,
-                            "agent_handled": True,
-                        },
-                    }
-                    normalized = normalize_answer(_agent_answer)
-                    persisted_session_id = _persist_chat_turn(
-                        user_id=request.user_id,
-                        query=request.query,
-                        answer_payload=normalized,
-                        session_id=session_id,
-                        new_session=bool(request.new_session),
-                    )
-                    answer_payload = AnswerPayload(**normalized)
-                    return AskResponse(
-                        answer=answer_payload,
-                        current_session_id=persisted_session_id,
-                        debug={"agent": _agent_name, "task": _task},
-                    )
-        except Exception as _agent_exc:
-            logger.debug("Agent dispatch via /ask failed, falling through: %s", _agent_exc)
-
     session_id, session_state, mode, ctx = _prepare_execution(request, agent_mode)
     want_stream = bool(getattr(request, "stream", False) or stream)
     result = execute_request(request, session_state, ctx, stream=want_stream, debug=bool(request.debug))
@@ -1079,7 +998,6 @@ def ask_question_api(
         debug=result.debug or {},
     )
 
-
 @api_router.post("/askStream", tags=["Default"], deprecated=True)
 def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
     """
@@ -1087,7 +1005,6 @@ def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool]
     """
     object.__setattr__(request, "stream", True)
     return ask_question_api(request, agent_mode=agent_mode, stream=True)
-
 
 @api_router.post("/extract/{doc_id}", tags=["Default"])
 def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
@@ -1104,30 +1021,84 @@ def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
         logging.error(f"Single extraction API error: {e}")
         raise HTTPException(status_code=500, detail="Single document extraction failed")
 
-
-@api_router.post("/train/{doc_id}", tags=["Default"], deprecated=True)
+@api_router.post("/train/{doc_id}", tags=["Default"])
 def trigger_single_training(doc_id: str, subscription_id: str = "default"):
-    """Deprecated alias for /extract/{doc_id}. Performs extraction only."""
-    return trigger_single_extraction(doc_id=doc_id, subscription_id=subscription_id)
+    """Train (embed) a single document by ID.
 
+    Called by the UI to trigger embedding for one document.
+    """
+    from src.api.embedding_service import embed_documents
+    from src.security.response_sanitizer import sanitize_user_payload
+
+    try:
+        logging.info("Train (embed) single document: doc=%s subscription=%s", doc_id, subscription_id)
+        result = embed_documents(
+            document_id=doc_id,
+            subscription_id=subscription_id if subscription_id != "default" else None,
+        )
+        return sanitize_user_payload(result)
+    except Exception as exc:
+        logging.error("Single train (embed) API error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Training failed: {exc}")
 
 @api_router.get("/extract", tags=["Default"])
 def trigger_extraction(subscription_id: str = "default"):
-    """API endpoint to trigger document extraction."""
+    """API endpoint to trigger document extraction.
+
+    This endpoint processes all eligible documents synchronously.
+    Extraction can take several minutes per document depending on
+    document size and complexity. The response includes per-document
+    timing so the caller knows exactly what happened.
+    """
     try:
         logging.info(f"Received extraction request (subscription: {subscription_id})")
-        status_response = trainData()
-        logging.info(status_response)
-        return {"status": "success", "message": status_response, "response": "Executed"}
+        result = trainData(subscription_id=subscription_id)
+        logging.info("Extraction result: status=%s", result.get("status"))
+        return result
     except Exception as e:
         logging.error(f"Extraction API error: {e}")
-        raise HTTPException(status_code=500, detail="Extraction process failed")
-
+        raise HTTPException(status_code=500, detail=f"Extraction process failed: {e}")
 
 @api_router.get("/train", tags=["Default"], deprecated=True)
 def trigger_training(subscription_id: str = "default"):
     """Deprecated alias for /extract. Performs extraction only."""
     return trigger_extraction(subscription_id=subscription_id)
+
+
+class TrainDocumentsRequest(BaseModel):
+    doc_ids: List[str] = Field(default_factory=list, description="Document IDs to train (embed)")
+    subscription_id: Optional[str] = Field(None, description="Subscription ID")
+    profile_id: Optional[str] = Field(None, description="Profile ID")
+
+
+@api_router.post("/train", tags=["Default"])
+def train_documents_batch(request: TrainDocumentsRequest = Body(...)):
+    """Train (embed) documents by IDs.
+
+    Called by the UI Tag-and-Train tab after screening completes.
+    This triggers the embedding pipeline which stores document content
+    into the vector database.
+    """
+    from src.api.embedding_service import embed_documents
+    from src.security.response_sanitizer import sanitize_user_payload
+
+    if not request.doc_ids:
+        raise HTTPException(status_code=400, detail="doc_ids is required and must not be empty")
+
+    try:
+        logging.info(
+            "Train (embed) request: %d documents, subscription=%s, profile=%s",
+            len(request.doc_ids), request.subscription_id, request.profile_id,
+        )
+        result = embed_documents(
+            document_ids=request.doc_ids,
+            subscription_id=request.subscription_id,
+            profile_id=request.profile_id,
+        )
+        return sanitize_user_payload(result)
+    except Exception as exc:
+        logging.error("Train (embed) API error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Training failed: {exc}")
 
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])
@@ -1192,12 +1163,12 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
             return summary
         except OllamaModelMissing as exc:
             if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
-                logger.warning("Agentic path missing model; falling back to legacy: %s", exc)
+                logger.debug("Agentic path missing model; falling back to legacy: %s", exc)
             else:
                 raise HTTPException(status_code=400, detail=str(exc))
         except OllamaUnavailable as exc:
             if getattr(Config.Finetune, "AGENT_FALLBACK_TO_LEGACY", True):
-                logger.warning("Agentic path Ollama unavailable; falling back to legacy: %s", exc)
+                logger.debug("Agentic path Ollama unavailable; falling back to legacy: %s", exc)
             else:
                 raise HTTPException(status_code=503, detail=str(exc))
         except Exception as exc:  # noqa: BLE001
@@ -1324,7 +1295,6 @@ def finetune_from_collection(request: CollectionOnlyFinetuneRequest):
 
     return _build_training_summary(run_record, total_profiles_discovered=len(discovered_profiles))
 
-
 @api_router.get("/finetune/status/{job_id}", tags=["Finetuning"])
 def finetune_status(job_id: str):
     manager = get_finetune_manager()
@@ -1333,6 +1303,53 @@ def finetune_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     return status.dict()
 
+@api_router.post("/finetune/intelligence", tags=["Finetuning"])
+async def finetune_intelligence(
+    max_iterations: int = 5,
+    target_score: int = 80,
+):
+    """Fine-tune DocWain-Agent-v2 for intelligent query understanding.
+
+    Runs the full pipeline: generate data → train → evaluate → iterate.
+    This is a long-running operation (2-3 hrs per iteration on T4).
+    """
+    import threading
+    from src.finetune.docwain_finetune import run_finetune_pipeline, FinetuneResult
+
+    # Run in background thread to avoid blocking the API
+    result_holder: Dict[str, Any] = {"status": "running", "result": None}
+
+    def _run():
+        try:
+            result = run_finetune_pipeline(
+                max_iterations=max_iterations,
+                target_score=target_score,
+            )
+            result_holder["status"] = "completed" if result.success else "failed"
+            result_holder["result"] = {
+                "success": result.success,
+                "model_name": result.model_name,
+                "iterations_run": result.iterations_run,
+                "final_score": result.final_score,
+                "eval_details": {
+                    k: v for k, v in result.eval_details.items()
+                    if k != "per_example"  # omit verbose per-example data
+                },
+                "error": result.error,
+            }
+        except Exception as exc:
+            result_holder["status"] = "error"
+            result_holder["result"] = {"error": str(exc)}
+
+    thread = threading.Thread(target=_run, daemon=True, name="finetune-intelligence")
+    thread.start()
+
+    return {
+        "message": "Intelligence fine-tuning started",
+        "max_iterations": max_iterations,
+        "target_score": target_score,
+        "note": "This runs in the background. Check /api/admin/taskspec-model/status for results.",
+    }
 
 def _collect_available_models() -> List[ModelInfo]:
     models: Dict[str, ModelInfo] = {}
@@ -1355,6 +1372,10 @@ def _collect_available_models() -> List[ModelInfo]:
     def _display_name(name: str) -> str:
         normalized = name.lower()
         if normalized == "gpt-oss" or normalized.startswith("gpt-oss:"):
+            return "DocWain-Agent"
+        if normalized == "docwain-agent" or normalized.startswith("docwain-agent:"):
+            return "DocWain-Agent"
+        if normalized.startswith("qwen3:"):
             return "DocWain-Agent"
         return name
 
@@ -1386,11 +1407,9 @@ def _collect_available_models() -> List[ModelInfo]:
     models.setdefault("gemini-2.5-flash", ModelInfo(model="gemini-2.5-flash", source="gemini", backend="gemini"))
     return list(models.values())
 
-
 @api_router.get("/models", tags=["Default"], response_model=ModelsResponse)
 def list_available_models():
     return ModelsResponse(models=_collect_available_models())
-
 
 @api_router.delete("/document/{doc_id}/embeddings", tags=["Default"])
 def delete_document_embeddings_api(
@@ -1443,6 +1462,17 @@ def delete_document_embeddings_api(
 
         if result["status"] == "success":
             logging.info(f"[API] Successfully deleted embeddings for document {doc_id}")
+
+            # Invalidate cached point counts so queries reflect deletion
+            try:
+                from src.api.dw_newron import _COLLECTION_COUNT_CACHE
+                from src.api.vector_store import build_collection_name as _bcn
+                _cname = _bcn(subscription_id)
+                _COLLECTION_COUNT_CACHE.pop(f"{_cname}:{profile_id}", None)
+                _COLLECTION_COUNT_CACHE.pop(_cname, None)
+            except Exception as exc:
+                logging.debug("Failed to invalidate collection count cache after deletion", exc_info=True)
+
             return {
                 "status": "success",
                 "document_id": doc_id,
@@ -1474,7 +1504,6 @@ def delete_document_embeddings_api(
             status_code=500,
             detail=f"Failed to delete embeddings: {str(e)}"
         )
-
 
 @api_router.get("/metrics", tags=["Default"])
 def get_metrics(
@@ -1517,8 +1546,8 @@ def get_metrics(
             if cached:
                 try:
                     return json.loads(cached)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logging.debug("Failed to parse cached metrics snapshot", exc_info=True)
 
         repo = MetricsRepository(store)
         hourly = repo.fetch_hourly(
@@ -1560,13 +1589,12 @@ def get_metrics(
         if cache_key and store.redis and cache_ttl > 0:
             try:
                 store.redis.setex(cache_key, cache_ttl, json.dumps(response))
-            except Exception:
-                pass
+            except Exception as exc:
+                logging.debug("Failed to cache metrics snapshot in Redis", exc_info=True)
         return response
     except Exception as e:
         logging.error(f"Failed to retrieve metrics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve metrics")
-
 
 @api_router.post("/feedback/positive", tags=["Default"])
 def record_positive_feedback(request: FeedbackRequest):
@@ -1596,7 +1624,6 @@ def record_positive_feedback(request: FeedbackRequest):
     except Exception as _fb_exc:
         logging.warning("Feedback MongoDB write failed: %s", _fb_exc)
     return {"status": "ok", "feedback": "positive"}
-
 
 @api_router.post("/feedback/negative", tags=["Default"])
 def record_negative_feedback(request: FeedbackRequest):
@@ -1686,7 +1713,6 @@ def get_sessions_api(user_id: str, subscription_id: str = "default"):
         logging.error(f"Failed to retrieve sessions: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
 
-
 @api_router.get("/session/{user_id}/{session_id}", tags=["Default"])
 def get_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to get a specific session's messages."""
@@ -1700,7 +1726,6 @@ def get_session_api(user_id: str, session_id: str, subscription_id: str = "defau
         logging.error(f"Failed to retrieve session: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve session")
 
-
 @api_router.delete("/chat-history/{user_id}", tags=["Default"])
 def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
     """API endpoint to delete all chat history for a user."""
@@ -1711,7 +1736,6 @@ def delete_chat_history_api(user_id: str, subscription_id: str = "default"):
         logging.error(f"Failed to delete chat history: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete chat history")
 
-
 @api_router.delete("/session/{user_id}/{session_id}", tags=["Default"])
 def delete_session_api(user_id: str, session_id: str, subscription_id: str = "default"):
     """API endpoint to delete a specific session."""
@@ -1721,6 +1745,34 @@ def delete_session_api(user_id: str, session_id: str, subscription_id: str = "de
     except Exception as e:
         logging.error(f"Failed to delete session: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete session")
+
+@api_router.get("/sessions/{user_id}/search", tags=["Default"])
+def search_sessions_api(
+    user_id: str,
+    q: str = Query(..., min_length=1, description="Search query"),
+    profile_id: Optional[str] = None,
+):
+    """Search sessions by query text with optional profile scope."""
+    try:
+        results = search_sessions(user_id, q, profile_id=profile_id)
+        return {"user_id": user_id, "query": q, "results": results}
+    except Exception as e:
+        logging.error(f"Failed to search sessions: {e}")
+        raise HTTPException(status_code=500, detail="Failed to search sessions")
+
+@api_router.get("/session/{user_id}/{session_id}/summary", tags=["Default"])
+def get_session_summary_api(user_id: str, session_id: str):
+    """Get a progressive summary of a session's conversation."""
+    try:
+        summary = get_session_summary(user_id, session_id)
+        if summary is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"user_id": user_id, "session_id": session_id, "summary": summary}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Failed to generate session summary: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate summary")
 
 '''
 @api_router.get("/pii/{doc_id}")
@@ -1744,7 +1796,6 @@ def get_pii_info(doc_id: str, subscription_id: str = "default"):
 class PIISettingUpdate(BaseModel):
     pii_enabled: bool
 
-
 @api_router.get("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def get_pii_setting(subscription_id: str):
     """
@@ -1760,7 +1811,6 @@ def get_pii_setting(subscription_id: str):
     except Exception as e:
         logging.error(f"Failed to get PII setting: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve PII setting")
-
 
 @api_router.put("/subscription/{subscription_id}/pii-setting", tags=["Subscriptions"])
 def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
@@ -1817,7 +1867,6 @@ def update_pii_setting(subscription_id: str, setting: PIISettingUpdate):
         logging.error(f"Failed to update PII setting: {e}")
         raise HTTPException(status_code=500, detail="Failed to update PII setting")
 
-
 @api_router.post("/subscription/{subscription_id}/reprocess-documents", tags=["Subscriptions"])
 def reprocess_documents_with_new_pii_setting(subscription_id: str):
     """
@@ -1859,13 +1908,11 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
         logging.error(f"Failed to reprocess documents: {e}")
         raise HTTPException(status_code=500, detail="Failed to reprocess documents")
 
-
 app.include_router(api_router)
 app.include_router(knowledge_graph_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

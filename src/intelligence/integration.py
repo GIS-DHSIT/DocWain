@@ -10,7 +10,7 @@ and the existing extraction/embedding pipelines:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
@@ -34,8 +34,7 @@ from src.intelligence.response_formatter import (
     format_acknowledged_response,
 )
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class IntelligenceResult:
@@ -62,7 +61,6 @@ class IntelligenceResult:
             "processing_time_ms": self.processing_time_ms,
             "errors": self.errors,
         }
-
 
 class DocumentIntelligenceProcessor:
     """
@@ -261,7 +259,6 @@ class DocumentIntelligenceProcessor:
             sources=sources,
             confidence=confidence,
         )
-
 
 class KnowledgeGraphBuilder:
     """
@@ -466,7 +463,6 @@ class KnowledgeGraphBuilder:
             except Exception as e:
                 logger.warning("Failed to create relationships: %s", e)
 
-
 def process_document_intelligence(
     document_id: str,
     content: Union[str, bytes],
@@ -505,7 +501,6 @@ def process_document_intelligence(
         file_size=file_size,
         raw_metadata=raw_metadata,
     )
-
 
 __all__ = [
     "IntelligenceResult",

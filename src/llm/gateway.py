@@ -1,201 +1,428 @@
-"""Centralized LLM gateway — single entry point for all LLM calls.
-
-Priority chain: vLLM (SafeTensor) → Gemini → Ollama (GGUF fallback).
-All 16+ files that previously did `import ollama` route through here.
 """
+LLM Gateway - unified interface to language model backends.
+
+Primary: vLLM via OpenAICompatibleClient
+Fallback (dev only): Ollama via OllamaClient
+
+Public API (unchanged):
+    create_llm_gateway() -> LLMGateway
+    get_llm_gateway()    -> LLMGateway
+    set_llm_gateway(gw)  -> None
+"""
+
 from __future__ import annotations
 
-import logging
-import os
-import threading
+import re
 import time
-from typing import Any, Dict, Optional, Tuple
+import threading
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
 
-from src.llm.clients import (
-    GeminiClient,
-    LLMClientWrapper,
-    OllamaClient,
-    OpenAICompatibleClient,
-    ResilientLLMClient,
-)
+from src.api.config import Config
+from src.utils.logging_utils import get_logger
+from src.llm.health import VLLMHealthMonitor
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-_GATEWAY: Optional["LLMGateway"] = None
-_GATEWAY_LOCK = threading.Lock()
+# ---------------------------------------------------------------------------
+# Response dataclass
+# ---------------------------------------------------------------------------
 
+@dataclass
+class LLMResponse:
+    """Structured response from an LLM call."""
+    text: str
+    thinking: Optional[str] = None
+    usage: Dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Thinking-block parser
+# ---------------------------------------------------------------------------
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _split_thinking(raw: str) -> Tuple[str, Optional[str]]:
+    """Split ``<think>...</think>`` blocks from Qwen3 output.
+
+    Returns:
+        (answer_text, thinking_text_or_None)
+    """
+    match = _THINK_RE.search(raw)
+    if not match:
+        return raw.strip(), None
+    thinking = match.group(1).strip()
+    answer = _THINK_RE.sub("", raw).strip()
+    return answer, thinking or None
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_gateway_instance: Optional[LLMGateway] = None
+_gateway_lock = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# LLMGateway
+# ---------------------------------------------------------------------------
 
 class LLMGateway:
-    """Single entry point for ALL LLM calls.
+    """Unified gateway to LLM backends.
 
-    Wraps a ResilientLLMClient with health tracking and backend info.
-    Duck-types the same interface as OllamaClient so existing code works unchanged.
+    Prioritises vLLM (via ``OpenAICompatibleClient``).  Falls back to Ollama
+    only when vLLM is disabled or unhealthy (intended for local dev).
     """
 
-    def __init__(self, primary: Any, fallback: Any = None, name: str = "default"):
-        if fallback is not None:
-            self._client = ResilientLLMClient(primary, fallback)
-        else:
-            self._client = primary
-        self.model_name = getattr(self._client, "model_name", None)
-        self.backend = getattr(primary, "backend", None) or "unknown"
-        self.name = name
-        self._created_at = time.time()
+    def __init__(self) -> None:
+        self._primary = None  # OpenAICompatibleClient
+        self._fallback = None  # OllamaClient (dev only)
+        self._health_monitor: Optional[VLLMHealthMonitor] = None
+
+        # Expose for backward compat
+        self.model_name: Optional[str] = None
+        self.backend: str = "unknown"
+
+        # Stats
         self._stats_lock = threading.Lock()
-        self._stats: Dict[str, int] = {"calls": 0, "errors": 0}
-        logger.info(
-            "LLMGateway '%s' initialized: primary=%s fallback=%s",
-            name,
-            getattr(primary, "backend", type(primary).__name__),
-            getattr(fallback, "backend", type(fallback).__name__) if fallback else "none",
+        self._stats: Dict[str, Any] = {
+            "requests": 0,
+            "failures": 0,
+            "fallback_used": 0,
+            "last_error": None,
+            "last_request_ts": None,
+        }
+        self._created_at = time.time()
+
+        # Cooldown tracking (populated on repeated failures)
+        self._cooldown_until: float = 0.0
+
+        self._init_clients()
+
+    # ------------------------------------------------------------------
+    # Initialisation helpers
+    # ------------------------------------------------------------------
+
+    def _init_clients(self) -> None:
+        """Create backend clients based on configuration.
+
+        Uses Ollama as the sole backend (GPU-efficient, single-server).
+        vLLM support removed to eliminate dual-backend complexity.
+        """
+        # --- Ollama (primary) ---
+        try:
+            from src.llm.clients import OllamaClient
+            self._primary = OllamaClient()
+            self.backend = "ollama"
+            self.model_name = self._primary.model_name
+            logger.info("Ollama primary client initialised (model=%s)", self.model_name)
+        except Exception as exc:
+            logger.error("Failed to create Ollama client: %s", exc)
+            self._primary = None
+
+        if self._primary is None:
+            logger.error("No LLM backend available - all calls will fail")
+
+    def _pick_client(self):
+        """Return the primary Ollama client."""
+        if self._primary is not None:
+            return self._primary
+
+        # Last resort: return primary even if unhealthy so caller gets a real error
+        if self._primary is not None:
+            return self._primary
+
+        raise RuntimeError("No LLM backend configured")
+
+    # ------------------------------------------------------------------
+    # Core generation
+    # ------------------------------------------------------------------
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        system: str = "",
+        think: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Generate text. Returns the answer string (backward compatible).
+
+        Args:
+            prompt: User prompt text.
+            system: Optional system prompt.
+            think: Enable Qwen3 thinking mode (``<think>`` tags).
+            temperature: Sampling temperature (default from Config.LLM).
+            max_tokens: Max generation tokens (default from Config.LLM).
+            **kwargs: Forwarded to the underlying client.
+
+        Returns:
+            Generated answer text (thinking blocks stripped).
+        """
+        resp = self._do_generate(
+            prompt, system=system, think=think,
+            temperature=temperature, max_tokens=max_tokens, **kwargs,
+        )
+        return resp.text
+
+    def generate_with_metadata(
+        self,
+        prompt: str,
+        *,
+        system: str = "",
+        think: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Generate text and return ``(text, metadata_dict)``.
+
+        Backward-compatible with the old gateway signature.
+        """
+        if options:
+            kwargs.setdefault("options", options)
+        resp = self._do_generate(
+            prompt, system=system, think=think,
+            temperature=temperature, max_tokens=max_tokens, **kwargs,
+        )
+        meta: Dict[str, Any] = {
+            "usage": resp.usage,
+            "backend": self._active_backend_name(),
+        }
+        if resp.thinking:
+            meta["thinking"] = resp.thinking
+        return resp.text, meta
+
+    def chat_with_metadata(
+        self,
+        messages: List[Dict[str, str]],
+        *,
+        think: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Chat-based generation with system/user messages.
+
+        When *think* is True and the primary client is vLLM, passes
+        ``extra_body={"chat_template_kwargs": {"enable_thinking": True}}``
+        so the server can activate Qwen3 thinking mode.
+        """
+        client = self._pick_client()
+
+        temperature = temperature if temperature is not None else Config.LLM.TEMPERATURE
+        max_tokens = max_tokens if max_tokens is not None else Config.LLM.MAX_TOKENS
+
+        opts = dict(options or {})
+        opts.setdefault("temperature", temperature)
+        opts.setdefault("max_tokens", max_tokens)
+        opts.setdefault("top_p", Config.LLM.TOP_P)
+
+        self._record_request()
+
+        raw, usage_meta = client.chat_with_metadata(
+            messages, options=opts, thinking=think, **kwargs,
         )
 
-    def generate(self, prompt: str, **kwargs) -> str:
-        with self._stats_lock:
-            self._stats["calls"] += 1
-            self._stats.setdefault(self.backend, 0)
-            self._stats[self.backend] += 1
-        try:
-            return self._client.generate(prompt, **kwargs)
-        except Exception:
-            with self._stats_lock:
-                self._stats["errors"] += 1
-            raise
+        answer, thinking = _split_thinking(raw)
 
-    def generate_with_metadata(self, prompt: str, **kwargs) -> Tuple[str, Dict[str, Any]]:
-        with self._stats_lock:
-            self._stats["calls"] += 1
-            self._stats.setdefault(self.backend, 0)
-            self._stats[self.backend] += 1
+        meta: Dict[str, Any] = {
+            "usage": usage_meta,
+            "backend": "ollama",
+        }
+        if thinking:
+            meta["thinking"] = thinking
+
+        return answer, meta
+
+    # ------------------------------------------------------------------
+    # Classification helper
+    # ------------------------------------------------------------------
+
+    def classify(self, prompt: str, **kwargs: Any) -> str:
+        """Convenience method for classification tasks (low temperature)."""
+        return self.generate(prompt, temperature=0.05, max_tokens=256, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def warm_up(self) -> None:
+        """Send a trivial request to warm up the backend."""
         try:
-            if hasattr(self._client, "generate_with_metadata"):
-                return self._client.generate_with_metadata(prompt, **kwargs)
-            text = self._client.generate(prompt, **kwargs)
-            return text, {"response": text}
-        except Exception:
-            with self._stats_lock:
-                self._stats["errors"] += 1
-            raise
+            self.generate("Say OK.", max_tokens=8)
+            logger.info("LLM warm-up complete")
+        except Exception as exc:
+            logger.warning("LLM warm-up failed: %s", exc)
+
+    def health_check(self) -> Dict[str, Any]:
+        """Return a health summary dict."""
+        return {
+            "healthy": self._primary is not None,
+            "primary": {
+                "available": self._primary is not None,
+                "backend": getattr(self._primary, "backend", None),
+                "model": getattr(self._primary, "model_name", None),
+            },
+        }
 
     def get_stats(self) -> Dict[str, Any]:
-        """Return per-backend call statistics."""
         with self._stats_lock:
             return {
                 **dict(self._stats),
                 "uptime_seconds": round(time.time() - self._created_at, 1),
             }
 
-    def classify(self, prompt: str, **kwargs) -> str:
-        """Low-latency classification call (intent, domain, sentiment).
-
-        Uses the same backend but callers can use this for semantic distinction.
-        """
-        return self.generate(prompt, max_retries=1, backoff=0.2, **kwargs)
-
-    def warm_up(self):
-        warm = getattr(self._client, "warm_up", None)
-        if callable(warm):
-            warm()
-
-    def health_check(self) -> Dict[str, Any]:
-        """Check if the gateway can generate responses."""
-        start = time.time()
-        try:
-            text = self.generate("Respond with OK.", max_retries=1, backoff=0.0)
-            latency_ms = (time.time() - start) * 1000
-            return {
-                "status": "healthy" if text else "degraded",
-                "backend": self.backend,
-                "model": self.model_name,
-                "latency_ms": round(latency_ms, 1),
-            }
-        except Exception as exc:
-            return {
-                "status": "unhealthy",
-                "backend": self.backend,
-                "model": self.model_name,
-                "error": str(exc),
-            }
-
-    # Backward compatibility — some code checks hasattr for in_cooldown
     def in_cooldown(self) -> bool:
-        checker = getattr(self._client, "in_cooldown", None)
-        if callable(checker):
-            return checker()
-        return False
+        return time.time() < self._cooldown_until
 
+    def shutdown(self) -> None:
+        """Stop background threads."""
+        if self._health_monitor:
+            self._health_monitor.stop()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _do_generate(
+        self,
+        prompt: str,
+        *,
+        system: str = "",
+        think: bool = False,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        """Unified generation logic shared by generate() and generate_with_metadata()."""
+        client = self._pick_client()
+
+        temperature = temperature if temperature is not None else Config.LLM.TEMPERATURE
+        max_tokens = max_tokens if max_tokens is not None else Config.LLM.MAX_TOKENS
+
+        # Extract extra options to merge later (avoids duplicate kwarg for 'options')
+        extra_options = kwargs.pop("options", None)
+
+        self._record_request()
+
+        full_prompt = f"{system}\n\n{prompt}".strip() if system else prompt
+        opts = {"temperature": temperature, "max_tokens": max_tokens}
+        if extra_options:
+            opts.update(extra_options)
+
+        raw, usage_meta = client.generate_with_metadata(
+            full_prompt, options=opts, thinking=think, **kwargs,
+        )
+
+        answer, thinking = _split_thinking(raw)
+        return LLMResponse(text=answer, thinking=thinking, usage=usage_meta)
+
+    def _vllm_chat(
+        self,
+        client,
+        messages: List[Dict[str, str]],
+        *,
+        think: bool = False,
+        opts: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[str, Dict]:
+        """Call vLLM via OpenAICompatibleClient, injecting thinking kwargs when needed."""
+        call_kwargs: Dict[str, Any] = dict(kwargs)
+        call_opts = dict(opts or {})
+
+        if think:
+            call_kwargs["extra_body"] = {
+                "chat_template_kwargs": {"enable_thinking": True}
+            }
+
+        # Format messages into a single prompt for the client
+        prompt = self._messages_to_prompt(messages)
+
+        return client.generate_with_metadata(prompt, options=call_opts, **call_kwargs)
+
+    @staticmethod
+    def _build_messages(prompt: str, system: str = "") -> List[Dict[str, str]]:
+        msgs: List[Dict[str, str]] = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.append({"role": "user", "content": prompt})
+        return msgs
+
+    @staticmethod
+    def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
+        """Flatten chat messages into a single prompt string for clients
+        that only accept a prompt argument."""
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                parts.append(f"[System]\n{content}")
+            elif role == "assistant":
+                parts.append(f"[Assistant]\n{content}")
+            else:
+                parts.append(content)
+        return "\n\n".join(parts)
+
+    def _active_backend_name(self) -> str:
+        client = self._pick_client()
+        return getattr(client, "backend", "unknown")
+
+    def _record_request(self) -> None:
+        with self._stats_lock:
+            self._stats["requests"] += 1
+            self._stats["last_request_ts"] = time.time()
+
+    def _record_failure(self, exc: Exception) -> None:
+        with self._stats_lock:
+            self._stats["failures"] += 1
+            self._stats["last_error"] = str(exc)
+
+    def _record_fallback(self) -> None:
+        with self._stats_lock:
+            self._stats["fallback_used"] += 1
+
+
+# ---------------------------------------------------------------------------
+# Module-level public API
+# ---------------------------------------------------------------------------
 
 def create_llm_gateway(
     model_name: Optional[str] = None,
     backend_override: Optional[str] = None,
 ) -> LLMGateway:
-    """Factory: creates an LLMGateway with vLLM primary → Ollama fallback.
+    """Create (or recreate) the global LLMGateway singleton.
 
-    Reads Config.VLLM for vLLM settings. Falls back to Gemini or Ollama
-    based on available configuration.
+    Args are accepted for backward compatibility but ignored — the gateway
+    reads its configuration from ``Config.VLLM`` and ``Config.LLM``.
     """
-    from src.api.config import Config
-    from src.llm.clients import _resolve_model_alias
-
-    model_name = _resolve_model_alias(model_name)
-    backend = (backend_override or os.getenv("LLM_BACKEND", "")).lower().strip()
-
-    primary = None
-    fallback = None
-
-    # Always create Ollama as the ultimate fallback
-    try:
-        fallback = OllamaClient(model_name)
-    except Exception as exc:
-        logger.warning("Ollama fallback init failed: %s", exc)
-
-    # Check for vLLM first (highest priority for speed)
-    vllm_enabled = getattr(Config, "VLLM", None) and getattr(Config.VLLM, "ENABLED", False)
-    if vllm_enabled or backend in ("vllm", "openai", "openai_compatible", "local_http"):
-        try:
-            vllm_cfg = getattr(Config, "VLLM", None)
-            primary = OpenAICompatibleClient(
-                model_name=getattr(vllm_cfg, "MODEL_NAME", None) or model_name,
-                endpoint=getattr(vllm_cfg, "ENDPOINT", None) if vllm_cfg else None,
-                api_key=getattr(vllm_cfg, "API_KEY", None) if vllm_cfg else None,
-            )
-        except Exception as exc:
-            logger.warning("vLLM/OpenAI-compatible client init failed: %s", exc)
-
-    # Gemini as secondary option
-    if primary is None and (backend == "gemini" or (model_name or "").lower().startswith("gemini")):
-        disable_external = getattr(Config.LLM, "DISABLE_EXTERNAL", False)
-        if not disable_external:
-            try:
-                primary = GeminiClient(model_name)
-            except Exception as exc:
-                logger.warning("Gemini init failed: %s", exc)
-
-    # If no primary was created, use Ollama as primary (no fallback needed)
-    if primary is None:
-        return LLMGateway(fallback or OllamaClient(model_name), fallback=None, name="ollama-only")
-
-    # Apply concurrency semaphore
-    max_concurrency = getattr(Config.LLM, "MAX_CONCURRENCY", 2)
-    semaphore = threading.Semaphore(max_concurrency)
-    primary = LLMClientWrapper(primary, semaphore)
-
-    return LLMGateway(primary, fallback, name=f"{getattr(primary, 'backend', 'primary')}-with-ollama-fallback")
+    global _gateway_instance
+    with _gateway_lock:
+        if _gateway_instance is not None:
+            _gateway_instance.shutdown()
+        _gateway_instance = LLMGateway()
+        return _gateway_instance
 
 
 def get_llm_gateway() -> LLMGateway:
-    """Get the singleton LLMGateway, creating it if needed."""
-    global _GATEWAY
-    if _GATEWAY is not None:
-        return _GATEWAY
-    with _GATEWAY_LOCK:
-        if _GATEWAY is not None:
-            return _GATEWAY
-        _GATEWAY = create_llm_gateway()
-        return _GATEWAY
+    """Return the existing singleton, creating it on first call."""
+    global _gateway_instance
+    if _gateway_instance is None:
+        with _gateway_lock:
+            if _gateway_instance is None:
+                _gateway_instance = LLMGateway()
+    return _gateway_instance
 
 
 def set_llm_gateway(gateway: LLMGateway) -> None:
-    """Set the singleton LLMGateway (called during app startup)."""
-    global _GATEWAY
-    _GATEWAY = gateway
+    """Replace the global singleton (useful for testing)."""
+    global _gateway_instance
+    with _gateway_lock:
+        _gateway_instance = gateway

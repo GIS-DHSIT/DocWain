@@ -1,0 +1,97 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    {
+      "type": "ColumnSet",
+      "columns": [
+        {
+          "type": "Column",
+          "width": "stretch",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "Document Identified",
+              "weight": "Bolder",
+              "size": "Medium",
+              "color": "Accent"
+            }
+          ]
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "[{doc_type}]",
+              "weight": "Bolder",
+              "size": "Small",
+              "color": "Accent"
+            }
+          ],
+          "verticalContentAlignment": "Center"
+        },
+        {
+          "type": "Column",
+          "width": "auto",
+          "items": [
+            {
+              "type": "TextBlock",
+              "text": "{confidence}",
+              "size": "Small",
+              "isSubtle": true
+            }
+          ],
+          "verticalContentAlignment": "Center"
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "{summary}",
+      "wrap": true,
+      "spacing": "Small"
+    },
+    {
+      "type": "Container",
+      "separator": true,
+      "spacing": "Medium",
+      "items": [
+        {
+          "type": "TextBlock",
+          "text": "Key Entities",
+          "weight": "Bolder",
+          "size": "Small",
+          "color": "Accent"
+        },
+        {
+          "type": "TextBlock",
+          "text": "{entities_text}",
+          "wrap": true,
+          "size": "Small"
+        }
+      ]
+    },
+    {
+      "type": "TextBlock",
+      "text": "Intent: {intent_text}",
+      "size": "Small",
+      "isSubtle": true,
+      "spacing": "Small"
+    }
+  ],
+  "actions": [
+    {
+      "type": "Action.Submit",
+      "title": "{action1_title}",
+      "data": { "action": "domain_query", "query": "{action1_query}" }
+    },
+    {
+      "type": "Action.Submit",
+      "title": "{action2_title}",
+      "data": { "action": "domain_query", "query": "{action2_query}" }
+    }
+  ]
+}

@@ -4,21 +4,20 @@ Each pipeline role (classifier, extractor, generator, verifier) maps to a
 specialized local model selected for that task:
   - classifier  → llama3.2  (2GB, fast intent/domain classification)
   - extractor   → mistral   (4.1GB, structured extraction)
-  - generator   → gpt-oss   (13GB, response synthesis)
+  - generator   → DocWain-Agent   (13GB, response synthesis)
   - verifier    → deepseek-r1 (4.7GB, chain-of-thought grounding)
 
 Duck-types the same interface as LLMGateway so existing code works unchanged.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class AgentRole(str, Enum):
     CLASSIFIER = "classifier"
@@ -29,23 +28,21 @@ class AgentRole(str, Enum):
     VISION = "vision"
     DEFAULT = "default"
 
-
 # Default model assignments per role — MoE routing
 # CRITICAL: On a single T4 16GB GPU, Ollama can only keep ONE large model loaded.
 # Routing CLASSIFIER/DEFAULT to a different model than GENERATOR triggers model
 # swaps (500 "loading model" errors + 10-30s swap delay).  Route ALL roles to
-# gpt-oss to eliminate swap contention.  lfm2.5-thinking is only used for
+# DocWain-Agent to eliminate swap contention.  lfm2.5-thinking is only used for
 # REASONER/VERIFIER (infrequent, can absorb the swap cost).
 _DEFAULT_ROLE_MODELS: Dict[str, str] = {
-    AgentRole.CLASSIFIER: "gpt-oss:latest",            # Same as generator — no model swap
-    AgentRole.EXTRACTOR: "gpt-oss:latest",             # Same as generator — no model swap
-    AgentRole.GENERATOR: "gpt-oss:latest",
-    AgentRole.VERIFIER: "gpt-oss:latest",              # Avoid swap on verification
-    AgentRole.REASONER: "gpt-oss:latest",              # Avoid swap on reasoning
+    AgentRole.CLASSIFIER: "DocWain-Agent:latest",            # Same as generator — no model swap
+    AgentRole.EXTRACTOR: "DocWain-Agent:latest",             # Same as generator — no model swap
+    AgentRole.GENERATOR: "DocWain-Agent:latest",
+    AgentRole.VERIFIER: "DocWain-Agent:latest",              # Avoid swap on verification
+    AgentRole.REASONER: "DocWain-Agent:latest",              # Avoid swap on reasoning
     AgentRole.VISION: "glm-ocr:latest",                # Vision/OCR sub-agent
-    AgentRole.DEFAULT: "gpt-oss:latest",               # Default — no model swap
+    AgentRole.DEFAULT: "DocWain-Agent:latest",               # Default — no model swap
 }
-
 
 class _RoleStats:
     """Thread-safe per-role call statistics."""
@@ -74,7 +71,6 @@ class _RoleStats:
                 "errors": self.errors,
                 "avg_latency_ms": round(avg, 1),
             }
-
 
 class MultiAgentGateway:
     """Routes LLM calls to role-specific Ollama models.
@@ -245,7 +241,7 @@ class MultiAgentGateway:
     # ── Convenience methods ────────────────────────────────────────
 
     def classify(self, prompt: str, **kwargs) -> str:
-        """Classification uses CLASSIFIER role (gpt-oss — same model, no swap)."""
+        """Classification uses CLASSIFIER role (DocWain-Agent — same model, no swap)."""
         return self.generate_for_role(AgentRole.CLASSIFIER, prompt, max_retries=2, backoff=0.5, **kwargs)
 
     def extract(self, prompt: str, **kwargs) -> str:
@@ -292,7 +288,6 @@ class MultiAgentGateway:
     def warm_up(self):
         """No-op — models are loaded on demand."""
         pass
-
 
 class TaskAwareGateway(MultiAgentGateway):
     """Extends MultiAgentGateway with task-type-aware model routing.
@@ -446,7 +441,6 @@ class TaskAwareGateway(MultiAgentGateway):
         base["task_routing"] = self.get_task_stats()
         base["model_clients"] = list(self._model_clients.keys())
         return base
-
 
 def create_multi_agent_gateway(
     fallback_gateway: Any = None,

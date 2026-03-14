@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import pickle
 import sys
@@ -87,7 +87,15 @@ from src.storage.azure_blob_client import normalize_blob_name
 from src.storage.blob_persistence import load_pickle as load_blob_pickle
 from src.utils.idempotency import acquire_lock, release_lock
 
-logger = logging.getLogger(__name__)
+try:
+    from src.docwain_intel.integration import run_intel_pipeline_hook, INTEL_PIPELINE_ENABLED
+    from src.docwain_intel.extraction import build_document_json_from_extracted
+except ImportError:
+    INTEL_PIPELINE_ENABLED = False
+    run_intel_pipeline_hook = None  # type: ignore[assignment]
+    build_document_json_from_extracted = None  # type: ignore[assignment]
+
+logger = get_logger(__name__)
 
 COMPLETED_STATUSES = {
     STATUS_EMBEDDING_COMPLETED,
@@ -95,14 +103,11 @@ COMPLETED_STATUSES = {
     STATUS_TRAINING_PARTIALLY_COMPLETED,
 }
 
-
 def _telemetry():
     return telemetry_store() if METRICS_V2_ENABLED else None
 
-
 def _metrics_store():
     return get_metrics_store()
-
 
 def _truncate_error_message(message: Optional[str], limit: int = 500) -> str:
     if not message:
@@ -111,7 +116,6 @@ def _truncate_error_message(message: Optional[str], limit: int = 500) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: max(0, limit - 3)]}..."
-
 
 def _build_error_payload(
     *,
@@ -132,7 +136,6 @@ def _build_error_payload(
     }
     return {k: v for k, v in error.items() if v is not None}
 
-
 def _safe_update_stage(
     document_id: str,
     stage: str,
@@ -146,7 +149,6 @@ def _safe_update_stage(
         logger.error("Failed to update stage %s for %s: %s", stage, document_id, exc, exc_info=True)
         if cause:
             logger.error("Original error for %s stage %s: %s", document_id, stage, cause, exc_info=True)
-
 
 def _safe_set_document_status(
     document_id: str,
@@ -170,7 +172,6 @@ def _safe_set_document_status(
         if cause:
             logger.error("Original error for %s status update: %s", document_id, cause, exc_info=True)
 
-
 def _build_failed_result(
     *,
     document_id: Optional[str],
@@ -188,7 +189,6 @@ def _build_failed_result(
         "error_message": error_message,
         "failed_reason": failed_reason,
     }
-
 
 def _set_document_status(
     document_id: str,
@@ -216,7 +216,6 @@ def _set_document_status(
     update_document_fields(document_id, fields)
     logger.info("Document %s status updated to %s", document_id, status)
 
-
 def _training_success_fields() -> Dict[str, Any]:
     now = time.time()
     return {
@@ -224,7 +223,6 @@ def _training_success_fields() -> Dict[str, Any]:
         "embedding_completed_at": now,
         "trained_at": now,
     }
-
 
 def _ingest_chunks_to_knowledge_graph(
     document_id: str,
@@ -269,7 +267,6 @@ def _ingest_chunks_to_knowledge_graph(
     except Exception as exc:  # noqa: BLE001
         logger.debug("KG chunk ingestion skipped for %s: %s", document_id, exc)
 
-
 def _get_max_workers(total: int) -> int:
     max_workers_env = os.getenv("EMBEDDING_MAX_WORKERS")
     try:
@@ -282,7 +279,6 @@ def _get_max_workers(total: int) -> int:
         max_workers = min(total, 2)
     return max_workers
 
-
 def _get_max_blobs(requested: Optional[int] = None) -> int:
     if requested is not None and requested > 0:
         return requested
@@ -293,7 +289,6 @@ def _get_max_blobs(requested: Optional[int] = None) -> int:
         parsed = None
     return parsed or 25
 
-
 def _lease_seconds() -> int:
     env_val = os.getenv("DOCWAIN_BLOB_LEASE_SECONDS")
     try:
@@ -301,7 +296,6 @@ def _lease_seconds() -> int:
     except ValueError:
         parsed = None
     return parsed or 60
-
 
 def _normalize_requested_ids(document_id: Optional[str], document_ids: Optional[List[str]]) -> List[str]:
     requested: List[str] = []
@@ -311,14 +305,12 @@ def _normalize_requested_ids(document_id: Optional[str], document_ids: Optional[
         requested.extend([str(doc_id).strip() for doc_id in document_ids if str(doc_id).strip()])
     return list(dict.fromkeys(requested))
 
-
 def _extract_doc_id(record: Dict[str, Any]) -> Optional[str]:
     for key in ("_id", "document_id", "documentId", "doc_id", "id"):
         value = record.get(key)
         if value:
             return str(value)
     return None
-
 
 def _fetch_document_ids_by_filters(
     subscription_id: Optional[str] = None,
@@ -333,7 +325,7 @@ def _fetch_document_ids_by_filters(
     if collection is None:
         raise ValueError("Document store is not accessible")
 
-    filters: List[Dict[str, Any]] = [{"status": {"$in": [STATUS_EXTRACTION_COMPLETED, STATUS_SCREENING_COMPLETED]}}]
+    filters: List[Dict[str, Any]] = [{"status": {"$in": [STATUS_SCREENING_COMPLETED]}}]
     if subscription_id:
         filters.append(
             {
@@ -363,7 +355,6 @@ def _fetch_document_ids_by_filters(
         if doc_id:
             doc_ids.append(doc_id)
     return doc_ids
-
 
 def _fetch_document_ids_for_integrity(
     subscription_id: Optional[str],
@@ -420,7 +411,6 @@ def _fetch_document_ids_for_integrity(
             doc_ids.append(doc_id)
     return doc_ids
 
-
 def _load_extracted_for_doc(document_id: str) -> Tuple[Optional[Any], Dict[str, Any]]:
     details: Dict[str, Any] = {"source": "missing"}
     if blob_storage_configured():
@@ -446,7 +436,6 @@ def _load_extracted_for_doc(document_id: str) -> Tuple[Optional[Any], Dict[str, 
     details.update({"source": "local", "path": str(path), "bytes": len(payload or b"")})
     return pickle.loads(payload), details
 
-
 def _min_chars_threshold() -> int:
     raw = os.getenv("EMBEDDING_MIN_CHARS", "50")
     try:
@@ -454,11 +443,9 @@ def _min_chars_threshold() -> int:
     except ValueError:
         return 50
 
-
 def _is_meta_tensor_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "meta tensor" in msg or "cannot copy out of meta tensor" in msg
-
 
 def _is_cuda_oom(exc: Exception) -> bool:
     """Detect CUDA out-of-memory errors including CUBLAS allocation failures."""
@@ -476,7 +463,6 @@ def _is_cuda_oom(exc: Exception) -> bool:
         or ("cuda error" in msg and "alloc" in msg)
     )
 
-
 def _clear_gpu_cache() -> None:
     """Best-effort GPU cache clear after CUDA OOM."""
     try:
@@ -486,13 +472,11 @@ def _clear_gpu_cache() -> None:
     except Exception:  # noqa: BLE001
         pass
 
-
 def _coverage_threshold() -> float:
     try:
         return float(getattr(Config.Retrieval, "CHUNK_COVERAGE_THRESHOLD", 0.98))
     except Exception:  # noqa: BLE001
         return 0.98
-
 
 def _basename(value: Optional[str]) -> str:
     if not value:
@@ -500,14 +484,12 @@ def _basename(value: Optional[str]) -> str:
     text = str(value)
     return text.split("/")[-1] if "/" in text else text
 
-
 def _sum_strings(values: Iterable[Optional[str]]) -> int:
     total = 0
     for value in values:
         if isinstance(value, str):
             total += len(value.strip())
     return total
-
 
 def _raw_coverage_for_content(content: Any) -> Optional[float]:
     threshold = _coverage_threshold()
@@ -538,7 +520,6 @@ def _raw_coverage_for_content(content: Any) -> Optional[float]:
         return None
     return None
 
-
 def _content_char_count(content: Any) -> int:
     if isinstance(content, ExtractedDocument):
         if content.full_text:
@@ -561,7 +542,6 @@ def _content_char_count(content: Any) -> int:
 
     return 0
 
-
 def _payload_has_required_schema(content: Any) -> bool:
     """Validate that the extracted payload contains at least one usable text field."""
     if isinstance(content, ExtractedDocument):
@@ -583,7 +563,6 @@ def _payload_has_required_schema(content: Any) -> bool:
         return bool(content.strip())
     return False
 
-
 def _safe_text_item(item: Any) -> str:
     """Extract text from a list item without stringifying dicts/objects."""
     if isinstance(item, str):
@@ -599,7 +578,6 @@ def _safe_text_item(item: Any) -> str:
         if isinstance(val, str) and val.strip():
             return val
     return ""
-
 
 def _normalize_content_in_place(content: Any) -> Any:
     """Normalize extracted text fields without losing layout cues."""
@@ -642,7 +620,6 @@ def _normalize_content_in_place(content: Any) -> Any:
         return normalize_text(content)
     return content
 
-
 def _normalize_metadata_in_place(content: Any, *, document_id: Optional[str]) -> Any:
     if isinstance(content, dict):
         if isinstance(content.get("chunk_metadata"), list):
@@ -657,7 +634,6 @@ def _normalize_metadata_in_place(content: Any, *, document_id: Optional[str]) ->
             )
         return content
     return content
-
 
 def _assess_extracted_docs(extracted_docs: Dict[str, Any]) -> Dict[str, Any]:
     total_chars = 0
@@ -680,7 +656,6 @@ def _assess_extracted_docs(extracted_docs: Dict[str, Any]) -> Dict[str, Any]:
         "min_chars": min_chars,
     }
 
-
 def _connector_lookup(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     connector_id = record.get("connector") or record.get("connector_id") or record.get("connectorId")
     if not connector_id:
@@ -695,7 +670,6 @@ def _connector_lookup(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Connector lookup failed for %s: %s", connector_id, exc)
         return None
-
 
 def _download_from_connector(
     *,
@@ -742,7 +716,6 @@ def _download_from_connector(
                 return None, None
     return None, None
 
-
 def _download_from_source_file(record: Dict[str, Any], document_id: str) -> Tuple[Optional[bytes], Optional[str]]:
     source_file = record.get("source_file")
     if not isinstance(source_file, str) or not source_file.strip():
@@ -754,7 +727,6 @@ def _download_from_source_file(record: Dict[str, Any], document_id: str) -> Tupl
     except Exception as exc:  # noqa: BLE001
         logger.warning("Source-file fallback download failed for %s (%s): %s", document_id, source_file, exc)
         return None, None
-
 
 def _reextract_from_source(
     *,
@@ -798,7 +770,6 @@ def _reextract_from_source(
 
     logger.info("Fallback extraction completed for %s using source %s", document_id, source_id)
     return masked_docs
-
 
 def _prepare_extracted_docs(
     *,
@@ -898,7 +869,6 @@ def _prepare_extracted_docs(
 
     return extracted_docs, expected_chunks, coverage_values, None
 
-
 def _select_blob_candidates(
     store: BlobStore,
     document_ids: List[str],
@@ -942,7 +912,6 @@ def _select_blob_candidates(
 
     return filtered
 
-
 def _split_text_preserve(input_text: str) -> List[str]:
     if not input_text:
         return []
@@ -959,7 +928,6 @@ def _split_text_preserve(input_text: str) -> List[str]:
         if end >= text_len:
             break
     return chunks_out
-
 
 def _merge_candidates(candidates: List[Any], min_len: int):
     merged = []
@@ -983,7 +951,6 @@ def _merge_candidates(candidates: List[Any], min_len: int):
     if buffer_meta and buffer_text:
         merged.append((buffer_text, buffer_meta))
     return merged
-
 
 def _build_chunks_for_extracted_doc(
     extracted: ExtractedDocument,
@@ -1126,7 +1093,6 @@ def _build_chunks_for_extracted_doc(
 
     return chunks, chunk_metadata, coverage_ratio, dropped
 
-
 def _estimate_chunks_for_content(content: Any, *, document_id: str, doc_name: str) -> Tuple[int, Optional[float]]:
     """
     Estimate the number of chunks that will be produced from content.
@@ -1250,7 +1216,6 @@ def _estimate_chunks_for_content(content: Any, *, document_id: str, doc_name: st
 
     return 0, None
 
-
 def _normalize_extracted_docs(extracted: Any) -> Dict[str, Any]:
     """
     Normalize extracted document payload to a consistent format for embedding.
@@ -1314,7 +1279,6 @@ def _normalize_extracted_docs(extracted: Any) -> Dict[str, Any]:
         return {"document": extracted}
     raise ValueError(f"Unsupported extracted payload type: {type(extracted)}")
 
-
 def _salvage_repr_text(text: str) -> str:
     """Salvage real content from ExtractedDocument/Section repr strings."""
     if not text or not isinstance(text, str):
@@ -1327,7 +1291,6 @@ def _salvage_repr_text(text: str) -> str:
     if salvaged and len(salvaged.strip()) >= 20:
         return salvaged
     return text
-
 
 def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
     """Convert structured extraction to embedding-compatible format."""
@@ -1348,7 +1311,7 @@ def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
                     text_content = _salvage_repr_text(str(value).strip())
                 from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage
                 if _is_metadata_garbage(text_content):
-                    logger.warning("Skipping garbage text from structured value for %s", name)
+                    logger.debug("Skipping garbage text from structured value for %s", name)
                     continue
                 if text_content:
                     normalized[name] = {
@@ -1498,7 +1461,6 @@ def _normalize_structured_payload(structured: Dict[str, Any]) -> Dict[str, Any]:
                 }
 
     return normalized
-
 
 def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
     """Convert raw extraction to embedding-compatible format."""
@@ -1658,12 +1620,39 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                     if not texts or not any(t.strip() for t in texts if isinstance(t, str)):
                         texts = [full_text]
 
+                    # Include translated English text alongside original for non-English docs
+                    translated_text = content.get("translated_text")
+                    if translated_text and content.get("detected_language", "en") != "en":
+                        # Append translated version of each section for bilingual embedding
+                        sections = content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}])
+                        translated_sections = []
+                        translated_texts = []
+                        for sec in sections:
+                            if isinstance(sec, dict):
+                                sec_translated = sec.get("translated_text")
+                                if sec_translated:
+                                    translated_sections.append({
+                                        **sec,
+                                        "text": sec_translated,
+                                        "chunk_type": "translated",
+                                    })
+                                    translated_texts.append(sec_translated)
+                        if not translated_texts and translated_text:
+                            translated_sections = [{"text": translated_text, "start_page": 1, "end_page": 1, "chunk_type": "translated"}]
+                            translated_texts = [translated_text]
+                        all_texts = texts + translated_texts
+                        all_sections = list(sections) + translated_sections
+                    else:
+                        all_texts = texts
+                        all_sections = content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}])
+
                     normalized[name] = {
                         "full_text": full_text,
-                        "texts": texts,
-                        "sections": content.get("sections", [{"text": full_text, "start_page": 1, "end_page": 1}]),
+                        "texts": all_texts,
+                        "sections": all_sections,
                         "chunk_metadata": content.get("chunk_metadata", []),
                         "doc_type": content.get("doc_type"),
+                        "detected_language": content.get("detected_language"),
                     }
             elif isinstance(content, str) and content.strip():
                 normalized[name] = {
@@ -1674,7 +1663,6 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
         return normalized if normalized else {}
 
     return {}
-
 
 def _has_useful_content(normalized: Dict[str, Any]) -> bool:
     """Check if normalized payload has useful content for embedding."""
@@ -1700,7 +1688,6 @@ def _has_useful_content(normalized: Dict[str, Any]) -> bool:
             return True
 
     return False
-
 
 def _recover_from_payload(extracted: Dict[str, Any]) -> Dict[str, Any]:
     """Attempt to recover any usable text from the payload."""
@@ -1738,7 +1725,6 @@ def _recover_from_payload(extracted: Dict[str, Any]) -> Dict[str, Any]:
 
     return recovered
 
-
 def _diagnose_content(content: Any, doc_name: str) -> str:
     """Generate diagnostic info for failed chunk estimation."""
     if content is None:
@@ -1761,7 +1747,6 @@ def _diagnose_content(content: Any, doc_name: str) -> str:
                     fields.append(f"{key}:{type(val).__name__}")
         return f"dict with {', '.join(fields) if fields else 'no text fields'}"
     return f"unknown type: {type(content).__name__}"
-
 
 def _screen_payload(extracted_docs: Dict[str, Any], document_id: str) -> Tuple[int, List[float]]:
     total_chunks = 0
@@ -1807,7 +1792,6 @@ def _screen_payload(extracted_docs: Dict[str, Any], document_id: str) -> Tuple[i
 
     return total_chunks, coverage_values
 
-
 def _count_qdrant_points(subscription_id: str, profile_id: str, document_id: str, *, exact: bool = False) -> int:
     client = get_qdrant_client()
     collection_name = build_collection_name(subscription_id)
@@ -1818,7 +1802,6 @@ def _count_qdrant_points(subscription_id: str, profile_id: str, document_id: str
     )
     result = client.count(collection_name=collection_name, count_filter=count_filter, exact=bool(exact))
     return int(getattr(result, "count", 0) or 0)
-
 
 def _verify_post_upsert_count(
     *,
@@ -1868,10 +1851,8 @@ def _verify_post_upsert_count(
 
     return last_count, expected == 0
 
-
 def _build_blob_store() -> BlobStore:
     return BlobStore()
-
 
 def _process_blob(
     *,
@@ -2007,7 +1988,7 @@ def _process_blob(
             result["failed_reason"] = None
             return result
         # HITL gate: only screened or retryable docs can be embedded
-        _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_EXTRACTION_COMPLETED, STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED, STATUS_TRAINING_STARTED}
+        _EMBEDDING_ELIGIBLE_STATUSES = {STATUS_SCREENING_COMPLETED, STATUS_TRAINING_FAILED, STATUS_TRAINING_STARTED}
         if current_status not in _EMBEDDING_ELIGIBLE_STATUSES:
             result["status"] = "SKIPPED"
             if current_status == STATUS_EXTRACTION_COMPLETED:
@@ -2247,6 +2228,28 @@ def _process_blob(
             _file_idx = 0
             _file_total = max(len(extracted_docs), 1)
             for file_name, content in extracted_docs.items():
+                # --- Intel pipeline hook (non-blocking, feature-flagged) ---
+                if INTEL_PIPELINE_ENABLED and run_intel_pipeline_hook is not None:
+                    try:
+                        _intel_t0 = time.time()
+                        _intel_doc_json = build_document_json_from_extracted(content, document_id=doc_id)
+                        _intel_result = run_intel_pipeline_hook(
+                            extracted_doc=_intel_doc_json,
+                            document_id=doc_id,
+                            subscription_id=subscription_id,
+                            profile_id=profile_id,
+                        )
+                        logger.info(
+                            "intel_pipeline doc=%s file=%s elapsed=%.3fs result=%s",
+                            doc_id, file_name, time.time() - _intel_t0,
+                            _intel_result.stage_reached if _intel_result else "none",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "intel_pipeline hook failed for doc=%s file=%s; continuing with embedding",
+                            doc_id, file_name, exc_info=True,
+                        )
+                # --- End intel pipeline hook ---
                 try:
                     embed_result = train_on_document(content, subscription_id, profile_id, doc_id, file_name)
                 except Exception as exc:  # noqa: BLE001
@@ -2523,8 +2526,8 @@ def _process_blob(
                 try:
                     from src.api.document_status import update_document_fields
                     update_document_fields(doc_id, _schema_mongo_fields)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to persist schema fields to MongoDB for %s", doc_id, exc_info=True)
             except Exception as schema_exc:
                 logger.debug("Schema/answerability detection failed for %s: %s", doc_id, schema_exc)
 
@@ -2564,7 +2567,7 @@ def _process_blob(
                             vector=[float(x) for x in _mr_vectors[i]],
                             payload=_payload,
                         ))
-                    from src.api.vector_store import get_vector_store
+                    from src.api.dataHandler import get_vector_store
                     _vs = get_vector_store()
                     _vs.client.upsert(collection_name=_mr_collection, points=_mr_points)
                     total_upserted += len(_mr_points)
@@ -2657,8 +2660,8 @@ def _process_blob(
                             _cd_model_result = _cd_get_model()
                             _cd_model = _cd_model_result[0] if isinstance(_cd_model_result, tuple) else _cd_model_result
                             _cd_doc_vector = _cd_model.encode([_mre["text"]], show_progress_bar=False)[0].tolist()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Failed to encode document vector for cross-doc intelligence", exc_info=True)
                         break
 
             _cd_entities = (_understanding or {}).get("key_entities") or []
@@ -2679,18 +2682,22 @@ def _process_blob(
 
             _cd_thread = _cd_threading.Thread(target=_run_cross_doc, daemon=True)
             _cd_thread.start()
-        except Exception:
-            pass  # cross-doc is purely additive, never blocks pipeline
+        except Exception as exc:
+            logger.debug("Cross-doc intelligence setup failed (purely additive, never blocks pipeline)", exc_info=True)
 
+        # Purge pickle after successful embedding — content now lives in vector DB.
         deleted = False
-        # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            logger.info("Skipping pickle deletion for %s (preserve enabled)", doc_id)
-            if telemetry:
-                telemetry.increment("embed_pickles_retained_total")
-            deleted = False
-            if not deleted:
-                cleanup_error = {"message": "pickle_retained"}
+            try:
+                from src.api.content_store import delete_extracted_pickle
+                deleted = delete_extracted_pickle(doc_id)
+                if deleted:
+                    logger.info("Pickle purged for %s after successful embedding", doc_id)
+                else:
+                    logger.info("Pickle not found for deletion for %s (may already be purged)", doc_id)
+            except Exception as del_exc:  # noqa: BLE001
+                logger.warning("Pickle purge failed for %s: %s", doc_id, del_exc)
+                cleanup_error = {"message": f"purge_failed: {del_exc}"}
         cleanup_payload = None
         if not deleted:
             cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
@@ -2768,7 +2775,6 @@ def _process_blob(
             result.get("status"),
         )
         request_ctx.__exit__(*sys.exc_info())
-
 
 def _process_local_document(
     *,
@@ -3023,6 +3029,28 @@ def _process_local_document(
             _file_idx_local = 0
             _file_total_local = max(len(extracted_docs), 1)
             for file_name, content in extracted_docs.items():
+                # --- Intel pipeline hook (non-blocking, feature-flagged) ---
+                if INTEL_PIPELINE_ENABLED and run_intel_pipeline_hook is not None:
+                    try:
+                        _intel_t0 = time.time()
+                        _intel_doc_json = build_document_json_from_extracted(content, document_id=document_id)
+                        _intel_result = run_intel_pipeline_hook(
+                            extracted_doc=_intel_doc_json,
+                            document_id=document_id,
+                            subscription_id=subscription_id,
+                            profile_id=profile_id,
+                        )
+                        logger.info(
+                            "intel_pipeline doc=%s file=%s elapsed=%.3fs result=%s",
+                            document_id, file_name, time.time() - _intel_t0,
+                            _intel_result.stage_reached if _intel_result else "none",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "intel_pipeline hook failed for doc=%s file=%s; continuing with embedding",
+                            document_id, file_name, exc_info=True,
+                        )
+                # --- End intel pipeline hook ---
                 try:
                     embed_result = train_on_document(content, subscription_id, profile_id, document_id, file_name)
                 except Exception as exc:  # noqa: BLE001
@@ -3301,18 +3329,22 @@ def _process_local_document(
 
             _cd_thread_local = _cd_threading_local.Thread(target=_run_cross_doc_local, daemon=True)
             _cd_thread_local.start()
-        except Exception:
-            pass  # cross-doc is purely additive, never blocks pipeline
+        except Exception as exc:
+            logger.debug("Cross-doc intelligence setup failed (purely additive, never blocks pipeline)", exc_info=True)
 
+        # Purge pickle after successful embedding — content now lives in vector DB.
         deleted = False
-        # Preserve pickles as source-of-truth. Skip deletion even if cleanup_allowed.
         if cleanup_allowed:
-            logger.info("Skipping pickle deletion for %s (preserve enabled)", document_id)
-            if telemetry:
-                telemetry.increment("embed_pickles_retained_total")
-            deleted = False
-            if not deleted:
-                cleanup_error = {"message": "pickle_retained"}
+            try:
+                from src.api.content_store import delete_extracted_pickle
+                deleted = delete_extracted_pickle(document_id)
+                if deleted:
+                    logger.info("Pickle purged for %s after successful embedding", document_id)
+                else:
+                    logger.info("Pickle not found for deletion for %s (may already be purged)", document_id)
+            except Exception as del_exc:  # noqa: BLE001
+                logger.warning("Pickle purge failed for %s: %s", document_id, del_exc)
+                cleanup_error = {"message": f"purge_failed: {del_exc}"}
         cleanup_payload = None
         if not deleted:
             cleanup_details = cleanup_error or {"message": "cleanup_deferred"}
@@ -3379,7 +3411,6 @@ def _process_local_document(
         )
         request_ctx.__exit__(*sys.exc_info())
 
-
 def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     succeeded = [entry for entry in results if entry.get("status") == "COMPLETED"]
     failed = [entry for entry in results if entry.get("status") == "FAILED"]
@@ -3412,7 +3443,6 @@ def _build_embed_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "documents": results,
     }
 
-
 def _embed_from_local_pickles(
     *,
     document_id: Optional[str],
@@ -3423,7 +3453,7 @@ def _embed_from_local_pickles(
     max_blobs: Optional[int],
     embed_request_id: Optional[str],
 ) -> Dict[str, Any]:
-    logger.warning("Blob storage not configured; using local pickles (deprecated).")
+    logger.debug("Blob storage not configured; using local pickles (deprecated).")
     requested_ids = _normalize_requested_ids(document_id, document_ids)
     filter_ids = _fetch_document_ids_by_filters(subscription_id=subscription_id, profile_id=profile_id)
     all_ids = requested_ids + filter_ids
@@ -3490,7 +3520,6 @@ def _embed_from_local_pickles(
     summary = _build_embed_summary(results)
     return summary
 
-
 def embed_documents(
     *,
     document_id: Optional[str] = None,
@@ -3536,7 +3565,21 @@ def embed_documents(
         telemetry.increment("embed_pickles_listed_total", amount=len(blob_candidates))
 
     if not blob_candidates:
-        return _build_embed_summary([])
+        # Blob storage is configured but no pickles found in blob.
+        # Extraction may have fallen back to local storage — try local pickles.
+        logger.info(
+            "embed_request_id=%s no blob candidates found; falling back to local pickles",
+            embed_request_id,
+        )
+        return _embed_from_local_pickles(
+            document_id=document_id,
+            document_ids=document_ids,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            doc_type=doc_type,
+            max_blobs=max_blobs,
+            embed_request_id=embed_request_id,
+        )
 
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(blob_candidates))
@@ -3591,7 +3634,6 @@ def embed_documents(
 
     summary = _build_embed_summary(results)
     return summary
-
 
 def embedding_integrity_report(
     *,

@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class RetrievalVerification:
@@ -26,6 +30,7 @@ class VerificationAgent:
         chunks: List[Any],
         metadata_filters: Optional[Dict[str, Any]] = None,
     ) -> RetrievalVerification:
+        logger.debug("verify called with intent=%s, chunks=%s", intent, len(chunks) if chunks else 0)
         if not chunks:
             return RetrievalVerification(0.0, ["no_chunks"], True, metadata_filters or {})
 
@@ -55,6 +60,8 @@ class VerificationAgent:
             issues.append("low_alignment")
 
         refined = metadata_filters or {}
+        logger.debug("verify returning alignment=%.4f, should_refine=%s, issues=%s",
+                     alignment, should_refine, issues)
         return RetrievalVerification(
             alignment_score=round(alignment, 4),
             issues=issues,

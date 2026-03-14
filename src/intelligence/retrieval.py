@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import random
 import time
 import re
@@ -25,12 +25,10 @@ from src.intelligence.kg_updater import KGUpdater
 from src.services.retrieval.hybrid_retriever import HybridRetriever, HybridRetrieverConfig, RetrievalCandidate
 from src.utils.payload_utils import get_content_text
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _normalize_value(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
-
 
 def _extract_name_candidates(query: str) -> List[str]:
     if not query:
@@ -49,7 +47,6 @@ def _extract_name_candidates(query: str) -> List[str]:
         if match:
             candidates.append(match.group(1).strip())
     return list(dict.fromkeys([c for c in candidates if c]))
-
 
 def _resolve_name_documents(
     *,
@@ -97,7 +94,6 @@ def _resolve_name_documents(
                 break
     return list(dict.fromkeys(doc_ids))
 
-
 def _doc_citation_from_facts(
     facts: List[Dict[str, Any]],
     *,
@@ -114,7 +110,6 @@ def _doc_citation_from_facts(
     if page:
         return f"{source_name}, p. {page}"
     return f"{source_name}"
-
 
 def _extract_resume_profile(
     facts: List[Dict[str, Any]],
@@ -172,7 +167,6 @@ def _extract_resume_profile(
     profile["achievements"] = _dedupe(profile["achievements"])[:6]
     return profile
 
-
 def _extract_invoice_profile(
     facts: List[Dict[str, Any]],
     *,
@@ -216,7 +210,6 @@ def _extract_invoice_profile(
     profile["line_items"] = _dedupe(profile["line_items"])[:10]
     profile["parties"] = _dedupe(profile["parties"])[:6]
     return profile
-
 
 def _extract_medical_profile(
     facts: List[Dict[str, Any]],
@@ -263,7 +256,6 @@ def _extract_medical_profile(
     profile["medications"] = _dedupe(profile["medications"])[:10]
     profile["notes"] = _dedupe(profile["notes"])[:6]
     return profile
-
 
 def _build_profile_task_response(
     *,
@@ -450,13 +442,11 @@ def _build_profile_task_response(
 
     return None
 
-
 @dataclass
 class IntelChunk:
     text: str
     score: float
     metadata: Dict[str, Any]
-
 
 def _with_retries(fn, *, retries: int = 2, base_delay: float = 0.2, jitter: float = 0.1):
     for attempt in range(retries + 1):
@@ -467,7 +457,6 @@ def _with_retries(fn, *, retries: int = 2, base_delay: float = 0.2, jitter: floa
                 raise
             delay = base_delay * (attempt + 1) + random.random() * jitter
             time.sleep(delay)
-
 
 def _safe_error_response(
     code: str,
@@ -486,7 +475,6 @@ def _safe_error_response(
         "context_found": False,
         "metadata": {"error": error_payload},
     }
-
 
 def _build_filters(
     *,
@@ -510,7 +498,6 @@ def _build_filters(
         filters["section_kinds"] = list(route_plan.section_focus)
     return filters
 
-
 def _infer_domain_from_hits(
     candidates: List[RetrievalCandidate],
     catalog: Dict[str, Any],
@@ -532,7 +519,6 @@ def _infer_domain_from_hits(
         return None
     ranked = sorted(domain_counts.items(), key=lambda kv: kv[1], reverse=True)
     return ranked[0][0]
-
 
 def _apply_kg_boost(
     candidates: List[RetrievalCandidate],
@@ -558,13 +544,11 @@ def _apply_kg_boost(
     boosted.sort(key=lambda c: c.score, reverse=True)
     return boosted
 
-
 def _candidates_to_chunks(candidates: List[RetrievalCandidate]) -> List[IntelChunk]:
     chunks: List[IntelChunk] = []
     for cand in candidates:
         chunks.append(IntelChunk(text=cand.text, score=cand.score, metadata=cand.metadata or {}))
     return chunks
-
 
 def _filter_candidates_by_profile(
     candidates: List[RetrievalCandidate],
@@ -585,13 +569,11 @@ def _filter_candidates_by_profile(
         logger.warning("Dropped %s retrieval candidates outside profile scope", dropped)
     return filtered
 
-
 def _facts_for_section_focus(facts: List[Dict[str, Any]], section_focus: List[str]) -> List[Dict[str, Any]]:
     if not section_focus:
         return facts
     focus_set = {str(k) for k in section_focus if k}
     return [fact for fact in facts if str(fact.get("section_kind")) in focus_set]
-
 
 def _documents_searched(
     catalog: Dict[str, Any],
@@ -607,7 +589,6 @@ def _documents_searched(
             if doc_id
         ]
     return [d.get("source_name") for d in docs if d.get("source_name")]
-
 
 def _build_not_found_response(
     *,
@@ -665,7 +646,6 @@ def _build_not_found_response(
         "request_id": request_id,
     }
 
-
 def _build_retrieval_filter_failed_response(
     *,
     query: str,
@@ -720,7 +700,6 @@ def _build_retrieval_filter_failed_response(
         "request_id": request_id,
     }
 
-
 def _is_filter_failure(exc: Exception) -> bool:
     if getattr(exc, "code", None) in {
         "RETRIEVAL_FILTER_FAILED",
@@ -743,7 +722,6 @@ def _is_filter_failure(exc: Exception) -> bool:
         )
     )
 
-
 def _build_missing_profile_scope_response(
     *,
     request_id: Optional[str],
@@ -760,7 +738,6 @@ def _build_missing_profile_scope_response(
         },
         "request_id": request_id,
     }
-
 
 def run_intelligent_pipeline(
     *,
@@ -935,6 +912,90 @@ def run_intelligent_pipeline(
                 retrieval_succeeded=False,
                 details="qdrant_unavailable",
             )
+
+    # --- ReasoningEngine: unified THINK→SEARCH→REASON→GENERATE→VERIFY ---
+    _use_reasoning_engine = getattr(Config.Intelligence, "REASONING_ENGINE_ENABLED", True)
+    if _use_reasoning_engine:
+        try:
+            from src.intelligence.reasoning_engine import ReasoningEngine
+            from src.llm.gateway import get_llm_gateway
+
+            _emb = embedder or get_embedding_model()[0]
+            _llm = get_llm_gateway()
+
+            # Build thinking client — use same model to avoid GPU swap on single-GPU
+            _thinker = _llm
+
+            # Build profile context summary for the THINK step
+            _profile_docs = catalog.get("documents") or []
+            _domain_counts: Dict[str, int] = {}
+            _profile_ctx_lines = []
+            for _doc in _profile_docs[:20]:
+                _dname = _doc.get("source_name") or _doc.get("document_name") or "unknown"
+                _ddomain = _doc.get("doc_domain") or "generic"
+                _profile_ctx_lines.append(f"- {_dname} (domain: {_ddomain})")
+                _domain_counts[_ddomain] = _domain_counts.get(_ddomain, 0) + 1
+            _domain_summary = ", ".join(f"{count} {dom}" for dom, count in sorted(_domain_counts.items(), key=lambda x: -x[1]))
+            _profile_ctx = f"PROFILE DOMAIN: {route_plan.domain_hint or 'unknown'} ({len(_profile_docs)} documents: {_domain_summary})\n"
+            _profile_ctx += "\n".join(_profile_ctx_lines) if _profile_ctx_lines else "No documents listed."
+
+            # Build conversation context from session state
+            _conv_parts = []
+            if session_state:
+                if hasattr(session_state, "active_document_id") and session_state.active_document_id:
+                    _conv_parts.append(f"Active document: {session_state.active_document_id}")
+                if hasattr(session_state, "active_domain") and session_state.active_domain:
+                    _conv_parts.append(f"Domain focus: {session_state.active_domain}")
+                if hasattr(session_state, "recent_queries"):
+                    _recent = getattr(session_state, "recent_queries", []) or []
+                    if _recent:
+                        _conv_parts.append("Previous queries: " + " | ".join(str(q) for q in _recent[-3:]))
+            _conv_history = "\n".join(_conv_parts) if _conv_parts else ""
+
+            engine = ReasoningEngine(
+                llm_client=_llm,
+                thinking_client=_thinker,
+                qdrant_client=qdrant,
+                embedder=_emb,
+                collection_name=collection_name,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                max_iterations=2 if route_plan.task_type in {"extract", "list", "qa"} else 3,
+            )
+
+            engine_result = engine.answer(
+                query=query,
+                profile_context=_profile_ctx,
+                conversation_history=_conv_history,
+                task_type=route_plan.task_type or "",
+            )
+
+            if engine_result and engine_result.get("context_found"):
+                engine_result.setdefault("metadata", {})
+                engine_result["metadata"]["route_plan"] = route_plan.to_dict()
+                engine_result["metadata"]["execution_trace"] = {
+                    "route_plan": route_plan.to_dict(),
+                    "facts_hit": False,
+                    "retrieval_attempted": True,
+                    "retrieval_succeeded": True,
+                    "documents_searched": _documents_searched(
+                        catalog,
+                        target_doc_ids=route_plan.target_document_ids or None,
+                    ),
+                    "engine": "reasoning_engine",
+                }
+                engine_result["metadata"]["user_id"] = user_id
+                logger.info(
+                    "ReasoningEngine handled query: intent=%s evidence=%d grounded=%s",
+                    engine_result.get("metadata", {}).get("intent", "?"),
+                    engine_result.get("metadata", {}).get("evidence_count", 0),
+                    engine_result.get("grounded"),
+                )
+                return engine_result
+            else:
+                logger.debug("ReasoningEngine returned no context, falling back to legacy pipeline")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ReasoningEngine failed, falling back to legacy pipeline: %s", exc)
 
     retriever = HybridRetriever(
         client=qdrant,
@@ -1240,6 +1301,5 @@ def run_intelligent_pipeline(
     answer["metadata"]["section_retrieval"] = section_retrieval_info
     answer["metadata"]["user_id"] = user_id
     return answer
-
 
 __all__ = ["run_intelligent_pipeline", "_apply_kg_boost", "IntelChunk"]

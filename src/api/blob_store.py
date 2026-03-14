@@ -17,7 +17,7 @@ Blob contract (expected pickle payload):
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import pickle
 from dataclasses import dataclass
@@ -30,16 +30,14 @@ from src.api.config import Config
 from src.storage.azure_blob_client import get_blob_service_client, get_document_container_client, has_blob_credentials
 from src.storage.blob_persistence import save_pickle_atomic
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DEFAULT_CONTAINER = "document-content"
 _DEFAULT_PREFIX = ""
 _TRUSTED_TYPE = "extracted_doc"
 
-
 class BlobConfigurationError(ValueError):
     """Raised when blob auth config is missing or invalid."""
-
 
 @dataclass
 class BlobInfo:
@@ -50,23 +48,19 @@ class BlobInfo:
     last_modified: Optional[Any] = None
     content_type: Optional[str] = None
 
-
 def blob_storage_configured() -> bool:
     return has_blob_credentials()
-
 
 def _normalize_prefix(prefix: Optional[str]) -> str:
     if not prefix:
         return ""
     return prefix if prefix.endswith("/") else f"{prefix}/"
 
-
 def _build_service_client() -> BlobServiceClient:
     try:
         return get_blob_service_client()
     except Exception as exc:  # noqa: BLE001
         raise BlobConfigurationError(str(exc)) from exc
-
 
 class BlobStore:
     def __init__(
@@ -223,7 +217,6 @@ class BlobStore:
             logger.warning("Failed to delete blob %s: %s", blob_name, exc)
             return False
 
-
 def is_trusted_blob(blob: BlobInfo, *, expected_prefix: str = "") -> bool:
     name = blob.name or ""
     if expected_prefix and not name.startswith(expected_prefix):
@@ -240,7 +233,6 @@ def is_trusted_blob(blob: BlobInfo, *, expected_prefix: str = "") -> bool:
         logger.warning("Blob %s has unexpected type=%s", name, metadata.get("type"))
         return False
     return True
-
 
 def extract_document_id(blob_name: str, *, prefix: str = "") -> str:
     base = blob_name

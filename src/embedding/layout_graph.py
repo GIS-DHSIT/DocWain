@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import re
 from typing import Any, Dict, Iterable, List, Optional
@@ -9,10 +9,9 @@ from typing import Any, Dict, Iterable, List, Optional
 from src.api.pipeline_models import ExtractedDocument, Table
 from src.embedding.chunking.section_chunker import normalize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[\.)])\s+")
-
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -20,27 +19,22 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except Exception:  # noqa: BLE001
         return default
 
-
 def _safe_int(value: Any, default: int = 0) -> int:
     try:
         return int(value)
     except Exception:  # noqa: BLE001
         return default
 
-
 def _text_tokens(text: str) -> List[str]:
     return [tok for tok in (text or "").split() if tok]
-
 
 def _is_all_caps(text: str) -> bool:
     clean = (text or "").strip()
     return bool(clean) and clean.isupper()
 
-
 def _hash_id(seed: str, *, prefix: str = "b") -> str:
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}{digest}"
-
 
 def _bbox_union(bboxes: Iterable[List[float]]) -> List[float]:
     xs0, ys0, xs1, ys1 = [], [], [], []
@@ -55,7 +49,6 @@ def _bbox_union(bboxes: Iterable[List[float]]) -> List[float]:
         return [0.0, 0.0, 0.0, 0.0]
     return [min(xs0), min(ys0), max(xs1), max(ys1)]
 
-
 def _column_split(points: List[float], page_width: float) -> Optional[float]:
     if not points or page_width <= 0:
         return None
@@ -68,7 +61,6 @@ def _column_split(points: List[float], page_width: float) -> Optional[float]:
         return None
     return (sorted_points[idx] + sorted_points[idx + 1]) / 2.0
 
-
 def _assign_columns(blocks: List[Dict[str, Any]], page_width: float) -> None:
     x0s = [float(block["bbox"][0]) for block in blocks if block.get("bbox")]
     split = _column_split(x0s, page_width)
@@ -80,10 +72,8 @@ def _assign_columns(blocks: List[Dict[str, Any]], page_width: float) -> None:
         x0 = float(block["bbox"][0]) if block.get("bbox") else 0.0
         block["_column"] = 0 if x0 <= split else 1
 
-
 def _reading_order(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(blocks, key=lambda b: (b.get("_column", 0), _safe_float(b["bbox"][1] if b.get("bbox") else 0), _safe_float(b["bbox"][0] if b.get("bbox") else 0)))
-
 
 def _overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
     left = max(a0, b0)
@@ -91,7 +81,6 @@ def _overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
     if right <= left:
         return 0.0
     return (right - left) / max(a1 - a0, b1 - b0, 1.0)
-
 
 def _neighbors(blocks: List[Dict[str, Any]]) -> None:
     for block in blocks:
@@ -144,7 +133,6 @@ def _neighbors(blocks: List[Dict[str, Any]]) -> None:
         if right:
             block["neighbors"]["right"] = [right["block_id"]]
 
-
 def _infer_heading_level(blocks: List[Dict[str, Any]]) -> None:
     sizes = [b.get("style", {}).get("font_size") for b in blocks if b.get("style", {}).get("font_size")]
     if sizes:
@@ -169,7 +157,6 @@ def _infer_heading_level(blocks: List[Dict[str, Any]]) -> None:
             text = (block.get("text") or "").strip()
             block["structure"]["heading_level"] = 2 if len(text.split()) <= 8 and _is_all_caps(text) else None
 
-
 def _infer_list_level(blocks: List[Dict[str, Any]]) -> None:
     x0s = [float(b["bbox"][0]) for b in blocks if b.get("bbox")]
     if not x0s:
@@ -186,7 +173,6 @@ def _infer_list_level(blocks: List[Dict[str, Any]]) -> None:
         indent = max(0.0, x0 - min_x)
         level = 1 + int(indent / max(30.0, (max(x0s) - min_x) * 0.25))
         block["structure"]["list_level"] = max(1, level)
-
 
 def _infer_headers_footers(pages: List[Dict[str, Any]]) -> None:
     if not pages:
@@ -214,7 +200,6 @@ def _infer_headers_footers(pages: List[Dict[str, Any]]) -> None:
             if text in footers:
                 block["type"] = "footer"
 
-
 def _build_table_payload(table: Table, *, table_id: str) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
     if table.csv:
@@ -232,7 +217,6 @@ def _build_table_payload(table: Table, *, table_id: str) -> Dict[str, Any]:
         "bbox": [0.0, 0.0, 0.0, 0.0],
         "rows": rows,
     }
-
 
 def _synthetic_blocks_from_text(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
@@ -261,7 +245,6 @@ def _synthetic_blocks_from_text(pages: List[Dict[str, Any]]) -> List[Dict[str, A
             )
             y += height + 8.0
     return blocks
-
 
 def build_layout_graph(
     extracted: Any,
@@ -438,6 +421,5 @@ def build_layout_graph(
         "page_digests": page_digests,
         "extraction_metrics": extraction_metrics,
     }
-
 
 __all__ = ["build_layout_graph"]

@@ -6,7 +6,7 @@ and the unified gateway.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence
@@ -14,8 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from .engine import ScreeningEngine
 from .models import ToolResult
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def format_results(
     doc_id: str,
@@ -33,7 +32,6 @@ def format_results(
         response["risk_level"] = results[0].risk_level
     return response
 
-
 _ALLOWED_CATEGORIES = {
     "integrity",
     "compliance",
@@ -46,7 +44,6 @@ _ALLOWED_CATEGORIES = {
     "legality",
     "all",
 }
-
 
 def normalize_categories(raw_categories: Optional[List[str]]) -> List[str]:
     """Normalize and validate screening category names."""
@@ -65,7 +62,6 @@ def normalize_categories(raw_categories: Optional[List[str]]) -> List[str]:
         return ["all"]
     return normalized
 
-
 def normalize_doc_ids(doc_ids: List[str]) -> List[str]:
     """Validate and deduplicate document IDs."""
     cleaned = [str(doc_id).strip() for doc_id in doc_ids if str(doc_id).strip()]
@@ -80,7 +76,6 @@ def normalize_doc_ids(doc_ids: List[str]) -> List[str]:
     if invalid:
         raise ValueError("Invalid doc_id placeholder. Pass real document ids.")
     return normalized
-
 
 def persist_screening_reports(
     run_id: str,

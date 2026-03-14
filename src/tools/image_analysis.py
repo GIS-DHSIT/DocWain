@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -17,7 +17,7 @@ from src.tools.common.grounding import build_source_record
 from src.tools.common.http_client import fetch_bytes
 from src.tools.common.io_limits import MAX_BINARY_BYTES, decode_base64, enforce_limit, validate_upload
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/image", tags=["Tools-Image"])
 
@@ -49,7 +49,6 @@ try:
 except AttributeError:  # pragma: no cover - Pillow < 9
     _LANCZOS = Image.LANCZOS
 
-
 class ImageAnalysisRequest(BaseModel):
     image_url: Optional[str] = Field(default=None, description="Public URL to the image")
     image_base64: Optional[str] = Field(default=None, description="Base64 encoded image bytes (data URI supported)")
@@ -59,7 +58,6 @@ class ImageAnalysisRequest(BaseModel):
     max_chars: int = Field(default=6000, ge=300, le=20000)
     min_confidence: float = Field(default=55.0, ge=0.0, le=100.0)
 
-
 @dataclass
 class OCRCandidate:
     engine: str
@@ -67,13 +65,11 @@ class OCRCandidate:
     text: str
     confidence: Optional[float]
 
-
 def _strip_data_url_prefix(value: str) -> str:
     raw = (value or "").strip()
     if raw.startswith("data:") and "," in raw:
         return raw.split(",", 1)[1]
     return raw
-
 
 def _dedupe(values: Sequence[str], *, limit: int) -> List[str]:
     out: List[str] = []
@@ -91,7 +87,6 @@ def _dedupe(values: Sequence[str], *, limit: int) -> List[str]:
             break
     return out
 
-
 def _normalize_text(text: str, *, max_chars: int) -> str:
     cleaned = (text or "").replace("\x00", " ")
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
@@ -99,7 +94,6 @@ def _normalize_text(text: str, *, max_chars: int) -> str:
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars]
     return cleaned
-
 
 def _extract_key_values(text: str, *, limit: int = 20) -> List[Dict[str, str]]:
     pairs: List[Dict[str, str]] = []
@@ -120,7 +114,6 @@ def _extract_key_values(text: str, *, limit: int = 20) -> List[Dict[str, str]]:
             break
     return pairs
 
-
 def _infer_document_type(text: str) -> str:
     lowered = (text or "").lower()
     if not lowered:
@@ -134,7 +127,6 @@ def _infer_document_type(text: str) -> str:
     if any(token in lowered for token in ("patient", "diagnosis", "prescription", "medication", "clinical")):
         return "medical"
     return "generic"
-
 
 def _query_hits(text: str, query: Optional[str], *, limit: int = 5) -> List[str]:
     if not query:
@@ -158,7 +150,6 @@ def _query_hits(text: str, query: Optional[str], *, limit: int = 5) -> List[str]
     scored.sort(key=lambda item: item[0], reverse=True)
     return _dedupe([item[1] for item in scored], limit=limit)
 
-
 def _build_insights(text: str, query: Optional[str]) -> Dict[str, Any]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     summary = " ".join(lines[:2])[:360] if lines else ""
@@ -179,16 +170,13 @@ def _build_insights(text: str, query: Optional[str]) -> Dict[str, Any]:
         "query_hits": _query_hits(text, query, limit=5),
     }
 
-
 @lru_cache(maxsize=2)
 def _get_ocr_extractor(engine: str) -> DocumentExtractor:
     return DocumentExtractor(ocr_engine=engine)
 
-
 def _ocr_with_engine(image: Image.Image, engine: str) -> Tuple[str, Optional[float]]:
     extractor = _get_ocr_extractor(engine if engine in {"easyocr", "pytesseract"} else "pytesseract")
     return extractor._ocr_image(image, engine=engine)
-
 
 def _build_image_variants(image: Image.Image, *, high_accuracy: bool) -> List[Tuple[str, Image.Image]]:
     variants: List[Tuple[str, Image.Image]] = [("original", image.convert("RGB"))]
@@ -210,14 +198,12 @@ def _build_image_variants(image: Image.Image, *, high_accuracy: bool) -> List[Tu
 
     return variants
 
-
 def _candidate_score(candidate: OCRCandidate) -> Tuple[int, float, int, int]:
     text = (candidate.text or "").strip()
     words = len(text.split())
     chars = len(text)
     conf = float(candidate.confidence) if candidate.confidence is not None else -1.0
     return (1 if text else 0, conf, words, chars)
-
 
 def _extract_text_high_accuracy(
     image: Image.Image,
@@ -243,7 +229,6 @@ def _extract_text_high_accuracy(
     best = max(candidates, key=_candidate_score)
     return best, candidates
 
-
 def _load_image(raw: bytes) -> Image.Image:
     try:
         image = Image.open(io.BytesIO(raw))
@@ -251,7 +236,6 @@ def _load_image(raw: bytes) -> Image.Image:
         return image.convert("RGB")
     except Exception as exc:  # noqa: BLE001
         raise ToolError("Invalid image payload", code="invalid_image") from exc
-
 
 async def _resolve_image_bytes(*, upload: UploadFile | None, req: ImageAnalysisRequest) -> bytes:
     if upload:
@@ -264,7 +248,6 @@ async def _resolve_image_bytes(*, upload: UploadFile | None, req: ImageAnalysisR
         enforce_limit(len(raw), MAX_BINARY_BYTES, "image_url")
         return raw
     raise ToolError("image_file, image_url, or image_base64 is required", code="missing_image")
-
 
 def _coerce_request(payload: Dict[str, Any]) -> ImageAnalysisRequest:
     input_payload = payload.get("input") if isinstance(payload, dict) else payload
@@ -279,7 +262,6 @@ def _coerce_request(payload: Dict[str, Any]) -> ImageAnalysisRequest:
         if key not in merged and key in context_payload:
             merged[key] = context_payload[key]
     return ImageAnalysisRequest(**merged)
-
 
 def _analyze_image_bytes(raw: bytes, req: ImageAnalysisRequest) -> Tuple[Dict[str, Any], List[str]]:
     image = _load_image(raw)
@@ -325,7 +307,6 @@ def _analyze_image_bytes(raw: bytes, req: ImageAnalysisRequest) -> Tuple[Dict[st
     }
     return result, warnings
 
-
 def _build_source(req: ImageAnalysisRequest, correlation_id: Optional[str], byte_count: int) -> Dict[str, Any]:
     if req.image_url:
         return build_source_record(
@@ -341,7 +322,6 @@ def _build_source(req: ImageAnalysisRequest, correlation_id: Optional[str], byte
         metadata={"bytes": byte_count, "modality": "image"},
     )
 
-
 @register_tool("image_analysis")
 async def image_analysis_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     req = _coerce_request(payload)
@@ -355,7 +335,6 @@ async def image_analysis_handler(payload: Dict[str, Any], correlation_id: Option
         "grounded": bool(result.get("text")),
         "context_found": bool(result.get("text")),
     }
-
 
 @router.post("/analyze")
 async def analyze(

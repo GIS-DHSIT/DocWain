@@ -6,14 +6,15 @@ fuses results via Reciprocal Rank Fusion (RRF).
 """
 from __future__ import annotations
 
-import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from .query_decomposer import DecomposedQuery, SubQuery
 from .types import Chunk
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Reciprocal Rank Fusion
@@ -58,7 +59,6 @@ def rrf_fuse(
 
     results.sort(key=lambda c: c.score, reverse=True)
     return results[:top_n]
-
 
 # ---------------------------------------------------------------------------
 # Sub-query dispatch
@@ -175,7 +175,6 @@ def _dispatch_subquery(
         )
         return []
 
-
 # ---------------------------------------------------------------------------
 # Orchestrator entry-point
 # ---------------------------------------------------------------------------
@@ -213,11 +212,13 @@ def retrieve_decomposed(
             correlation_id=correlation_id,
         )
 
-    # Multiple sub-queries -> dispatch each and fuse.
+    # Multiple sub-queries -> dispatch in parallel and fuse.
     ranked_lists: List[List[Chunk]] = []
-    for sq in subs:
-        try:
-            result = _dispatch_subquery(
+    max_workers = min(len(subs), 4)  # Cap at 4 to avoid Qdrant connection exhaustion
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _dispatch_subquery,
                 sq,
                 collection,
                 subscription_id,
@@ -226,16 +227,22 @@ def retrieve_decomposed(
                 qdrant_client=qdrant_client,
                 top_k=top_k,
                 correlation_id=correlation_id,
-            )
-            if result:
-                ranked_lists.append(result)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "Sub-query dispatch failed: %s",
-                sq.text[:80],
-                exc_info=True,
-                extra={"correlation_id": correlation_id},
-            )
+            ): sq
+            for sq in subs
+        }
+        for future in as_completed(futures):
+            sq = futures[future]
+            try:
+                result = future.result()
+                if result:
+                    ranked_lists.append(result)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Sub-query dispatch failed: %s",
+                    sq.text[:80],
+                    exc_info=True,
+                    extra={"correlation_id": correlation_id},
+                )
 
     if not ranked_lists:
         return []

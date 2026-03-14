@@ -23,11 +23,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── tunables ──────────────────────────────────────────────────────────
 _ENHANCE_TIMEOUT_S = 20.0
@@ -44,7 +44,6 @@ _LEGAL_DISCLAIMER = (
     "\n\n---\n*This analysis is for informational purposes only and does not "
     "constitute legal advice. Consult a qualified attorney for legal decisions.*"
 )
-
 
 # ── AgentProfile dataclass ───────────────────────────────────────────
 
@@ -67,10 +66,8 @@ class AgentProfile:
     supported_intents: List[str] = field(default_factory=list)
     output_format: str = "structured"
 
-
 # Backward-compat alias
 ToolProfile = AgentProfile
-
 
 # ── Agent Intelligence Profiles ──────────────────────────────────────
 
@@ -504,10 +501,8 @@ AGENT_PROFILES: Dict[str, AgentProfile] = {
     ),
 }
 
-
 # Backward-compat alias
 TOOL_PROFILES = AGENT_PROFILES
-
 
 # ── Core Functions ────────────────────────────────────────────────────
 
@@ -515,10 +510,8 @@ def get_agent_profile(agent_name: str) -> Optional[AgentProfile]:
     """Return the intelligence profile for *agent_name*, or ``None``."""
     return AGENT_PROFILES.get(agent_name)
 
-
 # Backward-compat alias
 get_tool_profile = get_agent_profile
-
 
 def build_agent_enhanced_prompt(
     profile: AgentProfile,
@@ -584,7 +577,6 @@ def build_agent_enhanced_prompt(
 
     return "\n".join(parts)
 
-
 def _build_evidence_from_chunks(chunks: Optional[list]) -> str:
     """Serialize top chunks into a compact evidence string."""
     if not chunks:
@@ -602,7 +594,6 @@ def _build_evidence_from_chunks(chunks: Optional[list]) -> str:
             parts.append(snippet)
     return "\n\n".join(parts)
 
-
 def _apply_post_processing(text: str, post_processing: List[str]) -> str:
     """Apply disclaimers and other post-processing to the enhanced text."""
     for pp in post_processing:
@@ -611,7 +602,6 @@ def _apply_post_processing(text: str, post_processing: List[str]) -> str:
         elif pp == "legal_disclaimer":
             text += _LEGAL_DISCLAIMER
     return text
-
 
 def enhance_agent_result(
     tool_name: str,
@@ -672,10 +662,8 @@ def enhance_agent_result(
         "intelligence": "tool_enhanced",
     }
 
-
 # Backward-compat alias
 enhance_tool_result = enhance_agent_result
-
 
 def _call_llm(llm_client: Any, prompt: str) -> str:
     """Invoke the LLM client's generate method.
@@ -696,7 +684,6 @@ def _call_llm(llm_client: Any, prompt: str) -> str:
     # Fallback: try calling directly
     result = llm_client(prompt)
     return str(result) if result else ""
-
 
 def build_agent_context_for_llm(
     agent_names: List[str],
@@ -726,13 +713,11 @@ def build_agent_context_for_llm(
 
     return "\n\n".join(parts) if parts else None
 
-
 # Backward-compat alias
 build_tool_context_for_llm = build_agent_context_for_llm
 
 # Backward-compat alias
 build_tool_enhanced_prompt = build_agent_enhanced_prompt
-
 
 def list_agents_with_capabilities() -> Dict[str, Any]:
     """Return a discovery payload listing all agents with intelligence profiles.
@@ -763,10 +748,8 @@ def list_agents_with_capabilities() -> Dict[str, Any]:
 
     return {"agents": agents_list, "tools": agents_list, "total": len(agents_list)}
 
-
 # Backward-compat alias
 list_tools_with_capabilities = list_agents_with_capabilities
-
 
 def _get_domain_knowledge_for_tool(domain: str, intent: str) -> str:
     """Get brief domain knowledge context for agent-enhanced prompts."""

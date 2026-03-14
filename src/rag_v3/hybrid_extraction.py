@@ -9,13 +9,12 @@ This ensures accurate retrieval even when Qdrant chunks are incomplete.
 """
 
 from typing import Any, Dict, List, Optional
-import logging
+from src.utils.logging_utils import get_logger
 
 from .document_extraction import extract_hr_from_complete_document
 from .extract import _extract_hr, Candidate, HRSchema, _candidates_field
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def extract_hr_hybrid(
     chunks: List[Any],
@@ -45,7 +44,7 @@ def extract_hr_hybrid(
             candidate_data = extract_hr_from_complete_document(document_data)
             candidates.append(_convert_to_candidate(candidate_data))
         except Exception as e:
-            logger.warning(f"Document-level extraction failed for {document_id}: {e}. Falling back to chunks.")
+            logger.debug(f"Document-level extraction failed for {document_id}: {e}. Falling back to chunks.")
             candidates = []
 
     # STRATEGY 2: Fallback to chunk-based extraction
@@ -56,7 +55,6 @@ def extract_hr_hybrid(
 
     # Return as HRSchema
     return HRSchema(candidates=_candidates_field(candidates))
-
 
 def _convert_to_candidate(data: Dict[str, Any]) -> Candidate:
     """Convert document extraction result to Candidate model."""

@@ -1,23 +1,21 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any
 
-from src.execution.common import ExecutionResult, chunk_text_stream
+from src.execution.common import ExecutionResult, chunk_text_stream, chunk_text_stream_with_metadata
 from src.metrics.ai_metrics import get_metrics_store
 from src.mode.execution_mode import ExecutionMode
 from src.runtime.chain_factory import build_chain
 from src.runtime.freshness_guard import FreshnessGuard
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _ensure_debug_metadata(answer: dict, debug_info: dict) -> dict:
     metadata = answer.get("metadata") or {}
     metadata["debug"] = {**debug_info, **metadata.get("debug", {})}
     answer["metadata"] = metadata
     return answer
-
 
 def run_normal_mode(
     request: Any,
@@ -60,7 +58,10 @@ def run_normal_mode(
 
     stream_iterable = None
     if stream:
-        stream_iterable = chunk_text_stream(answer.get("response") or "")
+        stream_iterable = chunk_text_stream_with_metadata(
+            answer.get("response") or "",
+            metadata=answer,
+        )
 
     if debug:
         logger.debug("Normal mode response metadata: %s", answer.get("metadata"))

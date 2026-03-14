@@ -1,12 +1,12 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from qdrant_client import QdrantClient
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TEXT_CANDIDATES = [
     "text",
@@ -21,7 +21,6 @@ TEXT_CANDIDATES = [
 
 PROFILE_CANDIDATES = ["profile_id", "profileId", "profile", "profileID"]
 
-
 def _get_nested(payload: Dict[str, Any], path: List[str]) -> Any:
     cur: Any = payload
     for key in path:
@@ -33,10 +32,8 @@ def _get_nested(payload: Dict[str, Any], path: List[str]) -> Any:
             return None
     return cur
 
-
 def _token_count(text: str) -> int:
     return len(text.split())
-
 
 @dataclass
 class FieldStats:
@@ -71,7 +68,6 @@ class FieldStats:
     def avg_tokens(self) -> float:
         return 0.0 if self.non_empty == 0 else self.total_tokens / self.non_empty
 
-
 @dataclass
 class SchemaProbeResult:
     text_field: FieldStats
@@ -96,7 +92,6 @@ class SchemaProbeResult:
             "observed_keys": self.observed_keys,
             "sample_payloads": self.sample_payloads,
         }
-
 
 class SchemaProbe:
     def __init__(self, client: QdrantClient, collection: str, sample_size: int = 64):
@@ -189,7 +184,6 @@ class SchemaProbe:
             sample_payloads=samples[:3],
         )
         return result
-
 
 def load_or_probe(
     client: QdrantClient,

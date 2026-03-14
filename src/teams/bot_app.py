@@ -1,4 +1,4 @@
-import logging
+import asyncio
 import os
 import re
 from typing import Any, Dict, Optional
@@ -24,6 +24,8 @@ except ImportError:
 from src.api.config import Config
 from src.teams import adapter as legacy_adapter
 from src.teams.attachments import ingest_attachments, DocumentIntelligence, ScreeningSummary
+from src.teams.attachments import _resolve_auth_token
+from src.teams.pipeline import TeamsDocumentPipeline
 from src.teams.cards import build_card
 from src.teams.insights import generate_proactive_insights, get_domain_actions
 from src.teams.logic import TeamsChatService
@@ -31,7 +33,7 @@ from src.teams.state import TeamsStateStore
 from src.teams.tools import TeamsToolRouter, _card_activity
 from src.utils.logging_utils import get_correlation_id, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MICROSOFT_APP_ID = Config.Teams.BOT_APP_ID or os.getenv("MICROSOFT_APP_ID")
 MICROSOFT_APP_PASSWORD = (
@@ -78,7 +80,6 @@ state_store = TeamsStateStore()
 chat_service = TeamsChatService()
 tool_router = TeamsToolRouter(chat_service, state_store)
 
-
 def _as_activity(payload: Dict[str, Any]):
     """Deserialize a dict into a Bot Framework Activity."""
     if not _BOTBUILDER_AVAILABLE or Activity is None:
@@ -87,7 +88,6 @@ def _as_activity(payload: Dict[str, Any]):
         return Activity().deserialize(payload)
     except Exception:  # noqa: BLE001
         return Activity(type=ActivityTypes.message, text=payload.get("text") or "")
-
 
 def _log_startup_credentials():
     app_id = MICROSOFT_APP_ID or ""
@@ -108,9 +108,7 @@ def _log_startup_credentials():
         _BOTBUILDER_AVAILABLE,
     )
 
-
 _log_startup_credentials()
-
 
 def _build_screening_card(filenames, screening_results):
     """Build a screening summary card from screening results."""
@@ -151,8 +149,7 @@ def _build_screening_card(filenames, screening_results):
         tools_summary=tools_summary,
     )
 
-
-def _build_di_report_card(ingestion, log) -> Optional[Dict[str, Any]]:
+def _build_di_report_card(ingestion, log, precomputed_insights=None) -> Optional[Dict[str, Any]]:
     """Build a Document Intelligence report card from ingestion results."""
     di_results = ingestion.intelligence_results
     if not di_results:
@@ -163,18 +160,20 @@ def _build_di_report_card(ingestion, log) -> Optional[Dict[str, Any]]:
     domain = primary.doc_type or "general"
     domain_badge = f"[{domain.title()}]"
 
-    # Generate proactive insights via LLM (non-blocking — falls back gracefully)
-    try:
-        insights = generate_proactive_insights(
-            doc_type=domain,
-            summary=primary.summary,
-            key_entities=primary.key_entities,
-            key_facts=primary.key_facts,
-            filename=ingestion.filenames[0] if ingestion.filenames else "document",
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.debug("Proactive insights generation failed (non-blocking): %s", exc)
-        insights = None
+    # Use precomputed insights if available, otherwise generate (fast fallback only)
+    insights = precomputed_insights
+    if insights is None:
+        try:
+            insights = generate_proactive_insights(
+                doc_type=domain,
+                summary=primary.summary,
+                key_entities=primary.key_entities,
+                key_facts=primary.key_facts,
+                filename=ingestion.filenames[0] if ingestion.filenames else "document",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Proactive insights generation failed (non-blocking): %s", exc)
+            insights = None
 
     # Summary text
     summary_text = primary.summary or "Document processed successfully."
@@ -219,7 +218,6 @@ def _build_di_report_card(ingestion, log) -> Optional[Dict[str, Any]]:
         **action_data,
     )
 
-
 class DocWainTeamsBot(TeamsActivityHandler):
     """Teams ActivityHandler that supports text, attachments, and Adaptive Card tool actions."""
 
@@ -230,7 +228,8 @@ class DocWainTeamsBot(TeamsActivityHandler):
         self.tool_router = tool_router
 
     @staticmethod
-    async def _send_safe(turn_context, activity, log) -> None:
+    async def _send_safe(turn_context, activity, log) -> object:
+        """Send an activity and return the response resource (has .id for updates)."""
         if MicrosoftAppCredentials is not None:
             MicrosoftAppCredentials.trust_service_url(turn_context.activity.service_url)
         try:
@@ -240,6 +239,7 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 getattr(getattr(turn_context.activity, "conversation", None), "id", None),
                 getattr(resp, "id", None),
             )
+            return resp
         except Exception as exc:  # noqa: BLE001
             is_auth = "unauthorized" in str(exc).lower() or "403" in str(exc)
             if is_auth:
@@ -257,6 +257,42 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 )
             else:
                 log.error("Failed to send activity: %s", exc, exc_info=True)
+        return None
+
+    @staticmethod
+    async def _update_or_replace(turn_context, placeholder_id, final_activity, log) -> None:
+        """Replace a placeholder card by updating it in-place, falling back to delete+send.
+
+        This prevents duplicate cards when delete_activity fails silently.
+        """
+        if not placeholder_id:
+            await DocWainTeamsBot._send_safe(turn_context, final_activity, log)
+            return
+
+        # Try 1: Update the existing activity in-place (no duplicates possible)
+        try:
+            if hasattr(final_activity, "id"):
+                final_activity.id = placeholder_id
+            elif isinstance(final_activity, dict):
+                final_activity["id"] = placeholder_id
+            await turn_context.update_activity(final_activity)
+            return
+        except Exception:  # noqa: BLE001
+            pass  # update_activity may not be supported in all channels
+
+        # Try 2: Delete placeholder, then send new
+        deleted = False
+        try:
+            await turn_context.delete_activity(placeholder_id)
+            deleted = True
+        except Exception:  # noqa: BLE001
+            pass
+
+        if deleted:
+            await DocWainTeamsBot._send_safe(turn_context, final_activity, log)
+        else:
+            # Placeholder couldn't be removed — don't send another card (prevents duplicates)
+            log.warning("Could not delete placeholder %s; skipping replacement to avoid duplicate", placeholder_id)
 
     async def _send_typing(self, turn_context) -> None:
         """Send a typing indicator so Teams shows '...' while we process."""
@@ -369,9 +405,9 @@ class DocWainTeamsBot(TeamsActivityHandler):
                     _file_attachment_dicts.append(att_dict)
 
         if _file_attachment_dicts:
-            log.info("Detected %d file attachment(s) for ingestion", len(_file_attachment_dicts))
+            log.info("Detected %d file attachment(s) — routing to autonomous pipeline", len(_file_attachment_dicts))
 
-            # Send immediate progress indicator so user knows upload is being processed
+            # Send immediate processing indicator
             _file_names_preview = ", ".join(
                 a.get("name") or "file" for a in _file_attachment_dicts[:3]
             )
@@ -381,68 +417,35 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 "processing_card",
                 status_message=f"Processing {len(_file_attachment_dicts)} file(s): {_file_names_preview}",
             )
-            _progress_response = None
             try:
-                _progress_response = await turn_context.send_activity(
+                await turn_context.send_activity(
                     _as_activity(_card_activity(_progress_card, text="Processing your upload..."))
                 )
             except Exception:  # noqa: BLE001
-                pass  # Best-effort progress indication
+                pass
 
-            # Build an activity dict with only file attachments for ingest_attachments()
-            _ingest_activity = dict(activity_dict)
-            _ingest_activity["attachments"] = _file_attachment_dicts
-            try:
-                self.chat_service.ensure_collection(context.subscription_id)
-                ingestion = await ingest_attachments(
-                    _ingest_activity,
-                    turn_context,
-                    context,
-                    correlation_id,
-                    state_store=self.state_store,
-                )
+            # Resolve auth token once
+            token = await _resolve_auth_token(turn_context, None)
 
-                # Remove progress card now that processing is done
-                if _progress_response and getattr(_progress_response, "id", None):
-                    try:
-                        await turn_context.delete_activity(_progress_response.id)
-                    except Exception:  # noqa: BLE001
-                        pass  # Best-effort cleanup
+            # Run pipeline for each file independently
+            pipeline = TeamsDocumentPipeline(state_store=self.state_store)
 
-                # Build DI report card (rich domain-aware) or fall back to generic success card
-                di_card = _build_di_report_card(ingestion, log)
-                if di_card:
-                    await self._send_safe(
-                        turn_context,
-                        _as_activity(_card_activity(di_card, text="Document analyzed")),
-                        log,
+            async def _run_pipeline_for(att):
+                try:
+                    await pipeline.run_full_pipeline(
+                        attachment=att,
+                        context=context,
+                        turn_context=turn_context,
+                        correlation_id=correlation_id,
+                        auth_token=token or "",
                     )
-                else:
-                    success_card = build_card(
-                        "upload_success_card",
-                        message="Files ingested. You can start chatting now.",
-                        filenames=", ".join(ingestion.filenames),
-                        documents_created=str(ingestion.documents_created),
-                    )
-                    await self._send_safe(turn_context, _as_activity(_card_activity(success_card, text="Upload complete")), log)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("Pipeline failed for %s: %s", att.get("name", "unknown"), exc, exc_info=True)
+                    error_card = build_card("error_card", message=f"Failed to process '{att.get('name', 'file')}'. Please try again.")
+                    await self._send_safe(turn_context, _as_activity(_card_activity(error_card, text="Upload failed")), log)
 
-                # Show screening summary if available (only when no DI card — DI card already includes security)
-                if not di_card and ingestion.screening_results:
-                    screening_card = _build_screening_card(ingestion.filenames, ingestion.screening_results)
-                    if screening_card:
-                        await self._send_safe(turn_context, _as_activity(_card_activity(screening_card, text="Security screening complete")), log)
-                return
-            except Exception as exc:  # noqa: BLE001
-                log.error("Attachment ingest failed: %s", exc, exc_info=True)
-                # Remove progress card on error too
-                if _progress_response and getattr(_progress_response, "id", None):
-                    try:
-                        await turn_context.delete_activity(_progress_response.id)
-                    except Exception:  # noqa: BLE001
-                        pass
-                error_card = build_card("error_card", message="Could not ingest your file. Please try again.")
-                await self._send_safe(turn_context, _as_activity(_card_activity(error_card)), log)
-                return
+            await asyncio.gather(*[_run_pipeline_for(att) for att in _file_attachment_dicts])
+            return
 
         # Handle Adaptive Card Submit actions
         if isinstance(turn_context.activity.value, dict) and turn_context.activity.value:
@@ -453,27 +456,40 @@ class DocWainTeamsBot(TeamsActivityHandler):
         # Text questions — handle special commands first
         question = legacy_adapter.extract_question(activity_dict)
         _lower_q = (question or "").lower().strip()
-        if not question or _lower_q in {"help", "tools", "delete", "delete docs", "delete documents", "delete all"}:
+        import re as _re
+        _DELETE_PHRASES = {"delete", "delete docs", "delete documents", "delete all",
+                           "remove all documents", "remove documents", "remove all docs",
+                           "clear documents", "clear all documents", "clear my documents",
+                           "delete my documents", "remove my documents", "erase documents",
+                           "remove all the documents", "delete all the documents",
+                           "clear all the documents"}
+        _is_delete_cmd = _lower_q in _DELETE_PHRASES or bool(
+            _re.search(r"(?:delete|remove|clear|erase)\s+(?:all\s+)?(?:the\s+)?(?:my\s+)?(?:document|doc|file)s?",
+                       _lower_q))
+        if not question or _lower_q in {"help", "tools"} or _is_delete_cmd:
             if _lower_q == "tools":
                 tools_payload = await self.tool_router.handle_action({"action": "show_tools"}, context)
                 await self._send_safe(turn_context, _as_activity(tools_payload), log)
-            elif _lower_q in {"delete", "delete docs", "delete documents", "delete all"}:
+            elif _is_delete_cmd:
                 delete_payload = await self.tool_router.handle_action({"action": "delete_documents"}, context)
                 await self._send_safe(turn_context, _as_activity(delete_payload), log)
             else:
                 await self._send_safe(turn_context, _as_activity(_card_activity(build_card("help_card"))), log)
             return
 
+        _proc_id = None
         try:
             # Show processing card while we work
             processing_card = build_card("processing_card", status_message="Analyzing your question...")
-            processing_activity = _as_activity(_card_activity(processing_card))
             try:
-                processing_response = await turn_context.send_activity(processing_activity)
+                _proc_resp = await turn_context.send_activity(
+                    _as_activity(_card_activity(processing_card))
+                )
+                _proc_id = getattr(_proc_resp, "id", None)
             except Exception:  # noqa: BLE001
-                processing_response = None
+                pass
 
-            answer_result = self.chat_service.answer_question(question, context)
+            answer_result = await self.chat_service.answer_question(question, context)
             answer = answer_result.answer
             response_text = answer.get("response") or "I could not generate a response."
             sources = answer.get("sources") or []
@@ -497,13 +513,6 @@ class DocWainTeamsBot(TeamsActivityHandler):
 
             sources_toggle = f"Show sources ({source_count})" if source_count else "Show sources"
 
-            # Delete the processing card before sending the answer
-            if processing_response and getattr(processing_response, "id", None):
-                try:
-                    await turn_context.delete_activity(processing_response.id)
-                except Exception:  # noqa: BLE001
-                    pass  # Best-effort cleanup
-
             card = build_card(
                 "answer_card",
                 title="Answer",
@@ -513,26 +522,34 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 sources_text=sources_text.replace("\n\nSources:\n", "") if sources_text else "No sources available.",
                 sources_toggle_title=sources_toggle,
             )
-            # Send card with text fallback — text is shown if Adaptive Card can't render
-            await self._send_safe(turn_context, _as_activity(_card_activity(card, text=response_text)), log)
+            # Replace processing card in-place (prevents duplicates)
+            final_activity = _as_activity(_card_activity(card, text=response_text))
+            await self._update_or_replace(turn_context, _proc_id, final_activity, log)
 
-            # Persist conversation history for context-aware follow-ups
+            # Persist conversation history for context-aware follow-ups (non-blocking)
             try:
+                import asyncio as _asyncio
                 from src.api.dw_chat import add_message_to_history
 
-                add_message_to_history(
-                    user_id=user_id,
-                    query=question,
-                    response=answer,
-                    session_id=context.session_id,
-                    new_session=False,
+                _asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: add_message_to_history(
+                        user_id=user_id,
+                        query=question,
+                        response=answer,
+                        session_id=context.session_id,
+                        new_session=False,
+                    ),
                 )
             except Exception as history_exc:  # noqa: BLE001
                 log.debug("Teams BF history persistence failed: %s", history_exc)
         except Exception as exc:  # noqa: BLE001
             log.error("Teams question handling failed: %s", exc, exc_info=True)
             error_card = build_card("error_card", message="I hit a snag answering that. Please try again.")
-            await self._send_safe(turn_context, _as_activity(_card_activity(error_card)), log)
+            await self._update_or_replace(
+                turn_context, _proc_id,
+                _as_activity(_card_activity(error_card, text="Error")), log,
+            )
 
     async def on_members_added_activity(self, members_added, turn_context):
         """Send a welcome card when the bot is first added to a conversation."""
@@ -571,7 +588,6 @@ class DocWainTeamsBot(TeamsActivityHandler):
                 log,
             )
 
-
 async def handle_bot_error(turn_context, error: Exception):  # type: ignore[func-returns-value]
     """Single-attempt error handler with trusted service URL."""
     if MicrosoftAppCredentials is not None:
@@ -581,7 +597,6 @@ async def handle_bot_error(turn_context, error: Exception):  # type: ignore[func
         await turn_context.send_activity("Sorry, something went wrong processing your request.")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to send error activity: %s", exc)
-
 
 # Configure adapter error handling
 if bot_adapter and _BOTBUILDER_AVAILABLE:

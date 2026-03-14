@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -16,8 +16,7 @@ from src.runtime.freshness_guard import FreshnessGuard
 from src.chat.companion_classifier import CompanionClassifier
 from src.api.dw_newron import get_redis_client
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get_thinking_client() -> Optional[Any]:
     """Create an OllamaClient pointed at lfm2.5-thinking for MoE reasoning steps."""
@@ -31,7 +30,6 @@ def _get_thinking_client() -> Optional[Any]:
     except Exception as exc:
         logger.debug("Thinking client unavailable: %s", exc)
         return None
-
 
 def _execute_agents_parallel(
     agents_and_contexts: List[tuple],
@@ -71,11 +69,9 @@ def _execute_agents_parallel(
 
     return results
 
-
 def _bounded_trace(max_steps: int) -> List[Dict[str, Any]]:
     """Create a trace list that respects the max step budget."""
     return [{"phase": "init", "detail": "Agent mode engaged", "timestamp": time.time(), "step": 0}][:max_steps]
-
 
 def _build_stream(trace: List[Dict[str, Any]], answer_text: str) -> Iterable[str]:
     def _stream():
@@ -87,7 +83,6 @@ def _build_stream(trace: List[Dict[str, Any]], answer_text: str) -> Iterable[str
         for chunk in chunk_text_stream(answer_text):
             yield chunk
     return _stream()
-
 
 def run_agent_mode(
     request: Any,
@@ -131,7 +126,7 @@ def run_agent_mode(
     # --- Domain agent detection ----------------------------------------
     # Check if the query requires a specialized domain agent (e.g. "generate
     # interview questions") before the standard retrieval pipeline.
-    # MoE: reasoning agents use lfm2.5-thinking, generation agents use gpt-oss.
+    # MoE: reasoning agents use lfm2.5-thinking, generation agents use DocWain-Agent.
     try:
         from src.agentic.domain_agents import detect_agent_task, get_domain_agent
         _agent_det = detect_agent_task(str(query_text))
@@ -227,13 +222,15 @@ def run_agent_mode(
     answer["sources"] = (answer.get("sources") or [])[:max_evidence]
 
     if not answer["sources"]:
-        answer["response"] = (
-            answer.get("response")
-            or "No grounded answer available. Unable to proceed without evidence."
-        )
+        # Only refuse if the response itself is empty — don't override a
+        # valid LLM response just because source metadata is missing.
+        if not (answer.get("response") or "").strip():
+            answer["response"] = (
+                "No grounded answer available. Unable to proceed without evidence."
+            )
         answer["grounded"] = False
         answer["metadata"]["agent"] = {
-            "limitations": "No supporting evidence found; withheld ungrounded response.",
+            "limitations": "No supporting evidence found in source metadata.",
             "max_evidence": max_evidence,
         }
     else:

@@ -3,13 +3,13 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 INTENT_CACHE_MAX = 512
 INTENT_CACHE_TTL_SEC = 60 * 60
@@ -33,7 +33,6 @@ _INTENT_PROMPT = (
     "QUERY: {query}\n"
 )
 
-
 @dataclass(frozen=True)
 class IntentParse:
     intent: str
@@ -43,7 +42,6 @@ class IntentParse:
     constraints: Dict[str, Any]
     entity_hints: List[str]
     source: str
-
 
 def parse_intent(
     *,
@@ -86,14 +84,11 @@ def parse_intent(
     _local_cache_set(key, fallback)
     return IntentParse(**fallback, source="heuristic")
 
-
 def _normalize(text: str) -> str:
     return " ".join((text or "").strip().split())
 
-
 def _cache_key(query: str) -> str:
     return hashlib.sha1(query.encode("utf-8")).hexdigest()
-
 
 def _cache_get(redis_client: Optional[Any], key: str) -> Optional[Dict[str, Any]]:
     if redis_client is None:
@@ -110,7 +105,6 @@ def _cache_get(redis_client: Optional[Any], key: str) -> Optional[Dict[str, Any]
         return None
     return None
 
-
 def _cache_set(redis_client: Optional[Any], key: str, payload: Dict[str, Any]) -> None:
     if redis_client is None:
         return
@@ -118,7 +112,6 @@ def _cache_set(redis_client: Optional[Any], key: str, payload: Dict[str, Any]) -
         redis_client.setex(f"intent:{key}", INTENT_CACHE_TTL_SEC, json.dumps(payload, ensure_ascii=True))
     except Exception:
         return
-
 
 def _local_cache_get(key: str) -> Optional[Dict[str, Any]]:
     entry = _INTENT_CACHE.get(key)
@@ -129,12 +122,10 @@ def _local_cache_get(key: str) -> Optional[Dict[str, Any]]:
         return None
     return entry.get("payload")
 
-
 def _local_cache_set(key: str, payload: Dict[str, Any]) -> None:
     if len(_INTENT_CACHE) >= INTENT_CACHE_MAX:
         _INTENT_CACHE.pop(next(iter(_INTENT_CACHE)))
     _INTENT_CACHE[key] = {"payload": payload, "_expires_at": time.time() + INTENT_CACHE_TTL_SEC}
-
 
 def _llm_parse(
     *,
@@ -175,7 +166,6 @@ def _llm_parse(
         return None
     return cleaned
 
-
 def _safe_json(raw: Any) -> Optional[Dict[str, Any]]:
     text = str(raw or "").strip()
     if not text:
@@ -194,7 +184,6 @@ def _safe_json(raw: Any) -> Optional[Dict[str, Any]]:
         except Exception:
             return None
     return None
-
 
 def _sanitize_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     intent = str(payload.get("intent") or "qa").strip().lower()
@@ -226,7 +215,6 @@ def _sanitize_payload(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "entity_hints": entity_hints,
     }
 
-
 def _clean_list(values: Any) -> List[str]:
     items = []
     for value in values if isinstance(values, (list, tuple)) else []:
@@ -243,7 +231,6 @@ def _clean_list(values: Any) -> List[str]:
         deduped.append(item)
     return deduped[:12]
 
-
 # ── Trained MLP intent + domain classifier ─────────────────────────────
 #
 # Uses a trained multi-head MLP (IntentDomainClassifier) for intent and
@@ -258,7 +245,6 @@ def _clean_list(values: Any) -> List[str]:
 
 import threading
 
-
 def _get_embedder():
     """Return the app-wide embedding model, or lazy-load a standalone one."""
     try:
@@ -271,11 +257,9 @@ def _get_embedder():
     # Standalone fallback (e.g. during tests or when app_state not ready)
     return _get_standalone_embedder()
 
-
 _standalone_embedder = None
 _standalone_embedder_attempted = False
 _standalone_embedder_lock = threading.Lock()
-
 
 def _get_standalone_embedder():
     """Lazy-load sentence-transformer embedder as last resort."""
@@ -291,6 +275,8 @@ def _get_standalone_embedder():
             return None
         _standalone_embedder_attempted = True
         try:
+            import warnings
+            warnings.filterwarnings("ignore", message=r".*_target_device.*has been deprecated", category=FutureWarning)
             from sentence_transformers import SentenceTransformer
             _standalone_embedder = SentenceTransformer("BAAI/bge-large-en-v1.5")
             logger.info("Loaded standalone sentence-transformer for intent classification")
@@ -298,7 +284,6 @@ def _get_standalone_embedder():
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not load sentence-transformer for intent classification: %s", exc)
             return None
-
 
 def _extract_entity_hints(query: str) -> List[str]:
     """Extract entity hints from query using NLP extractor."""
@@ -311,7 +296,6 @@ def _extract_entity_hints(query: str) -> List[str]:
     except Exception:  # noqa: BLE001
         pass
     return entity_hints
-
 
 def _detect_fields_from_embedding(query: str, embedder: Optional[Any] = None) -> List[str]:
     """Detect requested fields using FieldImportanceClassifier."""
@@ -326,7 +310,6 @@ def _detect_fields_from_embedding(query: str, embedder: Optional[Any] = None) ->
     except Exception:  # noqa: BLE001
         return []
 
-
 def _detect_output_format(query: str) -> str:
     """Detect output format from query text (simple structural check)."""
     lowered = query.lower()
@@ -339,7 +322,6 @@ def _detect_output_format(query: str) -> str:
     if "markdown" in lowered:
         return "markdown"
     return "bullets"
-
 
 def _neural_parse(query: str) -> Optional[Dict[str, Any]]:
     """Classify intent + domain using the trained MLP classifier.
@@ -381,9 +363,9 @@ def _neural_parse(query: str) -> Optional[Dict[str, Any]]:
     domain = result.get("domain", "generic")
     domain_conf = result.get("domain_confidence", 0.0)
 
-    if intent_conf < 0.45:
+    if intent_conf < 0.30:
         intent = "qa"
-    if domain_conf < 0.40:
+    if domain_conf < 0.25:
         domain = "generic"
 
     logger.debug(
@@ -399,7 +381,6 @@ def _neural_parse(query: str) -> Optional[Dict[str, Any]]:
         "constraints": {},
         "entity_hints": _extract_entity_hints(query),
     }
-
 
 def _fallback_parse(query: str) -> Dict[str, Any]:
     """Parse intent using trained MLP first, minimal regex fallback.
@@ -454,6 +435,5 @@ def _fallback_parse(query: str) -> Dict[str, Any]:
         "constraints": {},
         "entity_hints": _extract_entity_hints(query),
     }
-
 
 __all__ = ["IntentParse", "parse_intent"]

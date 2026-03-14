@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +16,7 @@ from src.api.statuses import (
     STATUS_TRAINING_STARTED,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DONT_DOWNGRADE_STATUSES = {
     STATUS_EMBEDDING_COMPLETED,
@@ -27,10 +27,10 @@ DONT_DOWNGRADE_STATUSES = {
 }
 
 SCREENING_ELIGIBLE_STATUSES = {
+    STATUS_UNDER_REVIEW,
     STATUS_EXTRACTION_COMPLETED,
     STATUS_SCREENING_COMPLETED,
 }
-
 
 def _embedding_already_completed(record: Dict[str, Any]) -> bool:
     """Detect embedding completion even if the top-level status is stale."""
@@ -44,7 +44,6 @@ def _embedding_already_completed(record: Dict[str, Any]) -> bool:
     if isinstance(embedding, dict) and str(embedding.get("status") or "").upper() == "COMPLETED":
         return True
     return False
-
 
 def filter_doc_ids_by_status(
     doc_ids: List[str],
@@ -60,7 +59,6 @@ def filter_doc_ids_by_status(
         else:
             skipped.append({"document_id": doc_id, "status": status})
     return eligible, skipped
-
 
 def promote_to_screening_completed(document_id: str) -> None:
     """Advance document status to SCREENING_COMPLETED if currently eligible.
@@ -79,12 +77,16 @@ def promote_to_screening_completed(document_id: str) -> None:
     if current_status in SCREENING_ELIGIBLE_STATUSES:
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
         update_stage(document_id, "screening", {"status": "COMPLETED", "completed_at": time.time(), "error": None})
-    else:
-        logger.debug(
-            "Skipping status promotion for %s; status %s not eligible",
+        logger.info(
+            "Document %s promoted from %s to SCREENING_COMPLETED",
             document_id, current_status,
         )
-
+    else:
+        logger.warning(
+            "Cannot promote document %s to SCREENING_COMPLETED; current status '%s' is not eligible. "
+            "Eligible statuses: %s",
+            document_id, current_status, SCREENING_ELIGIBLE_STATUSES,
+        )
 
 def _set_document_status(
     document_id: str,
@@ -103,11 +105,9 @@ def _set_document_status(
     update_document_fields(document_id, fields)
     logger.info("Document %s status updated to %s", document_id, status)
 
-
 def _status_from_security_report(report: Dict[str, Any]) -> str:
     risk_level = str(report.get("overall_risk_level") or report.get("risk_level") or "").upper()
     return "passed" if risk_level and risk_level not in {"HIGH", "CRITICAL"} else "failed"
-
 
 def _update_pickle_with_screening(document_id: str, screening_report: Dict[str, Any]) -> None:
     """Load existing pickle, add screening results, re-save."""
@@ -123,7 +123,6 @@ def _update_pickle_with_screening(document_id: str, screening_report: Dict[str, 
         logger.info("Updated pickle with screening results for %s", document_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to update pickle with screening for %s: %s", document_id, exc)
-
 
 def apply_security_result(document_id: str, report: Dict[str, Any]) -> None:
     status_text = _status_from_security_report(report)
@@ -151,18 +150,16 @@ def apply_security_result(document_id: str, report: Dict[str, Any]) -> None:
             )
             return
         if current_status not in SCREENING_ELIGIBLE_STATUSES:
-            logger.info(
-                "Security screening passed for %s; keeping non-eligible status %s",
-                document_id,
-                current_status,
+            logger.warning(
+                "Security screening passed for %s but status '%s' is not eligible for promotion. "
+                "Forcing promotion to SCREENING_COMPLETED. Eligible: %s",
+                document_id, current_status, SCREENING_ELIGIBLE_STATUSES,
             )
-            return
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
         # HITL: Screening only sets SCREENING_COMPLETED.
         # User must manually trigger embedding (POST /api/documents/embed).
     else:
         _set_document_status(document_id, STATUS_TRAINING_BLOCKED_SECURITY, "Security screening failed")
-
 
 def apply_security_results_for_endpoint(entries: List[Dict[str, Any]]) -> None:
     for entry in entries:
@@ -172,7 +169,6 @@ def apply_security_results_for_endpoint(entries: List[Dict[str, Any]]) -> None:
         if not isinstance(result, dict):
             continue
         apply_security_result(entry.get("doc_id", ""), result)
-
 
 def apply_security_results_for_run(entries: List[Dict[str, Any]]) -> None:
     for entry in entries:

@@ -58,6 +58,8 @@ def _sanitize_response_text(text: str) -> str:
     text = re.sub(r"\bAs a language model\b[^.]*\.", "", text, flags=re.IGNORECASE)
     # Strip internal references
     text = re.sub(r"\[SOURCE[^\]]*\]", "", text, flags=re.IGNORECASE)
+    # Strip leaked internal metadata tags (e.g. [META]{"grounded": true, ...})
+    text = re.sub(r"\n*\[META\]\{[^}]*\}", "", text)
     return text
 
 
@@ -71,6 +73,11 @@ def normalize_answer(answer: Any) -> Dict[str, Any]:
         response_text = answer.get("response") or answer.get("answer") or ""
         if isinstance(response_text, str):
             response_text = _sanitize_response_text(response_text)
+        # Extract media from answer or from metadata.media
+        media = answer.get("media")
+        if media is None and isinstance(meta.get("media"), list):
+            media = meta.pop("media")
+
         structured = {
             "response": response_text,
             "sources": answer.get("sources", []),
@@ -78,8 +85,10 @@ def normalize_answer(answer: Any) -> Dict[str, Any]:
             "context_found": answer.get("context_found", False),
             "metadata": meta,
         }
+        if media:
+            structured["media"] = media
         for k, v in answer.items():
-            if k in {"response", "answer", "sources", "metadata"}:
+            if k in {"response", "answer", "sources", "metadata", "media"}:
                 continue
             structured["metadata"][k] = v
         structured["metadata"] = structured.get("metadata") or {}
@@ -99,3 +108,45 @@ def chunk_text_stream(text: str, chunk_size: int = 256) -> Iterable[str]:
         return
     for idx in range(0, len(text), chunk_size):
         yield text[idx: idx + chunk_size]
+
+
+def chunk_text_stream_with_metadata(
+    text: str,
+    metadata: Optional[Dict[str, Any]] = None,
+    chunk_size: int = 256,
+) -> Iterable[str]:
+    """Stream text chunks followed by a final JSON metadata event.
+
+    The final chunk is a JSON line prefixed with '\\n\\n[META]' containing
+    grounding signals: grounded, confidence, evidence_coverage, sources.
+    Clients can detect this sentinel and parse the metadata.
+    """
+    import json as _json
+
+    if not text:
+        yield ""
+    else:
+        pos = 0
+        while pos < len(text):
+            end = min(pos + chunk_size, len(text))
+            if end < len(text):
+                # Find last good break point within chunk
+                chunk = text[pos:end]
+                # Prefer breaking at: newline > sentence end > table row boundary > space
+                last_nl = chunk.rfind('\n')
+                last_sent = max(chunk.rfind('. '), chunk.rfind('.\n'),
+                                chunk.rfind('? '), chunk.rfind('! '))
+                last_pipe_nl = chunk.rfind('|\n')  # Table row boundary
+
+                best_break = max(last_nl, last_sent, last_pipe_nl)
+                if best_break > chunk_size * 0.4:  # At least 40% of target size
+                    end = pos + best_break + 1
+
+            chunk_text = text[pos:end]
+            if chunk_text:  # Skip empty chunks
+                yield chunk_text
+            pos = end
+
+    # Internal metadata is returned via the response structure (headers / JSON),
+    # NOT appended to the streamed text.  Emitting [META] tags in the text stream
+    # leaks internal data to end users.

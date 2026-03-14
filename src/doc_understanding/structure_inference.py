@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     """Access attribute or dict key — supports both objects and dicts."""
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
-
 
 _ENTITY_PATTERNS = {
     "EMAIL": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.IGNORECASE),
@@ -23,13 +21,11 @@ _ENTITY_PATTERNS = {
 
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[\.)])\s+")
 
-
 def _numeric_ratio(text: str) -> float:
     if not text:
         return 0.0
     digits = sum(1 for ch in text if ch.isdigit())
     return digits / max(1, len(text))
-
 
 def _entity_density(text: str) -> float:
     if not text:
@@ -40,7 +36,6 @@ def _entity_density(text: str) -> float:
     word_count = max(1, len(re.findall(r"\w+", text)))
     return hits / word_count
 
-
 def _list_density(text: str) -> float:
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
@@ -48,10 +43,8 @@ def _list_density(text: str) -> float:
     bullets = sum(1 for ln in lines if _BULLET_RE.match(ln))
     return bullets / max(1, len(lines))
 
-
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
-
 
 _ROLE_KEYWORDS: Dict[str, List[str]] = {
     "header_meta": ["header", "title page", "cover", "metadata", "document info"],
@@ -67,7 +60,6 @@ _ROLE_KEYWORDS: Dict[str, List[str]] = {
     "requirements_like": ["requirements", "spec", "details", "scope", "objectives", "deliverables"],
     "transactional": ["total due", "amount due", "balance due", "invoice number", "invoice date", "payment terms", "subtotal", "unit price", "net amount"],
 }
-
 
 def _infer_section_role(text: str, title: str, numeric_ratio: float, list_density: float) -> str:
     lowered_title = (title or "").lower()
@@ -100,7 +92,6 @@ def _infer_section_role(text: str, title: str, numeric_ratio: float, list_densit
 
     return best_role
 
-
 def _section_importance_score(
     *,
     word_count: int,
@@ -127,14 +118,12 @@ def _section_importance_score(
     )
     return round(_clamp(weighted), 4)
 
-
 def _element_importance_score(text: str, base: float = 0.5) -> float:
     if not text:
         return round(base, 4)
     numeric_score = _clamp(_numeric_ratio(text) * 8.0)
     length_score = _clamp(len(text) / 400.0)
     return round(_clamp(0.6 * base + 0.25 * numeric_score + 0.15 * length_score), 4)
-
 
 def _extract_sections(extracted: Any) -> List[Dict[str, Any]]:
     sections = list(_get(extracted, "sections", []) or [])
@@ -152,7 +141,6 @@ def _extract_sections(extracted: Any) -> List[Dict[str, Any]]:
     if full_text:
         return [{"title": "Document", "text": full_text, "start_page": None, "end_page": None}]
     return []
-
 
 def infer_structure(extracted: Any) -> Dict[str, Any]:
     sections = _extract_sections(extracted)
@@ -225,6 +213,5 @@ def infer_structure(extracted: Any) -> Dict[str, Any]:
         "images": images_payload,
         "document_density": doc_density,
     }
-
 
 __all__ = ["infer_structure"]

@@ -8,15 +8,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .role_prompts import VERIFIER_SYSTEM, VERIFIER_TEMPLATE
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class VerificationResult:
@@ -36,7 +35,6 @@ class VerificationResult:
             "issues": self.issues,
             "reasoning": self.reasoning[:500] if self.reasoning else "",
         }
-
 
 def _parse_verification(raw: str) -> Optional[VerificationResult]:
     """Parse JSON from verifier output into a VerificationResult."""
@@ -93,7 +91,6 @@ def _parse_verification(raw: str) -> Optional[VerificationResult]:
         reasoning=reasoning,
     )
 
-
 def _build_evidence_text(chunks: List[Any], max_chars: int = 4000) -> str:
     """Build a compact evidence string from chunks."""
     parts = []
@@ -117,7 +114,6 @@ def _build_evidence_text(chunks: List[Any], max_chars: int = 4000) -> str:
         parts.append(entry)
         total += len(entry) + 1
     return "\n".join(parts)
-
 
 def verify_grounding(
     answer: str,

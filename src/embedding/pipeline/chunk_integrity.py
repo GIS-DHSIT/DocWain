@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.embedding.chunking.sentence_splitter import split_into_sentences
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[\.)])\s+")
 _HEADING_RE = re.compile(
@@ -22,7 +22,6 @@ _PAGE_MARKER_RE = re.compile(r"^\s*-+\s*page\s*\d+\s*-+\s*$", re.IGNORECASE)
 _PAGE_NUMBER_RE = re.compile(r"^\s*(?:page\s*)?\d+(?:\s*(?:/|of)\s*\d+)?\s*$", re.IGNORECASE)
 _ONLY_PUNCT_RE = re.compile(r"^[\W_]+$")
 
-
 @dataclass(frozen=True)
 class ChunkIntegrityConfig:
     target_min_tokens: int = 250
@@ -31,14 +30,12 @@ class ChunkIntegrityConfig:
     min_chars: int = 300
     overlap_tokens: int = 60
 
-
 @dataclass
 class AtomicUnit:
     text: str
     unit_type: str
     page_start: Optional[int]
     page_end: Optional[int]
-
 
 def clean_text_for_embedding(text: str) -> str:
     if not text:
@@ -65,7 +62,6 @@ def clean_text_for_embedding(text: str) -> str:
         cleaned.append(line)
     return "\n".join(cleaned).strip()
 
-
 def _is_heading_line(line: str) -> bool:
     clean = (line or "").strip()
     if not clean:
@@ -76,14 +72,11 @@ def _is_heading_line(line: str) -> bool:
         return True
     return False
 
-
 def _token_count(text: str) -> int:
     return len(text.split())
 
-
 def _lex_token_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9]+", text or ""))
-
 
 def is_valid_chunk_text(
     text: Optional[str],
@@ -119,7 +112,6 @@ def is_valid_chunk_text(
     if alnum_ratio < 0.2:
         return False
     return True
-
 
 def _split_bullets(lines: List[str], page_start: Optional[int], page_end: Optional[int]) -> List[AtomicUnit]:
     units: List[AtomicUnit] = []
@@ -164,7 +156,6 @@ def _split_bullets(lines: List[str], page_start: Optional[int], page_end: Option
             units.append(AtomicUnit(text, "sentence", page_start, page_end))
     return units
 
-
 def build_atomic_units(text: str, page_start: Optional[int], page_end: Optional[int]) -> List[AtomicUnit]:
     if not text:
         return []
@@ -186,7 +177,6 @@ def build_atomic_units(text: str, page_start: Optional[int], page_end: Optional[
             units.append(AtomicUnit(paragraph, "paragraph", page_start, page_end))
     return units
 
-
 def _dangling_heading(text: str) -> bool:
     stripped = (text or "").strip()
     if not stripped:
@@ -194,7 +184,6 @@ def _dangling_heading(text: str) -> bool:
     if stripped.endswith(":"):
         return True
     return _is_heading_line(stripped)
-
 
 def _finalize_chunk(units: List[AtomicUnit]) -> Tuple[str, Optional[int], Optional[int], str]:
     text = "\n\n".join(unit.text for unit in units if unit.text).strip()
@@ -208,7 +197,6 @@ def _finalize_chunk(units: List[AtomicUnit]) -> Tuple[str, Optional[int], Option
             page_end = unit.page_end if page_end is None else max(page_end, unit.page_end)
     chunk_type = unit_types.pop() if len(unit_types) == 1 else "text"
     return text, page_start, page_end, chunk_type
-
 
 def is_chunk_complete(text: str, chunk_type: str) -> bool:
     stripped = (text or "").strip()
@@ -226,7 +214,6 @@ def is_chunk_complete(text: str, chunk_type: str) -> bool:
     if last_line and _BULLET_RE.match(last_line):
         return True
     return stripped.endswith((".", "?", "!"))
-
 
 def _pack_units(units: List[AtomicUnit], config: ChunkIntegrityConfig) -> List[Tuple[str, Dict[str, Any]]]:
     packed: List[Tuple[str, Dict[str, Any]]] = []
@@ -264,7 +251,6 @@ def _pack_units(units: List[AtomicUnit], config: ChunkIntegrityConfig) -> List[T
         packed.append((text, {"page_start": page_start, "page_end": page_end, "chunk_type": chunk_type}))
     return packed
 
-
 def _apply_overlap(chunks: List[str], config: ChunkIntegrityConfig) -> List[str]:
     if config.overlap_tokens <= 0 or len(chunks) < 2:
         return chunks
@@ -281,7 +267,6 @@ def _apply_overlap(chunks: List[str], config: ChunkIntegrityConfig) -> List[str]
         merged = f"{prefix} {chunks[idx]}".strip() if prefix else chunks[idx]
         overlapped.append(merged)
     return overlapped
-
 
 def enforce_chunk_integrity(
     chunks: List[str],
@@ -358,7 +343,6 @@ def enforce_chunk_integrity(
     if merged_small:
         logger.warning("Merged %s undersized chunks during integrity enforcement", merged_small)
     return rebuilt_chunks, rebuilt_meta, stats
-
 
 __all__ = [
     "ChunkIntegrityConfig",

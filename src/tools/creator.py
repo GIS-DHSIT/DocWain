@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header
@@ -10,10 +10,9 @@ from src.tools.base import generate_correlation_id, register_tool, standard_resp
 from src.tools.common.grounding import build_source_record
 from src.tools.common.text_extract import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/creator", tags=["Tools-Creator"])
-
 
 class CreatorRequest(BaseModel):
     content_type: str = Field(..., pattern="^(summary|blog|sop|faq|slide_outline)$")
@@ -21,7 +20,6 @@ class CreatorRequest(BaseModel):
     length: str = Field(default="medium", description="rough size hint: short|medium|long")
     context: Optional[Dict[str, Any]] = None
     text: Optional[str] = Field(default=None, description="Reference text to ground generation")
-
 
 # ── Type-specific instructions ──────────────────────────────────────
 
@@ -34,7 +32,6 @@ _TYPE_INSTRUCTIONS = {
 }
 
 _EXPECTED_FIELDS = ["content"]
-
 
 # ── LLM generation ──────────────────────────────────────────────────
 
@@ -74,7 +71,6 @@ def _llm_generate(content_type: str, tone: str, length: str, reference: str) -> 
         logger.debug("Creator LLM generation failed: %s", exc)
         return None
 
-
 # ── Template fallback ───────────────────────────────────────────────
 
 def _build_outline(content: str) -> List[str]:
@@ -82,7 +78,6 @@ def _build_outline(content: str) -> List[str]:
         return []
     sentences = [s.strip() for s in content.split(".") if s.strip()]
     return sentences[:6]
-
 
 def _template_generate(req: CreatorRequest) -> Dict[str, Any]:
     reference = sanitize_text(req.text or "Provided context", max_chars=2400)
@@ -98,7 +93,6 @@ def _template_generate(req: CreatorRequest) -> Dict[str, Any]:
         "content": body,
         "faqs": faqs,
     }
-
 
 # ── Unified generation ──────────────────────────────────────────────
 
@@ -124,14 +118,12 @@ def _generate_content(req: CreatorRequest) -> Dict[str, Any]:
     result["iq_score"] = iq.as_dict()
     return result
 
-
 @register_tool("creator")
 async def creator_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     req = CreatorRequest(**(payload.get("input") or payload))
     result = _generate_content(req)
     sources = [build_source_record("tool", correlation_id or "creator", title=req.content_type)]
     return {"result": result, "sources": sources, "grounded": True, "context_found": True}
-
 
 @router.post("/generate")
 async def generate(request: CreatorRequest, x_correlation_id: str | None = Header(None)):

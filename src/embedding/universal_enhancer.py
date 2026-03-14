@@ -15,7 +15,7 @@ Key Features:
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 from dataclasses import dataclass, field
@@ -28,8 +28,7 @@ try:
 except ImportError:
     _HAS_NUMPY = False
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # =============================================================================
 # CONTENT TYPE DETECTION
@@ -181,7 +180,7 @@ class ContentTypeDetector:
                 dtype=np.float32,
             ).ravel()
         except Exception:
-            logger.warning("Embedder encode failed in detect_ml, falling back to regex", exc_info=True)
+            logger.debug("Embedder encode failed in detect_ml, falling back to regex", exc_info=True)
             return self.detect(text, section_title)
 
         return self._classify_vector(vec, text)
@@ -216,7 +215,7 @@ class ContentTypeDetector:
                 dtype=np.float32,
             )
         except Exception:
-            logger.warning("Batch encode failed in detect_ml_batch, falling back to regex", exc_info=True)
+            logger.debug("Batch encode failed in detect_ml_batch, falling back to regex", exc_info=True)
             return [self.detect(t, s) for t, s in zip(texts, titles)]
 
         return [self._classify_vector(vecs[i], texts[i]) for i in range(len(texts))]
@@ -348,7 +347,6 @@ class ContentTypeDetector:
             return "comma_list"
 
         return "prose"
-
 
 # =============================================================================
 # SEMANTIC FIELD EXTRACTION
@@ -530,7 +528,6 @@ class SemanticFieldExtractor:
 
         return list(set(terms))[:15]
 
-
 # =============================================================================
 # QUALITY SCORING
 # =============================================================================
@@ -552,7 +549,6 @@ class QualityScore:
             "density": self.information_density,
             "structure": self.structure_score,
         }
-
 
 class QualityScorer:
     """Scores chunk quality for better retrieval ranking."""
@@ -682,7 +678,6 @@ class QualityScorer:
 
         return min(1.0, base_score)
 
-
 # =============================================================================
 # EMBEDDING TEXT BUILDER
 # =============================================================================
@@ -758,7 +753,6 @@ class EmbeddingTextBuilder:
         text = text.replace('"', '"').replace('"', '"').replace("'", "'").replace("'", "'")
 
         return text.strip()
-
 
 # =============================================================================
 # QUERY ENRICHMENT
@@ -841,7 +835,6 @@ class QueryEnricher:
 
         return f"{prefix}{query}".strip()
 
-
 # =============================================================================
 # MAIN ENHANCER
 # =============================================================================
@@ -857,7 +850,6 @@ class EnhancedEmbeddingResult:
     semantic_fields: Dict[str, Any]
     content_hash: str
     metadata: Dict[str, Any]
-
 
 class UniversalEmbeddingEnhancer:
     """
@@ -1041,7 +1033,6 @@ class UniversalEmbeddingEnhancer:
 
         return enhanced_payload
 
-
 # =============================================================================
 # CONVENIENCE FUNCTIONS
 # =============================================================================
@@ -1074,7 +1065,6 @@ def enhance_for_embedding(
         document_type=document_type,
     )
 
-
 def enrich_query(query: str) -> str:
     """
     Convenience function to enrich a query.
@@ -1088,7 +1078,6 @@ def enrich_query(query: str) -> str:
     enricher = QueryEnricher()
     result = enricher.enrich(query)
     return result["enriched_query"]
-
 
 def get_enhanced_payload(
     text: str,

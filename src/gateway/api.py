@@ -1,7 +1,7 @@
 """Gateway HTTP endpoint — POST /screen for document screening."""
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -10,17 +10,15 @@ from pydantic import BaseModel, Field
 
 from .unified_executor import ScreeningExecutor
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 gateway_router = APIRouter(prefix="/gateway", tags=["Gateway"])
 
 _executor = ScreeningExecutor()
 
-
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
-
 
 class ScreenRequest(BaseModel):
     category: List[str] = Field(
@@ -38,7 +36,6 @@ class ScreenRequest(BaseModel):
         description="Document IDs to screen. Not needed for 'run' (batch) category.",
     )
 
-
 class ScreenResponse(BaseModel):
     status: str  # "success", "partial", "error"
     action: str  # e.g. "screen:integrity"
@@ -53,11 +50,9 @@ class ScreenResponse(BaseModel):
     duration_ms: int = 0
     metadata: Optional[Dict[str, Any]] = None
 
-
 # ---------------------------------------------------------------------------
 # Session-based context resolution
 # ---------------------------------------------------------------------------
-
 
 def _resolve_session_context(
     session_id: Optional[str],
@@ -93,11 +88,9 @@ def _resolve_session_context(
 
     return resolved
 
-
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
-
 
 @gateway_router.post("/screen", response_model=ScreenResponse)
 async def screen_documents(

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import time
 import uuid
 from typing import Callable, Optional
 
@@ -126,6 +127,8 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
         # Store in request state for handler access
         request.state.correlation_id = correlation_id
 
+        start = time.perf_counter()
+
         try:
             # Log request start (at debug level to avoid noise)
             logger.debug(
@@ -138,28 +141,37 @@ class CorrelationIdMiddleware(BaseHTTPMiddleware):
             # Process request
             response = await call_next(request)
 
-            # Add correlation ID to response headers
-            response.headers[self.header_name] = correlation_id
+            # Calculate request duration
+            duration_ms = (time.perf_counter() - start) * 1000
 
-            # Log request completion
-            logger.debug(
-                "Request completed: %s %s -> %s",
+            # Add correlation ID and response time to response headers
+            response.headers[self.header_name] = correlation_id
+            response.headers["X-Response-Time-Ms"] = f"{duration_ms:.2f}"
+
+            # Log request completion at INFO level with latency
+            logger.info(
+                "Request completed: %s %s -> %s (%.2fms)",
                 request.method,
                 request.url.path,
                 response.status_code,
-                extra={"correlation_id": correlation_id},
+                duration_ms,
+                extra={"correlation_id": correlation_id, "duration_ms": duration_ms, "status_code": response.status_code},
             )
 
             return response
 
         except Exception as exc:
-            # Log exception with correlation ID
+            # Calculate request duration
+            duration_ms = (time.perf_counter() - start) * 1000
+
+            # Log exception with correlation ID and latency
             logger.error(
-                "Request failed: %s %s -> %s",
+                "Request failed: %s %s -> %s (%.2fms)",
                 request.method,
                 request.url.path,
                 type(exc).__name__,
-                extra={"correlation_id": correlation_id},
+                duration_ms,
+                extra={"correlation_id": correlation_id, "duration_ms": duration_ms},
                 exc_info=True,
             )
             raise

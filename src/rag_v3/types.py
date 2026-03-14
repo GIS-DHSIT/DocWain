@@ -185,6 +185,7 @@ class LLMResponseSchema(BaseModel):
     text: str
     evidence_chunks: List[str] = Field(default_factory=list)
     thinking_used: bool = False
+    grounding_confidence: float = 0.0  # 0.0-1.0, set by lightweight grounding check
 
 
 @dataclass

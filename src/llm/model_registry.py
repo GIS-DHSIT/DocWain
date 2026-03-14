@@ -6,19 +6,19 @@ select the optimal model for each LLM task type.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Hardcoded model knowledge base
 # ---------------------------------------------------------------------------
 
 _MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
-    "gpt-oss": {
+    "docwain-agent": {
         "speed_tier": "heavy",
         "strengths": ["generation", "instruction_following", "creative", "tool_calling", "reasoning"],
         "supports_json_mode": True,
@@ -84,6 +84,15 @@ _MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "supports_tool_calling": True,
         "context_window": 131072,
     },
+    "docwain-agent-v2": {
+        "speed_tier": "heavy",
+        "strengths": ["classification", "intent_parsing", "structured_extraction", "json_generation"],
+        "supports_json_mode": True,
+        "supports_cot": False,
+        "supports_vision": False,
+        "supports_tool_calling": False,
+        "context_window": 4096,
+    },
 }
 
 # Requirement → preferred strength tags (ordered by relevance)
@@ -96,7 +105,6 @@ _REQUIREMENT_STRENGTHS: Dict[str, List[str]] = {
     "vision": ["vision", "image_understanding"],
     "tool_calling": ["tool_calling", "instruction_following"],
 }
-
 
 @dataclass
 class ModelCapability:
@@ -113,7 +121,6 @@ class ModelCapability:
     context_window: int = 4096
     available: bool = True
 
-
 def _match_family(model_name: str) -> Optional[str]:
     """Strip tag suffixes and match against known model families."""
     base = model_name.split(":")[0].lower().strip()
@@ -121,7 +128,7 @@ def _match_family(model_name: str) -> Optional[str]:
     if base in _MODEL_PROFILES:
         return base
     # Prefix match (e.g. "llama3.2-vision" → "llama3.2", "lfm2.5-thinking" → "lfm2.5-thinking")
-    _FAMILY_MAP = {"lfm2": "lfm2.5-thinking"}
+    _FAMILY_MAP = {"lfm2": "lfm2.5-thinking", "gpt-oss": "qwen3", "docwain-agent": "qwen3"}
     for alias, family in _FAMILY_MAP.items():
         if base.startswith(alias) and family in _MODEL_PROFILES:
             return family
@@ -129,7 +136,6 @@ def _match_family(model_name: str) -> Optional[str]:
         if base.startswith(family):
             return family
     return None
-
 
 def _speed_tier_from_size(size_bytes: int) -> str:
     """Derive speed tier from model file size."""
@@ -139,7 +145,6 @@ def _speed_tier_from_size(size_bytes: int) -> str:
     if gb <= 8.0:
         return "medium"
     return "heavy"
-
 
 class ModelRegistry:
     """Auto-discovers available Ollama models and catalogs their capabilities."""
@@ -241,7 +246,6 @@ class ModelRegistry:
             return best.name
         return ranked[0].name  # fallback to first available
 
-
 # ---------------------------------------------------------------------------
 # Singleton
 # ---------------------------------------------------------------------------
@@ -249,11 +253,9 @@ class ModelRegistry:
 _REGISTRY: Optional[ModelRegistry] = None
 _REGISTRY_LOCK = threading.Lock()
 
-
 def get_model_registry() -> Optional[ModelRegistry]:
     """Return the singleton ModelRegistry (may be None if not initialized)."""
     return _REGISTRY
-
 
 def set_model_registry(registry: ModelRegistry) -> None:
     """Set the singleton ModelRegistry."""

@@ -10,23 +10,21 @@ Provides:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 health_router = APIRouter(tags=["Health"])
-
 
 class ReindexRequest(BaseModel):
     subscription_id: str
     profile_id: str
     document_id: Optional[str] = None  # None = all documents in profile
-
 
 def _check_qdrant_connection() -> Dict[str, Any]:
     """Check Qdrant vector database connectivity."""
@@ -53,7 +51,6 @@ def _check_qdrant_connection() -> Dict[str, Any]:
             "error": str(e)[:100],
         }
 
-
 def _check_mongodb_connection() -> Dict[str, Any]:
     """Check MongoDB connectivity."""
     try:
@@ -73,7 +70,6 @@ def _check_mongodb_connection() -> Dict[str, Any]:
             "status": "unhealthy",
             "error": str(e)[:100],
         }
-
 
 def _check_redis_connection() -> Dict[str, Any]:
     """Check Redis cache connectivity."""
@@ -100,7 +96,6 @@ def _check_redis_connection() -> Dict[str, Any]:
             "error": str(e)[:100],
         }
 
-
 def _check_ollama_connection() -> Dict[str, Any]:
     """Check Ollama LLM service connectivity."""
     try:
@@ -119,7 +114,6 @@ def _check_ollama_connection() -> Dict[str, Any]:
             "error": str(e)[:100],
         }
 
-
 def _validate_configuration() -> Dict[str, Any]:
     """Validate critical configuration settings."""
     issues: List[str] = []
@@ -137,7 +131,6 @@ def _validate_configuration() -> Dict[str, Any]:
         "status": "healthy" if not issues else "warning",
         "issues": issues if issues else None,
     }
-
 
 @health_router.get("/health")
 def health_check(request: Request) -> Dict[str, Any]:
@@ -163,7 +156,6 @@ def health_check(request: Request) -> Dict[str, Any]:
         "qdrant_indexes": index_status,
         "instance_ids": getattr(request.app.state, "instance_ids", {}),
     }
-
 
 @health_router.get("/health/detailed")
 def health_check_detailed(request: Request) -> Dict[str, Any]:
@@ -212,7 +204,6 @@ def health_check_detailed(request: Request) -> Dict[str, Any]:
         "components": components,
     }
 
-
 @health_router.get("/health/ready")
 def readiness_check(request: Request, response: Response) -> Dict[str, Any]:
     """
@@ -248,7 +239,6 @@ def readiness_check(request: Request, response: Response) -> Dict[str, Any]:
         "ready": True,
     }
 
-
 @health_router.get("/health/live")
 def liveness_check() -> Dict[str, Any]:
     """
@@ -262,7 +252,6 @@ def liveness_check() -> Dict[str, Any]:
         "alive": True,
         "timestamp": time.time(),
     }
-
 
 @health_router.post("/admin/reindex")
 async def reindex_profile(body: ReindexRequest) -> Dict[str, Any]:
@@ -342,7 +331,6 @@ async def reindex_profile(body: ReindexRequest) -> Dict[str, Any]:
             "error": str(exc)[:200],
         }
 
-
 @health_router.get("/admin/metrics/quality")
 async def quality_metrics(hours: int = 24) -> Dict[str, Any]:
     """Return pipeline quality metrics aggregated over the last N hours."""
@@ -351,7 +339,6 @@ async def quality_metrics(hours: int = 24) -> Dict[str, Any]:
         return get_quality_summary(hours=hours)
     except Exception as exc:
         return {"error": str(exc)}
-
 
 @health_router.get("/admin/llm/status")
 async def llm_status() -> Dict[str, Any]:
@@ -372,7 +359,6 @@ async def llm_status() -> Dict[str, Any]:
         return info
     except Exception as exc:
         return {"status": "error", "error": str(exc)}
-
 
 @health_router.get("/admin/teams/status")
 async def teams_status() -> Dict[str, Any]:
@@ -424,7 +410,6 @@ async def teams_status() -> Dict[str, Any]:
         "default_persona": getattr(Config.Teams, "DEFAULT_PERSONA", ""),
     }
 
-
 @health_router.get("/admin/multi-agent/status")
 async def multi_agent_status() -> Dict[str, Any]:
     """Return multi-agent gateway status and per-role statistics."""
@@ -449,7 +434,6 @@ async def multi_agent_status() -> Dict[str, Any]:
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)[:200]}
 
-
 @health_router.get("/admin/intent-classifier/status")
 async def intent_classifier_status() -> Dict[str, Any]:
     """Return the trained intent classifier status."""
@@ -471,7 +455,6 @@ async def intent_classifier_status() -> Dict[str, Any]:
     except Exception as exc:
         return {"status": "error", "error": str(exc)[:200]}
 
-
 @health_router.get("/admin/line-classifier/status")
 async def line_classifier_status() -> Dict[str, Any]:
     """Return the trained line role classifier status."""
@@ -491,7 +474,6 @@ async def line_classifier_status() -> Dict[str, Any]:
         return {"status": "unavailable", "error": "line_classifier module not found"}
     except Exception as exc:
         return {"status": "error", "error": str(exc)[:200]}
-
 
 @health_router.get("/admin/kg/status")
 async def kg_status() -> Dict[str, Any]:
@@ -548,7 +530,6 @@ async def kg_status() -> Dict[str, Any]:
 
     return result
 
-
 @health_router.get("/admin/task-routing/status")
 async def task_routing_status() -> Dict[str, Any]:
     """Return task-aware model routing status, discovered models, and per-task statistics."""
@@ -602,7 +583,6 @@ async def task_routing_status() -> Dict[str, Any]:
     except Exception as exc:
         return {"enabled": True, "status": "error", "error": str(exc)[:200]}
 
-
 @health_router.get("/admin/tools/status")
 async def tools_status() -> Dict[str, Any]:
     """Return registered tool count and intelligence profile summary."""
@@ -627,7 +607,6 @@ async def tools_status() -> Dict[str, Any]:
         "intelligence_profiles": len(profiles_info),
         "tools": profiles_info,
     }
-
 
 @health_router.get("/admin/enterprise-intelligence/status")
 async def enterprise_intelligence_status() -> Dict[str, Any]:
@@ -694,7 +673,6 @@ async def enterprise_intelligence_status() -> Dict[str, Any]:
         "features": features,
     }
 
-
 @health_router.get("/admin/web-search/status")
 async def web_search_status() -> Dict[str, Any]:
     """Return web search configuration status."""
@@ -715,7 +693,6 @@ async def web_search_status() -> Dict[str, Any]:
         "max_url_fetch_chars": getattr(ws, "MAX_URL_FETCH_CHARS", 6000),
         "fallback_on_no_results": getattr(ws, "FALLBACK_ON_NO_RESULTS", True),
     }
-
 
 @health_router.get("/admin/vision-ocr/status")
 async def vision_ocr_status() -> Dict[str, Any]:
@@ -744,7 +721,6 @@ async def vision_ocr_status() -> Dict[str, Any]:
 
     return result
 
-
 @health_router.get("/admin/domain-knowledge/status")
 async def domain_knowledge_status() -> Dict[str, Any]:
     """Return domain knowledge engine status."""
@@ -771,7 +747,6 @@ async def domain_knowledge_status() -> Dict[str, Any]:
 
     return result
 
-
 @health_router.get("/admin/context-understanding/status")
 async def context_understanding_status() -> Dict[str, Any]:
     """Return ML-based context understanding module status."""
@@ -791,7 +766,6 @@ async def context_understanding_status() -> Dict[str, Any]:
         result["status"] = "not_available"
     return result
 
-
 @health_router.get("/admin/domain-agents/status")
 async def domain_agents_status() -> Dict[str, Any]:
     """Return domain agent availability and capabilities."""
@@ -808,7 +782,6 @@ async def domain_agents_status() -> Dict[str, Any]:
     except Exception:
         result["status"] = "error"
     return result
-
 
 @health_router.get("/admin/profile-domain/status")
 async def profile_domain_status() -> Dict[str, Any]:
@@ -832,7 +805,6 @@ async def profile_domain_status() -> Dict[str, Any]:
     except Exception:
         result["status"] = "error"
     return result
-
 
 @health_router.get("/admin/thinking-model/status")
 async def thinking_model_status() -> Dict[str, Any]:
@@ -864,7 +836,6 @@ async def thinking_model_status() -> Dict[str, Any]:
 
     return result
 
-
 @health_router.get("/admin/vision-analysis/status")
 async def vision_analysis_status() -> Dict[str, Any]:
     """Return glm-ocr enhanced vision analysis status."""
@@ -894,6 +865,5 @@ async def vision_analysis_status() -> Dict[str, Any]:
         result["status"] = "not_initialized"
 
     return result
-
 
 __all__ = ["health_router"]

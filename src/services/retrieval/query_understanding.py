@@ -4,10 +4,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-import logging
+from src.utils.logging_utils import get_logger
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class QueryUnderstandingResult:
@@ -27,7 +26,6 @@ class QueryUnderstandingResult:
             if cleaned and cleaned not in variants:
                 variants.append(cleaned)
         return variants
-
 
 class QueryUnderstanding:
     """Normalize and enrich user queries for higher-accuracy retrieval."""

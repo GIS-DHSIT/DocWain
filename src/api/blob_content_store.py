@@ -1,5 +1,5 @@
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import pickle
 from typing import Any, Dict
 
@@ -9,10 +9,9 @@ from azure.storage.blob import ContentSettings
 from src.api.config import Config
 from src.storage.azure_blob_client import get_document_container_client
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _EXTRACTED_DOC_TYPE = "extracted_doc"
-
 
 def get_blob_client():
     container_client = get_document_container_client()
@@ -27,7 +26,6 @@ def get_blob_client():
             exc,
         )
     return container_client
-
 
 def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any]:
     payload = pickle.dumps(extracted_obj, protocol=pickle.HIGHEST_PROTOCOL)
@@ -53,7 +51,6 @@ def save_extracted_pickle(document_id: str, extracted_obj: Any) -> Dict[str, Any
         "sha256": hashlib.sha256(payload).hexdigest(),
     }
 
-
 def load_extracted_pickle(document_id: str) -> Any:
     blob_name = f"{document_id}.pkl"
     container = get_blob_client()
@@ -70,7 +67,6 @@ def load_extracted_pickle(document_id: str) -> Any:
     except ResourceNotFoundError as exc:
         raise ValueError(f"Extracted content not found in blob for document_id={document_id}") from exc
     return pickle.loads(payload)
-
 
 def delete_extracted_pickle(document_id: str) -> bool:
     blob_name = f"{document_id}.pkl"

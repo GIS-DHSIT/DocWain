@@ -22,7 +22,6 @@ from typing import Optional
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 class QdrantSettings(BaseSettings):
     """Qdrant vector database configuration."""
 
@@ -37,7 +36,6 @@ class QdrantSettings(BaseSettings):
         description="Qdrant API key",
     )
     timeout: int = Field(default=120, description="Request timeout in seconds")
-
 
 class MongoDBSettings(BaseSettings):
     """MongoDB configuration."""
@@ -57,7 +55,6 @@ class MongoDBSettings(BaseSettings):
     profiles_collection: str = Field(default="profiles", description="Profiles collection name")
     subscriptions_collection: str = Field(default="subscriptions", description="Subscriptions collection name")
 
-
 class RedisSettings(BaseSettings):
     """Redis cache configuration."""
 
@@ -75,7 +72,6 @@ class RedisSettings(BaseSettings):
     ssl: bool = Field(default=True, description="Enable SSL/TLS")
     db: int = Field(default=0, description="Redis database number")
 
-
 class OllamaSettings(BaseSettings):
     """Ollama LLM configuration."""
 
@@ -84,7 +80,6 @@ class OllamaSettings(BaseSettings):
     host: str = Field(default="http://localhost:11434", description="Ollama API host")
     default_model: str = Field(default="llama3.2", description="Default model name")
     embedding_model: str = Field(default="bge-m3", description="Embedding model name")
-
 
 class GeminiSettings(BaseSettings):
     """Google Gemini API configuration."""
@@ -96,7 +91,6 @@ class GeminiSettings(BaseSettings):
         description="Gemini API key",
     )
     model_name: str = Field(default="gemini-2.5-flash", description="Default Gemini model")
-
 
 class TeamsSettings(BaseSettings):
     """Microsoft Teams bot configuration."""
@@ -111,7 +105,6 @@ class TeamsSettings(BaseSettings):
         description="Default subscription ID",
     )
 
-
 class ObservabilitySettings(BaseSettings):
     """Logging and observability configuration."""
 
@@ -120,7 +113,6 @@ class ObservabilitySettings(BaseSettings):
     log_level: str = Field(default="INFO", description="Root log level")
     json_logging: bool = Field(default=False, description="Enable JSON structured logging")
     include_correlation_id: bool = Field(default=True, description="Include correlation ID in logs")
-
 
 class Settings(BaseSettings):
     """
@@ -192,7 +184,6 @@ class Settings(BaseSettings):
         uri = self.mongodb.uri.get_secret_value()
         return uri if uri else self.mongodb.fallback_uri
 
-
 @lru_cache
 def get_settings() -> Settings:
     """
@@ -206,16 +197,15 @@ def get_settings() -> Settings:
     """
     return Settings()
 
-
 def validate_settings_on_startup() -> None:
     """
     Validate settings at application startup.
 
     Logs warnings for missing configurations.
     """
-    import logging
+    from src.utils.logging_utils import get_logger
 
-    logger = logging.getLogger(__name__)
+    logger = get_logger(__name__)
     settings = get_settings()
 
     missing = settings.validate_required()
@@ -227,7 +217,6 @@ def validate_settings_on_startup() -> None:
 
     if settings.debug:
         logger.warning("Debug mode is enabled. Do not use in production.")
-
 
 __all__ = [
     "Settings",

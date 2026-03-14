@@ -26,14 +26,14 @@ Usage::
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Region / Country Detection Patterns ──────────────────────────────
 
@@ -68,7 +68,6 @@ _CURRENCY_PATTERNS: List[Tuple[re.Pattern, str, str]] = [
     (re.compile(r"(?:AUD|A\$)\s*[\d,]+(?:\.\d{2})?"), "AU", "Australia"),
 ]
 
-
 def detect_country_of_origin(text: str) -> Tuple[str, str, float]:
     """Detect the likely country of origin from document text.
 
@@ -101,7 +100,6 @@ def detect_country_of_origin(text: str) -> Tuple[str, str, float]:
                 "EU": "European Union", "CA": "Canada", "AU": "Australia",
                 "INT": "International"}
     return (best_code, name_map.get(best_code, best_code), round(confidence, 2))
-
 
 # ── Domain Context Dataclass ─────────────────────────────────────────
 
@@ -156,7 +154,6 @@ class DomainContext:
         if self.region_context:
             parts.append(self.region_context)
         return "\n".join(parts)
-
 
 # ── Embedded Domain Knowledge Base ───────────────────────────────────
 
@@ -581,13 +578,11 @@ _INTENT_AUGMENTATION: Dict[str, Dict[str, str]] = {
     },
 }
 
-
 # ── Web Enrichment Cache ─────────────────────────────────────────────
 
 _web_cache: Dict[str, Tuple[str, float]] = {}
 _web_cache_lock = threading.Lock()
 _WEB_CACHE_TTL = 3600  # 1 hour
-
 
 def _get_cached_web_knowledge(cache_key: str) -> Optional[str]:
     """Get cached web knowledge if not expired."""
@@ -599,7 +594,6 @@ def _get_cached_web_knowledge(cache_key: str) -> Optional[str]:
             del _web_cache[cache_key]
     return None
 
-
 def _set_cached_web_knowledge(cache_key: str, text: str) -> None:
     """Cache web knowledge result."""
     with _web_cache_lock:
@@ -608,7 +602,6 @@ def _set_cached_web_knowledge(cache_key: str, text: str) -> None:
             oldest_key = min(_web_cache, key=lambda k: _web_cache[k][1])
             del _web_cache[oldest_key]
         _web_cache[cache_key] = (text, time.time())
-
 
 def _fetch_domain_web_knowledge(domain: str, query: str) -> Optional[str]:
     """Fetch supplementary domain knowledge from the web.
@@ -659,7 +652,6 @@ def _fetch_domain_web_knowledge(domain: str, query: str) -> Optional[str]:
     except Exception as exc:
         logger.debug("Web domain knowledge fetch failed: %s", exc)
         return None
-
 
 # ── DomainKnowledgeProvider ──────────────────────────────────────────
 
@@ -772,12 +764,10 @@ class DomainKnowledgeProvider:
         ctx = self._region_context.get(code, self._region_context["INT"])
         return (code, name, ctx)
 
-
 # ── Singleton Management ─────────────────────────────────────────────
 
 _provider: Optional[DomainKnowledgeProvider] = None
 _provider_lock = threading.Lock()
-
 
 def get_domain_knowledge_provider() -> DomainKnowledgeProvider:
     """Get the global DomainKnowledgeProvider singleton.
@@ -791,13 +781,11 @@ def get_domain_knowledge_provider() -> DomainKnowledgeProvider:
                 _provider = DomainKnowledgeProvider()
     return _provider
 
-
 def set_domain_knowledge_provider(provider: DomainKnowledgeProvider) -> None:
     """Set the global DomainKnowledgeProvider singleton."""
     global _provider
     with _provider_lock:
         _provider = provider
-
 
 def ensure_domain_knowledge_provider(*, web_enrichment: bool = False) -> DomainKnowledgeProvider:
     """Ensure the global provider is initialized with the given settings."""

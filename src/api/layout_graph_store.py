@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import time
 import uuid
@@ -13,15 +13,13 @@ from azure.storage.blob import ContentSettings
 from src.api.config import Config
 from src.storage.azure_blob_client import get_document_container_client, normalize_blob_name
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DEFAULT_PREFIX = "layout-graphs"
-
 
 def _layout_prefix() -> str:
     prefix = os.getenv("DOCWAIN_LAYOUT_PREFIX", _DEFAULT_PREFIX).strip().strip("/")
     return prefix or _DEFAULT_PREFIX
-
 
 def _blob_paths(document_id: str, run_id: str) -> Dict[str, str]:
     prefix = _layout_prefix()
@@ -30,7 +28,6 @@ def _blob_paths(document_id: str, run_id: str) -> Dict[str, str]:
         "latest": f"{base}/latest.json",
         "versioned": f"{base}/{run_id}.json",
     }
-
 
 def _write_blob(blob_name: str, payload: bytes, metadata: Dict[str, str]) -> None:
     container = get_document_container_client()
@@ -41,7 +38,6 @@ def _write_blob(blob_name: str, payload: bytes, metadata: Dict[str, str]) -> Non
         metadata=metadata,
         content_settings=ContentSettings(content_type="application/json"),
     )
-
 
 def save_layout_graph(
     *,
@@ -87,11 +83,9 @@ def save_layout_graph(
             "error": str(exc),
         }
 
-
 def _local_layout_dir(document_id: str) -> Path:
     base = Path(getattr(Config.Path, "DOCUMENTS_DIR", Path.cwd()))
     return base / "layout-graphs" / str(document_id)
-
 
 def save_layout_graph_local(
     *,
@@ -115,7 +109,6 @@ def save_layout_graph_local(
         "updated_at": time.time(),
     }
 
-
 def load_layout_graph(document_id: str) -> Optional[Dict[str, Any]]:
     """Attempt to load latest layout graph from local disk first, then blob storage."""
     local_latest = _local_layout_dir(document_id) / "latest.json"
@@ -134,6 +127,5 @@ def load_layout_graph(document_id: str) -> Optional[Dict[str, Any]]:
         return json.loads(payload)
     except Exception:
         return None
-
 
 __all__ = ["save_layout_graph", "save_layout_graph_local", "load_layout_graph"]

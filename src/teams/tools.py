@@ -1,5 +1,5 @@
 import asyncio
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Optional
 
 from src.api.config import Config
@@ -7,14 +7,13 @@ from src.teams.cards import build_card
 from src.teams.logic import TeamsChatContext, TeamsChatService
 from src.teams.state import TeamsStateStore
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 ADAPTIVE_CARD_TYPE = "application/vnd.microsoft.card.adaptive"
 DEFAULT_WEB_URL = getattr(Config.Teams, "WEB_APP_URL", "https://www.docwain.ai")
 
 _MAX_INPUT_LEN = 2000
 _VALID_PRESETS = frozenset({"invoice", "contract", "hr", "medical", "legal", "policy"})
-
 
 def _card_activity(card: Dict[str, Any], text: Optional[str] = None) -> Dict[str, Any]:
     activity: Dict[str, Any] = {
@@ -30,7 +29,6 @@ def _card_activity(card: Dict[str, Any], text: Optional[str] = None) -> Dict[str
         activity["text"] = text
     return activity
 
-
 def _format_sources(sources: Any) -> str:
     items = sources or []
     if not isinstance(items, list):
@@ -44,7 +42,6 @@ def _format_sources(sources: Any) -> str:
         else:
             snippets.append(f"- {name}")
     return "\n".join(snippets)
-
 
 class TeamsToolRouter:
     """Routes Teams Adaptive Card Submit actions to DocWain tools."""
@@ -127,6 +124,10 @@ class TeamsToolRouter:
             return await self._confirm_delete(context)
         if action == "domain_query":
             return await self._domain_query(context, query=action_value.get("query", ""))
+        if action == "pipeline_consent_proceed":
+            return await self._pipeline_consent_proceed(context, document_id=action_value.get("document_id", ""))
+        if action == "pipeline_consent_reject":
+            return await self._pipeline_consent_reject(context, document_id=action_value.get("document_id", ""))
         if action in {"help", "show_tools"}:
             return self._tools_menu(context)
 
@@ -420,6 +421,61 @@ class TeamsToolRouter:
             return _card_activity(
                 build_card("error_card", message="Failed to answer the query. Please try again.")
             )
+
+    async def _pipeline_consent_proceed(self, context: TeamsChatContext, document_id: str) -> Dict[str, Any]:
+        """User clicked 'Proceed Anyway' — resume pipeline to embedding stage."""
+        if not document_id:
+            return _card_activity(build_card("error_card", message="Missing document reference. Please re-upload."))
+        try:
+            from src.teams.pipeline import TeamsDocumentPipeline
+            from src.teams.teams_storage import TeamsDocumentStorage
+            pipeline = TeamsDocumentPipeline(state_store=self.state_store)
+            storage = TeamsDocumentStorage()
+            storage.consent_proceed(document_id)
+
+            doc = storage.get_document(document_id)
+            if doc:
+                cached_content = pipeline._get_cached_content(document_id)
+                if cached_content:
+                    filename = doc.get("filename", "document")
+                    doc_type = doc.get("document_type", "general")
+                    # Try to get doc_type from extraction subdoc if top-level is missing
+                    if doc_type == "general" and isinstance(doc.get("extraction"), dict):
+                        doc_type = doc["extraction"].get("doc_type", "general")
+
+                    stage3 = await pipeline.stage_embed(
+                        document_id=document_id,
+                        extracted_content=cached_content,
+                        filename=filename,
+                        doc_type=doc_type,
+                        context=context,
+                        correlation_id="consent-resume",
+                    )
+                    return _card_activity(stage3["card"], text="Document ready")
+
+            return _card_activity(
+                build_card("answer_card", title="Consent granted", text="Embedding in progress. You'll be able to query the document shortly.", sources_text=""),
+                text="Consent granted",
+            )
+        except Exception as exc:
+            logger.error("Pipeline consent proceed failed: %s", exc, exc_info=True)
+            return _card_activity(build_card("error_card", message="Failed to process consent. Please try again."))
+
+    async def _pipeline_consent_reject(self, context: TeamsChatContext, document_id: str) -> Dict[str, Any]:
+        """User clicked 'Cancel Embedding' on screening consent card."""
+        if not document_id:
+            return _card_activity(build_card("error_card", message="Missing document reference."))
+        try:
+            from src.teams.teams_storage import TeamsDocumentStorage
+            storage = TeamsDocumentStorage()
+            storage.consent_reject(document_id)
+            return _card_activity(
+                build_card("answer_card", title="Embedding cancelled", text="The document will not be embedded. It remains in the system but is not queryable. You can re-upload to try again.", sources_text=""),
+                text="Embedding cancelled",
+            )
+        except Exception as exc:
+            logger.error("Pipeline consent reject failed: %s", exc, exc_info=True)
+            return _card_activity(build_card("error_card", message="Failed to process cancellation. Please try again."))
 
     def _tools_menu(self, context: TeamsChatContext) -> Dict[str, Any]:
         prefs = self.state_store.get_preferences(context.subscription_id, context.profile_id)

@@ -1,5 +1,6 @@
+import asyncio
 import concurrent.futures
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -7,19 +8,21 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
 
 from src.api.config import Config
-from src.api.vector_store import QdrantVectorStore, build_collection_name
+from src.api.vector_store import QdrantVectorStore
+from src.teams.pipeline import _build_teams_collection_name
 
 try:
     from src.api import dw_newron
 except Exception:  # noqa: BLE001
     dw_newron = None
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
+# Shared thread pool for RAG pipeline calls — avoids per-call executor overhead
+_RAG_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="teams-rag")
 
 class TeamsChatError(Exception):
     """Raised when Teams chat handling cannot complete."""
-
 
 @dataclass
 class TeamsChatContext:
@@ -32,7 +35,6 @@ class TeamsChatContext:
     model_name: str
     persona: str
 
-
 @dataclass
 class TeamsAnswerResult:
     """Answer payload paired with the scope that produced it."""
@@ -42,7 +44,6 @@ class TeamsAnswerResult:
     profile_id: str
     fallback_used: bool = False
     internet_mode: bool = False
-
 
 class TeamsChatService:
     """
@@ -95,9 +96,9 @@ class TeamsChatService:
             persona=effective_persona,
         )
 
-    def ensure_collection(self, subscription_id: str) -> None:
+    def ensure_collection(self, subscription_id: str, profile_id: str = "") -> None:
         """Create or validate the Teams collection for the given subscription/session."""
-        collection_name = build_collection_name(subscription_id)
+        collection_name = _build_teams_collection_name(subscription_id, profile_id)
         try:
             self.vector_store.ensure_collection(collection_name, self.vector_size)
         except UnexpectedResponse as exc:
@@ -125,7 +126,7 @@ class TeamsChatService:
         """
         from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
-        collection_name = build_collection_name(subscription_id)
+        collection_name = _build_teams_collection_name(subscription_id, profile_id)
         try:
             # Count points before deletion
             count_filter = Filter(must=[
@@ -156,6 +157,21 @@ class TeamsChatService:
                 "Deleted %d embedding(s) for Teams user | subscription=%s profile=%s collection=%s",
                 point_count, subscription_id, profile_id, collection_name,
             )
+
+            # Invalidate cached counts so next query sees zero
+            try:
+                from src.api.dw_newron import _COLLECTION_COUNT_CACHE
+                _count_cache_key = f"{collection_name}:{profile_id}"
+                _COLLECTION_COUNT_CACHE.pop(_count_cache_key, None)
+                _COLLECTION_COUNT_CACHE.pop(collection_name, None)
+            except Exception:
+                pass
+            try:
+                from src.intelligence.conversational_nlp import _DOC_SUMMARY_CACHE
+                _DOC_SUMMARY_CACHE.pop(f"{subscription_id}:{profile_id}", None)
+            except Exception:
+                pass
+
             return point_count
         except UnexpectedResponse as exc:
             logger.error("Failed to delete Teams documents: %s", exc)
@@ -192,15 +208,15 @@ class TeamsChatService:
             "mode": "internet",
         }
 
-    def answer_question(self, question: str, context: TeamsChatContext) -> TeamsAnswerResult:
+    async def answer_question(self, question: str, context: TeamsChatContext) -> TeamsAnswerResult:
         """
         Answer a Teams question with Teams-aware scope. Ensures the per-session
         collection exists, and if no document context is found, answers using an
         internet-enabled fallback.
         """
-        self.ensure_collection(context.subscription_id)
+        await asyncio.to_thread(self.ensure_collection, context.subscription_id, context.profile_id)
 
-        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 90))
+        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 300))
 
         try:
             if dw_newron is None:
@@ -208,19 +224,22 @@ class TeamsChatService:
             else:
                 _dw_newron = dw_newron
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(
-                    _dw_newron.answer_question,
+            loop = asyncio.get_running_loop()
+            _teams_collection = _build_teams_collection_name(context.subscription_id, context.profile_id)
+            future = loop.run_in_executor(
+                _RAG_EXECUTOR,
+                lambda: _dw_newron.answer_question(
                     query=question,
                     user_id=context.user_id,
                     profile_id=context.profile_id,
-                    subscription_id=context.subscription_id,
+                    subscription_id=_teams_collection,
                     model_name=context.model_name,
                     persona=context.persona,
                     session_id=context.session_id,
-                )
-                answer = future.result(timeout=_RAG_TIMEOUT_S)
-        except concurrent.futures.TimeoutError:
+                ),
+            )
+            answer = await asyncio.wait_for(future, timeout=_RAG_TIMEOUT_S)
+        except asyncio.TimeoutError:
             logger.error(
                 "RAG pipeline timed out after %.0fs for Teams query | user=%s",
                 _RAG_TIMEOUT_S,
@@ -244,7 +263,9 @@ class TeamsChatService:
                 internet_mode=False,
             )
 
-        internet_answer = self._answer_with_internet_mode(question, context)
+        internet_answer = await asyncio.to_thread(
+            self._answer_with_internet_mode, question, context,
+        )
         return TeamsAnswerResult(
             answer=internet_answer,
             subscription_id=context.subscription_id,

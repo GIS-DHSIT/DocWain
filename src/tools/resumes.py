@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
@@ -14,14 +14,12 @@ from src.tools.base import ToolError
 from src.tools.common.grounding import build_source_record
 from src.tools.common.text_extract import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/resumes", tags=["Tools-Resumes"])
 
-
 class ResumeRequest(BaseModel):
     text: str = Field(..., description="Resume content to parse")
-
 
 # ── JSON Schema for LLM extraction ─────────────────────────────────
 
@@ -37,7 +35,6 @@ _JSON_SCHEMA = """{
 
 _EXPECTED_FIELDS = ["name", "skills", "experience", "education", "summary"]
 
-
 # ── LLM extraction ─────────────────────────────────────────────────
 
 def _llm_extract(text: str, query: str) -> Optional[Dict[str, Any]]:
@@ -49,7 +46,6 @@ def _llm_extract(text: str, query: str) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.debug("Resume LLM extraction failed: %s", exc)
         return None
-
 
 def _normalize_llm_result(raw: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize LLM output into the expected result shape."""
@@ -95,7 +91,6 @@ def _normalize_llm_result(raw: Dict[str, Any]) -> Dict[str, Any]:
         "ats_hints": ["Use consistent date formats", "Include measurable outcomes"],
     }
 
-
 # ── Regex fallback ──────────────────────────────────────────────────
 
 def _extract_section(text: str, header: str) -> str:
@@ -104,7 +99,6 @@ def _extract_section(text: str, header: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
-
 
 def _regex_parse_resume(text: str) -> Dict[str, Any]:
     cleaned = sanitize_text(text, max_chars=4500)
@@ -125,7 +119,6 @@ def _regex_parse_resume(text: str) -> Dict[str, Any]:
         "warnings": warnings,
         "ats_hints": ["Use consistent date formats", "Include measurable outcomes"],
     }
-
 
 # ── Unified parse ───────────────────────────────────────────────────
 
@@ -161,7 +154,6 @@ def _parse_resume(text: str, query: str = "") -> Dict[str, Any]:
         logger.debug("Web enrichment skipped: %s", exc)
     return result
 
-
 def _ensure_domain_enabled() -> None:
     if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
         raise ToolError(
@@ -169,7 +161,6 @@ def _ensure_domain_enabled() -> None:
             code="deprecated",
             status_code=410,
         )
-
 
 def _render_parsed(parsed: Dict[str, Any]) -> str:
     """Build a human-readable text summary from parsed resume fields."""
@@ -226,7 +217,6 @@ def _render_parsed(parsed: Dict[str, Any]) -> str:
             parts.append("\n".join(insight_lines))
     return "\n".join(parts)
 
-
 def _web_enrich_resume(parsed: Dict[str, Any]) -> Dict[str, Any]:
     """Enrich parsed resume with web-sourced insights (LinkedIn, certs)."""
     web_insights: List[Dict[str, str]] = []
@@ -272,7 +262,6 @@ def _web_enrich_resume(parsed: Dict[str, Any]) -> Dict[str, Any]:
     parsed["web_insights"] = web_insights
     return parsed
 
-
 @register_tool("resumes")
 async def resumes_handler(payload: Dict[str, Any], correlation_id: str | None = None) -> Dict[str, Any]:
     _ensure_domain_enabled()
@@ -282,7 +271,6 @@ async def resumes_handler(payload: Dict[str, Any], correlation_id: str | None = 
     rendered = _render_parsed(parsed)
     sources = [build_source_record("tool", correlation_id or "resumes", title="resume")]
     return {"result": {**parsed, "rendered": rendered}, "sources": sources, "grounded": True, "context_found": True, "warnings": parsed.get("warnings", [])}
-
 
 @router.post("/analyze")
 async def analyze(request: ResumeRequest, x_correlation_id: str | None = Header(None)):

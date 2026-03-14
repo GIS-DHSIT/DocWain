@@ -4,7 +4,7 @@ POST /api/extraction/extract -- extracts content, entities, temporal spans,
 domain assignment, quality grading, and optionally stores to configured databases.
 """
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -12,10 +12,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 extraction_router = APIRouter(prefix="/extraction", tags=["Extraction Pipeline"])
-
 
 class ExtractionPipelineResponse(BaseModel):
     """Response from the standalone extraction pipeline."""
@@ -38,7 +37,6 @@ class ExtractionPipelineResponse(BaseModel):
     extraction_time_ms: float = 0.0
     stored: bool = False
     storage_targets: List[str] = Field(default_factory=list)
-
 
 @extraction_router.post("/extract", response_model=ExtractionPipelineResponse)
 async def extract_document_endpoint(
@@ -96,7 +94,7 @@ async def extract_document_endpoint(
     # Step 1: Raw extraction
     try:
         from src.api.dataHandler import fileProcessor
-        extracted = fileProcessor(file_bytes, fname)
+        extracted = fileProcessor(file_bytes, fname, content_type=file.content_type or "")
         if not extracted:
             raise HTTPException(status_code=422, detail="No content could be extracted from file")
     except HTTPException:
@@ -237,14 +235,11 @@ async def extract_document_endpoint(
             except Exception as exc:
                 logger.warning("MongoDB storage failed: %s", exc)
 
-        # Qdrant storage (trigger embedding)
+        # HITL: Embedding requires screening first. Do not auto-embed.
+        # User must manually trigger screening (POST /api/gateway/screen)
+        # then embedding (POST /api/documents/embed) after verification.
         if target_db in ("qdrant", "all"):
-            try:
-                from src.api.embedding_service import embed_documents
-                embed_documents(document_id=doc_id, subscription_id=subscription_id, profile_id=profile_id)
-                storage_targets.append("qdrant")
-            except Exception as exc:
-                logger.warning("Qdrant embedding trigger failed: %s", exc)
+            logger.info("HITL: skipping auto-embed for %s; user must trigger screening then embedding", doc_id)
 
         # Profile domain refresh
         try:

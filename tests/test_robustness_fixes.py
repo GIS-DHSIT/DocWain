@@ -180,14 +180,18 @@ class TestDedupThreshold:
 
 class TestExtractionFixes:
 
-    def test_extract_timeout_10s(self):
+    def test_extract_timeout_15s(self):
         from src.rag_v3.extract import EXTRACT_TIMEOUT_MS
-        assert EXTRACT_TIMEOUT_MS == 30000
+        assert EXTRACT_TIMEOUT_MS == 15000
 
-    def test_llm_response_below_10_chars_rejected(self):
+    def test_llm_response_below_8_chars_rejected(self):
         from src.rag_v3.llm_extract import _parse_response
-        result = _parse_response("Too short", [])
+        # Minimum threshold is 8 chars — very short responses should be rejected
+        result = _parse_response("OK", [])
         assert result is None
+        # 9+ char responses should be accepted (valid short answers like "INV-2024")
+        result2 = _parse_response("Too short", [])
+        assert result2 is not None
 
     def test_llm_response_metadata_garbage_rejected(self):
         from src.rag_v3.llm_extract import _parse_response

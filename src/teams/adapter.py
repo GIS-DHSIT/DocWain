@@ -1,6 +1,5 @@
 import hashlib
 import hmac
-import logging
 import re
 from typing import Any, Dict, List, Optional
 
@@ -11,18 +10,15 @@ from src.teams.logic import TeamsAnswerResult, TeamsChatError, TeamsChatService
 from src.teams.state import TeamsStateStore
 from src.utils.logging_utils import get_correlation_id, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 TEAMS_CHAT_SERVICE = TeamsChatService()
 STATE_STORE = TeamsStateStore()
-
 
 class TeamsAuthError(Exception):
     """Raised when the Teams request fails authentication."""
 
-
 def _get_header(headers: Dict[str, str], key: str) -> str:
     return headers.get(key) or headers.get(key.lower()) or headers.get(key.upper()) or ""
-
 
 def _is_botframework_jwt(headers: Optional[Dict[str, str]]) -> bool:
     """Detect a Bot Framework bearer token (JWT) to bypass shared-secret auth."""
@@ -33,7 +29,6 @@ def _is_botframework_jwt(headers: Optional[Dict[str, str]]) -> bool:
         return False
     token = auth_header[7:].strip()
     return token.count(".") == 2
-
 
 def verify_shared_secret(headers: Dict[str, str], raw_body: Optional[bytes] = None) -> None:
     """Check shared secret (simple header-based auth for Teams outbound calls)."""
@@ -69,18 +64,15 @@ def verify_shared_secret(headers: Dict[str, str], raw_body: Optional[bytes] = No
         if not hmac.compare_digest(signature, computed):
             raise TeamsAuthError("Invalid Teams signature")
 
-
 def _strip_mentions(text: str) -> str:
     """Remove <at> mentions so the question text is clean."""
     if not text:
         return ""
     return re.sub(r"<at[^>]*>.*?</at>", "", text).strip()
 
-
 def extract_question(activity: Dict[str, Any]) -> str:
     """Pull the user question from the Teams activity payload."""
     return _strip_mentions((activity.get("text") or "").strip())
-
 
 def extract_user_id(activity: Dict[str, Any]) -> str:
     """Derive a stable user id from Teams activity."""
@@ -91,7 +83,6 @@ def extract_user_id(activity: Dict[str, Any]) -> str:
         or user.get("userPrincipalName")
         or "teams_user"
     )
-
 
 def extract_session_id(activity: Dict[str, Any]) -> str:
     """Use conversation id as a lightweight session key."""
@@ -104,7 +95,6 @@ def extract_session_id(activity: Dict[str, Any]) -> str:
         or channel_data.get("teamsChannelId")
         or "teams-session"
     )
-
 
 def format_sources(sources: List[Dict[str, Any]]) -> str:
     if not sources:
@@ -119,7 +109,6 @@ def format_sources(sources: List[Dict[str, Any]]) -> str:
             lines.append(f"- {name}")
     return "\n\nSources:\n" + "\n".join(lines)
 
-
 def build_teams_message(answer_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Construct a Bot Framework message activity from the DocWain answer."""
     text = answer_payload.get("response") or "I could not generate a response."
@@ -131,7 +120,6 @@ def build_teams_message(answer_payload: Dict[str, Any]) -> Dict[str, Any]:
         "type": "message",
         "text": text,
     }
-
 
 def answer_question(*args, **kwargs):
     """
@@ -145,7 +133,6 @@ def answer_question(*args, **kwargs):
             "DocWain RAG dependencies are missing; install requirements.txt to enable Teams Q&A"
         ) from exc
     return _answer_question(*args, **kwargs)
-
 
 async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     """Handle Teams activities that include file attachments."""
@@ -198,7 +185,6 @@ async def handle_attachment_activity(activity: Dict[str, Any], correlation_id: O
             "You can start chatting now."
         ),
     }
-
 
 async def handle_teams_activity(
     activity: Dict[str, Any],

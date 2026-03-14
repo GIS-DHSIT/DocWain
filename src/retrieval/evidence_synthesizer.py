@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
 from src.api.config import Config
 from src.prompting.evidence_synthesizer import build_evidence_synthesizer_prompt
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _extract_json(raw: str) -> Optional[Dict[str, Any]]:
     if not raw:
@@ -27,7 +26,6 @@ def _extract_json(raw: str) -> Optional[Dict[str, Any]]:
         return json.loads(match.group(0))
     except Exception:
         return None
-
 
 class EvidenceSynthesizer:
     def __init__(self, llm_client: Optional[Any] = None, *, enabled: Optional[bool] = None) -> None:
@@ -65,6 +63,5 @@ class EvidenceSynthesizer:
         except Exception as exc:  # noqa: BLE001
             logger.debug("Evidence synthesizer failed: %s", exc)
         return None
-
 
 __all__ = ["EvidenceSynthesizer"]

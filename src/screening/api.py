@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import time
 import uuid
@@ -27,15 +27,13 @@ from . import storage_adapter
 from .models import ToolResult
 from .resume.models import ResumeScreeningDetailedResponse
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 screening_router = APIRouter(prefix="/screening", tags=["Screening"])
 _engine = ScreeningEngine()
 
-
 def get_screening_engine() -> ScreeningEngine:
     return _engine
-
 
 def _decode_raw_bytes(raw_bytes_base64: Optional[str]) -> Optional[bytes]:
     if not raw_bytes_base64:
@@ -45,7 +43,6 @@ def _decode_raw_bytes(raw_bytes_base64: Optional[str]) -> Optional[bytes]:
     except Exception:
         return None
 
-
 def _require_domain_specific() -> None:
     if not Config.Features.DOMAIN_SPECIFIC_ENABLED:
         raise HTTPException(
@@ -53,10 +50,8 @@ def _require_domain_specific() -> None:
             detail="Domain-specific screening is deprecated. Enable DOCWAIN_DOMAIN_SPECIFIC_ENABLED to use.",
         )
 
-
 def _error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details or {}}}
-
 
 def _format_results(doc_id: str, results: Sequence[ToolResult], engine: Optional[ScreeningEngine] = None) -> Dict[str, Any]:
     active_engine = engine or _engine
@@ -69,14 +64,12 @@ def _format_results(doc_id: str, results: Sequence[ToolResult], engine: Optional
         response["risk_level"] = results[0].risk_level
     return response
 
-
 def _handle_error(exc: ValueError):
     detail = str(exc)
     status_code = status.HTTP_400_BAD_REQUEST
     if "not found" in detail.lower():
         status_code = status.HTTP_404_NOT_FOUND
     raise HTTPException(status_code=status_code, detail=_error_detail("screening_error", detail))
-
 
 def _get_documents_collection():
     try:
@@ -85,14 +78,12 @@ def _get_documents_collection():
         logger.error("Unable to access documents collection: %s", exc, exc_info=True)
         return None
 
-
 def _get_screening_collection():
     try:
         return db["screening"]
     except Exception as exc:  # pragma: no cover - defensive guard
         logger.error("Unable to access screening collection: %s", exc, exc_info=True)
         return None
-
 
 class ScreenDocumentRequest(BaseModel):
     text: constr(strip_whitespace=True, min_length=1)
@@ -104,15 +95,12 @@ class ScreenDocumentRequest(BaseModel):
     previous_version_text: Optional[str] = Field(None, description="Optional previous version text for diffing")
     raw_bytes_base64: Optional[str] = Field(None, description="Optional base64-encoded raw bytes")
 
-
 class ScreenResumeRequest(ScreenDocumentRequest):
     candidate_name: Optional[str] = Field(None, description="Candidate name (optional)")
-
 
 class ScreeningRunOptions(BaseModel):
     doc_type: Optional[str] = Field(None, description="Optional document type override")
     internet_enabled: Optional[bool] = Field(None, description="Override config to enable/disable web checks")
-
 
 class MultiDocOptions(BaseModel):
     doc_ids: List[constr(strip_whitespace=True, min_length=1)] = Field(
@@ -132,25 +120,21 @@ class MultiDocOptions(BaseModel):
         cleaned = [str(doc_id).strip() for doc_id in value if str(doc_id).strip()]
         return list(dict.fromkeys(cleaned))
 
-
 class MultiDocLegalityOptions(MultiDocOptions):
     region: Optional[str] = Field(None, description="Target region for legality checks")
     jurisdiction: Optional[str] = Field(None, description="Specific jurisdiction or venue")
 
     model_config = {"extra": "forbid"}
 
-
 class ScreeningDocumentResult(BaseModel):
     doc_id: str
     results: Optional[Dict[str, Any]] = None
     errors: List[str] = Field(default_factory=list)
 
-
 class ScreeningProfileSummary(BaseModel):
     processed: int = 0
     succeeded: int = 0
     failed: int = 0
-
 
 class ScreeningProfileResult(BaseModel):
     profile_id: str
@@ -159,13 +143,11 @@ class ScreeningProfileResult(BaseModel):
     documents: List[ScreeningDocumentResult]
     message: Optional[str] = None
 
-
 class ScreeningEndpointDocumentResult(BaseModel):
     doc_id: str
     status: str
     result: Optional[Dict[str, Any]] = None
     errors: List[str] = Field(default_factory=list)
-
 
 class ScreeningEndpointResponse(BaseModel):
     run_id: str
@@ -175,7 +157,6 @@ class ScreeningEndpointResponse(BaseModel):
     persist_error: Optional[str] = None
     documents: List[ScreeningEndpointDocumentResult]
     summary: ScreeningProfileSummary
-
 
 class ScreeningRunRequest(BaseModel):
     profile_ids: List[constr(min_length=1)]
@@ -192,11 +173,9 @@ class ScreeningRunRequest(BaseModel):
             return ["all"]
         return value
 
-
 class ScreeningRunResponse(BaseModel):
     status: str
     profiles: List[ScreeningProfileResult]
-
 
 _ALLOWED_CATEGORIES = {
     "integrity",
@@ -210,7 +189,6 @@ _ALLOWED_CATEGORIES = {
     "legality",
     "all",
 }
-
 
 def _normalize_categories(raw_categories: Optional[List[str]]) -> List[str]:
     if not raw_categories:
@@ -231,7 +209,6 @@ def _normalize_categories(raw_categories: Optional[List[str]]) -> List[str]:
     if "all" in normalized:
         return ["all"]
     return normalized
-
 
 def _screen_document_task(task: Dict[str, Any]) -> Dict[str, Any]:
     engine = ScreeningEngine()
@@ -284,7 +261,6 @@ def _screen_document_task(task: Dict[str, Any]) -> Dict[str, Any]:
         errors.append(str(exc))
     return {"doc_id": doc_id, "results": results or None, "errors": errors}
 
-
 def _run_parallel_screening(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(tasks) <= 1:
         return [_screen_document_task(task) for task in tasks]
@@ -302,7 +278,6 @@ def _run_parallel_screening(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                 results.append({"doc_id": task.get("doc_id", ""), "results": None, "errors": [str(exc)]})
     return results
 
-
 def _extract_doc_id(doc: Dict[str, Any]) -> Optional[str]:
     for key in ("_id", "document_id", "documentId", "doc_id", "id"):
         value = doc.get(key)
@@ -310,13 +285,11 @@ def _extract_doc_id(doc: Dict[str, Any]) -> Optional[str]:
             return str(value)
     return None
 
-
 def _summary_from_results(doc_results: List[ScreeningDocumentResult]) -> ScreeningProfileSummary:
     processed = len(doc_results)
     failed = len([d for d in doc_results if d.errors])
     succeeded = processed - failed
     return ScreeningProfileSummary(processed=processed, succeeded=succeeded, failed=failed)
-
 
 def _normalize_doc_ids(options: MultiDocOptions) -> List[str]:
     doc_ids = [doc_id.strip() for doc_id in options.doc_ids if doc_id and doc_id.strip()]
@@ -338,7 +311,6 @@ def _normalize_doc_ids(options: MultiDocOptions) -> List[str]:
         )
     return normalized
 
-
 def _serialize_results(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump()
@@ -346,13 +318,11 @@ def _serialize_results(value: Any) -> Any:
         return value.dict()
     return value
 
-
 def _summary_for_endpoint_results(doc_results: List[Dict[str, Any]]) -> ScreeningProfileSummary:
     processed = len(doc_results)
     failed = len([doc for doc in doc_results if doc.get("status") != "succeeded"])
     succeeded = processed - failed
     return ScreeningProfileSummary(processed=processed, succeeded=succeeded, failed=failed)
-
 
 def _screen_doc_task(task: Dict[str, Any]) -> Dict[str, Any]:
     engine = ScreeningEngine()
@@ -431,7 +401,6 @@ def _screen_doc_task(task: Dict[str, Any]) -> Dict[str, Any]:
             "duration_seconds": time.time() - task["started_at"],
         }
 
-
 def _run_parallel_doc_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(tasks) <= 1:
         return [_screen_doc_task(task) for task in tasks]
@@ -454,7 +423,6 @@ def _run_parallel_doc_tasks(tasks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                     "errors": [str(exc)],
                 }
     return [results[index] for index in sorted(results)]
-
 
 def _persist_screening_reports(
     run_id: str,
@@ -501,7 +469,6 @@ def _persist_screening_reports(
     except Exception as exc:  # pragma: no cover - defensive guard
         logger.error("Failed to persist screening results run_id=%s: %s", run_id, exc, exc_info=True)
         return {"persisted": False, "persisted_count": 0, "persist_error": str(exc)}
-
 
 def _run_doc_based_screening(endpoint: str, options: MultiDocOptions) -> Dict[str, Any]:
     run_id = str(uuid.uuid4())
@@ -572,11 +539,9 @@ def _run_doc_based_screening(endpoint: str, options: MultiDocOptions) -> Dict[st
     )
     return response
 
-
 @screening_router.get("/health")
 def screening_health(engine: ScreeningEngine = Depends(get_screening_engine)):
     return {"status": "ok", "enabled_tools": engine.config.enabled_tools}
-
 
 @screening_router.post("/document")
 def screen_document(request: ScreenDocumentRequest, engine: ScreeningEngine = Depends(get_screening_engine)):
@@ -591,7 +556,6 @@ def screen_document(request: ScreenDocumentRequest, engine: ScreeningEngine = De
         internet_enabled_override=request.internet_enabled,
     )
     return result
-
 
 @screening_router.post("/resume", response_model=Union[ResumeScreeningDetailedResponse, ScreeningEndpointResponse])
 def screen_resume(
@@ -617,7 +581,6 @@ def screen_resume(
     )
     return result
 
-
 @screening_router.post("/chunk")
 def screen_chunk(request: ScreenDocumentRequest, engine: ScreeningEngine = Depends(get_screening_engine)):
     raw_bytes = _decode_raw_bytes(request.raw_bytes_base64)
@@ -633,47 +596,38 @@ def screen_chunk(request: ScreenDocumentRequest, engine: ScreeningEngine = Depen
     result["chunk_id"] = request.chunk_id or request.doc_id
     return result
 
-
 @screening_router.post("/integrity", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_integrity(options: MultiDocOptions = Body(...)):
     return _run_doc_based_screening("integrity", options)
-
 
 @screening_router.post("/compliance", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_compliance(options: MultiDocOptions = Body(...)):
     return _run_doc_based_screening("compliance", options)
 
-
 @screening_router.post("/quality", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_quality(options: MultiDocOptions = Body(...)):
     return _run_doc_based_screening("quality", options)
-
 
 @screening_router.post("/language", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_language(options: MultiDocOptions = Body(...)):
     return _run_doc_based_screening("language", options)
 
-
 @screening_router.post("/security", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_security(options: MultiDocOptions = Body(...)):
     return _run_doc_based_screening("security", options)
-
 
 @screening_router.post("/legality", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_legality(options: MultiDocLegalityOptions = Body(...)):
     _require_domain_specific()
     return _run_doc_based_screening("legality", options)
 
-
 @screening_router.post("/ai-authorship", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_ai_authorship(options: MultiDocOptions = Body(...)):
     return _run_doc_based_screening("ai_authorship", options)
 
-
 @screening_router.post("/all", response_model=ScreeningEndpointResponse, response_model_exclude_none=True)
 def screen_all(options: MultiDocLegalityOptions = Body(...)):
     return _run_doc_based_screening("all", options)
-
 
 @screening_router.post("/run", response_model=ScreeningRunResponse)
 def run_screening(

@@ -17,13 +17,12 @@ Supported Types:
 """
 
 import re
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class DocumentType(Enum):
     """Canonical document types."""
@@ -37,7 +36,6 @@ class DocumentType(Enum):
     TAX_DOCUMENT = "TAX_DOCUMENT"
     POLICY = "POLICY"
     GENERIC = "GENERIC"
-
 
 @dataclass
 class DocumentClassification:
@@ -56,7 +54,6 @@ class DocumentClassification:
             self.key_indicators = []
         if self.structured_fields is None:
             self.structured_fields = {}
-
 
 class DocumentClassifier:
     """Classify documents by type and extract type-specific metadata."""
@@ -328,10 +325,8 @@ class DocumentClassifier:
         }
         return domain_map.get(doc_type)
 
-
 # Singleton instance
 _classifier_instance = None
-
 
 def get_document_classifier() -> DocumentClassifier:
     """Get or create singleton classifier instance."""

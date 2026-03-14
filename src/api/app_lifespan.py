@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 from contextlib import asynccontextmanager
@@ -14,8 +14,7 @@ from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, ensure_payload
 from src.api.rag_state import AppState, activate_singleton_guard, register_instance_ids, set_app_state
 from src.llm.gateway import create_llm_gateway, set_llm_gateway
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _bootstrap_qdrant_indexes(qdrant_client) -> Dict[str, Dict[str, object]]:
     index_status: Dict[str, Dict[str, object]] = {}
@@ -41,7 +40,6 @@ def _bootstrap_qdrant_indexes(qdrant_client) -> Dict[str, Dict[str, object]]:
 
     return index_status
 
-
 def initialize_app_state(app: FastAPI) -> AppState:
     default_model = os.getenv("DOCWAIN_DEFAULT_MODEL", "DocWain-Agent")
 
@@ -52,14 +50,27 @@ def initialize_app_state(app: FastAPI) -> AppState:
     ollama_client = None
     rag_system = None
 
-    try:
-        embedding_model = dw_newron.get_model()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Embedding model init failed: %s", exc)
-    try:
-        cross_encoder = dw_newron.get_cross_encoder()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Reranker init failed: %s", exc)
+    # Load embedding model + cross-encoder in parallel (they're CPU-bound and independent)
+    def _load_embedding():
+        nonlocal embedding_model
+        try:
+            embedding_model = dw_newron.get_model()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Embedding model init failed: %s", exc)
+
+    def _load_cross_encoder():
+        nonlocal cross_encoder
+        try:
+            cross_encoder = dw_newron.get_cross_encoder()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Reranker init failed: %s", exc)
+
+    t_embed = threading.Thread(target=_load_embedding, daemon=True)
+    t_rerank = threading.Thread(target=_load_cross_encoder, daemon=True)
+    t_embed.start()
+    t_rerank.start()
+
+    # While models load, initialize clients (I/O bound, fast)
     try:
         qdrant_client = dw_newron.get_qdrant_client()
     except Exception as exc:  # noqa: BLE001
@@ -68,6 +79,10 @@ def initialize_app_state(app: FastAPI) -> AppState:
         redis_client = dw_newron.get_redis_client()
     except Exception as exc:  # noqa: BLE001
         logger.error("Redis client init failed: %s", exc)
+
+    # Wait for model loading to finish
+    t_embed.join()
+    t_rerank.join()
     if redis_client and getattr(Config.Redis, "CLEAR_UNSAFE_ON_STARTUP", False):
         try:
             from src.utils.redis_startup import clear_unsafe_keys, parse_unsafe_patterns
@@ -140,69 +155,37 @@ def initialize_app_state(app: FastAPI) -> AppState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Zombie document recovery skipped: %s", exc)
 
-    # Task-aware multi-model routing (auto-discovers available Ollama models)
-    if getattr(Config, "TaskRouting", None) and getattr(Config.TaskRouting, "ENABLED", False):
+    # Recover documents stuck in extraction IN_PROGRESS (server killed during extraction)
+    try:
+        from src.api.document_status import recover_zombie_extractions
+        extraction_recovered = recover_zombie_extractions()
+        if extraction_recovered:
+            logger.info("Reset %d zombie extraction documents at startup", extraction_recovered)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Zombie extraction recovery skipped: %s", exc)
+
+    # Auto-retry extraction for UNDER_REVIEW documents (background thread, non-blocking)
+    def _startup_extraction():
         try:
-            from src.llm.model_registry import ModelRegistry, set_model_registry
-            from src.llm.task_router import TaskRouter
-            from src.llm.multi_agent import TaskAwareGateway
-
-            registry = ModelRegistry()
-            registry.discover()
-            set_model_registry(registry)
-            logger.info(
-                "ModelRegistry discovered %d models: %s",
-                len(registry.get_available()),
-                [m.name for m in registry.get_available()],
-            )
-
-            router = TaskRouter(registry)
-            task_aware_gateway = TaskAwareGateway(
-                router=router,
-                fallback_gateway=llm_gateway,
-            )
-
-            # Replace the llm_gateway singleton so all existing code uses task routing
-            set_llm_gateway(task_aware_gateway)
-            llm_gateway = task_aware_gateway
-            ollama_client = task_aware_gateway
-            logger.info("TaskAwareGateway active — task routing enabled")
-
-            # Pin gpt-oss in GPU memory to eliminate model swap latency.
-            # First evict non-essential models to free GPU memory for gpt-oss (13GB).
-            try:
-                import ollama as _ollama
-
-                # Evict ALL other models to make room for gpt-oss (14GB on T4 16GB)
-                # T4 can only hold one large model; gpt-oss is the critical generation model
-                try:
-                    _running = _ollama.ps()
-                    for _m in getattr(_running, "models", []) or []:
-                        _name = getattr(_m, "name", "") or ""
-                        if _name and "gpt-oss" not in _name:
-                            try:
-                                _ollama.generate(model=_name, prompt="", options={"num_predict": 0}, keep_alive="0s")
-                                logger.info("Evicted %s from GPU to make room for gpt-oss", _name)
-                            except Exception:  # noqa: BLE001
-                                pass
-                except Exception:  # noqa: BLE001
-                    pass
-
-                _ollama.generate(
-                    model="gpt-oss:latest",
-                    prompt="ping",
-                    options={"num_predict": 1},
-                    keep_alive="24h",
-                )
-                logger.info("gpt-oss pinned in GPU memory (keep_alive=24h)")
-            except Exception as _pin_exc:  # noqa: BLE001
-                logger.warning("gpt-oss pinning FAILED — expect model swap latency: %s", _pin_exc)
-
-            # NOTE: lfm2.5-thinking (1GB) loads on-demand in ~3s — no need to pin.
-            # T4 16GB cannot hold both gpt-oss (14GB) and lfm2.5-thinking simultaneously.
-            # lfm2.5-thinking is used for reasoning tasks and will load when needed.
+            from src.api.extraction_service import extract_documents
+            result = extract_documents()
+            status = result.get("status", "unknown")
+            if status == "completed":
+                results = result.get("results", {})
+                successful = len(results.get("successful", []))
+                failed = len(results.get("failed", []))
+                if successful or failed:
+                    logger.info("Startup extraction: %d succeeded, %d failed", successful, failed)
+            elif status != "no_documents":
+                logger.warning("Startup extraction: %s", result.get("message", status))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Task routing init failed (continuing with single-model): %s", exc)
+            logger.warning("Startup extraction failed: %s", exc)
+
+    threading.Thread(target=_startup_extraction, daemon=True, name="startup-extraction").start()
+
+    # Legacy task-aware routing disabled — single vLLM model handles all tasks.
+    # ModelRegistry, TaskRouter, TaskAwareGateway are no longer used.
+    # vLLM pre-loads the model at server start, no GPU pinning needed.
 
     # Multi-agent gateway (role-specific Ollama models)
     multi_agent_gateway = None
@@ -250,7 +233,6 @@ def initialize_app_state(app: FastAPI) -> AppState:
     logger.info("AppState initialized with model=%s", default_model)
     return state
 
-
 def _precreate_subscription_collections(qdrant_client) -> None:
     """Pre-create Qdrant collections for active subscriptions to avoid 404s on first document."""
     try:
@@ -265,7 +247,8 @@ def _precreate_subscription_collections(qdrant_client) -> None:
         try:
             for col in (qdrant_client.get_collections().collections or []):
                 existing.add(getattr(col, "name", str(col)))
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to list Qdrant collections for pre-creation", exc_info=True)
             return
         vec_size = int(getattr(Config.Model, "EMBEDDING_DIM", 1024))
         vs = VectorStoreClient(client=qdrant_client)
@@ -283,7 +266,6 @@ def _precreate_subscription_collections(qdrant_client) -> None:
             logger.info("Pre-created %d Qdrant collections for active subscriptions", created)
     except Exception as exc:
         logger.debug("Subscription collection pre-creation skipped: %s", exc)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -303,6 +285,26 @@ async def lifespan(app: FastAPI):
             logger.info("spaCy model pre-loaded at startup")
     except Exception as exc:  # noqa: BLE001
         logger.debug("spaCy pre-load skipped: %s", exc)
+
+    # Validate embedding dimension at startup
+    if state.embedding_model:
+        try:
+            test_vec = state.embedding_model.encode("dimension validation test",
+                                                     convert_to_numpy=True,
+                                                     normalize_embeddings=True)
+            actual_dim = len(test_vec)
+            expected_dim = int(getattr(Config.Model, "EMBEDDING_DIM", 1024))
+            if actual_dim != expected_dim:
+                raise ValueError(
+                    f"Embedding dimension mismatch: model produces {actual_dim}d vectors "
+                    f"but Config.Model.EMBEDDING_DIM={expected_dim}. "
+                    f"Fix EMBEDDING_DIM env var or change the embedding model."
+                )
+            logger.info("Embedding dimension validated: %dd", actual_dim)
+        except ValueError:
+            raise
+        except Exception as exc:
+            logger.warning("Embedding dimension validation skipped: %s", exc)
 
     # Pre-train intent classifier (fast, <2s on CPU)
     if state.embedding_model:
@@ -331,6 +333,24 @@ async def lifespan(app: FastAPI):
         except Exception as exc:  # noqa: BLE001
             logger.warning("Field importance classifier startup training skipped: %s", exc)
 
+    # Pre-warm NLU registries (batch-encodes all category descriptions once)
+    try:
+        from src.nlp.nlu_engine import classify_intent, classify_domain_task
+        classify_intent("warmup")
+        classify_domain_task("warmup")
+        logger.info("NLU registries pre-warmed at startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("NLU registry pre-warm skipped: %s", exc)
+
+    # Pre-warm domain classifier centroids
+    try:
+        from src.intelligence.domain_classifier import _build_centroids
+        if state.embedding_model:
+            _build_centroids(state.embedding_model)
+            logger.info("Domain classifier centroids pre-warmed at startup")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Domain classifier pre-warm skipped: %s", exc)
+
     # Initialize Vision OCR client (lazy availability check)
     if getattr(Config, "VisionOCR", None) and getattr(Config.VisionOCR, "ENABLED", True):
         try:
@@ -339,7 +359,7 @@ async def lifespan(app: FastAPI):
             if client and client.is_available():
                 logger.info("Vision OCR ready: %s", Config.VisionOCR.MODEL)
             else:
-                logger.warning("Vision OCR model not available; traditional OCR will be used")
+                logger.debug("Vision OCR model not available; traditional OCR will be used")
         except Exception as exc:
             logger.warning("Vision OCR init failed: %s", exc)
 
@@ -365,21 +385,25 @@ async def lifespan(app: FastAPI):
         if _cloud_enabled:
             try:
                 _gemini = GeminiClient()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Failed to initialize Gemini client", exc_info=True)
             _az_ep = getattr(_cloud_cfg, "AZURE_OPENAI_ENDPOINT", "")
             _az_key = getattr(_cloud_cfg, "AZURE_OPENAI_API_KEY", "")
             if _az_ep and _az_key:
                 try:
-                    _openai = OpenAIClient(endpoint=_az_ep, api_key=_az_key, deployment=getattr(_cloud_cfg, "AZURE_DEPLOYMENT", "gpt-4o"))
-                except Exception:
-                    pass
+                    _openai = OpenAIClient(
+                        endpoint=_az_ep, api_key=_az_key,
+                        deployment=getattr(_cloud_cfg, "AZURE_DEPLOYMENT", "gpt-4.1"),
+                        api_version=getattr(_cloud_cfg, "AZURE_API_VERSION", "2024-05-01-preview"),
+                    )
+                except Exception as exc:
+                    logger.debug("Failed to initialize Azure OpenAI client", exc_info=True)
             _cl_key = getattr(_cloud_cfg, "CLAUDE_API_KEY", "")
             if _cl_key:
                 try:
                     _claude = ClaudeClient(api_key=_cl_key, model=getattr(_cloud_cfg, "CLAUDE_MODEL", "claude-sonnet-4-20250514"))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to initialize Claude client", exc_info=True)
         router = IntelligenceRouter(_local, _gemini, _openai, _claude)
         if _cloud_enabled and _cloud_cfg:
             router.configure(
@@ -411,7 +435,7 @@ async def lifespan(app: FastAPI):
         from src.utils.logging_utils import configure_logging
         configure_logging(
             log_level=os.getenv("LOG_LEVEL", "INFO"),
-            json_format=os.getenv("JSON_LOGGING", "false").lower() in {"1", "true", "yes"},
+            json_format=os.getenv("JSON_LOGGING", "true").lower() in {"1", "true", "yes"},
             include_correlation_id=True,
         )
     except Exception as exc:
@@ -419,15 +443,15 @@ async def lifespan(app: FastAPI):
     try:
         from src.storage.blob_persistence import validate_storage_configured_once
         validate_storage_configured_once()
-    except (ImportError, AttributeError):
-        pass  # function not yet implemented
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Azure blob storage validation not available (function not yet implemented)", exc_info=True)
     except Exception as exc:
         logger.warning("Azure blob storage configuration check skipped: %s", exc)
     try:
         from src.storage.blob_persistence import validate_containers_once
         validate_containers_once()
-    except (ImportError, AttributeError):
-        pass  # function not yet implemented
+    except (ImportError, AttributeError) as exc:
+        logger.debug("Azure blob container validation not available (function not yet implemented)", exc_info=True)
     except Exception as exc:
         logger.warning("Azure blob container validation skipped: %s", exc)
     try:
@@ -445,9 +469,8 @@ async def lifespan(app: FastAPI):
         bg = get_background_analyzer()
         if bg:
             bg.stop_worker()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to stop background analyzer worker during shutdown", exc_info=True)
     logger.info("DocWain API shutting down")
-
 
 __all__ = ["initialize_app_state", "lifespan"]

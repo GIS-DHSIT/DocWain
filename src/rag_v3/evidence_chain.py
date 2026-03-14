@@ -13,7 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _QUERY_KEYWORDS_RE = re.compile(r"[A-Za-z]{3,}")
 _NUMERIC_KV_RE = re.compile(
-    r"^(.+?):\s*[\$£€₹]?\s*([\d,]+(?:\.\d+)?)\s*(%|years?|months?|days?|hours?|kg|lbs?|mg|ml)?",
+    r"([A-Za-z][A-Za-z\s]{0,40}?):\s*[\$£€₹¥]?\s*([\d,]+(?:\.\d+)?)\s*"
+    r"(%|years?|months?|days?|hours?|weeks?"
+    r"|kg|lbs?|mg|ml|oz|grams?"
+    r"|usd|eur|gbp|inr|[kKmMbB])?",
     re.IGNORECASE,
 )
 
@@ -82,15 +85,29 @@ class EvidenceChain:
         """Render the evidence chain as structured context for the LLM prompt."""
         parts: List[str] = []
 
+        # KEY FINDINGS summary — gives LLM a quick orientation before detailed evidence
+        if self.supporting_facts:
+            top_facts = self.supporting_facts[:3]
+            key_lines = []
+            for fact in top_facts:
+                # Extract first sentence as the key finding
+                _first_sent = fact.text.split(". ")[0].strip()
+                if len(_first_sent) > 120:
+                    _first_sent = _first_sent[:117] + "..."
+                key_lines.append(f"  • {_first_sent}")
+            if key_lines:
+                parts.append("KEY FINDINGS:")
+                parts.extend(key_lines)
+
         if self.supporting_facts:
             if self.topic_groups:
-                parts.append("EVIDENCE FOUND (grouped by topic):")
+                parts.append("\nEVIDENCE FOUND (grouped by topic):")
                 for group in self.topic_groups:
                     parts.append(f"\n  [{group.topic.title()}]")
                     for fact in group.facts:
                         parts.append(f"    - {fact.text} (Source: {fact.source})")
             else:
-                parts.append("EVIDENCE FOUND:")
+                parts.append("\nEVIDENCE FOUND:")
                 for i, fact in enumerate(self.supporting_facts, 1):
                     parts.append(f"  [{i}] {fact.text} (Source: {fact.source})")
 
@@ -118,7 +135,29 @@ class EvidenceChain:
                 parts.append(f"  - {gap}")
 
         if self.num_documents > 1:
-            parts.append(f"\nDocuments analyzed: {self.num_documents}")
+            # Show per-document fact distribution for multi-doc awareness
+            doc_fact_counts: dict[str, int] = {}
+            for fact in self.supporting_facts:
+                doc_fact_counts[fact.source] = doc_fact_counts.get(fact.source, 0) + 1
+            if doc_fact_counts:
+                dist = ", ".join(f"{doc}: {cnt}" for doc, cnt in sorted(doc_fact_counts.items(), key=lambda x: -x[1]))
+                parts.append(f"\nDocuments analyzed: {self.num_documents} (facts: {dist})")
+            else:
+                parts.append(f"\nDocuments analyzed: {self.num_documents}")
+
+        # Evidence quality summary — helps LLM calibrate confidence
+        if self.supporting_facts:
+            avg_relevance = sum(f.relevance for f in self.supporting_facts) / len(self.supporting_facts)
+            quality = "strong" if avg_relevance >= 0.5 else "moderate" if avg_relevance >= 0.25 else "weak"
+            has_gaps = len(self.gaps) > 0
+            has_conflicts = len(self.contradictions) > 0
+            quality_notes = []
+            if has_gaps:
+                quality_notes.append(f"{len(self.gaps)} gap(s)")
+            if has_conflicts:
+                quality_notes.append(f"{len(self.contradictions)} conflict(s)")
+            quality_suffix = f" ({', '.join(quality_notes)})" if quality_notes else ""
+            parts.append(f"\nEvidence quality: {quality} (avg relevance: {avg_relevance:.2f}){quality_suffix}")
 
         return "\n".join(parts)
 
@@ -175,9 +214,19 @@ def _detect_contradictions(facts: List[EvidenceFact]) -> List[Contradiction]:
     label_values: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
 
     for fact in facts:
-        match = _NUMERIC_KV_RE.match(fact.text)
+        # Use search() not match() — fact.text is raw chunk content,
+        # "Label: Value" patterns can appear anywhere, not just at the start
+        match = _NUMERIC_KV_RE.search(fact.text)
         if match:
-            label = match.group(1).strip().lower()
+            raw_label = match.group(1).strip().lower()
+            # Normalize label: strip common prefix words to compare field names
+            # e.g., "the document states salary" → "salary"
+            _PREFIX_WORDS = {"the", "a", "an", "this", "that", "its", "our", "their",
+                             "according", "to", "per", "from", "in", "of", "on", "by",
+                             "document", "documents", "states", "records", "report",
+                             "shows", "indicates", "lists", "mentions", "notes"}
+            label_words = [w for w in raw_label.split() if w not in _PREFIX_WORDS]
+            label = " ".join(label_words) if label_words else raw_label
             value = match.group(2).strip()
             label_values[label].append((value, fact.source))
 
@@ -197,7 +246,7 @@ def _compute_numeric_stats(facts: List[EvidenceFact]) -> List[NumericStat]:
     label_nums: Dict[str, NumericStat] = {}
 
     for fact in facts:
-        match = _NUMERIC_KV_RE.match(fact.text)
+        match = _NUMERIC_KV_RE.search(fact.text)
         if match:
             label = match.group(1).strip()
             raw_val = match.group(2).replace(",", "")
@@ -224,6 +273,10 @@ def build_evidence_chain(query: str, chunks: List[Any]) -> EvidenceChain:
     supporting: List[EvidenceFact] = []
     doc_names: set[str] = set()
 
+    # Extract named entities from query for entity-relevance boost
+    _entity_re = re.compile(r"\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,})*\b")
+    query_entities = {m.group().lower() for m in _entity_re.finditer(query) if len(m.group()) > 2}
+
     for chunk in chunks:
         text = (getattr(chunk, "text", "") or "").strip()
         if not text:
@@ -239,9 +292,28 @@ def build_evidence_chain(query: str, chunks: List[Any]) -> EvidenceChain:
         overlap = query_keywords & chunk_words
         relevance = len(overlap) / max(len(query_keywords), 1)
 
-        if relevance > 0.1 or getattr(chunk, "score", 0) > 0.5:
+        # Boost relevance for chunks mentioning query entities
+        if query_entities:
+            text_lower = text.lower()
+            entity_hits = sum(1 for e in query_entities if e in text_lower)
+            relevance = min(1.0, relevance + entity_hits * 0.15)
+
+        # Incorporate rerank/vector score as a floor — chunks that scored
+        # high in retrieval are relevant even if keyword overlap is low
+        _chunk_score = getattr(chunk, "score", 0) or 0
+        if _chunk_score > 0.5:
+            relevance = max(relevance, _chunk_score * 0.6)
+
+        if relevance > 0.1 or _chunk_score > 0.5:
+            # Sentence-boundary truncation instead of hard cut
+            if len(text) > 300:
+                _trunc = text[:300]
+                _last_period = max(_trunc.rfind(". "), _trunc.rfind(".\n"))
+                fact_text = text[:_last_period + 1] if _last_period > 150 else _trunc
+            else:
+                fact_text = text
             supporting.append(EvidenceFact(
-                text=text[:300],
+                text=fact_text,
                 source=source,
                 chunk_id=getattr(chunk, "id", ""),
                 relevance=relevance,
@@ -254,11 +326,25 @@ def build_evidence_chain(query: str, chunks: List[Any]) -> EvidenceChain:
         covered_keywords |= fact_words
 
     uncovered = query_keywords - covered_keywords - _STOPWORDS
-    gaps = [f"No evidence found about: {kw}" for kw in sorted(uncovered) if len(kw) > 3]
+    # Prioritize entity gaps: match uncovered keywords against original query
+    # entities (which preserve capitalization), then generic terms
+    entity_gap_words = {e.lower() for e in query_entities} & uncovered
+    term_gap_words = uncovered - entity_gap_words
+    gaps = []
+    for kw in sorted(entity_gap_words):
+        # Find original-case version from query_entities
+        original = next((e for e in query_entities if e.lower() == kw), kw)
+        gaps.append(f"No evidence found about: {original}")
+    for kw in sorted(term_gap_words):
+        if len(kw) > 3:
+            gaps.append(f"No evidence found about: {kw}")
 
     # Sort supporting facts by relevance
     supporting.sort(key=lambda f: f.relevance, reverse=True)
-    supporting = supporting[:10]
+
+    # Deduplicate near-identical facts (same content from different chunk boundaries)
+    supporting = _deduplicate_facts(supporting)
+    supporting = supporting[:12]  # Allow slightly more after dedup
 
     # Enhanced analysis: topic grouping, contradictions, statistics
     topic_groups = _group_facts_by_topic(supporting)
@@ -274,6 +360,41 @@ def build_evidence_chain(query: str, chunks: List[Any]) -> EvidenceChain:
         contradictions=contradictions,
         numeric_stats=numeric_stats,
     )
+
+
+def _deduplicate_facts(facts: List[EvidenceFact], threshold: float = 0.75) -> List[EvidenceFact]:
+    """Remove near-duplicate facts based on word overlap.
+
+    Keeps the first (highest-relevance) version of each fact cluster.
+    """
+    if len(facts) <= 1:
+        return facts
+
+    kept: List[EvidenceFact] = []
+    kept_words: List[set] = []
+
+    for fact in facts:
+        words = set(w.lower() for w in _QUERY_KEYWORDS_RE.findall(fact.text) if len(w) > 2)
+        if not words:
+            kept.append(fact)
+            kept_words.append(words)
+            continue
+
+        is_dup = False
+        for existing_words in kept_words:
+            if not existing_words:
+                continue
+            intersection = len(words & existing_words)
+            union = len(words | existing_words)
+            if union > 0 and intersection / union >= threshold:
+                is_dup = True
+                break
+
+        if not is_dup:
+            kept.append(fact)
+            kept_words.append(words)
+
+    return kept
 
 
 _STOPWORDS = frozenset({

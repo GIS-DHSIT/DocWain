@@ -82,6 +82,9 @@ class Config:
         SECTION_SUMMARY_MAX_CHARS = int(os.getenv("DWX_SECTION_SUMMARY_MAX_CHARS", "700"))
         SECTION_SUMMARY_TOPK = int(os.getenv("DWX_SECTION_SUMMARY_TOPK", "6"))
         SECTION_RETRIEVAL_ENABLED = os.getenv("DWX_SECTION_RETRIEVAL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        REASONING_ENGINE_ENABLED = os.getenv("DWX_REASONING_ENGINE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        REASONING_FAST_PATH_ENABLED = os.getenv("DWX_REASONING_FAST_PATH", "true").lower() in {"1", "true", "yes", "on"}
+        VERIFY_CONFIDENCE_THRESHOLD = float(os.getenv("DWX_VERIFY_CONFIDENCE_THRESHOLD", "0.8"))
 
     class Gemini:
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyB9jPJeY0W0HJXWbrrNdoQDIAlmrcrzcq8")
@@ -192,7 +195,7 @@ class Config:
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
         DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
-        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "gpt-oss")
+        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "DocWain-Agent")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
         BLOB_CONNECTION_STRING = os.getenv("TEAMS_BLOB_CONNECTION_STRING", "")
@@ -225,7 +228,7 @@ class Config:
 
     class Reranker:
         DEVICE = os.getenv("RERANKER_DEVICE", "cpu")
-        TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "12.0"))
+        TIMEOUT_S = float(os.getenv("RERANKER_TIMEOUT_S", "6.0"))
 
     class RagV3:
         DEBUG_LOGS = os.getenv("DOCWAIN_RAG_V3_DEBUG_LOGS", "false").lower() in {"1", "true", "yes", "on"}
@@ -243,13 +246,13 @@ class Config:
         CHUNK_COVERAGE_THRESHOLD = float(os.getenv("CHUNK_COVERAGE_THRESHOLD", "0.98"))
         TOPK_DENSE = int(os.getenv("TOPK_DENSE", "50"))
         TOPK_RERANK = int(os.getenv("TOPK_RERANK", "20"))
-        FINAL_CONTEXT_CHUNKS = int(os.getenv("FINAL_CONTEXT_CHUNKS", "8"))
+        FINAL_CONTEXT_CHUNKS = int(os.getenv("FINAL_CONTEXT_CHUNKS", "12"))
         HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.75"))
         MIN_CONFIDENCE_TO_ANSWER = float(os.getenv("MIN_CONFIDENCE_TO_ANSWER", "0.62"))
         DEDUP_THRESHOLD = float(os.getenv("RETRIEVAL_DEDUP_THRESHOLD", "0.92"))
-        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "2048"))
-        MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "12"))
-        MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "6000"))
+        MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "4096"))
+        MAX_CONTEXT_CHUNKS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHUNKS", "16"))
+        MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "14000"))
         SIMILARITY_THRESHOLD = float(os.getenv("RETRIEVAL_SIMILARITY_THRESHOLD", "0.10"))
         USE_SPARSE_VECTORS = os.getenv("RETRIEVAL_USE_SPARSE_VECTORS", "true").lower() == "true"
         USE_ADJACENT_EXPANSION = os.getenv("RETRIEVAL_USE_ADJACENT_EXPANSION", "true").lower() == "true"
@@ -327,16 +330,20 @@ class Config:
         TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
         TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
         MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
-        MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "2"))
+        MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "8"))
         DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
 
     class VLLM:
-        """vLLM serving config — SafeTensor models via OpenAI-compatible API."""
-        ENABLED = os.getenv("VLLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-        ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8000/v1/chat/completions")
-        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "gpt-oss")
+        """vLLM serving config — Qwen3-14B-AWQ via OpenAI-compatible API."""
+        ENABLED = os.getenv("VLLM_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+        ENDPOINT = os.getenv("VLLM_ENDPOINT", "http://localhost:8001/v1/chat/completions")
+        MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen3-14B-AWQ")
         API_KEY = os.getenv("VLLM_API_KEY", "")
         TIMEOUT = float(os.getenv("VLLM_TIMEOUT", "30"))
+
+    class DocumentProfiler:
+        """Ingestion-time document profiling via LLM."""
+        ENABLED = os.getenv("DOC_PROFILER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 
     class TaskRouting:
         ENABLED = os.getenv("TASK_ROUTING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -352,15 +359,15 @@ class Config:
         CONVERSATION_SUMMARY_MODEL = os.getenv("TASK_ROUTE_CONVERSATION_SUMMARY", "")
         DOCUMENT_UNDERSTANDING_MODEL = os.getenv("TASK_ROUTE_DOCUMENT_UNDERSTANDING", "")
         GENERAL_MODEL = os.getenv("TASK_ROUTE_GENERAL", "")
-        FALLBACK_MODEL = os.getenv("TASK_ROUTE_FALLBACK", "gpt-oss:latest")
+        FALLBACK_MODEL = os.getenv("TASK_ROUTE_FALLBACK", "DocWain-Agent:latest")
 
     class MultiAgent:
         ENABLED = os.getenv("MULTI_AGENT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-        CLASSIFIER_MODEL = os.getenv("MULTI_AGENT_CLASSIFIER", "gpt-oss:latest")
-        EXTRACTOR_MODEL = os.getenv("MULTI_AGENT_EXTRACTOR", "gpt-oss:latest")
-        GENERATOR_MODEL = os.getenv("MULTI_AGENT_GENERATOR", "gpt-oss:latest")
-        VERIFIER_MODEL = os.getenv("MULTI_AGENT_VERIFIER", "gpt-oss:latest")
-        DEFAULT_MODEL = os.getenv("MULTI_AGENT_DEFAULT", "gpt-oss:latest")
+        CLASSIFIER_MODEL = os.getenv("MULTI_AGENT_CLASSIFIER", "DocWain-Agent:latest")
+        EXTRACTOR_MODEL = os.getenv("MULTI_AGENT_EXTRACTOR", "DocWain-Agent:latest")
+        GENERATOR_MODEL = os.getenv("MULTI_AGENT_GENERATOR", "DocWain-Agent:latest")
+        VERIFIER_MODEL = os.getenv("MULTI_AGENT_VERIFIER", "DocWain-Agent:latest")
+        DEFAULT_MODEL = os.getenv("MULTI_AGENT_DEFAULT", "DocWain-Agent:latest")
         VERIFIER_ENABLED = os.getenv("MULTI_AGENT_VERIFIER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         CLASSIFIER_TIMEOUT = float(os.getenv("MULTI_AGENT_CLASSIFIER_TIMEOUT", "15.0"))
         VERIFIER_TIMEOUT = float(os.getenv("MULTI_AGENT_VERIFIER_TIMEOUT", "30.0"))
@@ -475,7 +482,8 @@ class Config:
         ENABLED = os.getenv("DOCWAIN_CLOUD_LLM_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
         AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
         AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
-        AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1")
+        AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-05-01-preview")
         CLAUDE_API_KEY = os.getenv("CLAUDE_API_KEY", "")
         CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
         GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")

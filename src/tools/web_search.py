@@ -12,7 +12,7 @@ private IP ranges.
 from __future__ import annotations
 
 import ipaddress
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -21,14 +21,13 @@ from urllib.parse import urlparse
 
 from src.tools.base import register_tool, standard_response
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # URL detection
 # ---------------------------------------------------------------------------
 
 _URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+")
-
 
 def detect_urls_in_query(query: str) -> Tuple[List[str], str]:
     """Extract URLs from query text.
@@ -45,7 +44,6 @@ def detect_urls_in_query(query: str) -> Tuple[List[str], str]:
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
     return urls, cleaned
 
-
 # ---------------------------------------------------------------------------
 # SSRF protection
 # ---------------------------------------------------------------------------
@@ -55,7 +53,6 @@ _SSRF_DENY_HOSTNAMES = frozenset({
     "metadata.google.internal",
     "metadata.azure.internal",
 })
-
 
 def _is_ssrf_target(url: str) -> bool:
     """Return True if *url* points to a denied host (cloud metadata, private IP)."""
@@ -77,7 +74,6 @@ def _is_ssrf_target(url: str) -> bool:
 
     return False
 
-
 # ---------------------------------------------------------------------------
 # Web search result dataclass
 # ---------------------------------------------------------------------------
@@ -88,7 +84,6 @@ class WebSearchResult:
     url: str
     snippet: str
     source: str = "web"
-
 
 # ---------------------------------------------------------------------------
 # DuckDuckGo search
@@ -129,7 +124,6 @@ def _search_duckduckgo(query: str, max_results: int, timeout: float) -> List[Web
         logger.warning("DuckDuckGo search failed: %s", exc)
     return results
 
-
 # ---------------------------------------------------------------------------
 # Tavily search
 # ---------------------------------------------------------------------------
@@ -164,7 +158,6 @@ def _search_tavily(query: str, max_results: int, timeout: float, api_key: str) -
     except Exception as exc:
         logger.warning("Tavily search failed: %s", exc)
     return results
-
 
 # ---------------------------------------------------------------------------
 # Unified search entry point
@@ -209,7 +202,6 @@ def search_web(
         results = _search_tavily(query, max_results, timeout, ws.TAVILY_API_KEY)
 
     return results
-
 
 # ---------------------------------------------------------------------------
 # URL fetching
@@ -257,7 +249,6 @@ def fetch_url_content(url: str, *, max_chars: int = 0) -> Dict[str, Any]:
 
     return {"url": url, "title": title, "text": text, "error": ""}
 
-
 def _extract_text_from_html(html: str) -> Tuple[str, str]:
     """Strip HTML tags and return (title, plain_text)."""
     title = ""
@@ -278,7 +269,6 @@ def _extract_text_from_html(html: str) -> Tuple[str, str]:
 
     return title, text
 
-
 # ---------------------------------------------------------------------------
 # Format search results for display
 # ---------------------------------------------------------------------------
@@ -287,7 +277,6 @@ _WEB_DISCLAIMER = (
     "\n\n---\n*Note: This information is from web search results, "
     "not from your uploaded documents. Verify important details independently.*"
 )
-
 
 def format_web_results(results: List[WebSearchResult], query: str = "") -> str:
     """Render search results as readable markdown text."""
@@ -302,7 +291,6 @@ def format_web_results(results: List[WebSearchResult], query: str = "") -> str:
     body = "\n\n".join(parts)
     return f"{body}{_WEB_DISCLAIMER}"
 
-
 def build_web_sources(results: List[WebSearchResult]) -> List[Dict[str, Any]]:
     """Build source records from web search results for the answer payload."""
     sources = []
@@ -315,7 +303,6 @@ def build_web_sources(results: List[WebSearchResult]) -> List[Dict[str, Any]]:
             "engine": r.source,
         })
     return sources
-
 
 # ---------------------------------------------------------------------------
 # Tool handler (registered in tool registry)

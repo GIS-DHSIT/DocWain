@@ -7,15 +7,14 @@ semantic similarity boosting for improved retrieval accuracy.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class RerankingConfig:
@@ -32,7 +31,6 @@ class RerankingConfig:
     enable_diversity_boost: bool = True
     diversity_penalty: float = 0.05
 
-
 @dataclass(frozen=True)
 class RerankResult:
     """Result of reranking operation."""
@@ -43,7 +41,6 @@ class RerankResult:
     cross_encoder_score: Optional[float] = None
     final_score: float = 0.0
     boost_applied: str = ""
-
 
 class RetrievalReranker:
     """Reranks retrieved chunks using ensemble scoring and cross-encoder models."""
@@ -418,7 +415,6 @@ class RetrievalReranker:
                 seen_sections.add(section_id)
 
         return reranked
-
 
 __all__ = ["RetrievalReranker", "RerankingConfig", "RerankResult"]
 

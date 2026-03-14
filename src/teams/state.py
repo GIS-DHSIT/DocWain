@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, List, Optional
 
@@ -7,8 +7,7 @@ import redis
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _build_redis_client() -> Optional[redis.Redis]:
     """Create a Redis client from Config.Redis settings."""
@@ -22,9 +21,8 @@ def _build_redis_client() -> Optional[redis.Redis]:
             decode_responses=True,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Redis client unavailable; falling back to in-memory store: %s", exc)
+        logger.debug("Redis client unavailable; falling back to in-memory store: %s", exc)
         return None
-
 
 class TeamsStateStore:
     """Tracks Teams uploads and per-session preferences."""

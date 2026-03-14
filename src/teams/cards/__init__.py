@@ -1,11 +1,11 @@
 import copy
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 CARD_DIR = Path(__file__).parent
 
@@ -15,7 +15,6 @@ _FALLBACK_CARD = {
     "version": "1.5",
     "body": [{"type": "TextBlock", "text": "Something went wrong. Please try again.", "wrap": True}],
 }
-
 
 def load_card_template(name: str) -> Dict[str, Any]:
     path = CARD_DIR / f"{name}.json"
@@ -28,7 +27,6 @@ def load_card_template(name: str) -> Dict[str, Any]:
     except json.JSONDecodeError as exc:
         logger.error("Invalid JSON in card template %s: %s", name, exc)
         return copy.deepcopy(_FALLBACK_CARD)
-
 
 def build_card(name: str, **kwargs) -> Dict[str, Any]:
     template = load_card_template(name)

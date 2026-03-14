@@ -1,0 +1,14 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "type": "AdaptiveCard",
+  "version": "1.5",
+  "body": [
+    { "type": "TextBlock", "text": "Delete all documents?", "weight": "Bolder", "size": "Medium", "color": "Attention" },
+    { "type": "TextBlock", "text": "This will permanently remove {file_count} uploaded file(s) and all their embeddings from this chat session.", "wrap": true },
+    { "type": "TextBlock", "text": "Files: {file_list}", "wrap": true, "isSubtle": true }
+  ],
+  "actions": [
+    { "type": "Action.Submit", "title": "Yes, delete all", "style": "destructive", "data": { "action": "confirm_delete" } },
+    { "type": "Action.Submit", "title": "Cancel", "data": { "action": "show_tools" } }
+  ]
+}

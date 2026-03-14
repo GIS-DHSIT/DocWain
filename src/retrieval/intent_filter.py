@@ -3,7 +3,10 @@ from __future__ import annotations
 import re
 from typing import Iterable, List, Pattern, Tuple
 
+from src.utils.logging_utils import get_logger
 from src.utils.payload_utils import get_source_name
+
+logger = get_logger(__name__)
 
 
 _ATTRIBUTE_TERMS = {
@@ -107,6 +110,7 @@ _ADDRESS_RE = re.compile(r"\b(street|st\.|avenue|ave\.|road|rd\.|lane|ln\.|drive
 
 
 def extract_required_attributes(query: str, intent_type: str) -> List[str]:
+    logger.debug("extract_required_attributes: intent_type=%s", intent_type)
     lowered = (query or "").lower()
     required: List[str] = []
     for attr, terms in _ATTRIBUTE_TERMS.items():
@@ -116,7 +120,9 @@ def extract_required_attributes(query: str, intent_type: str) -> List[str]:
         for attr in ("contact", "education", "experience", "skills", "certification"):
             if attr in lowered:
                 required.append(attr)
-    return sorted(set(required))
+    result = sorted(set(required))
+    logger.debug("extract_required_attributes: returning %d attributes", len(result))
+    return result
 
 
 def filter_chunks_by_intent(
@@ -125,6 +131,7 @@ def filter_chunks_by_intent(
     entities: List[str],
     intent_type: str,
 ) -> List[object]:
+    logger.debug("filter_chunks_by_intent: intent_type=%s, required_attributes=%d, entities=%d", intent_type, len(required_attributes or []), len(entities or []))
     chunk_list = list(chunks or [])
     if not chunk_list:
         return []
@@ -160,10 +167,13 @@ def filter_chunks_by_intent(
         return True
 
     filtered = [chunk for chunk in chunk_list if matches(chunk)]
-    return filtered or chunk_list
+    result = filtered or chunk_list
+    logger.debug("filter_chunks_by_intent: input=%d, output=%d", len(chunk_list), len(result))
+    return result
 
 
 def extract_answer_requirements(query: str, intent_type: str) -> List[Tuple[str, Pattern[str]]]:
+    logger.debug("extract_answer_requirements: intent_type=%s", intent_type)
     lowered = (query or "").lower()
     requirements: List[Tuple[str, Pattern[str]]] = []
 
@@ -187,6 +197,7 @@ def extract_answer_requirements(query: str, intent_type: str) -> List[Tuple[str,
     if "date" in lowered or "when" in lowered or "during" in lowered:
         requirements.append(("date", _DATE_RE))
 
+    logger.debug("extract_answer_requirements: returning %d requirements", len(requirements))
     return requirements
 
 
@@ -194,6 +205,7 @@ def validate_answer_requirements(
     chunks: Iterable[object],
     requirements: List[Tuple[str, Pattern[str]]],
 ) -> List[str]:
+    logger.debug("validate_answer_requirements: requirements=%d", len(requirements or []))
     if not requirements:
         return []
     chunk_list = list(chunks or [])
@@ -204,6 +216,8 @@ def validate_answer_requirements(
     for name, pattern in requirements:
         if not pattern.search(combined):
             missing.append(name)
+    if missing:
+        logger.debug("validate_answer_requirements: missing=%s", missing)
     return missing
 
 

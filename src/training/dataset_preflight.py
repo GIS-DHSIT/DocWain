@@ -1,11 +1,10 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class DropCounters:
@@ -21,7 +20,6 @@ class DropCounters:
             "no_embedding": self.no_embedding,
             "other": self.other,
         }
-
 
 @dataclass
 class ProfileStats:
@@ -64,13 +62,11 @@ class ProfileStats:
         d1 = sorted_tokens[c] * (k - f)
         return float(d0 + d1)
 
-
 def save_profile_stats(run_dir: Path, stats: List[ProfileStats]):
     path = run_dir / "preflight.json"
     payload = [s.as_json() for s in stats]
     path.write_text(json.dumps(payload, indent=2))
     logger.info("Preflight stats written to %s", path)
-
 
 def gate_training(stats: List[ProfileStats], min_pairs: int = 1) -> Dict[str, Dict[str, any]]:
     result: Dict[str, Dict[str, any]] = {}

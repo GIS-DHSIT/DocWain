@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from dataclasses import dataclass
@@ -10,8 +10,7 @@ from src.intelligence.redis_intel_cache import RedisIntelCache
 from src.kg.entity_extractor import EntityExtractor, ExtractedEntity, normalize_entity_name
 from src.utils.payload_utils import token_count
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 DOMAIN_KEYWORDS = {
     "resume": [
@@ -74,7 +73,6 @@ DOMAIN_KEYWORDS = {
     ],
 }
 
-
 def infer_domain(text: str, *, doc_type: Optional[str] = None, source_name: Optional[str] = None) -> str:
     try:
         from src.intelligence.domain_classifier import classify_domain
@@ -113,7 +111,6 @@ def infer_domain(text: str, *, doc_type: Optional[str] = None, source_name: Opti
             return "mixed"
         return top_domain[0]
 
-
 def _split_sentences(text: str) -> List[str]:
     if not text:
         return []
@@ -125,7 +122,6 @@ def _split_sentences(text: str) -> List[str]:
             continue
         sentences.append(cleaned)
     return sentences
-
 
 def summarize_text_bullets(text: str, max_bullets: int = 6) -> List[str]:
     sentences = _split_sentences(text)
@@ -143,7 +139,6 @@ def summarize_text_bullets(text: str, max_bullets: int = 6) -> List[str]:
             break
     return bullets
 
-
 @dataclass
 class DocumentQuality:
     extracted_chars: int
@@ -160,7 +155,6 @@ class DocumentQuality:
             "ocr_used": self.ocr_used,
             "valid_chunks": self.valid_chunks,
         }
-
 
 class DomainIndexer:
     def __init__(
@@ -378,6 +372,5 @@ class DomainIndexer:
             return
         entities = self._extract_entities(chunk_texts, document_id=document_id)
         self._update_entities(subscription_id, profile_id, entities, document_id=document_id)
-
 
 __all__ = ["DomainIndexer", "infer_domain", "summarize_text_bullets", "DocumentQuality"]

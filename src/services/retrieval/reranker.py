@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from .hybrid_retriever import RetrievalCandidate
 from .score_utils import RerankShapeError, describe_scores, normalize_scores, to_py_scalar
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class RerankerConfig:
     top_k: int = 20
     llm_fallback: bool = True
-
 
 class Reranker:
     """Deterministic reranking with cross-encoder preferred, LLM fallback."""
@@ -58,7 +56,7 @@ class Reranker:
                     "score_shape": exc.score_shape,
                 }
                 details.update(describe_scores(scores))
-                logger.warning("Cross-encoder rerank shape mismatch; falling back: %s", exc, extra=details, exc_info=True)
+                logger.debug("Cross-encoder rerank shape mismatch; falling back: %s", exc, extra=details, exc_info=True)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Cross-encoder rerank failed: %s",

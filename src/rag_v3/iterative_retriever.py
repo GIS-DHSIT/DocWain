@@ -1,7 +1,7 @@
 """Iterative (multi-hop) retrieval: retrieve -> evaluate -> re-retrieve for missing evidence."""
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -10,8 +10,7 @@ from src.rag_v3.multi_retriever import retrieve_decomposed
 from src.rag_v3.query_decomposer import DecomposedQuery, SubQuery
 from src.rag_v3.types import Chunk
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class IterativeResult:
@@ -20,7 +19,6 @@ class IterativeResult:
     hops_used: int
     sufficiency: EvidenceSufficiency
     per_hop_chunks: List[List[Chunk]] = field(default_factory=list)
-
 
 def _build_gap_queries(
     missing_entities: List[str],
@@ -36,7 +34,6 @@ def _build_gap_queries(
         ))
     return gap_queries
 
-
 def _merge_chunks(existing: List[Chunk], new: List[Chunk]) -> List[Chunk]:
     """Merge new chunks into existing set, dedup by id, keep best score."""
     by_id: Dict[str, Chunk] = {c.id: c for c in existing}
@@ -44,7 +41,6 @@ def _merge_chunks(existing: List[Chunk], new: List[Chunk]) -> List[Chunk]:
         if c.id not in by_id or c.score > by_id[c.id].score:
             by_id[c.id] = c
     return sorted(by_id.values(), key=lambda c: -(c.score or 0))
-
 
 def iterative_retrieve(
     decomposed: DecomposedQuery,

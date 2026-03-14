@@ -387,6 +387,16 @@ def classify_doc_domain(
         text or "",
         metadata={"source_name": filename, "doc_type": doc_type},
     )
+    # When the classifier is uncertain (low confidence / small gap between
+    # top domains), cross-check with keyword fallback.  If keyword matching
+    # also finds no strong indicators, fall back to "generic" instead of
+    # returning a random domain that happened to score marginally highest.
+    if result.uncertain:
+        from src.intelligence.domain_classifier import _keyword_fallback_classify
+        kw = _keyword_fallback_classify(text or "", {"source_name": filename, "doc_type": doc_type})
+        if not kw.uncertain:
+            return kw.domain  # keyword evidence is strong — trust it
+        return "generic"
     return result.domain
 
 

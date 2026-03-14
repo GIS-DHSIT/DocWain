@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,29 +9,37 @@ from src.api.vector_store import build_collection_name, build_qdrant_filter
 
 from .types import Chunk, ChunkSource
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Retrieval configuration - tuned for accuracy over recall
 MIN_RESULTS = 6  # Reduced: prefer quality over quantity
 FALLBACK_LIMIT = 100  # Reduced from 200
 MAX_UNION_RESULTS = 16  # Reduced from 24
-LOW_SCORE_THRESHOLD = 0.45  # Increased from 0.2 - reject low-quality matches
-HIGH_SCORE_THRESHOLD = 0.7  # New: high-confidence threshold
-MAX_EXPANDED_DOCS = 3
-MAX_DOC_CHUNKS = 15  # Reduced from 20
-MAX_FULL_SCAN_DOCS = 2  # Reduced from 3
-MAX_FULL_SCAN_CHUNKS = 40  # Reduced from 160 - critical fix for noise reduction
-MAX_PROFILE_SCAN_CHUNKS = 500  # Reduced from 5000
-MAX_UNSCOPED_SCAN_CHUNKS = 200  # Reduced from 2000
+LOW_SCORE_THRESHOLD = 0.30  # Balanced: reject garbage, keep borderline-relevant chunks
+HIGH_SCORE_THRESHOLD = 0.7  # High-confidence threshold
+MAX_EXPANDED_DOCS = 4
+MAX_DOC_CHUNKS = 20  # Allow more chunks per doc for complete context
+MAX_FULL_SCAN_DOCS = 3
+MAX_FULL_SCAN_CHUNKS = 60  # Moderate scan to capture relevant chunks without noise
+MAX_PROFILE_SCAN_CHUNKS = 800
+MAX_UNSCOPED_SCAN_CHUNKS = 400
 SECTION_KEYWORDS_BY_DOMAIN = {
-    "hr": ["experience", "summary", "skills", "certification", "education", "project"],
-    "invoice": ["total", "amount", "payment", "invoice", "bill to", "due"],
-    "legal": ["clause", "section", "term", "liability", "warranty"],
+    "hr": ["experience", "summary", "skills", "certification", "education", "project",
+           "achievement", "reference", "objective", "contact", "language"],
+    "invoice": ["total", "amount", "payment", "invoice", "bill to", "due",
+                "line item", "subtotal", "tax", "discount", "purchase order"],
+    "legal": ["clause", "section", "term", "liability", "warranty",
+              "indemnification", "termination", "confidentiality", "governing law",
+              "obligation", "penalty", "notice"],
+    "medical": ["diagnosis", "medication", "prescription", "treatment", "lab result",
+                "allergy", "vitals", "symptom", "history", "assessment"],
+    "policy": ["coverage", "premium", "deductible", "exclusion", "benefit",
+               "claim", "rider", "policyholder", "insured"],
     "generic": [],
 }
 
-
 _QUERY_SECTION_MAP = [
+    # HR/Resume sections
     (("skills", "technical skills", "tech stack", "tools", "technologies", "frameworks", "programming"), "skills_technical"),
     (("soft skills", "functional skills", "communication", "leadership"), "skills_functional"),
     (("education", "degree", "university", "academic", "qualification"), "education"),
@@ -40,8 +48,25 @@ _QUERY_SECTION_MAP = [
     (("summary", "objective", "profile", "overview", "about"), "summary_objective"),
     (("contact", "email", "phone", "address"), "identity_contact"),
     (("achievement", "award", "accomplishment"), "achievements"),
+    # Medical sections
+    (("diagnosis", "condition", "assessment", "impression"), "diagnosis"),
+    (("medication", "prescription", "drug", "dosage", "treatment", "therapy"), "treatment"),
+    (("lab result", "test result", "blood work", "vitals", "laboratory"), "lab_results"),
+    (("allergy", "allergies", "medical history", "surgical history"), "medical_history"),
+    # Legal sections
+    (("clause", "provision", "article"), "clause"),
+    (("liability", "indemnification", "indemnity"), "liability"),
+    (("termination", "cancellation"), "termination"),
+    (("confidentiality", "non-disclosure", "nda"), "confidentiality"),
+    # Invoice sections
+    (("line item", "product", "service"), "items"),
+    (("total", "subtotal", "amount due", "balance"), "totals"),
+    (("payment term", "due date"), "payment_terms"),
+    # Policy sections
+    (("coverage", "benefit", "protection"), "coverage"),
+    (("exclusion", "exception", "limitation"), "exclusions"),
+    (("claim", "filing"), "claims"),
 ]
-
 
 def _infer_query_section_kind(query: str) -> Optional[str]:
     lowered = (query or "").lower()
@@ -50,6 +75,61 @@ def _infer_query_section_kind(query: str) -> Optional[str]:
             return kind
     return None
 
+_COMPARISON_PATTERN = re.compile(
+    r'\b(compare|comparison|vs\.?|versus|difference between|similarities between)\b',
+    re.IGNORECASE,
+)
+_COMPARISON_WORDS = {"compare", "comparison", "difference", "similarities", "between"}
+_AND_ENTITY_PATTERN = re.compile(
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:and|vs\.?|versus|&)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
+)
+_POSSESSIVE_MULTI = re.compile(
+    r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'s\s+(?:and\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'s",
+)
+
+def _decompose_comparison_query(query: str) -> List[str]:
+    """Decompose comparison queries into per-entity sub-queries.
+
+    Returns list of sub-queries (1 per entity) or empty list if not a comparison.
+    """
+    if not _COMPARISON_PATTERN.search(query):
+        # Also check possessive multi-entity pattern
+        match = _POSSESSIVE_MULTI.search(query)
+        if not match:
+            return []
+        entities = [match.group(1), match.group(2)]
+    else:
+        match = _AND_ENTITY_PATTERN.search(query)
+        if not match:
+            return []
+        # Strip comparison verbs that regex may capture as part of entity name
+        entities = []
+        for g in [match.group(1), match.group(2)]:
+            parts = [w for w in g.split() if w.lower() not in _COMPARISON_WORDS]
+            if parts:
+                entities.append(" ".join(parts))
+
+    # Build topic by removing comparison words and entity names
+    _skip_words = {'compare', 'comparison', 'vs', 'vs.', 'versus', 'and', 'between',
+                   'difference', 'similarities', "'s"}
+    _entity_words = set()
+    for e in entities:
+        for w in e.split():
+            _entity_words.add(w.lower())
+    topic_words = []
+    for word in query.split():
+        clean = word.rstrip("'s").rstrip("'s")
+        if word.lower() not in _skip_words and clean.lower() not in _entity_words:
+            topic_words.append(word)
+    topic = " ".join(topic_words).strip()
+
+    sub_queries = []
+    for entity in entities:
+        sub_q = f"{entity} {topic}".strip()
+        if sub_q:
+            sub_queries.append(sub_q)
+
+    return sub_queries[:3]  # Max 3 entities
 
 def retrieve_chunks(
     *,
@@ -90,6 +170,20 @@ def retrieve_chunks(
     )
 
     results = _query(qdrant_client, collection, vector, q_filter, top_k, correlation_id)
+
+    # Multi-entity comparison: run sub-queries for each entity to improve recall
+    sub_queries = _decompose_comparison_query(raw_query)
+    if sub_queries and len(sub_queries) >= 2:
+        for sq in sub_queries:
+            sq_vector = _embed(sq, embedder)
+            sq_results = _query(qdrant_client, collection, sq_vector, q_filter, top_k // 2, correlation_id, label="retrieve_entity_sub")
+            results = _merge_results(results, sq_results)
+        logger.info(
+            "Comparison decomposition: %d sub-queries, %d total chunks",
+            len(sub_queries), len(results),
+            extra={"stage": "retrieve_decompose", "correlation_id": correlation_id},
+        )
+
     if _needs_expansion(results):
         expanded_query = _expand_query(raw_query)
         if expanded_query and expanded_query != query:
@@ -101,9 +195,10 @@ def retrieve_chunks(
         results = _boost_skill_chunks(results)
         results = _boost_section_title(results)
     results = _boost_by_section_kind(results, raw_query)
+    results = _boost_exact_query_terms(results, raw_query)
     _log_top5(results, correlation_id, label="vector")
 
-    if _needs_hybrid_fallback(results):
+    if _needs_hybrid_fallback(results, raw_query=raw_query):
         fallback_tokens = _query_tokens(raw_query)
         if wants_skill_rank or skill_focus:
             fallback_tokens = _merge_tokens(fallback_tokens, _skill_tokens())
@@ -140,7 +235,6 @@ def retrieve_chunks(
 
     return results
 
-
 def retrieve_entity_scoped(
     query: str,
     entity_name: str,
@@ -164,25 +258,45 @@ def retrieve_entity_scoped(
 
     base_filter = build_qdrant_filter(subscription_id, profile_id)
 
-    # Step 1: Find documents containing the entity name via scroll + text match
+    # Step 1: Find documents containing the entity name via paginated scroll
+    # Use MAX_PROFILE_SCAN_CHUNKS (500) to avoid missing entities on large profiles
+    # (was limited to 200, causing silent fallback to unscoped search)
+    points: list = []
     try:
-        scroll_result = qdrant_client.scroll(
-            collection_name=collection,
-            scroll_filter=base_filter,
-            limit=200,
-            with_payload=["document_id", "source_name", "canonical_text", "embedding_text"],
-        )
-        points = scroll_result[0] if scroll_result else []
+        _scroll_limit = min(MAX_PROFILE_SCAN_CHUNKS, 500)
+        _offset = None
+        _scrolled = 0
+        while _scrolled < _scroll_limit:
+            _batch_size = min(100, _scroll_limit - _scrolled)
+            scroll_result = qdrant_client.scroll(
+                collection_name=collection,
+                scroll_filter=base_filter,
+                limit=_batch_size,
+                offset=_offset,
+                with_payload=["document_id", "source_name", "canonical_text", "embedding_text"],
+            )
+            _batch = scroll_result[0] if scroll_result else []
+            if not _batch:
+                break
+            points.extend(_batch)
+            _scrolled += len(_batch)
+            _offset = scroll_result[1] if len(scroll_result) > 1 else None
+            if _offset is None:
+                break
     except Exception:  # noqa: BLE001
         points = []
 
     entity_lower = entity_name.lower()
+    # Also try underscore-normalized and possessive-stripped variants
+    _entity_variants = {entity_lower, entity_lower.replace(" ", "_"), entity_lower.rstrip("s")}
+    if entity_lower.endswith("'s"):
+        _entity_variants.add(entity_lower[:-2])
     matching_doc_ids: set = set()
     for pt in points:
         payload = getattr(pt, "payload", None) or {}
         text = (payload.get("canonical_text") or payload.get("embedding_text") or "").lower()
-        source = (payload.get("source_name") or "").lower()
-        if entity_lower in text or entity_lower in source:
+        source = (payload.get("source_name") or "").lower().replace("_", " ")
+        if any(v in text or v in source for v in _entity_variants):
             doc_id = payload.get("document_id")
             if doc_id:
                 matching_doc_ids.add(str(doc_id))
@@ -197,6 +311,10 @@ def retrieve_entity_scoped(
             FieldCondition(key="document_id", match=MatchAny(any=list(matching_doc_ids))),
         ])
     else:
+        logger.warning(
+            "Entity '%s' not found in %d scrolled points — falling back to unscoped search | cid=%s",
+            entity_name, len(points), correlation_id,
+        )
         entity_filter = base_filter
 
     try:
@@ -218,7 +336,6 @@ def retrieve_entity_scoped(
         result_points = []
 
     return [_to_chunk(pt) for pt in result_points if _to_chunk(pt).text.strip()]
-
 
 def retrieve(
     *,
@@ -245,7 +362,6 @@ def retrieve(
         correlation_id=correlation_id,
         intent_type=intent_type,
     )
-
 
 def expand_full_scan_by_document(
     *,
@@ -320,7 +436,6 @@ def expand_full_scan_by_document(
     _log_top5(merged, correlation_id, label="full_scan")
     return merged
 
-
 def expand_full_scan_by_profile(
     *,
     qdrant_client: Any,
@@ -329,6 +444,7 @@ def expand_full_scan_by_profile(
     profile_id: str,
     correlation_id: Optional[str],
     max_chunks: int = MAX_PROFILE_SCAN_CHUNKS,
+    domain_hint: Optional[str] = None,
 ) -> List[Chunk]:
     q_filter = build_qdrant_filter(
         subscription_id=subscription_id,
@@ -362,6 +478,39 @@ def expand_full_scan_by_profile(
         if offset is None:
             break
     chunks = [_to_chunk(point) for point in collected if point is not None]
+
+    # Domain-scoped filtering: when a domain is known, prioritize chunks from
+    # matching documents to prevent cross-domain noise (e.g. invoice chunks
+    # diluting a resume query).  Keep non-matching chunks as fallback only if
+    # domain-matching yields too few results.
+    if domain_hint and chunks:
+        _dh_lower = domain_hint.lower()
+        _domain_match = []
+        _domain_other = []
+        for _ch in chunks:
+            _ch_domain = ""
+            _m = getattr(_ch, "meta", None) or {}
+            _ch_domain = str(
+                _m.get("doc_domain") or _m.get("domain") or _m.get("category") or ""
+            ).lower()
+            if _ch_domain and _ch_domain == _dh_lower:
+                _domain_match.append(_ch)
+            else:
+                _domain_other.append(_ch)
+        # Use domain-matched chunks if we have enough; otherwise mix in others
+        if len(_domain_match) >= 3:
+            chunks = _domain_match + _domain_other[:max(0, max_chunks // 4)]
+            logger.info(
+                "Domain filter: %d matched '%s', %d other kept | cid=%s",
+                len(_domain_match), domain_hint, min(len(_domain_other), max_chunks // 4),
+                correlation_id,
+            )
+        else:
+            logger.debug(
+                "Domain filter: only %d matched '%s' — keeping all %d chunks | cid=%s",
+                len(_domain_match), domain_hint, len(chunks), correlation_id,
+            )
+
     chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
 
     # Fallback: if filtered scroll returned 0 chunks, try unscoped scroll
@@ -391,7 +540,6 @@ def expand_full_scan_by_profile(
 
     _log_top5(chunks, correlation_id, label="profile_scan")
     return chunks
-
 
 def _scroll_unscoped_raw(
     qdrant_client: Any,
@@ -426,7 +574,6 @@ def _scroll_unscoped_raw(
         if offset is None:
             break
     return collected
-
 
 def expand_full_scan_unscoped(
     *,
@@ -465,7 +612,6 @@ def expand_full_scan_unscoped(
     chunks = sorted(chunks, key=lambda c: c.score, reverse=True)
     _log_top5(chunks, correlation_id, label="unscoped_scan")
     return chunks
-
 
 def filter_chunks_by_profile_scope(
     chunks: List[Chunk],
@@ -532,7 +678,6 @@ def filter_chunks_by_profile_scope(
     )
     return []
 
-
 def _query(
     qdrant_client: Any,
     collection: str,
@@ -570,23 +715,52 @@ def _query(
         )
         return []
 
-
 def _embed(query: str, embedder: Any) -> List[float]:
     if hasattr(embedder, "encode"):
         vec = embedder.encode([query], normalize_embeddings=True, convert_to_numpy=False)
         return _to_vector(vec)
     raise RuntimeError("Embedder missing encode")
 
-
 def _enrich_query_for_embedding(query: str, correlation_id: Optional[str] = None) -> str:
-    """Return query as-is.
+    """Enrich query for better embedding match.
 
-    Section prefixes were removed to match the rebuilt embedding format
-    where prefixes are only added for high-confidence title-derived kinds.
-    Symmetric query/embedding treatment maximizes cosine similarity.
+    Adds lightweight domain-context hint when query clearly targets a domain,
+    improving cosine similarity with domain-specific chunks.  The hint is a
+    single descriptor word prepended — keeps the query close to its original
+    semantic meaning while biasing the embedding toward relevant document types.
     """
-    return query
+    if not query or len(query.split()) < 3:
+        return query
 
+    ql = query.lower()
+
+    # Domain context hints — single word that biases the embedding
+    _DOMAIN_HINTS = {
+        "resume": ("candidate", {"resume", "candidate", "applicant", "experience", "skills", "education", "certification"}),
+        "medical": ("clinical", {"patient", "diagnosis", "medication", "lab", "clinical", "treatment", "symptoms", "vitals"}),
+        "invoice": ("financial", {"invoice", "payment", "vendor", "amount", "total", "due", "bill"}),
+        "legal": ("legal", {"clause", "agreement", "liability", "contract", "obligation", "jurisdiction", "indemnification"}),
+        "policy": ("insurance", {"coverage", "premium", "exclusion", "deductible", "policyholder", "benefit", "claim"}),
+    }
+
+    # Strong keywords: a single occurrence is sufficient for domain identification
+    _STRONG_KEYWORDS = frozenset({
+        "patient", "diagnosis", "prescription", "invoice", "indemnification",
+        "policyholder", "deductible", "candidate", "applicant", "resume",
+        "medication", "liability", "coverage", "premium",
+    })
+
+    for domain, (hint, keywords) in _DOMAIN_HINTS.items():
+        matched_words = [kw for kw in keywords if kw in ql]
+        matched = len(matched_words)
+        # Single strong keyword or 2+ regular keywords trigger enrichment
+        if matched >= 2 or (matched == 1 and matched_words[0] in _STRONG_KEYWORDS):
+            # Only prepend if hint word not already in query
+            if hint not in ql:
+                return f"{hint} {query}"
+            break
+
+    return query
 
 def _to_vector(vec: Any) -> List[float]:
     if vec is None:
@@ -605,7 +779,6 @@ def _to_vector(vec: Any) -> List[float]:
     if isinstance(vec, (int, float)):
         return [float(vec)]
     raise RuntimeError("Unsupported embedding output type")
-
 
 _METADATA_GARBAGE_MARKERS = (
     "'chunk_type':", "'section_id':", "'section_title':", "'page': None",
@@ -627,7 +800,6 @@ _STRONG_GARBAGE_MARKERS = (
 _EXTRACTED_DOC_REPR_RE = re.compile(r"^Extracted\s*Document\s*\(\s*full_text='", re.IGNORECASE)
 _EXTRACTED_DOC_FULLTEXT_RE = re.compile(r"full_text='(.*?)(?:',\s*\w+=|'\s*\)$)", re.DOTALL)
 
-
 def _is_metadata_garbage(text: str) -> bool:
     """Detect text that is actually stringified chunk metadata dicts or ExtractedDocument repr."""
     if not text or len(text) < 30:
@@ -640,7 +812,6 @@ def _is_metadata_garbage(text: str) -> bool:
     if text.count("text : ") >= 2 or text.count(", text ") >= 2:
         return True
     return sum(1 for marker in _METADATA_GARBAGE_MARKERS if marker in text) >= 2
-
 
 def _extract_text_from_repr(text: str) -> str:
     """Extract actual document text from ExtractedDocument repr string."""
@@ -657,7 +828,6 @@ def _extract_text_from_repr(text: str) -> str:
         stripped = re.sub(r"'\s*\)\s*$", "", stripped)
         return stripped.replace("\\n", "\n").strip()
     return ""
-
 
 def _salvage_text_from_garbage(payload: dict) -> str:
     """Try to extract actual text content from a garbage payload."""
@@ -691,7 +861,6 @@ def _salvage_text_from_garbage(payload: dict) -> str:
             return val
     return ""
 
-
 _EMBEDDING_PREFIX_RE = re.compile(r"^\[[\w\s]+\]\s*(?:Section\s*\d+\s*:\s*)?(?:[\w\s&/,-]+:\s*)?")
 
 _METADATA_KEY_RE = re.compile(
@@ -706,16 +875,13 @@ _CHUNK_CANDIDATE_RE = re.compile(
 # "text <actual content>" — strip key prefix, keep value
 _TEXT_KEY_RE = re.compile(r"^text\s+:?\s*", re.IGNORECASE)
 
-
 def _strip_embedding_prefix(text: str) -> str:
     """Strip the [Section Kind] Section N: prefix added by the embedding pipeline."""
     return _EMBEDDING_PREFIX_RE.sub("", text).strip() if text else ""
 
-
 _EXTRACTED_DOC_PREFIX_RE = re.compile(
     r"^(?:Extracted\s+Document\s+(?:full_text|[\w.]+)\s*)", re.IGNORECASE
 )
-
 
 def _clean_metadata_from_text(text: str) -> str:
     """Strip metadata key-value fragments that are comma-separated with actual content."""
@@ -752,7 +918,6 @@ def _clean_metadata_from_text(text: str) -> str:
     result = ", ".join(content_parts) if content_parts else ""
     return re.sub(r"\s{2,}", " ", result).strip()
 
-
 def _to_chunk(point: Any) -> Chunk:
     payload = getattr(point, "payload", None) or {}
 
@@ -781,7 +946,6 @@ def _to_chunk(point: Any) -> Chunk:
         meta=payload,
     )
 
-
 def _needs_expansion(chunks: List[Chunk]) -> bool:
     if not chunks:
         return True
@@ -790,13 +954,33 @@ def _needs_expansion(chunks: List[Chunk]) -> bool:
     top_score = max((c.score for c in chunks), default=0.0)
     return top_score < 0.2
 
-
-def _needs_hybrid_fallback(chunks: List[Chunk]) -> bool:
+def _needs_hybrid_fallback(chunks: List[Chunk], raw_query: str = "") -> bool:
     if len(chunks) < MIN_RESULTS:
         return True
-    top_score = max((c.score for c in chunks), default=0.0)
-    return top_score < LOW_SCORE_THRESHOLD
-
+    scores = [c.score for c in chunks]
+    top_score = max(scores, default=0.0)
+    if top_score < LOW_SCORE_THRESHOLD:
+        return True
+    # Wide score spread with very low median indicates uncertain retrieval
+    if len(scores) >= 4:
+        sorted_scores = sorted(scores, reverse=True)
+        median_score = sorted_scores[len(sorted_scores) // 2]
+        if top_score - median_score > 0.35 and median_score < 0.20:
+            return True
+    # Entity-aware: if query contains proper nouns that aren't found in top chunks,
+    # hybrid keyword fallback may recover entity-specific results
+    if raw_query and chunks:
+        _entities = [w for w in raw_query.split()
+                     if w[0:1].isupper() and len(w) > 2
+                     and w.lower() not in {"the", "what", "how", "who", "where", "when",
+                                           "which", "can", "could", "does", "list", "show",
+                                           "compare", "find", "get"}]
+        if _entities:
+            _top_text = " ".join(c.text.lower() for c in chunks[:6])
+            _found = sum(1 for e in _entities if e.lower() in _top_text)
+            if _found < len(_entities):
+                return True  # Not all entities found in top chunks
+    return False
 
 def _needs_doc_expansion(chunks: List[Chunk]) -> bool:
     if not chunks:
@@ -808,7 +992,6 @@ def _needs_doc_expansion(chunks: List[Chunk]) -> bool:
         return True
     top_score = max((c.score for c in chunks), default=0.0)
     return top_score < 0.25
-
 
 def _expand_by_document(
     *,
@@ -873,7 +1056,6 @@ def _expand_by_document(
     _log_top5(merged, correlation_id, label="expand_doc")
     return merged
 
-
 def _filter_section_chunks(chunks: List[Chunk], domain: str) -> List[Chunk]:
     keywords = SECTION_KEYWORDS_BY_DOMAIN.get(domain) or []
     if not keywords:
@@ -888,22 +1070,86 @@ def _filter_section_chunks(chunks: List[Chunk], domain: str) -> List[Chunk]:
             filtered.append(chunk)
     return filtered or chunks
 
+_DOMAIN_SYNONYMS: Dict[str, List[str]] = {
+    # Medical
+    "medication": ["drug", "prescription", "medicine"],
+    "drug": ["medication", "prescription"],
+    "diagnosis": ["condition", "disease", "disorder"],
+    "symptom": ["complaint", "sign", "presentation"],
+    "treatment": ["therapy", "intervention", "procedure"],
+    "patient": ["individual", "subject"],
+    "allergy": ["sensitivity", "reaction", "intolerance"],
+    "lab": ["laboratory", "test", "diagnostic"],
+    # Legal
+    "clause": ["provision", "section", "term"],
+    "liability": ["obligation", "responsibility", "exposure"],
+    "indemnification": ["indemnity", "compensation"],
+    "termination": ["cancellation", "expiry", "end"],
+    "contract": ["agreement", "deed"],
+    "party": ["signatory", "counterparty"],
+    "breach": ["violation", "default", "infringement"],
+    # HR/Resume
+    "experience": ["background", "history", "tenure"],
+    "qualification": ["credential", "certification"],
+    "skill": ["competency", "proficiency", "expertise"],
+    "education": ["degree", "academic", "university"],
+    "salary": ["compensation", "pay", "remuneration"],
+    "candidate": ["applicant", "prospect"],
+    # Invoice/Financial
+    "invoice": ["bill", "statement"],
+    "payment": ["remittance", "disbursement"],
+    "vendor": ["supplier", "provider"],
+    "amount": ["sum", "total", "value"],
+    "discount": ["rebate", "reduction"],
+    "overdue": ["delinquent", "past due", "late"],
+    # Policy/Insurance
+    "coverage": ["protection", "benefit"],
+    "premium": ["cost", "rate"],
+    "exclusion": ["exception", "limitation"],
+    "deductible": ["excess", "copay"],
+    "claim": ["request", "submission"],
+    "policyholder": ["insured", "subscriber"],
+}
+
+_EXPAND_STOP = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "for", "on",
+    "with", "from", "about", "what", "how", "who", "when", "where",
+    "which", "why", "does", "did", "are", "was", "were", "been",
+    "has", "have", "had", "will", "would", "can", "could", "shall",
+    "should", "may", "might", "must", "not", "all", "any", "each",
+    "this", "that", "these", "those", "his", "her", "its", "their",
+    "our", "your", "my", "but", "than", "then", "also", "only",
+    "just", "very", "much", "more", "most", "some", "other",
+    "tell", "show", "give", "get", "find", "please",
+})
 
 def _expand_query(query: str) -> str:
+    """Expand query with domain-aware synonyms for better recall."""
     tokens = re.findall(r"[A-Za-z0-9]+", query.lower())
-    stop = {"the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "from", "about"}
-    keywords = [t for t in tokens if t not in stop and len(t) > 2]
+    keywords = [t for t in tokens if t not in _EXPAND_STOP and len(t) > 2]
     if not keywords:
         return query
     deduped: List[str] = []
-    seen = set()
+    seen: set[str] = set()
     for tok in keywords:
         if tok in seen:
             continue
         seen.add(tok)
         deduped.append(tok)
-    return " ".join(deduped) if deduped else query
 
+    # Add domain synonyms (max 1 synonym per keyword, max 2 total additions)
+    expansions: List[str] = []
+    for tok in deduped:
+        synonyms = _DOMAIN_SYNONYMS.get(tok, [])
+        added = 0
+        for syn in synonyms:
+            if syn not in seen and added < 1 and len(expansions) < 2:
+                expansions.append(syn)
+                seen.add(syn)
+                added += 1
+
+    result = deduped + expansions
+    return " ".join(result) if result else query
 
 def _merge_results(primary: List[Chunk], secondary: List[Chunk]) -> List[Chunk]:
     merged: Dict[str, Chunk] = {}
@@ -914,7 +1160,6 @@ def _merge_results(primary: List[Chunk], secondary: List[Chunk]) -> List[Chunk]:
         else:
             merged[chunk.id] = chunk
     return list(merged.values())
-
 
 def _keyword_fallback(
     *,
@@ -940,7 +1185,6 @@ def _keyword_fallback(
         scored.append(chunk)
     scored.sort(key=lambda c: c.score, reverse=True)
     return scored[:MAX_UNION_RESULTS]
-
 
 def _scroll_points(
     qdrant_client: Any,
@@ -975,7 +1219,6 @@ def _scroll_points(
         )
         return []
 
-
 def _payload_text(payload: Dict[str, Any]) -> str:
     return (
         payload.get("canonical_text")
@@ -985,12 +1228,10 @@ def _payload_text(payload: Dict[str, Any]) -> str:
         or ""
     )
 
-
 def _query_tokens(query: str) -> List[str]:
     tokens = re.findall(r"[A-Za-z0-9]+", (query or "").lower())
     stop = {"the", "a", "an", "and", "or", "of", "to", "in", "for", "on", "with", "from", "about"}
     return [tok for tok in tokens if tok not in stop and len(tok) > 2]
-
 
 def _skill_tokens() -> List[str]:
     return [
@@ -1005,7 +1246,6 @@ def _skill_tokens() -> List[str]:
         "frameworks",
         "platforms",
     ]
-
 
 def _needs_skill_focus(query: str) -> bool:
     lowered = (query or "").lower()
@@ -1022,7 +1262,6 @@ def _needs_skill_focus(query: str) -> bool:
         )
     )
 
-
 def _merge_tokens(base: List[str], extra: List[str]) -> List[str]:
     merged = list(base)
     seen = set(base)
@@ -1033,13 +1272,11 @@ def _merge_tokens(base: List[str], extra: List[str]) -> List[str]:
         merged.append(tok)
     return merged
 
-
 def _wants_skill_ranking(query: str, intent_type: Optional[str]) -> bool:
     lowered = (query or "").lower()
     if intent_type in {"rank", "compare"}:
         return True
     return "rank" in lowered and "skill" in lowered
-
 
 def _boost_skill_chunks(chunks: List[Chunk]) -> List[Chunk]:
     if not chunks:
@@ -1052,7 +1289,6 @@ def _boost_skill_chunks(chunks: List[Chunk]) -> List[Chunk]:
             chunk.score += 0.05 * hits
     return sorted(chunks, key=lambda c: c.score, reverse=True)
 
-
 def _boost_section_title(chunks: List[Chunk]) -> List[Chunk]:
     if not chunks:
         return chunks
@@ -1062,7 +1298,6 @@ def _boost_section_title(chunks: List[Chunk]) -> List[Chunk]:
         if any(token in title for token in ("skill", "experience", "education", "certification")):
             chunk.score += 0.1
     return sorted(chunks, key=lambda c: c.score, reverse=True)
-
 
 def _boost_by_section_kind(chunks: List[Chunk], query: str, boost: float = 0.12) -> List[Chunk]:
     query_kind = _infer_query_section_kind(query)
@@ -1075,6 +1310,52 @@ def _boost_by_section_kind(chunks: List[Chunk], query: str, boost: float = 0.12)
             chunk.score += boost
     return sorted(chunks, key=lambda c: c.score, reverse=True)
 
+def _boost_exact_query_terms(chunks: List[Chunk], query: str, boost: float = 0.08) -> List[Chunk]:
+    """Boost chunks that contain exact query content words.
+
+    Complements embedding similarity (which captures semantics) with
+    lexical matching (which captures exact terminology). Useful when
+    query uses specific technical terms, names, or numbers that
+    embeddings may not perfectly capture.
+    """
+    if not chunks or not query:
+        return chunks
+    _stop = frozenset({
+        "what", "is", "are", "the", "a", "an", "of", "for", "in", "how",
+        "do", "does", "can", "about", "from", "with", "tell", "me", "show",
+        "please", "give", "could", "would", "all", "each", "every", "this",
+        "that", "those", "these", "my", "their", "your",
+    })
+    q_words = [w.lower().rstrip("?,!.") for w in query.split()
+               if w.lower().rstrip("?,!.") not in _stop and len(w) > 2]
+    if not q_words:
+        return chunks
+    # Section-aware boost: if query targets a specific section, boost matching chunks
+    _target_section = None
+    _ql = query.lower()
+    for keywords, section_name in _QUERY_SECTION_MAP:
+        if any(kw in _ql for kw in keywords):
+            _target_section = section_name
+            break
+
+    for chunk in chunks:
+        text_lower = ((getattr(chunk, "text", "") or "") + " " +
+                      str((chunk.meta or {}).get("section_title") or "")).lower()
+        # Word-boundary match to avoid partial matches ("skill" in "skilled")
+        matches = sum(1 for w in q_words if re.search(r'\b' + re.escape(w) + r'\b', text_lower))
+        if matches > 0:
+            # Proportional boost: more matching terms = higher boost
+            ratio = matches / len(q_words)
+            chunk.score += boost * ratio
+
+        # Section boost: if chunk's section matches query target, add small boost
+        if _target_section:
+            _chunk_section = ((chunk.meta or {}).get("section_kind") or
+                              (chunk.meta or {}).get("chunk_type") or "").lower()
+            if _target_section.lower() in _chunk_section or _chunk_section in _target_section.lower():
+                chunk.score += boost * 0.5
+
+    return sorted(chunks, key=lambda c: c.score, reverse=True)
 
 def _keyword_score(text: str, tokens: List[str]) -> float:
     if not text or not tokens:
@@ -1085,7 +1366,6 @@ def _keyword_score(text: str, tokens: List[str]) -> float:
         return 0.0
     return max(matches / float(len(tokens)), 0.2)
 
-
 def _merge_dedupe(primary: List[Chunk], secondary: List[Chunk]) -> List[Chunk]:
     merged: Dict[Tuple[str, str], Chunk] = {}
     for chunk in primary + secondary:
@@ -1095,19 +1375,21 @@ def _merge_dedupe(primary: List[Chunk], secondary: List[Chunk]) -> List[Chunk]:
             merged[key] = chunk
     return list(merged.values())
 
-
 def _chunk_key(chunk: Chunk) -> Tuple[str, str]:
     meta = chunk.meta or {}
     doc_id = str(meta.get("document_id") or meta.get("doc_id") or meta.get("docId") or "")
     chunk_id = str(meta.get("chunk_id") or chunk.id or "")
+    # Fallback: use text hash when both IDs are missing to prevent
+    # all unidentified chunks from collapsing into a single entry
+    if not doc_id and not chunk_id:
+        text = getattr(chunk, "text", "") or ""
+        chunk_id = f"_hash_{hash(text[:200])}"
     return doc_id, chunk_id
-
 
 def _normalize_chunk_domain(chunk: Chunk) -> str:
     """Map stored Qdrant doc_domain to internal retrieval domain for comparison."""
     raw = _chunk_domain(chunk)
     return _QDRANT_TO_RETRIEVAL_DOMAIN.get(raw, raw)
-
 
 def _apply_domain_gate(chunks: List[Chunk], query: str, correlation_id: Optional[str]) -> List[Chunk]:
     domain = _infer_domain(query)
@@ -1132,11 +1414,9 @@ def _apply_domain_gate(chunks: List[Chunk], query: str, correlation_id: Optional
         )
     return chunks
 
-
 def _chunk_domain(chunk: Chunk) -> str:
     meta = chunk.meta or {}
     return str(meta.get("doc_domain") or meta.get("doc_type") or meta.get("document.type") or "").lower()
-
 
 def _chunk_doc_id(chunk: Chunk) -> Optional[str]:
     meta = chunk.meta or {}
@@ -1146,13 +1426,16 @@ def _chunk_doc_id(chunk: Chunk) -> Optional[str]:
             return str(value)
     return None
 
-
 # Maps Qdrant-stored doc_domain values to internal retrieval domain names
 _QDRANT_TO_RETRIEVAL_DOMAIN = {
     "resume": "hr",
     "invoice": "invoice",
     "purchase_order": "invoice",
     "legal": "legal",
+    "medical": "medical",
+    "clinical": "medical",
+    "policy": "policy",
+    "insurance": "policy",
     "generic": "generic",
 }
 
@@ -1161,21 +1444,24 @@ _RETRIEVAL_TO_QDRANT_DOMAIN = {
     "hr": "resume",
     "invoice": "invoice",
     "legal": "legal",
+    "medical": "medical",
+    "policy": "policy",
     "generic": None,
 }
-
 
 def _infer_domain(query: str) -> str:
     lowered = (query or "").lower()
     if any(token in lowered for token in ("invoice", "amount due", "subtotal", "billing", "payment terms")):
         return "invoice"
-    # Only strong HR signals for domain inference
     if any(token in lowered for token in ("resume", "cv", "candidate")):
         return "hr"
     if any(token in lowered for token in ("agreement", "contract", "clause", "warranty", "liability")):
         return "legal"
+    if any(token in lowered for token in ("diagnosis", "patient", "medication", "prescription", "symptom", "lab result")):
+        return "medical"
+    if any(token in lowered for token in ("policy", "premium", "deductible", "coverage", "insured", "policyholder")):
+        return "policy"
     return "generic"
-
 
 def _log_top5(chunks: List[Chunk], correlation_id: Optional[str], label: str) -> None:
     previews = []
@@ -1191,7 +1477,6 @@ def _log_top5(chunks: List[Chunk], correlation_id: Optional[str], label: str) ->
         "; ".join(previews),
         extra={"stage": "retrieve_top5", "correlation_id": correlation_id},
     )
-
 
 # ============================================================================
 # Quality Filtering Functions - Critical for accuracy
@@ -1219,7 +1504,6 @@ def filter_by_score(
 
     # Fall back to keeping top N if strict filtering removes too many
     return sorted(chunks, key=lambda c: c.score, reverse=True)[:max(min_results, len(filtered))]
-
 
 def filter_high_quality(
     chunks: List[Chunk],
@@ -1273,7 +1557,6 @@ def filter_high_quality(
     )
     return sorted(chunks, key=lambda c: c.score, reverse=True)[:min_keep]
 
-
 def score_query_relevance(
     chunks: List[Chunk],
     query: str,
@@ -1306,15 +1589,16 @@ def score_query_relevance(
 
     return sorted(chunks, key=lambda c: c.score, reverse=True)
 
-
 def deduplicate_by_content(
     chunks: List[Chunk],
-    similarity_threshold: float = 0.78,
+    similarity_threshold: float = 0.85,
 ) -> List[Chunk]:
     """
     Remove near-duplicate chunks based on content similarity.
 
     Keeps the highest-scoring version of similar chunks.
+    Threshold 0.85 preserves chunks with shared vocabulary but different facts
+    (e.g., two job experiences at same company).
     """
     if len(chunks) <= 1:
         return chunks
@@ -1354,6 +1638,32 @@ def deduplicate_by_content(
 
     return kept
 
+def _boost_entity_name_match(chunks: List[Chunk], query: str, boost: float = 0.12) -> List[Chunk]:
+    """Boost chunks that contain multi-word entity names from the query.
+
+    Detects capitalized multi-word names (e.g., "John Smith", "Acme Corp")
+    and gives a stronger boost to chunks containing the full name vs. partial.
+    """
+    if not chunks or not query:
+        return chunks
+    # Extract multi-word capitalized sequences (potential entity names)
+    _name_re = re.compile(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b')
+    names = _name_re.findall(query)
+    if not names:
+        return chunks
+    for chunk in chunks:
+        text_lower = (chunk.text or "").lower()
+        for name in names:
+            name_lower = name.lower()
+            if name_lower in text_lower:
+                chunk.score += boost  # Full name match — strong boost
+            else:
+                # Partial: check individual words
+                parts = name_lower.split()
+                matched = sum(1 for p in parts if p in text_lower)
+                if matched > 0 and matched < len(parts):
+                    chunk.score += boost * 0.3  # Partial match — weaker
+    return sorted(chunks, key=lambda c: c.score, reverse=True)
 
 def apply_quality_pipeline(
     chunks: List[Chunk],
@@ -1365,6 +1675,7 @@ def apply_quality_pipeline(
 
     Pipeline:
     1. Score by query relevance (boost term matches)
+    1b. Boost entity name matches
     2. Filter by quality threshold
     3. Deduplicate similar content
     4. Limit to reasonable size
@@ -1376,6 +1687,9 @@ def apply_quality_pipeline(
 
     # Step 1: Boost chunks that match query terms
     chunks = score_query_relevance(chunks, query)
+
+    # Step 1b: Boost chunks containing entity names from query
+    chunks = _boost_entity_name_match(chunks, query)
 
     # Step 2: Apply quality filtering
     chunks = filter_high_quality(chunks)
@@ -1394,7 +1708,6 @@ def apply_quality_pipeline(
     )
 
     return chunks
-
 
 # ============================================================================
 # Section-Filtered Retrieval

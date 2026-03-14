@@ -4,6 +4,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Tuple
 
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
 _NUMBER_RE = re.compile(r"\b\d+[\d,\.]*\b")
 _DATE_RE = re.compile(
     r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}|jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)\b",
@@ -54,6 +58,7 @@ class EvidenceConstraints:
     def score_chunk(self, text: str, requirements: EvidenceRequirements) -> float:
         if not text:
             return 0.0
+        logger.debug("score_chunk: text_len=%d", len(text))
         score = 0.0
         text_lower = text.lower()
         if requirements.requires_number:
@@ -81,6 +86,7 @@ class EvidenceConstraints:
 
     def evaluate(self, chunks: Iterable[object], requirements: EvidenceRequirements, min_ratio: float = 0.6) -> EvidenceCoverage:
         chunks_list = list(chunks)
+        logger.debug("evaluate: chunks=%d, min_ratio=%.2f", len(chunks_list), min_ratio)
         if not chunks_list:
             return EvidenceCoverage(False, 0.0, ["no_chunks"], {})
 
@@ -116,9 +122,10 @@ class EvidenceConstraints:
 
         total = sum(value for _, value in coverage_items)
         ratio = total / max(len(coverage_items), 1)
-        missing = [name for name, value in coverage_items if value < 0.5]
+        missing = [name for name, value in coverage_items if value < 0.6]
         breakdown = {name: round(value, 3) for name, value in coverage_items}
         satisfied = ratio >= min_ratio
+        logger.debug("evaluate: satisfied=%s, ratio=%.3f, missing=%s", satisfied, ratio, missing)
         return EvidenceCoverage(satisfied, ratio, missing, breakdown)
 
     @staticmethod

@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from src.utils.logging_utils import get_logger
 import os
 import subprocess
 import sys
@@ -32,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -85,7 +87,6 @@ class BotDeployConfig:
             missing.append("MICROSOFT_APP_TENANT_ID")
         if missing:
             raise ValueError(f"Missing required config: {', '.join(missing)}")
-
 
 # ---------------------------------------------------------------------------
 # Deployer
@@ -412,7 +413,6 @@ class TeamsBotDeployer:
 
         return {**status, "checks": checks}
 
-
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -471,7 +471,6 @@ def main():
     else:
         print(f"Unknown command: {command}")
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

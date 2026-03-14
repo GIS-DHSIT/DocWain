@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import hashlib
 from dataclasses import dataclass
@@ -26,8 +26,7 @@ from src.finetune.pair_generator import (
 from src.finetune.schema_probe import load_or_probe
 from src.finetune.config_resolver import as_int, as_float
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class DatasetBuildResult:
@@ -36,7 +35,6 @@ class DatasetBuildResult:
     status: str
     pair_count: int
     diagnostics: Dict[str, Any]
-
 
 def _ensure_profile_indexes(client: QdrantClient, collection_name: str) -> None:
     """Create keyword indexes for profile_id/profileId when missing to avoid Qdrant 400 errors."""
@@ -52,7 +50,6 @@ def _ensure_profile_indexes(client: QdrantClient, collection_name: str) -> None:
             if "already exists" in msg or "index exists" in msg:
                 continue
             logger.debug("Ensure payload index %s on %s failed: %s", field, collection_name, exc)
-
 
 def _get_llm_client(model_name: Optional[str] = None):
     # Lazy import to avoid circular dependencies
@@ -70,7 +67,6 @@ def _get_llm_client(model_name: Optional[str] = None):
         _LLM_CLIENT_CACHE[key] = create_llm_client(model_name)
     return _LLM_CLIENT_CACHE[key]
 
-
 def _payload_get(payload: Dict[str, Any], path: List[str]) -> Any:
     cur: Any = payload
     for key in path:
@@ -81,7 +77,6 @@ def _payload_get(payload: Dict[str, Any], path: List[str]) -> Any:
         else:
             return None
     return cur
-
 
 def _convert_profile_value(value: Any, profile_type: str) -> Any:
     if value is None:
@@ -97,7 +92,6 @@ def _convert_profile_value(value: Any, profile_type: str) -> Any:
         except Exception:
             return value
     return str(value)
-
 
 def _sample_chunks(
     profile_id: str,
@@ -193,7 +187,6 @@ def _sample_chunks(
     )
     return chunks
 
-
 def _discover_profiles_in_collection(
         client: QdrantClient,
         collection_name: str,
@@ -236,7 +229,6 @@ def _discover_profiles_in_collection(
             break
     return sorted(profiles)
 
-
 def discover_collections_and_profiles(
         subscription_ids: Optional[List[str]] = None,
         max_profiles_per_collection: Optional[int] = None,
@@ -265,12 +257,11 @@ def discover_collections_and_profiles(
                 client=client,
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Skipping collection %s due to discovery error: %s", collection_name, exc)
+            logger.debug("Skipping collection %s due to discovery error: %s", collection_name, exc)
             continue
         if profiles:
             discovered[sub] = profiles
     return discovered
-
 
 def discover_profiles_for_collection(
         collection_name: str,
@@ -294,13 +285,11 @@ def discover_profiles_for_collection(
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"Unable to read collection {collection_name}: {exc}") from exc
 
-
 def list_profile_ids_in_collection(collection_name: str, client: Optional[QdrantClient] = None) -> List[str]:
     """
     Public helper to resolve all profile ids contained in a collection.
     """
     return discover_profiles_for_collection(collection_name=collection_name, client=client)
-
 
 def _get_profile_snapshot(
     client: QdrantClient,
@@ -326,7 +315,6 @@ def _get_profile_snapshot(
         except Exception:
             return {}
 
-
 def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if not a or not b:
         return -1.0
@@ -338,7 +326,6 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     if norm_a == 0 or norm_b == 0:
         return -1.0
     return dot / (norm_a * norm_b)
-
 
 def _build_embedding_bundles(blocks: List[ChunkRecord], k: int = 2, min_sim: float = 0.6) -> List[ChunkRecord]:
     bundles: List[ChunkRecord] = []
@@ -364,7 +351,6 @@ def _build_embedding_bundles(blocks: List[ChunkRecord], k: int = 2, min_sim: flo
         bundles.append(ChunkRecord(text="\n\n".join(texts), metadata=meta, vector=block.vector, chunk_id=block.chunk_id))
     return bundles
 
-
 def _coerce_vector(vec: Any) -> Optional[List[float]]:
     if vec is None:
         return None
@@ -372,7 +358,6 @@ def _coerce_vector(vec: Any) -> Optional[List[float]]:
         return [float(x) for x in vec]
     except Exception:
         return None
-
 
 def _percentile(values: List[int], pct: int) -> float:
     if not values:
@@ -387,7 +372,6 @@ def _percentile(values: List[int], pct: int) -> float:
     d1 = vals[c] * (k - f)
     return float(d0 + d1)
 
-
 def _load_dataset_cache(cache_path: Path) -> Dict[str, Dict]:
     if not cache_path.exists():
         return {}
@@ -396,13 +380,11 @@ def _load_dataset_cache(cache_path: Path) -> Dict[str, Dict]:
     except Exception:
         return {}
 
-
 def _save_dataset_cache(cache_path: Path, cache: Dict[str, Dict]) -> None:
     try:
         cache_path.write_text(json.dumps(cache, indent=2))
     except Exception as exc:
         logger.warning("Failed to persist dataset cache: %s", exc)
-
 
 def build_dataset_from_qdrant(
         profile_id: str,
@@ -569,7 +551,7 @@ def build_dataset_from_qdrant(
         try:
             llm_client = _get_llm_client(gen_model)
         except Exception as exc:
-            logger.warning("LLM generation unavailable (%s); falling back to heuristic strategies.", exc)
+            logger.debug("LLM generation unavailable (%s); falling back to heuristic strategies.", exc)
 
     generator = MultiStrategyPairGenerator(
         llm_client=llm_client,

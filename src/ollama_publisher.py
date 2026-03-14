@@ -1,5 +1,5 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import platform
 import subprocess
@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 DEFAULT_SYSTEM_PROMPT = """You are DocWain (Document Wise AI Node).
 
@@ -215,7 +215,6 @@ Behave like a domain-aware, language-aware document intelligence system — not 
 
 DEFAULT_PARAMS = {"temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.1}
 
-
 class OllamaPublisher:
     """
     Package a fine-tuned adapter into an Ollama model via Modelfile and register it locally.
@@ -268,7 +267,7 @@ class OllamaPublisher:
         if code == 0:
             logger.info("Ollama detected: %s", out or err)
             return True, out or err
-        logger.warning("Ollama CLI not available: %s %s", out, err)
+        logger.debug("Ollama CLI not available: %s %s", out, err)
         return False, err or out or "ollama CLI not found"
 
     def check_ollama_running(self) -> Tuple[bool, str]:

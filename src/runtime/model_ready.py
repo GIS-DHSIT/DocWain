@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Set
 
 import ollama
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _extract_model_names(payload: dict) -> Set[str]:
     names: Set[str] = set()
@@ -18,7 +17,6 @@ def _extract_model_names(payload: dict) -> Set[str]:
         if name:
             names.add(str(name))
     return names
-
 
 def ensure_model_ready(
     model_name: str,

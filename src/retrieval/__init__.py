@@ -1,5 +1,6 @@
-"""Intent-aware retrieval helpers."""
+"""Intent-aware retrieval helpers + unified retrieval system."""
 
+# --- Legacy exports (used by existing modules) ---
 from .query_analyzer import QueryAnalyzer, QueryAnalysis
 from .evidence_constraints import EvidenceConstraints, EvidenceRequirements, EvidenceCoverage
 from .hybrid_ranker import HybridRanker, HybridRankerConfig
@@ -15,7 +16,13 @@ from .intent_filter import (
     build_intent_miss_response,
 )
 
+# --- New unified retrieval system ---
+from .retriever import EvidenceChunk, RetrievalResult, UnifiedRetriever
+from .reranker import rerank_chunks
+from .context_builder import build_context
+
 __all__ = [
+    # Legacy
     "QueryAnalyzer",
     "QueryAnalysis",
     "EvidenceConstraints",
@@ -35,4 +42,10 @@ __all__ = [
     "extract_answer_requirements",
     "validate_answer_requirements",
     "build_intent_miss_response",
+    # New
+    "EvidenceChunk",
+    "RetrievalResult",
+    "UnifiedRetriever",
+    "rerank_chunks",
+    "build_context",
 ]

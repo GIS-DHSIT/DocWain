@@ -10,11 +10,11 @@ Thread-safe singleton via ``get_vision_ocr_client()``.
 from __future__ import annotations
 
 import io
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from typing import Any, Optional, Tuple
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _PAGE_PROMPT = (
     "Extract ALL text from this scanned document page. "
@@ -78,7 +78,6 @@ _ANALYSIS_PROMPTS = {
     "photo": _PHOTO_ANALYSIS_PROMPT,
     "general": _CONTENT_PROMPT,
 }
-
 
 class VisionOCRClient:
     """Ollama-based vision OCR using the ``images`` parameter."""
@@ -220,14 +219,12 @@ class VisionOCRClient:
             return 85.0
         return 50.0
 
-
 # ------------------------------------------------------------------
 # Singleton
 # ------------------------------------------------------------------
 
 _client: Optional[VisionOCRClient] = None
 _client_lock = threading.Lock()
-
 
 def get_vision_ocr_client() -> Optional[VisionOCRClient]:
     """Return (or create) the global VisionOCRClient singleton."""
@@ -244,7 +241,6 @@ def get_vision_ocr_client() -> Optional[VisionOCRClient]:
             return None
         _client = VisionOCRClient()
         return _client
-
 
 def set_vision_ocr_client(client: Optional[VisionOCRClient]) -> None:
     """Override the singleton (used by tests)."""

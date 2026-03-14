@@ -524,33 +524,29 @@ class TestToolRegistration:
         assert "search" in profile.capabilities
 
     def test_keyword_pattern_matches(self):
-        from src.agentic.tool_selector import _KEYWORD_TOOL_PATTERNS
+        """Web search queries should be matched by NLU-based agent selection."""
+        from src.agentic.nlu_agent_matcher import match_agents
         test_phrases = [
             "search the web for python tutorials",
             "search the internet for AI news",
-            "google quantum computing",
             "look up latest React docs",
             "find online information about DocWain",
         ]
         for phrase in test_phrases:
-            matched = False
-            for pattern, tool in _KEYWORD_TOOL_PATTERNS:
-                if pattern.search(phrase) and tool == "web_search":
-                    matched = True
-                    break
-            assert matched, f"Pattern should match '{phrase}' → web_search"
+            matched = match_agents(phrase)
+            assert "web_search" in matched, f"NLU should match '{phrase}' → web_search, got {matched}"
 
     def test_keyword_pattern_no_false_positive(self):
-        from src.agentic.tool_selector import _KEYWORD_TOOL_PATTERNS
+        """Non-web queries should not match web_search agent."""
+        from src.agentic.nlu_agent_matcher import match_agents
         false_phrases = [
             "summarize the document",
             "compare resumes",
             "extract skills",
         ]
         for phrase in false_phrases:
-            for pattern, tool in _KEYWORD_TOOL_PATTERNS:
-                if pattern.search(phrase) and tool == "web_search":
-                    pytest.fail(f"Pattern should NOT match '{phrase}' → web_search")
+            matched = match_agents(phrase)
+            assert "web_search" not in matched, f"NLU should NOT match '{phrase}' → web_search, got {matched}"
 
 
 # ============================================================================

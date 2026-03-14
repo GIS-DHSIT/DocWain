@@ -2,6 +2,8 @@ import csv
 import hashlib
 import json
 import logging
+
+from src.utils.logging_utils import get_logger
 import math
 import os
 import re
@@ -18,6 +20,8 @@ from Crypto.Cipher import AES
 from bson.objectid import ObjectId
 from pymongo import MongoClient, errors
 from qdrant_client import QdrantClient
+import warnings
+warnings.filterwarnings("ignore", message=r".*_target_device.*has been deprecated", category=FutureWarning)
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import HashingVectorizer
 from urllib.parse import urlparse
@@ -54,8 +58,6 @@ from src.storage.azure_blob_client import (
     sanitize_blob_url,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
 # Lazy-loaded globals to avoid heavy initialization during import
 docEx = None
 _MODEL = None
@@ -63,17 +65,15 @@ _MODEL_DEVICE = None
 _QDRANT_CLIENT = None
 _VECTOR_STORE = None
 _HASH_VECTORIZER = None
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 '-------------------------------modified by maha/maria-----------------------'
 '---------------------------------new function for checking PII status in mongodb--------------------'
-
 
 class ChunkingDiagnosticError(RuntimeError):
     def __init__(self, message: str, diagnostics: Optional[Dict[str, Any]] = None):
         super().__init__(message)
         self.diagnostics = diagnostics or {}
-
 
 def get_subscription_pii_setting(subscription_id: str) -> bool:
     """
@@ -112,7 +112,7 @@ def get_subscription_pii_setting(subscription_id: str) -> bool:
                 'enable_pii')
 
             if pii_enabled is not None:
-                logging.info(
+                logger.info(
                     f"Subscription {subscription_id}: PII masking is {'ENABLED' if pii_enabled else 'DISABLED'}")
                 return bool(pii_enabled)
             else:
@@ -122,27 +122,26 @@ def get_subscription_pii_setting(subscription_id: str) -> bool:
                         {"_id": subscription["_id"]},
                         {"$set": {"pii_enabled": True}},
                     )
-                    logging.info(
+                    logger.info(
                         "Subscription %s: PII setting not found, persisted default ENABLED",
                         subscription_id,
                     )
                 except Exception as persist_exc:
-                    logging.warning(
+                    logger.warning(
                         "Subscription %s: PII setting not found, defaulting to ENABLED (persist failed: %s)",
                         subscription_id, persist_exc,
                     )
                 return True  # Safe default - enable PII masking if not specified
         else:
-            logging.info(
+            logger.info(
                 "PII masking defaulted to enabled because subscription not found (subscription_id=%s)",
                 subscription_id,
             )
             return True  # Safe default
 
     except Exception as e:
-        logging.error(f"Error fetching PII setting for subscription {subscription_id}: {e}")
+        logger.error(f"Error fetching PII setting for subscription {subscription_id}: {e}")
         return True  # Safe default - enable PII masking on error
-
 
 def normalize_embedding_matrix(raw_vectors, expected_dim=None):
     """
@@ -187,7 +186,6 @@ def normalize_embedding_matrix(raw_vectors, expected_dim=None):
 
     return normalized_vectors, (dim or expected_dim)
 
-
 def build_sparse_vectors(texts: List[str]) -> List[Dict[str, List[float]]]:
     """Build hashing-based sparse vectors for keyword search."""
     vectorizer = get_hash_vectorizer()
@@ -202,7 +200,6 @@ def build_sparse_vectors(texts: List[str]) -> List[Dict[str, List[float]]]:
             }
         )
     return sparse_vectors
-
 
 def compute_section_summaries(
     chunks: List[str], chunk_metadata: List[dict], extracted: Optional[ExtractedDocument] = None
@@ -241,7 +238,6 @@ def compute_section_summaries(
     section_summaries = {sec.section_id: ctx.summarize_section(sec) for sec in sections}
     return ContextUnderstanding.attach_summaries_to_chunks(chunk_metadata, section_summaries)
 
-
 def create_mongo_client():
     """Create a Mongo client with a graceful fallback when the primary URI is misconfigured."""
     primary_uri = Config.MongoDB.URI
@@ -251,35 +247,33 @@ def create_mongo_client():
         client = MongoClient(primary_uri, serverSelectionTimeoutMS=5000)
         try:
             client.admin.command("ping")
-            logging.info(f"Connected to MongoDB primary URI: {primary_uri}")
+            logger.info(f"Connected to MongoDB primary URI: {primary_uri}")
             return client
         except Exception as ping_exc:
-            logging.warning(f"Ping to primary MongoDB URI failed: {ping_exc}")
+            logger.warning(f"Ping to primary MongoDB URI failed: {ping_exc}")
     except Exception as exc:
-        logging.warning(f"Primary MongoDB URI failed ({exc}); attempting fallback")
+        logger.warning(f"Primary MongoDB URI failed ({exc}); attempting fallback")
 
     if fallback_uri and fallback_uri != primary_uri:
         try:
             fallback_client = MongoClient(fallback_uri, serverSelectionTimeoutMS=5000)
             try:
                 fallback_client.admin.command("ping")
-                logging.info(f"Connected to MongoDB fallback URI: {fallback_uri}")
+                logger.info(f"Connected to MongoDB fallback URI: {fallback_uri}")
             except Exception as fb_ping:
-                logging.warning(f"Ping to fallback MongoDB URI failed: {fb_ping}")
+                logger.warning(f"Ping to fallback MongoDB URI failed: {fb_ping}")
             return fallback_client
         except Exception as fb_exc:
-            logging.error(f"Fallback MongoDB URI also failed: {fb_exc}")
+            logger.error(f"Fallback MongoDB URI also failed: {fb_exc}")
 
     if client is not None:
-        logging.warning("Using MongoClient without verified connectivity")
+        logger.warning("Using MongoClient without verified connectivity")
         return client
-    logging.error("Unable to create MongoClient; falling back to localhost without ping")
+    logger.error("Unable to create MongoClient; falling back to localhost without ping")
     return MongoClient("mongodb://localhost:27017", serverSelectionTimeoutMS=5000)
-
 
 mongoClient = create_mongo_client()
 db = mongoClient[Config.MongoDB.DB]
-
 
 def get_doc_extractor():
     """Lazy init for document extractor."""
@@ -288,13 +282,12 @@ def get_doc_extractor():
         docEx = DocumentExtractor()
     return docEx
 
-
 def _torch_cuda_available() -> bool:
     try:
         return bool(torch) and bool(torch.cuda.is_available())
     except Exception:  # noqa: BLE001
+        logger.debug("CUDA availability check failed")
         return False
-
 
 def _preferred_embedding_device() -> str:
     env_device = (os.getenv("EMBEDDING_DEVICE") or "").strip().lower()
@@ -302,18 +295,16 @@ def _preferred_embedding_device() -> str:
         return env_device
     return "cuda" if _torch_cuda_available() else "cpu"
 
-
 def _is_meta_tensor_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "meta tensor" in msg or "cannot copy out of meta tensor" in msg
-
 
 def _is_cuda_oom(exc: Exception) -> bool:
     try:
         if torch and isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as _check_exc:  # noqa: BLE001
+        logger.debug("CUDA OOM type check failed: %s", _check_exc)
     msg = str(exc).lower()
     return (
         "cuda out of memory" in msg
@@ -322,15 +313,13 @@ def _is_cuda_oom(exc: Exception) -> bool:
         or ("cuda error" in msg and "alloc" in msg)
     )
 
-
 def _clear_gpu_cache() -> None:
     """Best-effort GPU cache clear after CUDA OOM."""
     try:
         if torch and torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001
-        pass
-
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("GPU cache clear failed: %s", exc)
 
 def _resolve_torch_dtype(device: str):
     if not torch:
@@ -345,14 +334,12 @@ def _resolve_torch_dtype(device: str):
     # Default to float32 for robustness unless explicitly overridden.
     return torch.float32
 
-
 def _model_kwargs_for_device(device: str) -> Dict[str, Any]:
     kwargs: Dict[str, Any] = {"device_map": None, "low_cpu_mem_usage": False}
     dtype = _resolve_torch_dtype(device)
     if dtype is not None:
         kwargs["torch_dtype"] = dtype
     return kwargs
-
 
 def _embedding_candidates() -> List[str]:
     candidates: List[str] = []
@@ -366,9 +353,8 @@ def _embedding_candidates() -> List[str]:
         candidates.append(str(fallback_name))
     return candidates
 
-
 def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
-    logging.info("Loading sentence transformer model: %s (device=%s)", name, device)
+    logger.info("Loading sentence transformer model: %s (device=%s)", name, device)
     model_kwargs = _model_kwargs_for_device(device)
     try:
         if getattr(Config.Model, "OFFLINE_ONLY", True):
@@ -377,7 +363,7 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
         return SentenceTransformer(name, device=device, model_kwargs=model_kwargs, local_files_only=True)
     except Exception as exc:  # noqa: BLE001
         if device != "cpu" and (_is_meta_tensor_error(exc) or _is_cuda_oom(exc)):
-            logging.warning(
+            logger.warning(
                 "Model load on %s failed (%s); retrying on cpu for stability",
                 device,
                 exc,
@@ -386,23 +372,21 @@ def _load_sentence_transformer(name: str, device: str) -> SentenceTransformer:
             return SentenceTransformer(name, device="cpu", model_kwargs=cpu_kwargs, local_files_only=True)
         raise
 
-
 def get_model(*, reload: bool = False, device: Optional[str] = None):
     """Lazy init for sentence transformer model with robust device fallback."""
     global _MODEL, _MODEL_DEVICE
     model, _dim = get_embedding_model(reload=reload, device=device)
     _MODEL = model
-    _MODEL_DEVICE = getattr(model, "_target_device", None) or _MODEL_DEVICE
+    _MODEL_DEVICE = getattr(model, "device", None) or getattr(model, "_target_device", None) or _MODEL_DEVICE
     return model
-
 
 def _embedding_batch_size(default: int = 32) -> int:
     raw = os.getenv("EMBEDDING_BATCH_SIZE", str(default))
     try:
         return max(1, int(raw))
     except ValueError:
+        logger.debug("Invalid EMBEDDING_BATCH_SIZE=%r, using default=%d", raw, default)
         return default
-
 
 def encode_with_fallback(
     texts: List[str],
@@ -423,7 +407,6 @@ def encode_with_fallback(
         device=device,
     )
 
-
 def get_qdrant_client():
     """Lazy init for Qdrant client."""
     global _QDRANT_CLIENT
@@ -431,14 +414,12 @@ def get_qdrant_client():
         _QDRANT_CLIENT = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API, timeout=120)
     return _QDRANT_CLIENT
 
-
 def get_vector_store() -> QdrantVectorStore:
     """Shared vector store wrapper to centralize collection handling."""
     global _VECTOR_STORE
     if _VECTOR_STORE is None:
         _VECTOR_STORE = QdrantVectorStore(client=get_qdrant_client())
     return _VECTOR_STORE
-
 
 def get_hash_vectorizer():
     """Return a stable hashing vectorizer for sparse keyword vectors."""
@@ -453,7 +434,6 @@ def get_hash_vectorizer():
         )
     return _HASH_VECTORIZER
 
-
 def decrypt_data(encrypted_value: str, encryption_key=Config.Encryption.ENCRYPTION_KEY) -> str:
     """Decrypts data using AES CBC mode."""
     try:
@@ -463,21 +443,44 @@ def decrypt_data(encrypted_value: str, encryption_key=Config.Encryption.ENCRYPTI
         encrypted_bytes = bytes.fromhex(encrypted)
         cipher = AES.new(key, AES.MODE_CBC, iv)
         decrypted_text = cipher.decrypt(encrypted_bytes).rstrip(b"\x00").decode('utf-8')
-        logging.info("Decryption successful.")
+        logger.info("Decryption successful.")
         return decrypted_text
     except Exception as e:
-        logging.error(f"Decryption failed: {e}")
+        logger.error(f"Decryption failed: {e}")
         return ""
 
-
-def fileProcessor(content, file):
+def fileProcessor(content, file, content_type: str = ""):
     """Processes different types of documents and extracts text or dataframe."""
     extracted_data = {}
     try:
         file_name = file.split('/')[-1]
         extractor = get_doc_extractor()
+
+        # MIME-type fallback: detect format from content_type when extension is
+        # missing or generic (e.g. ".bin", no extension at all).
+        _ct = (content_type or "").lower()
+        _ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+        _KNOWN_EXTS = {"csv", "xlsx", "xls", "json", "pdf", "docx", "doc", "pptx", "ppt", "txt"}
+        if _ext not in _KNOWN_EXTS and _ct:
+            _MIME_EXT_MAP = {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+                "application/vnd.ms-excel": "xls",
+                "application/pdf": "pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+                "application/msword": "doc",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+                "application/vnd.ms-powerpoint": "ppt",
+                "text/csv": "csv",
+                "application/json": "json",
+                "text/plain": "txt",
+            }
+            mapped_ext = _MIME_EXT_MAP.get(_ct)
+            if mapped_ext:
+                logger.info(f"MIME-type fallback: '{_ct}' → .{mapped_ext} for file '{file_name}'")
+                file_name = f"{file_name}.{mapped_ext}"
+
         if content:
-            logging.info(f"Extracting File {file_name}")
+            logger.info(f"Extracting File {file_name}")
             if file_name.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
                 extracted_data[file_name] = extractor.extract_dataframe(df, sheet_name=file_name)
@@ -501,25 +504,36 @@ def fileProcessor(content, file):
                 # extract_text_from_txt handles via _smart_decode()
                 extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
             else:
-                extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
+                # Last resort: try to detect Excel by magic bytes
+                if content[:4] == b'PK\x03\x04':
+                    # ZIP-based format — could be xlsx/docx/pptx; try Excel first
+                    try:
+                        sheets = pd.read_excel(BytesIO(content), sheet_name=None)
+                        for sheet_name, df in sheets.items():
+                            key = f"{file_name}#{sheet_name}"
+                            extracted_data[key] = extractor.extract_dataframe(df, sheet_name=sheet_name)
+                        logger.info(f"Magic-byte detection: treated '{file_name}' as Excel (xlsx)")
+                    except Exception as exc:
+                        logger.debug("Excel parse failed for %s, falling back to text: %s", file_name, exc)
+                        extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
+                else:
+                    extracted_data[file_name] = extractor.extract_text_from_txt(content, filename=file_name)
         return extracted_data
     except Exception as e:
-        logging.error(f"Error processing file {file}: {e}")
+        logger.error(f"Error processing file {file}: {e}")
         return {}
-
 
 def read_s3_file(s3, bucket, file_key):
     """Reads a file from S3."""
     try:
-        logging.info(f"Reading S3 file: {file_key} from bucket: {bucket}")
+        logger.info(f"Reading S3 file: {file_key} from bucket: {bucket}")
         obj = s3.get_object(Bucket=bucket, Key=file_key)
         content = obj["Body"].read()
-        logging.info("S3 file read successfully.")
+        logger.info("S3 file read successfully.")
         return content
     except Exception as e:
-        logging.error(f"Error reading S3 file {file_key}: {e}")
+        logger.error(f"Error reading S3 file {file_key}: {e}")
         return None
-
 
 def get_s3_client(AWS_ACCESS_KEY, AWS_SECRET_KEY, Region):
     """Returns an S3 client."""
@@ -536,9 +550,8 @@ def get_s3_client(AWS_ACCESS_KEY, AWS_SECRET_KEY, Region):
             region_name=Region,
         )
     except Exception as e:
-        logging.error(f"Error creating S3 client: {e}")
+        logger.error(f"Error creating S3 client: {e}")
         return None
-
 
 def get_s3_document_info(s3_uri):
     """Reads document content from S3 using a URI."""
@@ -555,8 +568,8 @@ def get_s3_document_info(s3_uri):
         content = read_s3_file(s3, bucket_name, object_key)
         return content
     except Exception as e:
+        logger.warning("S3 document fetch failed for %s/%s: %s", bucket_name, object_key, e)
         return {"Error": str(e)}
-
 
 def update_training_status(document_id, status, error_msg=None):
     """Updates training status in MongoDB for a specific document."""
@@ -577,15 +590,14 @@ def update_training_status(document_id, status, error_msg=None):
         result = collection.update_one(filter_criteria, update_operation)
 
         if result.matched_count > 0:
-            logging.info(f"Training status for document {document_id} updated to {status}")
+            logger.info(f"Training status for document {document_id} updated to {status}")
             return {"status": "success"}
         else:
-            logging.warning(f"No document found with ID {document_id}")
+            logger.warning(f"No document found with ID {document_id}")
             return {"status": "not_found"}
     except Exception as e:
-        logging.error(f"Error updating training status for {document_id}: {e}")
+        logger.error(f"Error updating training status for {document_id}: {e}")
         return {"status": "error", "message": str(e)}
-
 
 def update_extraction_metadata(
     document_id: str,
@@ -624,8 +636,7 @@ def update_extraction_metadata(
         collection = db[Config.MongoDB.DOCUMENTS]
         collection.update_one(filter_criteria, {"$set": update_data})
     except Exception as exc:  # noqa: BLE001
-        logging.error(f"Error updating extraction metadata for {document_id}: {exc}")
-
+        logger.error(f"Error updating extraction metadata for {document_id}: {exc}")
 
 def update_layout_graph_metadata(
     document_id: str,
@@ -651,8 +662,7 @@ def update_layout_graph_metadata(
         collection = db[Config.MongoDB.DOCUMENTS]
         collection.update_one(filter_criteria, {"$set": update_data})
     except Exception as exc:  # noqa: BLE001
-        logging.error(f"Error updating layout graph metadata for {document_id}: {exc}")
-
+        logger.error(f"Error updating layout graph metadata for {document_id}: {exc}")
 
 def update_security_screening(document_id: str, report: Dict[str, Any], status: str) -> None:
     """Persist security screening results for audit/debugging."""
@@ -671,8 +681,7 @@ def update_security_screening(document_id: str, report: Dict[str, Any], status: 
         collection = db[Config.MongoDB.DOCUMENTS]
         collection.update_one(filter_criteria, {"$set": update_data})
     except Exception as exc:  # noqa: BLE001
-        logging.error(f"Error updating security screening for {document_id}: {exc}")
-
+        logger.error(f"Error updating security screening for {document_id}: {exc}")
 
 def run_security_screening(document_id: str, extracted_payload: Optional[Any] = None) -> Dict[str, Any]:
     """Run mandatory security screening using extracted payload when provided."""
@@ -685,7 +694,6 @@ def run_security_screening(document_id: str, extracted_payload: Optional[Any] = 
         include_overall_score=True,
     )
 
-
 def resolve_subscription_id(document_id: str, provided: Optional[str] = None) -> str:
     if provided and str(provided).strip().lower() != "default":
         return str(provided).strip()
@@ -697,7 +705,6 @@ def resolve_subscription_id(document_id: str, provided: Optional[str] = None) ->
     if not resolved or str(resolved).strip().lower() == "default":
         raise ValueError(f"subscription_id missing for document_id={document_id}")
     return str(resolved).strip()
-
 
 def resolve_profile_id(document_id: str, provided: Optional[str] = None) -> str:
     if provided and str(provided).strip():
@@ -716,7 +723,6 @@ def resolve_profile_id(document_id: str, provided: Optional[str] = None) -> str:
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"profile_id lookup failed for document_id={document_id}: {exc}") from exc
     raise ValueError(f"profile_id missing for document_id={document_id}")
-
 
 def update_pii_stats(document_id, masked_count, high_confidential, pii_items=None):
     """Persist PII masking stats for a document."""
@@ -737,8 +743,7 @@ def update_pii_stats(document_id, masked_count, high_confidential, pii_items=Non
         collection = db[Config.MongoDB.DOCUMENTS]
         collection.update_one(filter_criteria, {"$set": update_data})
     except Exception as e:
-        logging.error(f"Error updating PII stats for {document_id}: {e}")
-
+        logger.error(f"Error updating PII stats for {document_id}: {e}")
 
 def clear_legacy_vetting_metadata() -> None:
     """Remove deprecated vetting metadata from all documents."""
@@ -746,12 +751,11 @@ def clear_legacy_vetting_metadata() -> None:
         collection = db[Config.MongoDB.DOCUMENTS]
         result = collection.update_many({"vettingPoints": {"$exists": True}}, {"$unset": {"vettingPoints": ""}})
         if result.modified_count:
-            logging.info("Cleared legacy vetting metadata from %s documents.", result.modified_count)
+            logger.info("Cleared legacy vetting metadata from %s documents.", result.modified_count)
         else:
-            logging.info("Legacy vetting metadata not present; no cleanup needed.")
+            logger.info("Legacy vetting metadata not present; no cleanup needed.")
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Legacy vetting metadata cleanup skipped: %s", exc)
-
+        logger.warning("Legacy vetting metadata cleanup skipped: %s", exc)
 
 def get_pii_stats(document_id):
     """Retrieve PII masking stats for a document."""
@@ -793,9 +797,8 @@ def get_pii_stats(document_id):
             "pii_items": doc.get("pii_items", [])
         }
     except Exception as e:
-        logging.error(f"Error fetching PII stats for {document_id}: {e}")
+        logger.error(f"Error fetching PII stats for {document_id}: {e}")
         return None
-
 
 def get_azure_docs(files, *, document_id: Optional[str] = None):
     """Fetch documents from Azure Blob Storage."""
@@ -842,9 +845,9 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
                     blob_client = container_client.get_blob_client(blob=candidate)
                     blob_url = sanitize_blob_url(getattr(blob_client, "url", ""))
                     if blob_url:
-                        logging.info("Downloading blob for document_id=%s url=%s", document_id, blob_url)
+                        logger.info("Downloading blob for document_id=%s url=%s", document_id, blob_url)
                     else:
-                        logging.info(
+                        logger.info(
                             "Downloading blob for document_id=%s container=%s blob=%s",
                             document_id,
                             candidate_container,
@@ -853,6 +856,7 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
                     try:
                         return blob_client.download_blob().readall()
                     except ResourceNotFoundError as exc:
+                        logger.debug("Blob not found at %s/%s, trying next candidate", candidate_container, candidate)
                         last_exc = exc
                         continue
         if last_exc:
@@ -860,7 +864,7 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
         raise ResourceNotFoundError(message="Blob name candidates empty", response=None)  # type: ignore[arg-type]
     except Exception as exc:  # noqa: BLE001
         error = classify_blob_error(exc, document_id=document_id, blob_name=blob_name)
-        logging.error(
+        logger.error(
             "Blob download failed document_id=%s blob=%s error_type=%s message=%s request_id=%s",
             document_id,
             blob_name,
@@ -870,10 +874,8 @@ def get_azure_docs(files, *, document_id: Optional[str] = None):
         )
         raise error from exc
 
-
 '-------------------------------modified by maha/maria-----------------------'
 '---------------Added a PII control per subscription in connectData function--------------------'
-
 
 def connectData(documentConnection):
     """
@@ -900,25 +902,26 @@ def connectData(documentConnection):
         try:
             subscriptionId = resolve_subscription_id(docId, subscription_candidate)
         except Exception as exc:
-            logging.error(f"Subscription resolution failed for document {docId}: {exc}")
+            logger.error(f"Subscription resolution failed for document {docId}: {exc}")
             update_training_status(docId, 'TRAINING_FAILED', 'subscription_id missing')
             continue
 
         # Check PII setting for this subscription
         pii_masking_enabled = get_subscription_pii_setting(subscriptionId)
-        logging.info(f"Document {docId} (Subscription {subscriptionId}): PII masking = {pii_masking_enabled}")
+        logger.info(f"Document {docId} (Subscription {subscriptionId}): PII masking = {pii_masking_enabled}")
 
         allowed_statuses = {'UNDER_REVIEW', 'TRAINING_FAILED'}
 
         if docData.get('status') in allowed_statuses:
             try:
-                logging.info(f"=" * 80)
-                logging.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
-                logging.info(f"=" * 80)
+                logger.info(f"=" * 80)
+                logger.info(f"Processing document {docId}: {docData.get('name', 'Unknown')}")
+                logger.info(f"=" * 80)
                 if telemetry:
                     try:
                         telemetry.record_metadata_quality(docId, docData, expected_fields=list(docData.keys()))
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("Metadata quality recording failed for %s: %s", docId, exc)
                         telemetry.increment("metadata_parse_failures_count")
                 all_extracted_docs = {}
 
@@ -931,7 +934,7 @@ def connectData(documentConnection):
                     s3 = get_s3_client(ak, sk, region)
 
                     if not s3:
-                        logging.error(f"Failed to create S3 client for document {docId}")
+                        logger.error(f"Failed to create S3 client for document {docId}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Failed to create S3 client')
                         continue
 
@@ -939,19 +942,19 @@ def connectData(documentConnection):
                     file = [obj['Key'] for obj in objs.get("Contents", []) if obj['Key'] == docData['name']]
 
                     if not file:
-                        logging.error(f"File {docData['name']} not found in S3 bucket {bkName}")
+                        logger.error(f"File {docData['name']} not found in S3 bucket {bkName}")
                         update_training_status(docId, 'TRAINING_FAILED', 'File not found in S3')
                         continue
 
                     docContent = read_s3_file(s3, bkName, file[0])
                     if docContent is None:
-                        logging.error(f"Failed to read S3 file for document {docId}")
+                        logger.error(f"Failed to read S3 file for document {docId}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Failed to read S3 file')
                         continue
 
                     extractedDoc = fileProcessor(docContent, file[0])
                     if not extractedDoc:
-                        logging.error(f"Failed to extract content from document {docId}")
+                        logger.error(f"Failed to extract content from document {docId}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
                         continue
 
@@ -965,15 +968,15 @@ def connectData(documentConnection):
                     doc_name = docData.get('name', '')
 
                     if not doc_name:
-                        logging.error(f"No filename found for document {docId}")
+                        logger.error(f"No filename found for document {docId}")
                         update_training_status(docId, 'TRAINING_FAILED', 'No filename specified')
                         continue
 
                     # Get all files from connector
                     all_connector_files = connData.get('locations', [])
 
-                    logging.info(f"Looking for EXACT match: '{doc_name}'")
-                    logging.info(f"Connector has {len(all_connector_files)} files")
+                    logger.info(f"Looking for EXACT match: '{doc_name}'")
+                    logger.info(f"Connector has {len(all_connector_files)} files")
 
                     #  FIX: Use EXACT filename matching
                     matching_files = []
@@ -989,30 +992,30 @@ def connectData(documentConnection):
                         #  EXACT match (case-sensitive)
                         if file_name_only == doc_name:
                             matching_files.append(file_path)
-                            logging.info(f" EXACT MATCH: {file_path} matches {doc_name}")
+                            logger.info(f" EXACT MATCH: {file_path} matches {doc_name}")
                             break  # Stop after first exact match
 
                     # L If no exact match, DO NOT fallback to partial matching
                     if not matching_files:
-                        logging.error(f"L NO EXACT MATCH for document {docId} (name: '{doc_name}')")
-                        logging.error(f"Available files in connector:")
+                        logger.error(f"L NO EXACT MATCH for document {docId} (name: '{doc_name}')")
+                        logger.error(f"Available files in connector:")
                         for f in all_connector_files:
                             file_only = f.split('/')[-1] if '/' in f else f
-                            logging.error(f"  - {file_only} (full path: {f})")
+                            logger.error(f"  - {file_only} (full path: {f})")
                         update_training_status(docId, 'TRAINING_FAILED', f'Exact file match not found: {doc_name}')
                         continue
 
                     #  Should only have ONE match due to break statement
                     if len(matching_files) > 1:
-                        logging.error(
+                        logger.error(
                             f"L CRITICAL: Multiple exact matches for {doc_name}: {matching_files}"
                         )
-                        logging.error("This should not happen with exact matching!")
+                        logger.error("This should not happen with exact matching!")
                         update_training_status(docId, 'TRAINING_FAILED', 'Multiple file matches')
                         continue
 
                     file_path = matching_files[0]
-                    logging.info(f" Document {docId} will process ONLY: {file_path}")
+                    logger.info(f" Document {docId} will process ONLY: {file_path}")
 
                     # Process ONLY this document's specific file
                     try:
@@ -1020,17 +1023,17 @@ def connectData(documentConnection):
                         file_key = normalize_blob_name(
                             file_path, container_name=Config.AzureBlob.DOCUMENT_CONTAINER_NAME
                         )
-                        logging.info(f"Reading file: {file_key} for document {docId}")
+                        logger.info(f"Reading file: {file_key} for document {docId}")
 
                         docContent = get_azure_docs(file_key, document_id=docId)
                         if docContent is None:
-                            logging.error(f"Failed to read Azure file {file_key} for document {docId}")
+                            logger.error(f"Failed to read Azure file {file_key} for document {docId}")
                             update_training_status(docId, 'TRAINING_FAILED', f'Failed to read file {file_key}')
                             continue
 
                         extractedDoc = fileProcessor(docContent, file_path)
                         if not extractedDoc:
-                            logging.error(f"Failed to extract content from file {file_key}")
+                            logger.error(f"Failed to extract content from file {file_key}")
                             update_training_status(docId, 'TRAINING_FAILED', 'Content extraction failed')
                             continue
 
@@ -1038,15 +1041,15 @@ def connectData(documentConnection):
 
                         #  VERIFICATION: Should only have ONE file extracted
                         if len(all_extracted_docs) != 1:
-                            logging.warning(
+                            logger.warning(
                                 f"� Expected 1 extracted file for {docId}, got {len(all_extracted_docs)}: "
                                 f"{list(all_extracted_docs.keys())}"
                             )
                         else:
-                            logging.info(f" Successfully extracted 1 file from {file_key}")
+                            logger.info(f" Successfully extracted 1 file from {file_key}")
 
                     except Exception as file_error:
-                        logging.error(f"Error processing file {file_path}: {file_error}")
+                        logger.error(f"Error processing file {file_path}: {file_error}")
                         update_training_status(docId, 'TRAINING_FAILED', str(file_error))
                         continue
 
@@ -1061,7 +1064,7 @@ def connectData(documentConnection):
                             save_info.get("sha256"),
                         )
                     except Exception as exc:
-                        logging.error(f"Failed to persist extracted pickle for {docId}: {exc}")
+                        logger.error(f"Failed to persist extracted pickle for {docId}: {exc}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Failed to persist extracted content')
                         continue
 
@@ -1075,11 +1078,11 @@ def connectData(documentConnection):
                             security_status = "failed"
                         update_security_screening(docId, security_report, security_status)
                         if security_status != "passed":
-                            logging.error(f"Security screening failed for document {docId}; blocking training")
+                            logger.error(f"Security screening failed for document {docId}; blocking training")
                             update_training_status(docId, 'TRAINING_BLOCKED_SECURITY', 'Security screening failed')
                             continue
                     except Exception as exc:
-                        logging.error(f"Security screening failed for {docId}: {exc}")
+                        logger.error(f"Security screening failed for {docId}: {exc}")
                         update_training_status(docId, 'TRAINING_FAILED', 'Security screening failed')
                         continue
 
@@ -1099,7 +1102,7 @@ def connectData(documentConnection):
                                     )
                                 masked_docs[fname] = content
                     else:
-                        logging.info(f"PII masking disabled for subscription {subscriptionId}")
+                        logger.info(f"PII masking disabled for subscription {subscriptionId}")
                         masked_docs = all_extracted_docs
                         pii_count = 0
                         pii_items = []
@@ -1116,58 +1119,55 @@ def connectData(documentConnection):
                         'security_status': security_status,
                     }
 
-                    logging.info(
+                    logger.info(
                         f" Stored document {docId} with {len(masked_docs)} file(s) "
                         f"(PII masked: {pii_count})"
                     )
                 else:
-                    logging.error(f"No documents extracted for {docId}")
+                    logger.error(f"No documents extracted for {docId}")
                     update_training_status(docId, 'TRAINING_FAILED', 'No content extracted')
 
             except Exception as e:
-                logging.error(f"Error processing document {docId} ({docData.get('name', 'Unknown')}): {e}")
+                logger.error(f"Error processing document {docId} ({docData.get('name', 'Unknown')}): {e}")
                 update_training_status(docId, 'TRAINING_FAILED', str(e))
 
         elif docData['status'] == 'DELETED':
             profileData = str(docData['profile'])
             delete_embeddings(subscriptionId, profileData, docId)
 
-    logging.info(f"=" * 80)
-    logging.info(f" connectData completed: {len(dataDict)} documents processed")
-    logging.info(f"=" * 80)
+    logger.info(f"=" * 80)
+    logger.info(f" connectData completed: {len(dataDict)} documents processed")
+    logger.info(f"=" * 80)
 
     return dataDict
 
-
-
 def collectionConnect(name):
     """Fetches documents from a MongoDB collection."""
-    logging.info(f"Fetching connection details for collection: {name}")
+    logger.info(f"Fetching connection details for collection: {name}")
     try:
         collection = db[name]
         try:
             # Count documents to make emptiness explicit in the logs
             count = collection.count_documents({})
-            logging.info(f"Collection '{name}' document count: {count}")
+            logger.info(f"Collection '{name}' document count: {count}")
         except Exception as count_exc:
-            logging.warning(f"Unable to count documents for collection '{name}': {count_exc}")
+            logger.warning(f"Unable to count documents for collection '{name}': {count_exc}")
         return collection.find()
     except Exception as e:
-        logging.error(f"Error connecting to collection {name}: {e}")
+        logger.error(f"Error connecting to collection {name}: {e}")
         # return an empty iterator to keep calling code behavior predictable
         return []
-
 
 def extract_document_info():
     """Retrieves connector details from MongoDB."""
     try:
-        logging.info(
+        logger.info(
             f"Extracting document info from DB: {Config.MongoDB.DB}, collections: {Config.MongoDB.DOCUMENTS}, {Config.MongoDB.CONNECTOR}")
         try:
             existing = db.list_collection_names()
-            logging.info(f"Existing collections in DB '{Config.MongoDB.DB}': {existing}")
+            logger.info(f"Existing collections in DB '{Config.MongoDB.DB}': {existing}")
         except Exception as lc_exc:
-            logging.warning(f"Could not list collections: {lc_exc}")
+            logger.warning(f"Could not list collections: {lc_exc}")
 
         docs = collectionConnect(Config.MongoDB.DOCUMENTS)
         Docs = {}
@@ -1175,21 +1175,22 @@ def extract_document_info():
         for doc in docs:
             try:
                 refConnector = doc.get('_id').__str__()
-            except Exception:
-                # fallback if doc['_id'] is not present
+            except Exception as exc:
+                logger.debug("Document _id extraction fallback: %s", exc)
                 refConnector = str(doc.get('_id', 'unknown'))
             Docs[refConnector] = doc
-        logging.info(f"Found {len(Docs)} document definitions in collection '{Config.MongoDB.DOCUMENTS}'")
+        logger.info(f"Found {len(Docs)} document definitions in collection '{Config.MongoDB.DOCUMENTS}'")
 
         connInfo = {}
         connectors = collectionConnect(Config.MongoDB.CONNECTOR)
         for conn in connectors:
             try:
                 connId = conn.get('_id').__str__()
-            except Exception:
+            except Exception as exc:
+                logger.debug("Connector _id extraction fallback: %s", exc)
                 connId = str(conn.get('_id', 'unknown'))
             connInfo[connId] = conn
-        logging.info(f"Found {len(connInfo)} connector definitions in collection '{Config.MongoDB.CONNECTOR}'")
+        logger.info(f"Found {len(connInfo)} connector definitions in collection '{Config.MongoDB.CONNECTOR}'")
 
         connList = list(connInfo.keys())
         docInfo = {}
@@ -1197,22 +1198,20 @@ def extract_document_info():
             # docData expected to have a 'connector' field referencing a connector id
             try:
                 connRef = docData.get('connector').__str__()
-            except Exception:
+            except Exception as exc:
+                logger.debug("Connector ref extraction fallback for doc %s: %s", docId, exc)
                 connRef = str(docData.get('connector', ''))
             if connRef in connList:
                 docInfo[docId] = {'dataDict': docData, 'connDict': connInfo[connRef]}
             else:
-                logging.info(f"Document {docId} references connector {connRef} which is not in connectors list")
+                logger.info(f"Document {docId} references connector {connRef} which is not in connectors list")
 
-        logging.info(f"Extracted {len(docInfo)} documents with valid connectors")
+        logger.info(f"Extracted {len(docInfo)} documents with valid connectors")
         return docInfo
 
     except Exception as e:
-        logging.error(f"Error fetching connection details: {e}")
+        logger.error(f"Error fetching connection details: {e}")
         return {}
-
-
-
 
 def delete_embeddings(subscription_id: str, profile_id: str, document_id: str):
     """
@@ -1227,7 +1226,7 @@ def delete_embeddings(subscription_id: str, profile_id: str, document_id: str):
         Dict with status and details
     """
     try:
-        logging.info(
+        logger.info(
             f"[DELETE_EMBEDDINGS] Deleting embeddings for document_id={document_id}, "
             f"subscription_id={subscription_id}, profile_id={profile_id}"
         )
@@ -1240,13 +1239,12 @@ def delete_embeddings(subscription_id: str, profile_id: str, document_id: str):
         return result
 
     except Exception as e:
-        logging.error("[DELETE_EMBEDDINGS] Failed", exc_info=True)
+        logger.error("[DELETE_EMBEDDINGS] Failed", exc_info=True)
         return {
             "status": "error",
             "message": str(e),
             "document_id": document_id,
         }
-
 
 def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
     """Ensure Qdrant collection exists with multi-vector schema and payload indexes."""
@@ -1254,9 +1252,8 @@ def ensure_qdrant_collection(collection_name: str, vector_size: int) -> None:
         store = get_vector_store()
         store.ensure_collection(collection_name, vector_size)
     except Exception as e:
-        logging.error(f"Error ensuring collection in Qdrant: {e}")
+        logger.error(f"Error ensuring collection in Qdrant: {e}")
         raise
-
 
 def save_embeddings_to_qdrant(
     embeddings: Dict,
@@ -1274,14 +1271,14 @@ def save_embeddings_to_qdrant(
             raise ValueError("profile_id is required for saving embeddings")
 
         if "embeddings" not in embeddings or embeddings["embeddings"] is None:
-            logging.error(f"Error: 'embeddings' key missing or None for document {doctag}!")
+            logger.error(f"Error: 'embeddings' key missing or None for document {doctag}!")
             raise ValueError("Embeddings data is invalid")
 
         raw_vectors = embeddings["embeddings"]
 
         # Fallback: if embeddings are actually plain text strings, re-embed them
         if isinstance(raw_vectors, (list, tuple)) and raw_vectors and all(isinstance(v, str) for v in raw_vectors):
-            logging.warning(
+            logger.warning(
                 f"Embeddings payload appears to be text; re-encoding {len(raw_vectors)} chunks for document {doctag}"
             )
             raw_vectors = encode_with_fallback(
@@ -1329,8 +1326,8 @@ def save_embeddings_to_qdrant(
                     languages = [lang]
                 doc_metadata["detected_language"] = lang
                 doc_metadata["language_confidence"] = confidence
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Language detection failed: %s", exc)
         if languages:
             doc_metadata["languages"] = languages
         if doc_metadata.get("detected_language"):
@@ -1375,7 +1372,7 @@ def save_embeddings_to_qdrant(
                 embeddings["section_intelligence"] = section_intel_result.to_dict()
                 embeddings["doc_domain"] = doc_domain
             except Exception as exc:  # noqa: BLE001
-                logging.debug("Section intelligence build skipped for %s: %s", doctag, exc)
+                logger.debug("Section intelligence build skipped for %s: %s", doctag, exc)
                 if not doc_domain:
                     try:
                         from src.intelligence.domain_indexer import infer_domain
@@ -1386,7 +1383,8 @@ def save_embeddings_to_qdrant(
                             doc_type=doc_type or document_type,
                             source_name=filename or source_filename,
                         )
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("Domain inference (section intel) failed: %s", exc)
                         doc_domain = None
 
         if not doc_domain or str(doc_domain).strip().lower() in {"unknown", "generic"}:
@@ -1398,7 +1396,8 @@ def save_embeddings_to_qdrant(
                     doc_type=doc_type or document_type,
                     source_name=filename or source_filename,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.debug("Domain inference fallback failed: %s", exc)
                 doc_domain = doc_domain or "unknown"
 
         # Final safety net — use content classifier if still unknown
@@ -1443,12 +1442,12 @@ def save_embeddings_to_qdrant(
             store = get_vector_store()
             store.delete_document(subscription_id, profile_id, doctag)
             old_points_deleted = True
-            logging.info(
+            logger.info(
                 "Cleaned old embeddings for document_id=%s before re-embedding",
                 doctag,
             )
         except Exception as exc:  # noqa: BLE001
-            logging.warning("Old embedding cleanup failed for %s: %s", doctag, exc)
+            logger.warning("Old embedding cleanup failed for %s: %s", doctag, exc)
 
         # Apply embedding enhancement for better retrieval
         dropped_dedup = 0
@@ -1495,13 +1494,13 @@ def save_embeddings_to_qdrant(
                         else:
                             chunk_metadata.append(enhanced_meta)
 
-            logging.info(
+            logger.info(
                 f"Embedding enhancement: {enhancement_result.original_count} -> "
                 f"{enhancement_result.deduplicated_count} chunks, "
                 f"avg quality: {enhancement_result.average_quality_score:.2f}"
             )
         except Exception as enhance_exc:  # noqa: BLE001
-            logging.warning("Embedding enhancement failed for %s: %s", doctag, enhance_exc)
+            logger.warning("Embedding enhancement failed for %s: %s", doctag, enhance_exc)
 
         records: List[ChunkRecord] = []
         invalid_samples: List[Dict[str, Any]] = []
@@ -1609,7 +1608,7 @@ def save_embeddings_to_qdrant(
                 )
             except Exception as chunk_exc:  # noqa: BLE001
                 chunk_errors += 1
-                logging.warning(
+                logger.warning(
                     "Chunk %d/%d failed for doc %s: %s",
                     idx + 1, max_len, doctag, chunk_exc,
                 )
@@ -1624,16 +1623,16 @@ def save_embeddings_to_qdrant(
             saved = get_vector_store().upsert_records(collection_name, records, batch_size=batch_size)
         except Exception as upsert_exc:
             if old_points_deleted:
-                logging.error(
+                logger.error(
                     "CRITICAL: Old embeddings deleted but re-upsert failed for %s — document has ZERO vectors: %s",
                     doctag, upsert_exc,
                 )
             raise
-        logging.info(
+        logger.info(
             f"Saved {saved} embeddings for document {doctag} in collection {collection_name} (profile={profile_id})"
         )
         if invalid_samples:
-            logging.warning(
+            logger.warning(
                 "Skipped %s invalid chunks during embedding for %s (min_chars=%s min_tokens=%s)",
                 len(invalid_samples),
                 doctag,
@@ -1641,21 +1640,23 @@ def save_embeddings_to_qdrant(
                 min_tokens,
             )
         if chunk_errors:
-            logging.warning(
+            logger.warning(
                 "Per-chunk errors during record building for %s: %d/%d chunks failed",
                 doctag, chunk_errors, max_len,
             )
 
         try:
             from src.api.dw_newron import get_redis_client
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Redis client import unavailable: %s", exc)
             get_redis_client = None
 
         redis_client = None
         if get_redis_client:
             try:
                 redis_client = get_redis_client()
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Redis client initialization failed: %s", exc)
                 redis_client = None
 
         graph_payload = build_graph_payload(
@@ -1717,7 +1718,7 @@ def save_embeddings_to_qdrant(
                         chunk_texts=list(texts),
                     )
         except Exception as exc:  # noqa: BLE001
-            logging.warning("DWX section intelligence/KG update skipped: %s", exc)
+            logger.warning("DWX section intelligence/KG update skipped: %s", exc)
 
         try:
             from src.embed.embed_pipeline import update_profile_indexes_from_embeddings
@@ -1734,7 +1735,7 @@ def save_embeddings_to_qdrant(
                     kg_store=KGStore(),
                 )
         except Exception as exc:  # noqa: BLE001
-            logging.warning("DocWain profile index update skipped: %s", exc)
+            logger.warning("DocWain profile index update skipped: %s", exc)
 
         try:
             if doc_domain:
@@ -1749,7 +1750,7 @@ def save_embeddings_to_qdrant(
                     update_fields["language_confidence"] = doc_metadata.get("language_confidence")
                 collection.update_one(filter_criteria, {"$set": update_fields})
         except Exception as exc:  # noqa: BLE001
-            logging.debug("Failed to update doc_domain metadata for %s: %s", doctag, exc)
+            logger.debug("Failed to update doc_domain metadata for %s: %s", doctag, exc)
 
         return {
             "status": "success",
@@ -1761,15 +1762,14 @@ def save_embeddings_to_qdrant(
         }
 
     except Exception as e:
-        logging.error(f"Error saving embeddings to Qdrant for document {doctag}, file {source_filename}: {e}")
+        logger.error(f"Error saving embeddings to Qdrant for document {doctag}, file {source_filename}: {e}")
         raise
-
 
 # from enhanced_retrieval import chunk_text_for_embedding
 # def train_on_document(text, subscription_id, profile_tag, doc_tag, doc_name):
 #     """Trains and stores embeddings with enhanced chunking."""
 #     try:
-#         logging.info(f"Starting training for {doc_name}")
+#         logger.info(f"Starting training for {doc_name}")
 #
 #         if isinstance(text, dict):
 #             # Handle pre-embedded structured data (CSV/Excel)
@@ -1792,7 +1792,7 @@ def save_embeddings_to_qdrant(
 #             chunks = [chunk_text for chunk_text, meta in chunks_with_meta]
 #             chunk_metadata = [meta for chunk_text, meta in chunks_with_meta]
 #
-#             logging.info(f"Created {len(chunks)} enhanced chunks for {doc_name}")
+#             logger.info(f"Created {len(chunks)} enhanced chunks for {doc_name}")
 #
 #             # Generate embeddings
 #             model = get_model()
@@ -1845,9 +1845,8 @@ def save_embeddings_to_qdrant(
 #             raise ValueError(f"Unsupported format: {type(text)}")
 #
 #     except Exception as e:
-#         logging.error(f"Training error for {doc_name}: {e}")
+#         logger.error(f"Training error for {doc_name}: {e}")
 #         raise
-
 
 # CRITICAL FIX for train_on_document() in dataHandler.py
 
@@ -1855,13 +1854,11 @@ def save_embeddings_to_qdrant(
 
 from src.api.enhanced_retrieval import chunk_text_for_embedding
 
-
 def _safe_basename(value: Optional[str]) -> str:
     if not value:
         return ""
     text = str(value)
     return text.split("/")[-1] if "/" in text else text
-
 
 def _coerce_list(value: Any) -> List[str]:
     if value is None:
@@ -1872,7 +1869,6 @@ def _coerce_list(value: Any) -> List[str]:
         parts = [part.strip() for part in re.split(r"[;,]", value) if part.strip()]
         return parts or [value.strip()]
     return [str(value)]
-
 
 def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optional[str]) -> Dict[str, Any]:
     """Best-effort document metadata lookup for payload enrichment."""
@@ -1886,7 +1882,7 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
         if not record:
             record = collection.find_one({"document_id": str(doc_tag)}) or {}
     except Exception as exc:  # noqa: BLE001
-        logging.debug("Document metadata lookup failed for %s: %s", doc_tag, exc)
+        logger.debug("Document metadata lookup failed for %s: %s", doc_tag, exc)
         record = {}
 
     doc_type = (
@@ -1936,7 +1932,6 @@ def _fetch_document_metadata(doc_tag: str, doc_name: str, doc_type_hint: Optiona
         "temporal_span": temporal_span,
     }
 
-
 def _record_chunking_metrics(
     *,
     metrics_store: Any,
@@ -1959,7 +1954,6 @@ def _record_chunking_metrics(
         document_id=doc_tag,
         agent="embedding",
     )
-
 
 def _score_chunk_quality(text: str) -> Tuple[float, Dict[str, float]]:
     cleaned = (text or "").strip()
@@ -1985,7 +1979,6 @@ def _score_chunk_quality(text: str) -> Tuple[float, Dict[str, float]]:
         "repeat_ratio": repeat_ratio,
     }
 
-
 def _apply_chunk_quality_filter(
     chunks: List[str],
     metadata: List[Dict[str, Any]],
@@ -2009,13 +2002,11 @@ def _apply_chunk_quality_filter(
         meta["chunk_index"] = idx
     return filtered_chunks, filtered_meta, dropped
 
-
 def _sanitize_text_sample(text: Optional[str], limit: int = 80) -> str:
     sample = re.sub(r"\s+", " ", (text or "").strip())
     if len(sample) > limit:
         sample = sample[:limit].rstrip() + "..."
     return sample
-
 
 def _filter_invalid_chunk_texts(
     chunks: List[str],
@@ -2065,7 +2056,6 @@ def _filter_invalid_chunk_texts(
 
     return valid_chunks, valid_meta, diagnostics, valid_indices
 
-
 def _mark_chunking_failed(doc_tag: str, doc_name: str, diagnostics: Dict[str, Any]) -> None:
     try:
         from src.api.document_status import update_stage, update_document_fields
@@ -2088,8 +2078,7 @@ def _mark_chunking_failed(doc_tag: str, doc_name: str, diagnostics: Dict[str, An
             },
         )
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Failed to record chunking diagnostics for %s: %s", doc_tag, exc)
-
+        logger.warning("Failed to record chunking diagnostics for %s: %s", doc_tag, exc)
 
 def _extract_facts(text: str) -> List[str]:
     facts: List[str] = []
@@ -2101,7 +2090,6 @@ def _extract_facts(text: str) -> List[str]:
             if len(candidate) <= 200:
                 facts.append(candidate)
     return facts
-
 
 def _table_rows_from_csv(table_csv: str, *, max_rows: int = 25) -> List[str]:
     rows: List[str] = []
@@ -2117,10 +2105,10 @@ def _table_rows_from_csv(table_csv: str, *, max_rows: int = 25) -> List[str]:
             pairs = [f"{hdr}: {val}" for hdr, val in zip(headers, cells) if hdr.strip() and val.strip()]
             if pairs:
                 rows.append("; ".join(pairs))
-    except Exception:
+    except Exception as exc:
+        logger.debug("CSV table row parsing failed, returning %d partial rows: %s", len(rows), exc)
         return rows
     return rows
-
 
 def _build_chunk_metadata_from_section_chunks(
     section_chunks: List[Any],
@@ -2161,7 +2149,6 @@ def _build_chunk_metadata_from_section_chunks(
         )
     return metadata
 
-
 def _chunk_with_section_chunker(
     content: Any,
     *,
@@ -2198,7 +2185,6 @@ def _chunk_with_section_chunker(
         if full_text:
             coverage_ratio = len("".join(aligned_chunks)) / max(1, len(full_text))
     return aligned_chunks, aligned_meta, coverage_ratio
-
 
 def _fallback_chunk_text_sliding_window(
     text: str,
@@ -2256,7 +2242,6 @@ def _fallback_chunk_text_sliding_window(
 
     return chunks
 
-
 def _build_fallback_metadata(
     chunks: List[str],
     *,
@@ -2285,7 +2270,6 @@ def _build_fallback_metadata(
             }
         )
     return metadata
-
 
 def _fallback_chunks_for_full_text(
     full_text: str,
@@ -2334,7 +2318,6 @@ def _fallback_chunks_for_full_text(
     )
     return fallback_chunks, fallback_meta, prep_stats, validity_diag, valid_indices
 
-
 def _extract_text_from_item(item: Any) -> str:
     """Extract clean text from a texts list item that may be a string or chunk dict."""
     if isinstance(item, str):
@@ -2357,7 +2340,6 @@ def _extract_text_from_item(item: Any) -> str:
     # Never return str(item) — that's the garbage source
     return ""
 
-
 def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, device: Optional[str] = None):
     """
      COMPLETELY FIXED: Trains and stores embeddings with strict document_id verification
@@ -2372,12 +2354,12 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
         metrics_store = get_metrics_store()
         coverage_ratio = None
         dropped_chunks = 0
-        logging.info(f"=" * 80)
-        logging.info(f"Starting training for {doc_name}")
-        logging.info(f"  Document ID: {doc_tag}")
-        logging.info(f"  Subscription: {subscription_id}")
-        logging.info(f"  Profile: {profile_id}")
-        logging.info(f"=" * 80)
+        logger.info(f"=" * 80)
+        logger.info(f"Starting training for {doc_name}")
+        logger.info(f"  Document ID: {doc_tag}")
+        logger.info(f"  Subscription: {subscription_id}")
+        logger.info(f"  Profile: {profile_id}")
+        logger.info(f"=" * 80)
 
         if metrics_store.available:
             metrics_store.record(
@@ -2441,7 +2423,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             if len(doc_ids) > 1:
                 raise ValueError(f"Multiple document_ids in structured data: {doc_ids}")
             if doc_ids and list(doc_ids)[0] != doc_tag:
-                logging.warning(f"Fixing document_id in structured data: {doc_ids} -> {doc_tag}")
+                logger.warning(f"Fixing document_id in structured data: {doc_ids} -> {doc_tag}")
                 for meta in chunk_metadata:
                     meta["document_id"] = doc_tag
 
@@ -2612,7 +2594,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                         if added:
                             force_reembed = True
                 except Exception as exc:  # noqa: BLE001
-                    logging.debug("Section intelligence build skipped for %s: %s", doctag, exc)
+                    logger.debug("Section intelligence build skipped for %s: %s", doctag, exc)
             chunk_metadata = normalize_chunk_chain(
                 chunk_metadata,
                 subscription_id=subscription_id,
@@ -2634,7 +2616,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 isinstance(text.get("embeddings"), (list, tuple))
                 and len(text.get("embeddings") or []) != len(texts)
             ):
-                logging.info(
+                logger.info(
                     "Re-embedding structured chunks after integrity/dedupe: %s -> %s",
                     len(text.get("embeddings") or []),
                     len(texts),
@@ -2648,7 +2630,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 )
                 _encode_elapsed = time.time() - _encode_start
                 _cps = len(texts) / max(_encode_elapsed, 0.001)
-                logging.info(
+                logger.info(
                     "Embedding encode completed for %s: %d chunks in %.1fs (%.1f chunks/sec)",
                     doc_tag, len(texts), _encode_elapsed, _cps,
                 )
@@ -2685,7 +2667,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             # Post-pipeline expected count accounts for chunks dropped during upsert
             expected_points = pre_upsert_count - upsert_dropped - upsert_dedup
             if upsert_dropped:
-                logging.warning(
+                logger.warning(
                     "Embedding upsert dropped %d/%d chunks for %s (below min_chars/min_tokens)",
                     upsert_dropped, pre_upsert_count, doc_tag,
                 )
@@ -2693,7 +2675,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
                 )
-            logging.info(f" Stored {saved} structured embeddings")
+            logger.info(f" Stored {saved} structured embeddings")
             return {
                 "status": "success",
                 "points_saved": saved,
@@ -2708,7 +2690,8 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             if ocr_confidences:
                 try:
                     doc_ocr_confidence = float(sum(ocr_confidences) / len(ocr_confidences))
-                except Exception:
+                except Exception as exc:
+                    logger.debug("OCR confidence calculation failed: %s", exc)
                     doc_ocr_confidence = None
 
             if metrics_store.available:
@@ -2783,7 +2766,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 if full_text:
                     coverage_ratio = len("".join([normalize_text(c) for c in chunks if c])) / max(1, len(full_text))
             except Exception as exc:  # noqa: BLE001
-                logging.warning("LayoutGraph chunking failed for %s; falling back: %s", doc_name, exc)
+                logger.warning("LayoutGraph chunking failed for %s; falling back: %s", doc_name, exc)
                 chunking_mode = "section_aware"
                 chunks, chunk_metadata, coverage_ratio = _chunk_with_section_chunker(
                     text,
@@ -2815,12 +2798,12 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                         ttl_seconds=cache.summary_ttl,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logging.debug("LayoutGraph cache skipped for %s: %s", doc_tag, exc)
+                    logger.debug("LayoutGraph cache skipped for %s: %s", doc_tag, exc)
 
             full_text = normalize_text(text.full_text or "")
             coverage_threshold = float(getattr(Config.Retrieval, "CHUNK_COVERAGE_THRESHOLD", 0.98))
             if full_text and coverage_ratio is not None and coverage_ratio < coverage_threshold:
-                logging.warning(
+                logger.warning(
                     "Section chunk coverage %.3f below threshold %.3f for %s; falling back to full text",
                     coverage_ratio,
                     coverage_threshold,
@@ -2923,14 +2906,14 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 sentence_complete_flags=sentence_flags,
             )
 
-            logging.info("Generated %s section-aware chunks for %s", len(chunks), doc_name)
+            logger.info("Generated %s section-aware chunks for %s", len(chunks), doc_name)
 
             # Pre-embedding validation: filter garbage text before vectorization
             from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage as _is_embed_garbage
             _valid_c, _valid_m = [], []
             for _vc_t, _vc_m in zip(chunks, chunk_metadata):
                 if _is_embed_garbage(_vc_t) or len((_vc_t or "").strip()) < 20:
-                    logging.warning("Pre-embed gate: dropping garbage chunk for %s", doc_tag)
+                    logger.warning("Pre-embed gate: dropping garbage chunk for %s", doc_tag)
                     continue
                 _valid_c.append(_vc_t)
                 _valid_m.append(_vc_m)
@@ -2946,7 +2929,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 device=device,
             )
             embed_latency_ms = (time.time() - embed_start) * 1000
-            logging.info(
+            logger.info(
                 "Embedding encode completed for %s: %d chunks in %.1fs (%.1f chunks/sec)",
                 doc_tag, len(chunks), embed_latency_ms / 1000.0,
                 len(chunks) / max(embed_latency_ms / 1000.0, 0.001),
@@ -2975,7 +2958,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             try:
                 summaries = compute_section_summaries(chunks, chunk_metadata, extracted=text)
             except Exception as exc:  # noqa: BLE001
-                logging.warning("Section summaries skipped for %s: %s", doc_tag, exc)
+                logger.warning("Section summaries skipped for %s: %s", doc_tag, exc)
                 summaries = [None for _ in chunks]
 
             ctx = ContextUnderstanding()
@@ -2991,7 +2974,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                     if not section_summary_map:
                         section_summary_map = doc_summary_bundle.get("section_summaries") or {}
                 except Exception as exc:  # noqa: BLE001
-                    logging.warning("Document summary skipped for %s: %s", doc_tag, exc)
+                    logger.warning("Document summary skipped for %s: %s", doc_tag, exc)
             section_title_to_pages = {
                 (sec.title or "").strip(): (sec.start_page, sec.end_page) for sec in text.sections
             }
@@ -3168,7 +3151,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             }
 
             # Save to Qdrant (will perform additional verification)
-            logging.info(f"Saving to Qdrant...")
+            logger.info(f"Saving to Qdrant...")
             result = save_embeddings_to_qdrant(
                 embeddings_payload,
                 subscription_id,
@@ -3177,7 +3160,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 doc_name
             )
 
-            logging.info(f"=" * 80)
+            logger.info(f"=" * 80)
             saved = result.get("points_saved", 0)
             upsert_dropped_ed = int(result.get("dropped_invalid", 0))
             upsert_dedup_ed = int(result.get("dropped_dedup", 0))
@@ -3187,10 +3170,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
                 )
-            logging.info(f" SUCCESS: Stored {saved} embeddings")
-            logging.info(f"  Document ID: {doc_tag}")
-            logging.info(f"  File: {doc_name}")
-            logging.info(f"=" * 80)
+            logger.info(f" SUCCESS: Stored {saved} embeddings")
+            logger.info(f"  Document ID: {doc_tag}")
+            logger.info(f"  File: {doc_name}")
+            logger.info(f"=" * 80)
 
             return {
                 "status": "success",
@@ -3204,7 +3187,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             if not text.strip():
                 raise ValueError(f"Empty content in {doc_name}")
 
-            logging.info(f"Chunking document with document_id={doc_tag}")
+            logger.info(f"Chunking document with document_id={doc_tag}")
 
             doc_metadata = _fetch_document_metadata(doc_tag, doc_name, None)
             doc_type = doc_metadata.get("doc_type")
@@ -3221,7 +3204,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 )
             except Exception as exc:  # noqa: BLE001
                 # Fallback to the legacy chunker to avoid total failure on edge cases.
-                logging.warning("Section chunking failed for %s: %s; falling back", doc_name, exc)
+                logger.warning("Section chunking failed for %s: %s; falling back", doc_name, exc)
                 chunks_with_meta = chunk_text_for_embedding(text, doc_name, document_id=doc_tag)
                 chunks = [chunk_text for chunk_text, _meta in chunks_with_meta if (chunk_text or "").strip()]
                 chunk_metadata = [meta for chunk_text, meta in chunks_with_meta if (chunk_text or "").strip()]
@@ -3310,14 +3293,14 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 sentence_complete_flags=sentence_flags,
             )
 
-            logging.info("Generated %s section-aware chunks for %s", len(chunks), doc_name)
+            logger.info("Generated %s section-aware chunks for %s", len(chunks), doc_name)
 
             # Pre-embedding validation: filter garbage text before vectorization
             from src.embedding.pipeline.schema_normalizer import _is_metadata_garbage as _is_embed_garbage
             _valid_c, _valid_m = [], []
             for _vc_t, _vc_m in zip(chunks, chunk_metadata):
                 if _is_embed_garbage(_vc_t) or len((_vc_t or "").strip()) < 20:
-                    logging.warning("Pre-embed gate: dropping garbage chunk for %s", doc_tag)
+                    logger.warning("Pre-embed gate: dropping garbage chunk for %s", doc_tag)
                     continue
                 _valid_c.append(_vc_t)
                 _valid_m.append(_vc_m)
@@ -3333,7 +3316,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 device=device,
             )
             embed_latency_ms = (time.time() - embed_start) * 1000
-            logging.info(
+            logger.info(
                 "Embedding encode completed for %s: %d chunks in %.1fs (%.1f chunks/sec)",
                 doc_tag, len(chunks), embed_latency_ms / 1000.0,
                 len(chunks) / max(embed_latency_ms / 1000.0, 0.001),
@@ -3362,13 +3345,13 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             try:
                 summaries = compute_section_summaries(chunks, chunk_metadata)
             except Exception as exc:  # noqa: BLE001
-                logging.warning("Section summaries skipped for %s: %s", doc_tag, exc)
+                logger.warning("Section summaries skipped for %s: %s", doc_tag, exc)
                 summaries = []
             if not any(summaries):
                 summaries = [chunk[:200] + "..." if len(chunk) > 200 else chunk for chunk in chunks]
 
             #  VERIFICATION STEP 2: Final check before saving
-            logging.info(f"Final verification before saving to Qdrant")
+            logger.info(f"Final verification before saving to Qdrant")
             for idx, meta in enumerate(chunk_metadata):
                 if meta.get('document_id') != doc_tag:
                     raise ValueError(
@@ -3409,7 +3392,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             }
 
             # Save to Qdrant (will perform additional verification)
-            logging.info(f"Saving to Qdrant...")
+            logger.info(f"Saving to Qdrant...")
             result = save_embeddings_to_qdrant(
                 embeddings,
                 subscription_id,
@@ -3418,7 +3401,7 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 doc_name
             )
 
-            logging.info(f"=" * 80)
+            logger.info(f"=" * 80)
             saved = result.get("points_saved", 0)
             upsert_dropped_ed = int(result.get("dropped_invalid", 0))
             upsert_dedup_ed = int(result.get("dropped_dedup", 0))
@@ -3428,10 +3411,10 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
                 raise ValueError(
                     f"Embedding upsert mismatch for {doc_tag}: expected {expected_points}, saved {saved}"
                 )
-            logging.info(f" SUCCESS: Stored {saved} embeddings")
-            logging.info(f"  Document ID: {doc_tag}")
-            logging.info(f"  File: {doc_name}")
-            logging.info(f"=" * 80)
+            logger.info(f" SUCCESS: Stored {saved} embeddings")
+            logger.info(f"  Document ID: {doc_tag}")
+            logger.info(f"  File: {doc_name}")
+            logger.info(f"=" * 80)
 
             return {
                 "status": "success",
@@ -3445,18 +3428,17 @@ def train_on_document(text, subscription_id, profile_id, doc_tag, doc_name, devi
             raise ValueError(f"Unsupported format: {type(text)}")
 
     except Exception as e:
-        logging.error(f"=" * 80)
-        logging.error(f"L TRAINING FAILED for {doc_name}")
-        logging.error(f"  Document ID: {doc_tag}")
-        logging.error(f"  Error: {e}")
-        logging.error(f"=" * 80)
+        logger.error(f"=" * 80)
+        logger.error(f"L TRAINING FAILED for {doc_name}")
+        logger.error(f"  Document ID: {doc_tag}")
+        logger.error(f"  Error: {e}")
+        logger.error(f"=" * 80)
         try:
             if telemetry:
                 telemetry.increment("embedding_failures_count")
-        except Exception:
-            pass
+        except Exception as tel_exc:
+            logger.debug("Telemetry increment failed: %s", tel_exc)
         raise
-
 
 def process_document_pipeline(
     document_id: str,
@@ -3486,6 +3468,7 @@ def process_document_pipeline(
         )
         extraction_info = {"status": "ok", "blob": save_info.get("blob_name")}
     except Exception as exc:  # noqa: BLE001
+        logger.error("Document extraction failed for %s: %s", document_id, exc)
         errors.append(str(exc))
         return {
             "document_id": document_id,
@@ -3507,6 +3490,7 @@ def process_document_pipeline(
                 save_info.get("sha256"),
             )
     except Exception as exc:  # noqa: BLE001
+        logger.error("Metadata update failed for %s: %s", document_id, exc)
         errors.append(str(exc))
         return {
             "document_id": document_id,
@@ -3528,6 +3512,7 @@ def process_document_pipeline(
         }
         update_security_screening(document_id, security_report, security_status)
     except Exception as exc:  # noqa: BLE001
+        logger.error("Security screening failed for %s: %s", document_id, exc)
         errors.append(str(exc))
         security_info = {"status": "failed", "risk_level": "UNKNOWN"}
         return {
@@ -3559,6 +3544,7 @@ def process_document_pipeline(
             masked_docs = extracted_doc
             update_pii_stats(document_id, 0, False, [])
     except Exception as exc:  # noqa: BLE001
+        logger.error("PII masking failed for %s: %s", document_id, exc)
         errors.append(str(exc))
         embedding_info = {"status": "failed", "chunks": 0, "upserted": 0}
         return {
@@ -3587,6 +3573,7 @@ def process_document_pipeline(
             raise ValueError(f"Embedding upsert mismatch: expected {total_chunks}, saved {total_upserted}")
         embedding_info = {"status": "completed", "chunks": total_chunks, "upserted": total_upserted}
     except Exception as exc:  # noqa: BLE001
+        logger.error("Embedding failed for %s: %s", document_id, exc)
         errors.append(str(exc))
         embedding_info = {"status": "failed", "chunks": 0, "upserted": 0}
         return {
@@ -3600,11 +3587,11 @@ def process_document_pipeline(
 
     # Preserve extracted pickle files for audit / retraining. Do NOT delete by default.
     try:
-        logging.info("Preserving extracted pickle for document %s (deletion skipped)", document_id)
+        logger.info("Preserving extracted pickle for document %s (deletion skipped)", document_id)
         cleanup_info["pickle_deleted"] = False
         cleanup_info["cleanup_pending"] = False
     except Exception as exc:  # noqa: BLE001
-        logging.warning("Preserve-pickle logging failed for %s: %s", document_id, exc)
+        logger.warning("Preserve-pickle logging failed for %s: %s", document_id, exc)
         cleanup_info["pickle_deleted"] = False
         cleanup_info["cleanup_pending"] = False
 
@@ -3617,20 +3604,18 @@ def process_document_pipeline(
         "errors": errors,
     }
 
-
-def trainData():
+def trainData(subscription_id: str = None):
     """Extraction-only pipeline for documents eligible for processing."""
     try:
         from src.api.extraction_service import extract_documents
 
-        logging.info("=" * 80)
-        logging.info("Starting extraction process")
-        logging.info("=" * 80)
-        return extract_documents()
+        logger.info("=" * 80)
+        logger.info("Starting extraction process (subscription=%s)", subscription_id)
+        logger.info("=" * 80)
+        return extract_documents(subscription_id=subscription_id)
     except Exception as e:
-        logging.error(f"Critical error in extraction data: {e}", exc_info=True)
-        return {"status": "error", "message": str(e), "results": None}
-
+        logger.error(f"Critical error in extraction data: {e}", exc_info=True)
+        return {"status": "error", "message": str(e), "documents": []}
 
 # New function: train_single_document
 def train_single_document(doc_id: str):
@@ -3638,9 +3623,9 @@ def train_single_document(doc_id: str):
     try:
         from src.api.extraction_service import extract_single_document
 
-        logging.info(f"Starting single-document extraction for ID: {doc_id}")
+        logger.info(f"Starting single-document extraction for ID: {doc_id}")
         return extract_single_document(doc_id)
     except Exception as e:
-        logging.error(f"Critical error during single-document extraction for {doc_id}: {e}", exc_info=True)
+        logger.error(f"Critical error during single-document extraction for {doc_id}: {e}", exc_info=True)
         update_training_status(doc_id, 'TRAINING_FAILED', str(e))
         return {"status": "error", "message": str(e)}

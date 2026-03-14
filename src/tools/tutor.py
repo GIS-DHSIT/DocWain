@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
@@ -11,17 +11,15 @@ from src.tools.base import generate_correlation_id, register_tool, standard_resp
 from src.tools.common.grounding import build_source_record
 from src.tools.common.text_extract import sanitize_text
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/tutor", tags=["Tools-Tutor"])
-
 
 class TutorRequest(BaseModel):
     topic: Optional[str] = Field(default=None, description="Topic of interest")
     learning_level: str = Field(default="beginner", pattern="^(beginner|intermediate|advanced)$")
     text: Optional[str] = Field(default=None, description="Raw reference text")
     context: Optional[Dict[str, Any]] = Field(default=None, description="Context metadata or sources")
-
 
 def _derive_key_points(text: str) -> List[str]:
     """Derive key points using LLM first, regex fallback."""
@@ -44,7 +42,6 @@ def _derive_key_points(text: str) -> List[str]:
         return []
     parts = [p.strip() for p in text.replace("\n", " ").split(".") if p.strip()]
     return parts[:5] or [text[:120]]
-
 
 def _build_quiz(points: List[str]) -> List[Dict[str, str]]:
     """Build quiz questions using LLM first, template fallback."""
@@ -72,7 +69,6 @@ def _build_quiz(points: List[str]) -> List[Dict[str, str]]:
     for idx, point in enumerate(points[:5], start=1):
         quiz.append({"question": f"Q{idx}: What does this mean? {point}", "answer": f"It refers to: {point}"})
     return quiz
-
 
 def _llm_build_lesson(topic: str, text: str, level: str) -> Optional[Dict[str, Any]]:
     """LLM-powered lesson builder. Returns None on failure."""
@@ -105,7 +101,6 @@ def _llm_build_lesson(topic: str, text: str, level: str) -> Optional[Dict[str, A
         logger.debug("LLM lesson build failed: %s", exc)
         return None
 
-
 def _render_lesson(topic: str, level: str, key_points: List[str], quiz: List[Dict[str, str]], llm_explanation: str = "") -> str:
     """Render lesson into markdown for pipeline pre-rendering."""
     parts: List[str] = []
@@ -121,7 +116,6 @@ def _render_lesson(topic: str, level: str, key_points: List[str], quiz: List[Dic
         for q in quiz[:3]:
             parts.append(f"- {q.get('question', '')}")
     return "\n".join(parts)
-
 
 def _build_lesson(req: TutorRequest) -> Dict[str, Any]:
     """Build a lesson using LLM-powered generation with regex fallback."""
@@ -150,7 +144,6 @@ def _build_lesson(req: TutorRequest) -> Dict[str, Any]:
         "rendered": rendered,
     }
 
-
 @register_tool("tutor")
 async def tutor_handler(payload: Dict[str, Any], correlation_id: Optional[str] = None) -> Dict[str, Any]:
     req = TutorRequest(**(payload.get("input") or payload))
@@ -162,7 +155,6 @@ async def tutor_handler(payload: Dict[str, Any], correlation_id: Optional[str] =
         "grounded": True,
         "context_found": bool(req.text or req.topic),
     }
-
 
 @router.post("/lesson")
 async def lesson(request: TutorRequest, x_correlation_id: str | None = Header(None)):

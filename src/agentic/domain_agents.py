@@ -12,19 +12,20 @@ Each agent performs domain-specific tasks beyond simple extraction:
 - WebAgent: web search, URL fetching, research, fact checking
 - InsightsAgent: anomaly detection, pattern finding, action items, risk assessment
 - ScreeningAgent: PII detection, AI content detection, resume screening, readability
+- CustomerServiceAgent: issue resolution, troubleshooting, escalation, customer responses
+- AnalyticsVisualizationAgent: chart generation, distributions, comparisons, dashboards
 
 Agents use the existing tool handlers for data extraction, then add an LLM reasoning
 layer for higher-order analysis tasks.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Agent result
@@ -52,7 +53,6 @@ class AgentTaskResult:
             "error": self.error,
         }
 
-
 # ---------------------------------------------------------------------------
 # Base domain agent
 # ---------------------------------------------------------------------------
@@ -62,8 +62,8 @@ class DomainAgent(ABC):
 
     MoE routing:
       - Agents with ``use_thinking_model = True`` (reasoning-heavy) use lfm2.5-thinking
-        when a thinking_client is provided, falling back to gpt-oss.
-      - Agents with ``use_thinking_model = False`` (generation-heavy) always use gpt-oss.
+        when a thinking_client is provided, falling back to DocWain-Agent.
+      - Agents with ``use_thinking_model = False`` (generation-heavy) always use DocWain-Agent.
     """
 
     domain: str = "generic"
@@ -78,7 +78,7 @@ class DomainAgent(ABC):
         """Return the appropriate LLM client based on MoE routing.
 
         Reasoning agents → lfm2.5-thinking (fast, parallel-safe)
-        Generation agents → gpt-oss (full power, long text)
+        Generation agents → DocWain-Agent (full power, long text)
         """
         # For reasoning tasks, prefer thinking model when available
         if self.use_thinking_model and self._thinking is not None:
@@ -93,7 +93,7 @@ class DomainAgent(ABC):
         return self._llm
 
     def _get_base_llm(self) -> Any:
-        """Always return the base (gpt-oss) LLM, bypassing thinking model."""
+        """Always return the base (DocWain-Agent) LLM, bypassing thinking model."""
         if self._llm is None:
             try:
                 from src.llm.clients import OllamaClient
@@ -102,7 +102,7 @@ class DomainAgent(ABC):
                 logger.warning("Failed to initialize base LLM client: %s", exc)
         return self._llm
 
-    def _generate(self, prompt: str, temperature: float = 0.3, max_tokens: int = 1024) -> str:
+    def _generate(self, prompt: str, temperature: float = 0.3, max_tokens: int = 2048) -> str:
         """Generate text using the LLM client (MoE-routed)."""
         llm = self._get_llm()
         if llm is None:
@@ -143,7 +143,6 @@ class DomainAgent(ABC):
     def can_handle(self, task_type: str) -> bool:
         """Check if this agent can handle the given task type."""
         return task_type in self.get_capabilities()
-
 
 # ---------------------------------------------------------------------------
 # Resume Agent
@@ -191,17 +190,24 @@ class ResumeAgent(DomainAgent):
         job_role = context.get("job_role", "")
         num_questions = min(context.get("num_questions", 10), 20)
 
-        role_context = f" for the role of {job_role}" if job_role else ""
+        role_context = f" for the role of **{job_role}**" if job_role else ""
         prompt = (
             f"You are an expert technical interviewer. Based on the following resume, "
             f"generate {num_questions} targeted interview questions{role_context}.\n\n"
             f"Include a mix of:\n"
-            f"- Technical questions about their claimed skills\n"
-            f"- Behavioral questions about their experience\n"
-            f"- Situational questions relevant to their background\n"
-            f"- Questions that probe depth vs breadth of knowledge\n\n"
+            f"- Technical questions that probe depth of their claimed skills\n"
+            f"- Behavioral questions (STAR format) about their specific experience\n"
+            f"- Situational questions relevant to their career level\n"
+            f"- Questions that verify claims made in the resume\n\n"
+            f"OUTPUT FORMAT — use this exact structure for each question:\n"
+            f"1. [TECHNICAL] Question text here\n"
+            f"   *Rationale: Why this question matters for this candidate*\n\n"
+            f"EXAMPLE:\n"
+            f"1. [TECHNICAL] You mention leading a migration to Kubernetes. "
+            f"Walk me through how you handled rollback strategy for stateful services.\n"
+            f"   *Rationale: Tests depth of K8s knowledge beyond basic deployment*\n\n"
             f"Resume:\n{resume_text[:4000]}\n\n"
-            f"Format each question with a brief rationale in parentheses."
+            f"Generate exactly {num_questions} questions. Reference specific details from the resume."
         )
         output = self._generate(prompt, temperature=0.4, max_tokens=2048)
         return AgentTaskResult(
@@ -301,7 +307,6 @@ class ResumeAgent(DomainAgent):
         output = self._generate(prompt, temperature=0.2)
         return AgentTaskResult(task_type="certification_lookup", success=bool(output), output=output)
 
-
 # ---------------------------------------------------------------------------
 # Medical Agent
 # ---------------------------------------------------------------------------
@@ -310,6 +315,7 @@ class MedicalAgent(DomainAgent):
     """Specialized agent for medical document analysis tasks."""
 
     domain = "medical"
+    use_thinking_model = False  # Generation-heavy (summaries, interpretations) — not reasoning
 
     def get_capabilities(self) -> List[str]:
         return [
@@ -345,12 +351,18 @@ class MedicalAgent(DomainAgent):
         """Analyze potential drug interactions from medical records."""
         text = context.get("text", "")
         prompt = (
-            f"Analyze the following medical document for potential drug interactions.\n"
-            f"List each medication mentioned, then identify:\n"
-            f"1. Known drug-drug interactions\n"
-            f"2. Potential contraindications\n"
-            f"3. Dosage concerns\n"
-            f"NOTE: This is for informational purposes only. Always consult a healthcare provider.\n\n"
+            f"Analyze the following medical document for potential drug interactions.\n\n"
+            f"For each medication found:\n"
+            f"1. **Name** and dosage as stated in the document\n"
+            f"2. Drug class (e.g., SSRI, beta-blocker, anticoagulant)\n\n"
+            f"Then for each potential interaction pair:\n"
+            f"- **Drugs involved**: Drug A + Drug B\n"
+            f"- **Interaction type**: pharmacokinetic/pharmacodynamic\n"
+            f"- **Severity**: HIGH / MEDIUM / LOW\n"
+            f"- **Clinical effect**: What could happen\n"
+            f"- **Management**: How to mitigate\n\n"
+            f"Present interactions in a markdown table.\n"
+            f"NOTE: For informational purposes only. Always consult a healthcare provider.\n\n"
             f"Document:\n{text[:4000]}"
         )
         output = self._generate(prompt, temperature=0.1)
@@ -389,10 +401,15 @@ class MedicalAgent(DomainAgent):
         """Interpret lab results with clinical context."""
         text = context.get("text", "")
         prompt = (
-            f"Interpret the following lab results. For each result:\n"
-            f"1. State whether it's normal, high, or low\n"
-            f"2. Explain clinical significance\n"
-            f"3. Suggest possible conditions if abnormal\n"
+            f"Interpret the following lab results using this format:\n\n"
+            f"| Test | Value | Reference Range | Status | Clinical Significance |\n"
+            f"|------|-------|-----------------|--------|----------------------|\n"
+            f"| HbA1c | 7.2% | <7% | **HIGH** | Sub-optimal glycemic control |\n\n"
+            f"For each abnormal result:\n"
+            f"- **Status**: HIGH / LOW / CRITICAL\n"
+            f"- **Clinical significance**: What this means for the patient\n"
+            f"- **Possible conditions**: Only list conditions supported by the lab pattern\n\n"
+            f"End with an overall assessment paragraph.\n"
             f"NOTE: For informational purposes only.\n\n"
             f"Lab Results:\n{text[:4000]}"
         )
@@ -446,7 +463,6 @@ class MedicalAgent(DomainAgent):
         output = self._generate(prompt, temperature=0.1)
         return AgentTaskResult(task_type="evidence_based_review", success=bool(output), output=output)
 
-
 # ---------------------------------------------------------------------------
 # Legal Agent
 # ---------------------------------------------------------------------------
@@ -489,12 +505,19 @@ class LegalAgent(DomainAgent):
     def _clause_risk_assessment(self, context: Dict[str, Any]) -> AgentTaskResult:
         text = context.get("text", "")
         prompt = (
-            f"Analyze the following legal document for risky clauses.\n"
-            f"For each risky clause:\n"
-            f"1. Quote the clause\n"
-            f"2. Risk level (HIGH/MEDIUM/LOW)\n"
-            f"3. Explanation of risk\n"
-            f"4. Suggested alternative language\n\n"
+            f"Analyze the following legal document for risky clauses.\n\n"
+            f"RISK CLASSIFICATION:\n"
+            f"- **HIGH**: Creates unilateral liability, unreasonable indemnification, "
+            f"unlimited penalties, or is potentially unenforceable\n"
+            f"- **MEDIUM**: Ambiguous language, missing definitions, one-sided but common\n"
+            f"- **LOW**: Standard boilerplate, well-balanced provisions\n\n"
+            f"For each risky clause found:\n\n"
+            f"| # | Clause (quoted) | Risk | Impact | Suggested Alternative |\n"
+            f"|---|-----------------|------|--------|----------------------|\n\n"
+            f"EXAMPLE:\n"
+            f"| 1 | \"Party A shall bear unlimited liability...\" | **HIGH** | "
+            f"Unrestricted financial exposure | Add liability cap: \"not to exceed 2x contract value\" |\n\n"
+            f"End with a **Risk Summary**: total HIGH/MEDIUM/LOW counts and overall assessment.\n\n"
             f"Document:\n{text[:4000]}"
         )
         output = self._generate(prompt, temperature=0.1)
@@ -594,7 +617,6 @@ class LegalAgent(DomainAgent):
             structured_data={"country": country},
         )
 
-
 # ---------------------------------------------------------------------------
 # Invoice/Financial Agent
 # ---------------------------------------------------------------------------
@@ -687,7 +709,6 @@ class InvoiceAgent(DomainAgent):
         output = self._generate(prompt, temperature=0.1)
         return AgentTaskResult(task_type="duplicate_detection", success=bool(output), output=output)
 
-
 # ---------------------------------------------------------------------------
 # Content Agent
 # ---------------------------------------------------------------------------
@@ -699,7 +720,7 @@ class ContentAgent(DomainAgent):
     """
 
     domain = "content"
-    use_thinking_model = False  # Generation-heavy — always uses gpt-oss
+    use_thinking_model = False  # Generation-heavy — always uses DocWain-Agent
 
     def get_capabilities(self) -> List[str]:
         return [
@@ -839,7 +860,6 @@ class ContentAgent(DomainAgent):
             structured_data={"num_slides": num_slides, "topic": topic},
         )
 
-
 # ---------------------------------------------------------------------------
 # Translator Agent
 # ---------------------------------------------------------------------------
@@ -851,7 +871,7 @@ class TranslatorAgent(DomainAgent):
     """
 
     domain = "translation"
-    use_thinking_model = False  # Generation-heavy — always uses gpt-oss
+    use_thinking_model = False  # Generation-heavy — always uses DocWain-Agent
 
     def get_capabilities(self) -> List[str]:
         return [
@@ -959,7 +979,6 @@ class TranslatorAgent(DomainAgent):
             structured_data={"target_region": target_region, "target_language": target_language},
         )
 
-
 # ---------------------------------------------------------------------------
 # Tutor Agent
 # ---------------------------------------------------------------------------
@@ -971,7 +990,7 @@ class TutorAgent(DomainAgent):
     """
 
     domain = "education"
-    use_thinking_model = False  # Generation-heavy — always uses gpt-oss
+    use_thinking_model = False  # Generation-heavy — always uses DocWain-Agent
 
     def get_capabilities(self) -> List[str]:
         return [
@@ -1093,7 +1112,6 @@ class TutorAgent(DomainAgent):
             task_type="study_guide", success=bool(output), output=output,
             structured_data={"topic": topic},
         )
-
 
 # ---------------------------------------------------------------------------
 # Image Agent
@@ -1273,7 +1291,6 @@ class ImageAgent(DomainAgent):
             structured_data={"method": "text_based"},
         )
 
-
 # ---------------------------------------------------------------------------
 # Web Agent
 # ---------------------------------------------------------------------------
@@ -1396,7 +1413,6 @@ class WebAgent(DomainAgent):
             task_type="fact_check", success=bool(output), output=output,
             structured_data={"claim": claim[:200]},
         )
-
 
 # ---------------------------------------------------------------------------
 # Insights Agent
@@ -1534,7 +1550,6 @@ class InsightsAgent(DomainAgent):
             task_type="generate_report", success=bool(output), output=output,
             structured_data={"report_type": report_type},
         )
-
 
 # ---------------------------------------------------------------------------
 # Screening Agent
@@ -1693,7 +1708,6 @@ class ScreeningAgent(DomainAgent):
             structured_data={"standards": standards},
         )
 
-
 # ---------------------------------------------------------------------------
 # Cloud Platform Agent
 # ---------------------------------------------------------------------------
@@ -1788,6 +1802,442 @@ class CloudPlatformAgent(DomainAgent):
         output = self._generate(prompt, temperature=0.3, max_tokens=2048)
         return AgentTaskResult(task_type="cross_platform_summary", success=bool(output), output=output)
 
+# ---------------------------------------------------------------------------
+# Customer Service Agent
+# ---------------------------------------------------------------------------
+
+class CustomerServiceAgent(DomainAgent):
+    """Specialized agent for customer support, issue resolution, and FAQ tasks.
+
+    Provides document-grounded support: resolves user issues, troubleshoots
+    problems, assesses escalation needs, drafts customer responses, and
+    searches knowledge base / FAQ content.
+    """
+
+    domain = "customer_service"
+    use_thinking_model = True  # reasoning needed for issue resolution
+
+    def get_capabilities(self) -> List[str]:
+        return [
+            "resolve_issue",
+            "troubleshoot",
+            "escalation_assessment",
+            "generate_response",
+            "faq_search",
+        ]
+
+    def execute(self, task_type: str, context: Dict[str, Any]) -> AgentTaskResult:
+        handlers = {
+            "resolve_issue": self._resolve_issue,
+            "troubleshoot": self._troubleshoot,
+            "escalation_assessment": self._escalation_assessment,
+            "generate_response": self._generate_response,
+            "faq_search": self._faq_search,
+        }
+        handler = handlers.get(task_type)
+        if not handler:
+            return AgentTaskResult(task_type=task_type, success=False, error=f"Unknown task: {task_type}")
+        try:
+            return handler(context)
+        except Exception as exc:
+            logger.warning("CustomerServiceAgent.%s failed: %s", task_type, exc)
+            return AgentTaskResult(task_type=task_type, success=False, error=str(exc))
+
+    def _resolve_issue(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Analyze query against document knowledge to resolve customer questions."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        prompt = (
+            f"You are an expert customer service agent. Resolve the customer's "
+            f"issue using ONLY the provided document evidence.\n\n"
+            f"Customer query: {query}\n\n"
+            f"Guidelines:\n"
+            f"1. Address the customer's concern directly and specifically\n"
+            f"2. Reference relevant policy sections, terms, or procedures from the documents\n"
+            f"3. Provide clear next steps the customer can take\n"
+            f"4. If the documents don't fully answer the question, state what IS covered\n"
+            f"5. Use a professional, empathetic tone\n\n"
+            f"Document evidence:\n{text[:4000]}"
+        )
+        output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+        return AgentTaskResult(task_type="resolve_issue", success=bool(output), output=output)
+
+    def _troubleshoot(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Step-by-step troubleshooting from manuals/FAQs/guides."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        prompt = (
+            f"Provide clear step-by-step troubleshooting for the customer's problem. "
+            f"Number each step.\n\n"
+            f"Customer problem: {query}\n\n"
+            f"Guidelines:\n"
+            f"1. Start with the simplest, most common fix\n"
+            f"2. Progress to more complex solutions\n"
+            f"3. Include any prerequisites or warnings for each step\n"
+            f"4. Reference specific sections from the documentation\n"
+            f"5. End with escalation guidance if the steps don't resolve the issue\n\n"
+            f"Reference documentation:\n{text[:4000]}"
+        )
+        output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+        return AgentTaskResult(task_type="troubleshoot", success=bool(output), output=output)
+
+    def _escalation_assessment(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Determine if issue needs escalation based on complexity."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        prompt = (
+            f"Assess whether this customer issue needs escalation.\n\n"
+            f"Customer issue: {query}\n\n"
+            f"Provide:\n"
+            f"1. **Severity**: Low / Medium / High / Critical\n"
+            f"2. **Category**: Technical / Billing / Policy / Compliance / Safety\n"
+            f"3. **Escalation Recommended**: Yes / No\n"
+            f"4. **Escalation Path**: Which team or level should handle this\n"
+            f"5. **Justification**: Why this level of escalation is appropriate\n"
+            f"6. **Immediate Actions**: What can be done before escalation\n"
+            f"7. **SLA Impact**: Any time-sensitive considerations\n\n"
+            f"Context from documents:\n{text[:4000]}"
+        )
+        output = self._generate(prompt, temperature=0.1, max_tokens=1024)
+        return AgentTaskResult(
+            task_type="escalation_assessment", success=bool(output), output=output,
+            structured_data={"assessment_type": "escalation"},
+        )
+
+    def _generate_response(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Draft customer-facing response (empathetic, formal tone)."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        prompt = (
+            f"Draft a professional, empathetic customer response. "
+            f"Address the issue directly.\n\n"
+            f"Customer query: {query}\n\n"
+            f"Guidelines:\n"
+            f"1. Open with acknowledgement of the customer's concern\n"
+            f"2. Provide a clear, actionable resolution\n"
+            f"3. Reference relevant policy or documentation where helpful\n"
+            f"4. Close with next steps and an offer for further assistance\n"
+            f"5. Keep tone warm but professional\n"
+            f"6. Avoid jargon — use plain language\n\n"
+            f"Supporting documentation:\n{text[:4000]}"
+        )
+        output = self._generate(prompt, temperature=0.3, max_tokens=1024)
+        return AgentTaskResult(task_type="generate_response", success=bool(output), output=output)
+
+    def _faq_search(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Find most relevant FAQ/KB entries for the query."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        prompt = (
+            f"Find the most relevant knowledge base entries for this customer query. "
+            f"Format as Q&A pairs.\n\n"
+            f"Customer query: {query}\n\n"
+            f"Instructions:\n"
+            f"1. Extract the most relevant Q&A pairs from the documents\n"
+            f"2. Format each as:\n"
+            f"   **Q:** [Question]\n"
+            f"   **A:** [Answer]\n"
+            f"3. Rank by relevance to the customer's query\n"
+            f"4. Include at most 5 Q&A pairs\n"
+            f"5. If no direct FAQ match, synthesize answers from the document content\n\n"
+            f"Knowledge base content:\n{text[:4000]}"
+        )
+        output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+        return AgentTaskResult(task_type="faq_search", success=bool(output), output=output)
+
+# ---------------------------------------------------------------------------
+# Analytics Visualization Agent
+# ---------------------------------------------------------------------------
+
+class AnalyticsVisualizationAgent(DomainAgent):
+    """Specialized agent for generating charts, graphs, and visualizations
+    from document data using matplotlib.
+
+    Generates base64-encoded PNG images that can be embedded in responses.
+    """
+
+    domain = "analytics_viz"
+    use_thinking_model = False  # generation-heavy, not reasoning
+
+    def get_capabilities(self) -> List[str]:
+        return [
+            "generate_chart",
+            "generate_distribution",
+            "generate_comparison_chart",
+            "generate_timeline_chart",
+            "generate_summary_dashboard",
+            "compute_statistics",
+        ]
+
+    def execute(self, task_type: str, context: Dict[str, Any]) -> AgentTaskResult:
+        handlers = {
+            "generate_chart": self._generate_chart,
+            "generate_distribution": self._generate_distribution,
+            "generate_comparison_chart": self._generate_comparison_chart,
+            "generate_timeline_chart": self._generate_timeline_chart,
+            "generate_summary_dashboard": self._generate_summary_dashboard,
+            "compute_statistics": self._compute_statistics,
+        }
+        handler = handlers.get(task_type)
+        if not handler:
+            return AgentTaskResult(task_type=task_type, success=False, error=f"Unknown task: {task_type}")
+        try:
+            return handler(context)
+        except Exception as exc:
+            logger.warning("AnalyticsVisualizationAgent.%s failed: %s", task_type, exc)
+            return AgentTaskResult(task_type=task_type, success=False, error=str(exc))
+
+    def _extract_data(self, text: str, query: str) -> List[Dict[str, Any]]:
+        """Use LLM to extract structured chart data from chunk text."""
+        try:
+            from src.tools.analytics_visualization import extract_chart_data
+            llm = self._get_base_llm()
+            return extract_chart_data(text, query, llm)
+        except Exception as exc:
+            logger.warning("Chart data extraction failed: %s", exc)
+            return []
+
+    def _generate_chart(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Auto-select and generate the best chart type from document data."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        data = self._extract_data(text, query)
+        if not data:
+            # Fall back to LLM text summary
+            prompt = (
+                f"The user asked for a chart/visualization but the data could not be "
+                f"extracted into a structured format. Provide a text-based data summary "
+                f"instead, formatted as a table.\n\n"
+                f"Query: {query}\n\nData:\n{text[:4000]}"
+            )
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_chart", success=bool(output), output=output)
+
+        try:
+            from src.tools.analytics_visualization import (
+                select_chart_type, generate_bar_chart, generate_pie_chart,
+                generate_line_chart,
+            )
+            chart_type = select_chart_type(query, data)
+            labels = [d.get("label", "") for d in data]
+            values = [d.get("value", 0) for d in data]
+            title = query[:80]
+
+            if chart_type == "pie":
+                img_b64 = generate_pie_chart(labels, values, title)
+            elif chart_type == "line":
+                img_b64 = generate_line_chart(labels, values, title)
+            else:
+                img_b64 = generate_bar_chart(labels, values, title)
+
+            summary = self._generate(
+                f"Briefly describe this chart data in 2-3 sentences:\n"
+                f"Title: {title}\nData: {data[:10]}",
+                temperature=0.2, max_tokens=256,
+            )
+            output = f"{summary}\n\n![chart](data:image/png;base64,{img_b64})"
+            return AgentTaskResult(
+                task_type="generate_chart", success=True, output=output,
+                structured_data={
+                    "charts": [{"title": title, "image_base64": img_b64, "type": chart_type}],
+                    "media": [{"type": "image/png", "title": title, "data": img_b64}],
+                },
+            )
+        except Exception as exc:
+            logger.debug("Chart generation failed, falling back to text: %s", exc)
+            prompt = f"Summarize this data as a text table:\nQuery: {query}\nData: {data[:10]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_chart", success=bool(output), output=output)
+
+    def _generate_distribution(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Generate distribution/histogram visualization."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        data = self._extract_data(text, query)
+        if not data:
+            prompt = f"Provide a text-based frequency/distribution analysis.\n\nQuery: {query}\n\nData:\n{text[:4000]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_distribution", success=bool(output), output=output)
+
+        try:
+            from src.tools.analytics_visualization import generate_histogram
+            values = [d.get("value", 0) for d in data]
+            title = query[:80]
+            img_b64 = generate_histogram(values, title)
+            summary = self._generate(
+                f"Describe this distribution in 2-3 sentences:\nTitle: {title}\nValues: {values[:20]}",
+                temperature=0.2, max_tokens=256,
+            )
+            output = f"{summary}\n\n![histogram](data:image/png;base64,{img_b64})"
+            return AgentTaskResult(
+                task_type="generate_distribution", success=True, output=output,
+                structured_data={
+                    "charts": [{"title": title, "image_base64": img_b64, "type": "histogram"}],
+                    "media": [{"type": "image/png", "title": title, "data": img_b64}],
+                },
+            )
+        except Exception as exc:
+            logger.warning("Histogram generation failed: %s", exc)
+            prompt = f"Provide a text distribution analysis.\nQuery: {query}\nData: {data[:10]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_distribution", success=bool(output), output=output)
+
+    def _generate_comparison_chart(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Side-by-side comparison chart."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        data = self._extract_data(text, query)
+        if not data:
+            prompt = f"Provide a text-based comparison table.\n\nQuery: {query}\n\nData:\n{text[:4000]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_comparison_chart", success=bool(output), output=output)
+
+        try:
+            from src.tools.analytics_visualization import generate_grouped_bar_chart
+            title = query[:80]
+            img_b64 = generate_grouped_bar_chart(data, title)
+            summary = self._generate(
+                f"Describe this comparison in 2-3 sentences:\nTitle: {title}\nData: {data[:10]}",
+                temperature=0.2, max_tokens=256,
+            )
+            output = f"{summary}\n\n![comparison](data:image/png;base64,{img_b64})"
+            return AgentTaskResult(
+                task_type="generate_comparison_chart", success=True, output=output,
+                structured_data={
+                    "charts": [{"title": title, "image_base64": img_b64, "type": "grouped_bar"}],
+                    "media": [{"type": "image/png", "title": title, "data": img_b64}],
+                },
+            )
+        except Exception as exc:
+            logger.warning("Comparison chart failed: %s", exc)
+            prompt = f"Provide a text comparison.\nQuery: {query}\nData: {data[:10]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_comparison_chart", success=bool(output), output=output)
+
+    def _generate_timeline_chart(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Temporal progression chart."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        data = self._extract_data(text, query)
+        if not data:
+            prompt = f"Provide a text-based timeline analysis.\n\nQuery: {query}\n\nData:\n{text[:4000]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_timeline_chart", success=bool(output), output=output)
+
+        try:
+            from src.tools.analytics_visualization import generate_line_chart
+            labels = [d.get("label", "") for d in data]
+            values = [d.get("value", 0) for d in data]
+            title = query[:80]
+            img_b64 = generate_line_chart(labels, values, title, xlabel="Time")
+            summary = self._generate(
+                f"Describe this timeline trend in 2-3 sentences:\nTitle: {title}\nData: {data[:10]}",
+                temperature=0.2, max_tokens=256,
+            )
+            output = f"{summary}\n\n![timeline](data:image/png;base64,{img_b64})"
+            return AgentTaskResult(
+                task_type="generate_timeline_chart", success=True, output=output,
+                structured_data={
+                    "charts": [{"title": title, "image_base64": img_b64, "type": "line"}],
+                    "media": [{"type": "image/png", "title": title, "data": img_b64}],
+                },
+            )
+        except Exception as exc:
+            logger.warning("Timeline chart failed: %s", exc)
+            prompt = f"Provide a text timeline.\nQuery: {query}\nData: {data[:10]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=1024)
+            return AgentTaskResult(task_type="generate_timeline_chart", success=bool(output), output=output)
+
+    def _generate_summary_dashboard(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Multi-chart summary dashboard."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        data = self._extract_data(text, query)
+        if not data:
+            prompt = (
+                f"Create a comprehensive text-based dashboard summary.\n\n"
+                f"Query: {query}\n\nData:\n{text[:4000]}"
+            )
+            output = self._generate(prompt, temperature=0.2, max_tokens=2048)
+            return AgentTaskResult(task_type="generate_summary_dashboard", success=bool(output), output=output)
+
+        try:
+            from src.tools.analytics_visualization import generate_bar_chart, generate_pie_chart
+            labels = [d.get("label", "") for d in data]
+            values = [d.get("value", 0) for d in data]
+            title = query[:80]
+            bar_b64 = generate_bar_chart(labels, values, f"{title} — Bar Chart")
+            pie_b64 = generate_pie_chart(labels, values, f"{title} — Pie Chart")
+            summary = self._generate(
+                f"Provide an executive summary of this data in 3-4 sentences:\n"
+                f"Title: {title}\nData: {data[:10]}",
+                temperature=0.2, max_tokens=512,
+            )
+            output = (
+                f"## Dashboard: {title}\n\n"
+                f"{summary}\n\n"
+                f"### Distribution\n"
+                f"![bar](data:image/png;base64,{bar_b64})\n\n"
+                f"### Proportions\n"
+                f"![pie](data:image/png;base64,{pie_b64})"
+            )
+            return AgentTaskResult(
+                task_type="generate_summary_dashboard", success=True, output=output,
+                structured_data={
+                    "charts": [
+                        {"title": f"{title} — Bar", "image_base64": bar_b64, "type": "bar"},
+                        {"title": f"{title} — Pie", "image_base64": pie_b64, "type": "pie"},
+                    ],
+                    "media": [
+                        {"type": "image/png", "title": f"{title} — Bar", "data": bar_b64},
+                        {"type": "image/png", "title": f"{title} — Pie", "data": pie_b64},
+                    ],
+                },
+            )
+        except Exception as exc:
+            logger.warning("Dashboard generation failed: %s", exc)
+            prompt = f"Create a text dashboard summary.\nQuery: {query}\nData: {data[:10]}"
+            output = self._generate(prompt, temperature=0.2, max_tokens=2048)
+            return AgentTaskResult(task_type="generate_summary_dashboard", success=bool(output), output=output)
+
+    def _compute_statistics(self, context: Dict[str, Any]) -> AgentTaskResult:
+        """Statistical analysis with visual output."""
+        text = context.get("text", "")
+        query = context.get("query", "")
+        data = self._extract_data(text, query)
+
+        # Always generate LLM statistical analysis
+        prompt = (
+            f"Perform a statistical analysis on the following document data.\n\n"
+            f"Query: {query}\n\n"
+            f"Provide:\n"
+            f"1. Key metrics (count, sum, average, min, max, median)\n"
+            f"2. Distribution characteristics\n"
+            f"3. Notable patterns or outliers\n"
+            f"4. Summary statistics table\n\n"
+            f"Data:\n{text[:4000]}"
+        )
+        analysis = self._generate(prompt, temperature=0.1, max_tokens=1024)
+
+        if data:
+            try:
+                from src.tools.analytics_visualization import generate_bar_chart
+                labels = [d.get("label", "") for d in data]
+                values = [d.get("value", 0) for d in data]
+                title = query[:80]
+                img_b64 = generate_bar_chart(labels, values, title)
+                output = f"{analysis}\n\n![statistics](data:image/png;base64,{img_b64})"
+                return AgentTaskResult(
+                    task_type="compute_statistics", success=True, output=output,
+                    structured_data={
+                        "charts": [{"title": title, "image_base64": img_b64, "type": "bar"}],
+                        "media": [{"type": "image/png", "title": title, "data": img_b64}],
+                    },
+                )
+            except Exception:
+                pass
+
+        return AgentTaskResult(task_type="compute_statistics", success=bool(analysis), output=analysis)
 
 # ---------------------------------------------------------------------------
 # Agent Registry
@@ -1824,20 +2274,24 @@ _DOMAIN_AGENTS: Dict[str, type] = {
     "sharepoint": CloudPlatformAgent,
     "jira": CloudPlatformAgent,
     "confluence": CloudPlatformAgent,
+    "customer_service": CustomerServiceAgent,
+    "support": CustomerServiceAgent,
+    "helpdesk": CustomerServiceAgent,
+    "analytics_viz": AnalyticsVisualizationAgent,
+    "chart": AnalyticsVisualizationAgent,
+    "visualization": AnalyticsVisualizationAgent,
 }
-
 
 def get_domain_agent(domain: str, llm_client: Any = None, thinking_client: Any = None) -> Optional[DomainAgent]:
     """Get a domain-specialized agent by domain name.
 
     MoE routing: ``thinking_client`` (lfm2.5-thinking) is passed to reasoning-heavy
-    agents; generation-heavy agents ignore it and always use gpt-oss.
+    agents; generation-heavy agents ignore it and always use DocWain-Agent.
     """
     agent_class = _DOMAIN_AGENTS.get(domain.lower())
     if agent_class is None:
         return None
     return agent_class(llm_client=llm_client, thinking_client=thinking_client)
-
 
 def list_available_agents() -> Dict[str, List[str]]:
     """List all available agents and their capabilities."""
@@ -1850,7 +2304,6 @@ def list_available_agents() -> Dict[str, List[str]]:
         agent = agent_class()
         result[domain] = agent.get_capabilities()
     return result
-
 
 def _ml_detect_domain(query: str) -> Optional[str]:
     """Use ML intent classifier to detect domain. Returns domain string or None."""
@@ -1877,156 +2330,111 @@ def _ml_detect_domain(query: str) -> Optional[str]:
         # Map ML domain names to agent domain names
         _ML_DOMAIN_TO_AGENT = {
             "resume": "hr", "invoice": "invoice", "legal": "legal",
-            "policy": "legal", "report": "analytics", "generic": None,
+            "policy": "legal", "medical": "medical",
+            "report": "analytics", "generic": None,
         }
         return _ML_DOMAIN_TO_AGENT.get(domain_name)
     except Exception:
         return None
 
+# Task detection now uses NLU engine — see src/nlp/nlu_engine.py domain_task registry.
+# No hardcoded keyword patterns needed.
 
-# Task type indicators — maps (domain, keyword_set) to task_type.
-# Used by both ML-detected and keyword-detected domains to resolve task type.
-_TASK_INDICATORS: Dict[str, List[tuple]] = {
-    "hr": [
-        (("interview question", "interview prep"), "generate_interview_questions"),
-        (("skill gap", "gap analysis", "missing skill"), "skill_gap_analysis"),
-        (("fit for", "suitable for", "good fit", "role fit"), "role_fit_assessment"),
-        (("experience timeline", "career timeline", "career history"), "experience_timeline"),
-        (("candidate summary", "summarize candidate", "profile summary"), "candidate_summary"),
-    ],
-    "medical": [
-        (("drug interaction", "interaction check", "contraindication"), "drug_interaction_check"),
-        (("treatment plan", "care plan"), "treatment_plan_review"),
-        (("lab result", "test result", "blood work"), "lab_result_interpretation"),
-        (("clinical summary", "medical summary"), "clinical_summary"),
-        (("patient history", "patient timeline", "medical history"), "patient_history_timeline"),
-    ],
-    "legal": [
-        (("risky clause", "risk assess", "red flag"), "clause_risk_assessment"),
-        (("compliance", "compliant", "regulation"), "compliance_check"),
-        (("compare contract", "contract comparison"), "contract_comparison"),
-        (("key terms", "defined terms", "legal definitions"), "key_terms_extraction"),
-        (("obligation", "deadline", "deliverable"), "obligation_tracker"),
-    ],
-    "invoice": [
-        (("anomal", "unusual", "suspicious"), "payment_anomaly_detection"),
-        (("categorize", "category", "classify expense"), "expense_categorization"),
-        (("duplicate", "double charge"), "duplicate_detection"),
-        (("vendor analysis", "vendor review", "supplier"), "vendor_analysis"),
-        (("financial summary", "invoice summary"), "financial_summary"),
-    ],
-    "content": [
-        (("draft email", "compose email", "write email", "draft an email"), "draft_email"),
-        (("create documentation", "generate docs", "api doc", "technical doc"), "generate_documentation"),
-        (("rewrite", "rephrase", "improve the text", "reword"), "rewrite_text"),
-        (("presentation", "slide deck", "slides"), "create_presentation"),
-        (("generate content", "create a summary", "generate summary"), "generate_content"),
-    ],
-    "translation": [
-        (("what language", "detect language", "identify language", "which language"), "detect_language"),
-        (("localize", "adapt for", "regional version"), "localize_content"),
-        (("summarize in", "summary in", "key points in"), "multilingual_summary"),
-        (("translate",), "translate_text"),
-    ],
-    "education": [
-        (("quiz", "test me"), "generate_quiz"),
-        (("study guide", "revision guide", "study material"), "study_guide"),
-        (("lesson", "teach me", "lesson plan"), "create_lesson"),
-        (("explain", "break down", "help me understand", "what does this mean"), "explain_concept"),
-    ],
-    "image": [
-        (("extract text from image", "ocr", "read the image text"), "extract_text_from_image"),
-        (("describe the image", "what is in the image"), "describe_image"),
-        (("extract data from image", "table from image", "form from image"), "extract_data_from_image"),
-        (("analyze image", "image analysis"), "analyze_image"),
-    ],
-    "web": [
-        (("fetch url", "open url", "get this url"), "fetch_url"),
-        (("fact check", "fact-check", "verify this claim", "is this true"), "fact_check"),
-        (("research", "deep dive", "investigate"), "research_topic"),
-        (("search the web", "search online", "search the internet", "look up"), "search_web"),
-    ],
-    "analytics": [
-        (("anomal", "outlier"), "detect_anomalies"),
-        (("pattern", "trend"), "find_patterns"),
-        (("action item", "extract tasks", "to-do", "deadlines"), "extract_action_items"),
-        (("risk assessment", "risk analysis", "identify risks", "red flags"), "risk_assessment"),
-        (("generate report", "analytical report", "create report"), "generate_report"),
-    ],
-    "screening": [
-        (("pii", "personal information", "pii scan"), "screen_pii"),
-        (("ai generated", "ai content", "ai written", "detect ai"), "detect_ai_content"),
-        (("screen resume", "resume screening", "evaluate resume"), "screen_resume"),
-        (("readability", "reading level", "writing quality"), "assess_readability"),
-        (("compliance scan", "compliance check"), "compliance_scan"),
-    ],
-    "cloud_platform": [
-        (("jira", "sprint", "issue tracker"), "jira_analysis"),
-        (("confluence", "wiki", "documentation hub"), "confluence_analysis"),
-        (("sharepoint", "document library", "sharepoint site"), "sharepoint_analysis"),
-        (("cross platform", "multi platform", "unified view"), "cross_platform_summary"),
-    ],
-}
+def _customer_service_fast_path(query: str) -> Optional[Dict[str, str]]:
+    """Keyword fast-path for customer service tasks.
 
-# Domain entry keywords — when domain isn't pre-set, these trigger domain detection
-_DOMAIN_ENTRY_KEYWORDS: Dict[str, tuple] = {
-    "hr": ("resume", "candidate", "interview"),
-    "medical": ("drug interaction", "medication", "clinical", "patient", "diagnosis", "treatment plan", "lab result", "blood work"),
-    "legal": ("contract", "clause", "agreement", "legal", "compliance", "obligation"),
-    "invoice": ("invoice", "payment", "expense", "financial"),
-    "content": ("draft email", "draft an email", "compose email", "create documentation", "rewrite", "generate content", "write email"),
-    "translation": ("translate", "translation", "what language"),
-    "education": ("teach me", "quiz", "explain", "study guide", "lesson"),
-    "image": ("analyze image", "extract text from image", "describe image"),
-    "web": ("search the web", "fetch url", "research", "fact check"),
-    "analytics": ("anomalies", "patterns", "action items", "risk assessment", "analytical report"),
-    "screening": ("pii", "ai generated", "screen resume", "readability"),
-    "cloud_platform": ("sharepoint", "jira project", "confluence wiki", "cloud platform"),
-}
+    Fires only on high-confidence signals that embedding similarity may miss.
+    """
+    import re
+    ql = query.lower().strip()
 
+    # resolve_issue: "resolve" + customer/support context
+    if re.search(r"\bresolv\w*\b", ql) and re.search(r"\b(customer|support|service|issue|complaint|request)\b", ql):
+        return {"domain": "customer_service", "task_type": "resolve_issue"}
 
-def _resolve_task_type(query_lower: str, agent_domain: str) -> Optional[str]:
-    """Given a domain, match the best task type from query keywords."""
-    indicators = _TASK_INDICATORS.get(agent_domain, [])
-    for keywords, task_type in indicators:
-        if any(kw in query_lower for kw in keywords):
-            return task_type
+    # troubleshoot: explicit troubleshooting
+    if re.search(r"\btroubleshoot\b", ql):
+        return {"domain": "customer_service", "task_type": "troubleshoot"}
+    if re.search(r"\bdiagnos\w*\b.*\b(issue|problem|error)\b", ql):
+        return {"domain": "customer_service", "task_type": "troubleshoot"}
+
+    # escalation_assessment: escalation keywords
+    if re.search(r"\bescalat\w*\b", ql):
+        return {"domain": "customer_service", "task_type": "escalation_assessment"}
+
+    # generate_response: draft/generate + customer/support reply context
+    if re.search(r"\b(generate|draft|compose|write)\b", ql) and re.search(r"\b(customer|support|service)\b", ql) and re.search(r"\b(reply|response|message|answer)\b", ql):
+        return {"domain": "customer_service", "task_type": "generate_response"}
+
+    # faq_search: FAQ or knowledge base search
+    if re.search(r"\b(faq|frequently\s+asked)\b", ql):
+        return {"domain": "customer_service", "task_type": "faq_search"}
+    if re.search(r"\b(search|find|look\s+up)\b.*\b(help\s+article|knowledge\s+base|support\s+doc)\b", ql):
+        return {"domain": "customer_service", "task_type": "faq_search"}
+
     return None
 
+def _keyword_task_fast_path(query: str) -> Optional[Dict[str, str]]:
+    """Keyword fast-path for domain tasks where embedding similarity
+    between closely related tasks (e.g., anomaly vs duplicate detection)
+    produces ambiguous scores.
+    """
+    import re
+    ql = query.lower().strip()
+
+    # Invoice: payment anomaly detection
+    if re.search(r"\banomal\w*\b", ql) and re.search(r"\b(payment|invoice|billing|charge)\b", ql):
+        return {"domain": "invoice", "task_type": "payment_anomaly_detection"}
+
+    # Legal: compliance check
+    if re.search(r"\bcompl\w*\b", ql) and re.search(r"\b(regulat|gdpr|standard|law|rule|requirement)\b", ql):
+        return {"domain": "legal", "task_type": "compliance_check"}
+
+    # Translation: detect language
+    if re.search(r"\b(what\s+)?language\b", ql) and re.search(r"\b(written|detect|identify|what)\b", ql):
+        return {"domain": "translation", "task_type": "detect_language"}
+
+    return None
 
 def detect_agent_task(query: str, domain: str = "") -> Optional[Dict[str, str]]:
     """Detect if a query requires a specialized agent task.
 
-    Uses ML-first approach: IntentDomainClassifier provides domain signal,
-    then keyword matching resolves the specific task type within that domain.
-    Falls back to keyword-based domain detection when ML is unavailable.
+    Uses the centralized NLU engine with embedding similarity + structural NLP
+    to match queries to domain-specific task types. No hardcoded keywords.
 
     Returns {"domain": ..., "task_type": ...} or None.
     """
-    query_lower = query.lower()
+    # Strategy 0a: keyword fast-path for customer service tasks
+    cs_match = _customer_service_fast_path(query)
+    if cs_match:
+        return cs_match
 
-    # Strategy 1: Explicit domain provided (from agent_name or tool routing)
-    if domain and domain in _TASK_INDICATORS:
-        task = _resolve_task_type(query_lower, domain)
-        if task:
-            return {"domain": domain, "task_type": task}
+    # Strategy 0b: keyword fast-path for ambiguous embedding pairs
+    kw_match = _keyword_task_fast_path(query)
+    if kw_match:
+        return kw_match
 
-    # Strategy 2: ML-based domain detection (IntentDomainClassifier)
+    # Strategy 1: NLU-based task classification
+    try:
+        from src.nlp.nlu_engine import classify_domain_task
+        result = classify_domain_task(query, domain=domain)
+        if result:
+            return result
+    except Exception as exc:
+        logger.debug("NLU domain task classification failed: %s", exc)
+
+    # Strategy 2: ML-based domain detection (fallback)
     ml_domain = _ml_detect_domain(query)
-    if ml_domain and ml_domain in _TASK_INDICATORS:
-        task = _resolve_task_type(query_lower, ml_domain)
-        if task:
-            return {"domain": ml_domain, "task_type": task}
-
-    # Strategy 3: Keyword-based domain detection (fallback)
-    for agent_domain, entry_keywords in _DOMAIN_ENTRY_KEYWORDS.items():
-        if any(kw in query_lower for kw in entry_keywords):
-            task = _resolve_task_type(query_lower, agent_domain)
-            if task:
-                return {"domain": agent_domain, "task_type": task}
+    if ml_domain:
+        try:
+            from src.nlp.nlu_engine import classify_domain_task
+            result = classify_domain_task(query, domain=ml_domain)
+            if result:
+                return result
+        except Exception:
+            pass
 
     return None
-
 
 __all__ = [
     "DomainAgent",
@@ -2042,6 +2450,8 @@ __all__ = [
     "WebAgent",
     "InsightsAgent",
     "ScreeningAgent",
+    "CustomerServiceAgent",
+    "AnalyticsVisualizationAgent",
     "get_domain_agent",
     "list_available_agents",
     "detect_agent_task",

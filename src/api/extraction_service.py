@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import threading
 import time
@@ -67,7 +67,7 @@ from src.storage.azure_blob_client import BlobDownloadError, CredentialError, no
 from src.utils.idempotency import acquire_lock, release_lock
 from src.embedding.layout_graph import build_layout_graph
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Semaphore to limit concurrent deep_analyze() calls — prevents CPU starvation
 # when multiple documents are uploaded simultaneously.
@@ -75,19 +75,112 @@ _DOC_PROCESSING_SEMAPHORE = threading.Semaphore(
     int(os.getenv("DOC_PROCESSING_MAX_CONCURRENT", "2"))
 )
 
-
 def _mark_intelligence_ready(document_id: str) -> None:
-    """Set intelligence_ready=true in MongoDB after understanding + deep analysis complete."""
+    """Set intelligence_ready=true and persist intelligence subdocument to MongoDB.
+
+    The Core Agent reads ``intelligence.summary``, ``intelligence.entities``,
+    ``intelligence.answerable_topics``, ``intelligence.key_facts``, and
+    ``intelligence.document_type`` from MongoDB.  This function builds that
+    subdocument from the extraction pickle so the agent has what it needs.
+    """
     try:
         from src.api.document_status import update_document_fields
-        update_document_fields(document_id, {
+        fields: Dict[str, Any] = {
             "intelligence_ready": True,
             "intelligence_completed_at": time.time(),
-        })
+        }
+
+        # Build intelligence subdocument from pickle for Core Agent consumption
+        try:
+            from src.api.content_store import load_extracted_pickle
+            pkl = load_extracted_pickle(document_id)
+            if isinstance(pkl, dict):
+                understanding = pkl.get("understanding") or {}
+                intel_raw = pkl.get("intelligence") or {}
+                deep = pkl.get("deep_analysis") or {}
+                classification = pkl.get("document_classification") or {}
+                domain_info = pkl.get("document_domain") or {}
+
+                # Build summary from understanding
+                summary = understanding.get("document_summary", "")
+
+                # Build document type
+                doc_type = (
+                    understanding.get("document_type")
+                    or classification.get("document_type")
+                    or ""
+                )
+
+                # Build entities list (flatten from structured format)
+                entities: List[str] = []
+                raw_entities = intel_raw.get("entities") or {}
+                if isinstance(raw_entities, dict):
+                    for category, items in raw_entities.items():
+                        if isinstance(items, list):
+                            for item in items[:20]:
+                                name = item.get("value") or item.get("name") or str(item) if isinstance(item, dict) else str(item)
+                                if name and len(name) < 100:
+                                    entities.append(name)
+                elif isinstance(raw_entities, list):
+                    for item in raw_entities[:50]:
+                        name = item.get("value") or item.get("name") or str(item) if isinstance(item, dict) else str(item)
+                        if name and len(name) < 100:
+                            entities.append(name)
+                # Also include key_entities from understanding
+                for ent in understanding.get("key_entities") or []:
+                    text = ent.get("text", "") if isinstance(ent, dict) else str(ent)
+                    if text and text not in entities and len(text) < 100:
+                        entities.append(text)
+
+                # Build key_facts
+                key_facts = understanding.get("key_facts") or []
+
+                # Build answerable_topics from section summaries and intent tags
+                answerable_topics: List[str] = []
+                section_summaries = understanding.get("section_summaries") or {}
+                if isinstance(section_summaries, dict):
+                    for title, _summ in section_summaries.items():
+                        if title and len(title) < 200:
+                            answerable_topics.append(title)
+                for tag in understanding.get("intent_tags") or []:
+                    if tag and tag not in answerable_topics:
+                        answerable_topics.append(tag)
+
+                # Build domain
+                domain = domain_info.get("domain", "") if isinstance(domain_info, dict) else ""
+
+                # Extract language detection and translation metadata from raw docs
+                raw_docs = pkl.get("raw") or {}
+                detected_language = "en"
+                has_translation = False
+                for _fn, _content in raw_docs.items():
+                    if isinstance(_content, dict):
+                        detected_language = _content.get("detected_language", "en") or "en"
+                        has_translation = bool(_content.get("translated_text"))
+                        break
+
+                intelligence = {
+                    "summary": str(summary)[:3000] if summary else "",
+                    "document_type": doc_type,
+                    "entities": entities[:100],
+                    "key_facts": key_facts[:50],
+                    "answerable_topics": answerable_topics[:30],
+                    "domain": domain,
+                    "quality_grade": deep.get("quality_grade"),
+                    "quality_score": deep.get("quality_score"),
+                    "detected_language": detected_language,
+                    "has_translation": has_translation,
+                }
+                fields["intelligence"] = intelligence
+                fields["doc_type"] = doc_type
+                fields["detected_language"] = detected_language
+        except Exception as exc:
+            logger.warning("Failed to build intelligence subdocument for %s: %s", document_id, exc)
+
+        update_document_fields(document_id, fields)
         logger.info("Document %s marked intelligence_ready", document_id)
     except Exception as exc:
         logger.warning("Failed to mark intelligence_ready for %s: %s", document_id, exc)
-
 
 def _ingest_to_knowledge_graph(
     document_id: str,
@@ -140,15 +233,18 @@ def _ingest_to_knowledge_graph(
         if deep_result is not None:
             try:
                 deep_entities = [e.to_dict() for e in (deep_result.entities or [])]
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract deep entities from analysis result", exc_info=True)
                 deep_entities = None
             try:
                 typed_relationships = list(deep_result.typed_relationships or [])
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract typed relationships from analysis result", exc_info=True)
                 typed_relationships = None
             try:
                 temporal_spans = list(deep_result.temporal_spans or [])
-            except Exception:
+            except Exception as exc:
+                logger.debug("Failed to extract temporal spans from analysis result", exc_info=True)
                 temporal_spans = None
 
         doc_classification = payload_to_save.get("document_classification") or {}
@@ -177,7 +273,6 @@ def _ingest_to_knowledge_graph(
             logger.info("KG ingestion enqueued for document %s", document_id)
     except Exception as exc:  # noqa: BLE001
         logger.debug("KG ingestion skipped for %s: %s", document_id, exc)
-
 
 def _persist_layout_graph(
     *,
@@ -211,7 +306,6 @@ def _persist_layout_graph(
     except Exception as exc:  # noqa: BLE001
         logger.warning("LayoutGraph persistence skipped for %s: %s", document_id, exc)
         return None
-
 
 def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
     total_chars = 0
@@ -253,7 +347,6 @@ def _build_extraction_summary(extracted_obj: Any) -> Dict[str, Any]:
         "chars": total_chars,
         "language": None,
     }
-
 
 def _update_understanding_fields(document_id: str, understanding: Dict[str, Any]) -> None:
     """Persist document understanding / deep-analysis fields to MongoDB."""
@@ -311,7 +404,6 @@ def _update_understanding_fields(document_id: str, understanding: Dict[str, Any]
         coll.update_one(filt, {"$set": update_fields}, upsert=True)
     logger.info("Persisted %d understanding fields for document %s", len(update_fields), document_id)
 
-
 def _process_document_intelligence(
     document_id: str,
     extracted_docs: Dict[str, Any],
@@ -365,8 +457,8 @@ def _process_document_intelligence(
         try:
             from src.api.dataHandler import get_redis_client
             redis_client = get_redis_client()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to get Redis client for intelligence processing", exc_info=True)
 
         # Process through intelligence layer
         result = process_document_intelligence(
@@ -393,7 +485,6 @@ def _process_document_intelligence(
         logger.warning("Intelligence processing failed for %s: %s", document_id, exc)
         return None
 
-
 def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> Any:
     if isinstance(extracted_docs, dict):
         normalized: Dict[str, Any] = {}
@@ -413,7 +504,6 @@ def _normalize_extracted_metadata(extracted_docs: Any, *, document_id: str) -> A
             normalized[name] = content
         return normalized
     return extracted_docs
-
 
 def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> Dict[str, Any]:
     """Extract document type/classification from structured extraction results.
@@ -441,7 +531,6 @@ def _extract_classification_from_structured(structured_docs: Dict[str, Any]) -> 
             }
     return {"document_type": "GENERIC", "domain": "generic", "confidence": 0.0}
 
-
 # ── Ingestion-time entity metadata extraction ──────────────────────────
 
 import re as _re
@@ -451,7 +540,6 @@ _PHONE_RE = _re.compile(
     r"(?:\+?\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}"
 )
 _LINKEDIN_RE = _re.compile(r"linkedin\.com/in/[\w\-]+", _re.IGNORECASE)
-
 
 def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any]:
     """Extract entity name, email, and phone from raw text at ingestion time.
@@ -498,8 +586,8 @@ def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any
         try:
             from src.rag_v3.extract import _name_from_filename
             name = _name_from_filename(filename) or ""
-        except ImportError:
-            pass
+        except ImportError as exc:
+            logger.debug("_name_from_filename not available from rag_v3.extract", exc_info=True)
     if not name and text:
         # Use first non-empty line that looks like a name (2-4 words, no special chars)
         for line in text.split("\n")[:5]:
@@ -517,7 +605,6 @@ def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any
         result["entity_name"] = name
 
     return result
-
 
 def _validate_extraction_fields(
     doc_classification: Dict[str, Any],
@@ -567,7 +654,6 @@ def _validate_extraction_fields(
         if not has_items:
             logger.warning("extraction_validation: invoice missing line items/total — doc=%s file=%s", filename, doc_type)
 
-
 # ---------------------------------------------------------------------------
 # Authoritative per-document domain assignment
 # ---------------------------------------------------------------------------
@@ -578,7 +664,6 @@ _DOC_TYPE_TO_DOMAIN = {
     "report": "generic", "brochure": "generic", "presentation": "generic",
     "other": "generic",
 }
-
 
 def _resolve_authoritative_domain(
     domain_signals: Dict[str, float],
@@ -629,8 +714,14 @@ def _resolve_authoritative_domain(
         result = {"domain": mapped, "confidence": max(doc_type_confidence, 0.5), "source": "doc_type_mapping"}
         return result
 
-    return result
+    # Normalize final domain through canonical map
+    try:
+        from src.intelligence.domain_classifier import normalize_domain
+        result["domain"] = normalize_domain(result["domain"])
+    except ImportError as exc:
+        logger.debug("normalize_domain not available from domain_classifier", exc_info=True)
 
+    return result
 
 def _persist_document_domain(document_id: str, domain_result: Dict[str, Any]) -> None:
     """Persist authoritative document domain to MongoDB."""
@@ -648,7 +739,6 @@ def _persist_document_domain(document_id: str, domain_result: Dict[str, Any]) ->
         }}, upsert=False)
     except Exception as exc:
         logger.warning("Failed to persist document domain for %s: %s", document_id, exc)
-
 
 def _extract_text_from_extracted_document(doc: "ExtractedDocument") -> str:
     """Extract usable text from an ExtractedDocument, trying all available fields.
@@ -687,7 +777,6 @@ def _extract_text_from_extracted_document(doc: "ExtractedDocument") -> str:
 
     logger.warning("ExtractedDocument has no usable text content")
     return ""
-
 
 def _sanitize_raw_text_fields(docs: Any) -> Any:
     """Ensure no stringified repr or dict garbage in text fields."""
@@ -742,7 +831,6 @@ def _sanitize_raw_text_fields(docs: Any) -> Any:
             content["texts"] = clean_texts
     return docs
 
-
 def _set_document_status(
     document_id: str,
     status: str,
@@ -759,7 +847,6 @@ def _set_document_status(
         fields.update(extra_fields)
     update_document_fields(document_id, fields)
     logger.info("Document %s status updated to %s", document_id, status)
-
 
 def _run_auto_screening(document_id: str, doc_type: Optional[str] = None) -> None:
     """Run screening automatically after extraction completes.
@@ -804,9 +891,7 @@ def _run_auto_screening(document_id: str, doc_type: Optional[str] = None) -> Non
         )
         _set_document_status(document_id, STATUS_SCREENING_COMPLETED)
 
-
 _DEBOUNCE_TTL_SECONDS = 5
-
 
 def _debounce_extraction(subscription_id: str, doc_id: str) -> bool:
     """Return True if this extraction request is a duplicate within the debounce window."""
@@ -824,8 +909,193 @@ def _debounce_extraction(subscription_id: str, doc_id: str) -> bool:
             return True
         redis_client.setex(debounce_key, _DEBOUNCE_TTL_SECONDS, "1")
         return False
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to check extraction debounce in Redis", exc_info=True)
         return False
+
+# ── Extraction Auto-Subagents ─────────────────────────────────────────────────
+# These run automatically during extraction to enrich documents before
+# structured extraction / intelligence processing.  They are pre-screening
+# enrichments and do NOT affect the HITL pipeline stages.
+
+
+def _detect_document_language(text: str) -> str:
+    """Detect the primary language of *text*.  Returns ISO 639-1 code."""
+    if not text or len(text.strip()) < 20:
+        return "en"
+    try:
+        from src.utils.language import detect_language
+        lang, confidence = detect_language(text)
+        if lang and lang not in ("unknown", "mixed", "non_en") and confidence >= 0.5:
+            return lang
+        if lang == "non_en":
+            # langdetect unavailable but text is clearly non-English
+            return "non_en"
+    except Exception:
+        pass
+    return "en"
+
+
+def _translate_content(text: str, source_lang: str) -> Optional[str]:
+    """Translate *text* from *source_lang* to English using the translator tool's 3-tier backend.
+
+    Returns the translated English text, or ``None`` on failure.
+    """
+    if not text or source_lang == "en":
+        return None
+    try:
+        from src.tools.translator import TranslateRequest, _translate_text
+        request = TranslateRequest(text=text[:30000], target_lang="en", source_lang=source_lang)
+        result = _translate_text(request)
+        translated = result.get("translated_text", "")
+        backend = result.get("backend", "unknown")
+        if translated and backend != "fallback":
+            logger.info("Auto-translated %d chars from %s to en via %s", len(text), source_lang, backend)
+            return translated
+    except Exception as exc:
+        logger.warning("Auto-translation failed for lang=%s: %s", source_lang, exc)
+    return None
+
+
+def _run_ocr_enhancement(doc_id: str, content: Any) -> Optional[str]:
+    """Run enhanced Vision OCR on scanned document content.
+
+    Loads the glm-ocr model on demand and unloads it after processing.
+    Returns enhanced OCR text or ``None`` if not applicable.
+    """
+    if not isinstance(content, dict):
+        return None
+
+    # Check if document appears to be scanned
+    full_text = content.get("full_text") or content.get("text") or ""
+    sections = content.get("sections") or []
+
+    # Heuristic: scanned docs have short/garbled text relative to page count
+    page_count = 0
+    for sec in sections:
+        if isinstance(sec, dict):
+            page_count = max(page_count, sec.get("end_page") or sec.get("start_page") or 0)
+    page_count = max(page_count, 1)
+
+    # If text is very sparse relative to pages, likely scanned
+    chars_per_page = len(full_text) / max(page_count, 1)
+    is_scanned = chars_per_page < 200 and page_count > 0
+
+    if not is_scanned:
+        return None
+
+    logger.info("Document %s appears scanned (%d chars/%d pages); running Vision OCR enhancement", doc_id, len(full_text), page_count)
+
+    try:
+        from src.llm.vision_ocr import get_vision_ocr_client
+        client = get_vision_ocr_client()
+        if client is None or not client.is_available():
+            logger.debug("Vision OCR client unavailable for %s", doc_id)
+            return None
+
+        # OCR each page image if available in sections
+        enhanced_texts: List[str] = []
+        for sec in sections:
+            if isinstance(sec, dict):
+                img_data = sec.get("page_image") or sec.get("image_bytes")
+                if img_data:
+                    ocr_text, confidence = client.ocr_page_image(img_data)
+                    if ocr_text and len(ocr_text) > len(sec.get("text", "")):
+                        enhanced_texts.append(ocr_text)
+                    else:
+                        enhanced_texts.append(sec.get("text", ""))
+                else:
+                    enhanced_texts.append(sec.get("text", ""))
+
+        result = None
+        if enhanced_texts:
+            enhanced_full = "\n\n".join(enhanced_texts)
+            if len(enhanced_full) > len(full_text) * 1.2:
+                logger.info("OCR enhancement improved text from %d to %d chars for %s", len(full_text), len(enhanced_full), doc_id)
+                result = enhanced_full
+
+        # Unload model after processing (on-demand only)
+        try:
+            import ollama
+            ollama.generate(model=client.model_name, prompt="", keep_alive=0)
+            logger.debug("Unloaded Vision OCR model %s after processing %s", client.model_name, doc_id)
+        except Exception:
+            pass
+
+        return result
+
+    except Exception as exc:
+        logger.warning("OCR enhancement failed for %s: %s", doc_id, exc)
+        # Still try to unload model on error
+        try:
+            from src.llm.vision_ocr import get_vision_ocr_client
+            import ollama
+            _client = get_vision_ocr_client()
+            if _client:
+                ollama.generate(model=_client.model_name, prompt="", keep_alive=0)
+        except Exception:
+            pass
+
+    return None
+
+
+def _run_extraction_subagents(doc_id: str, masked_docs: Dict[str, Any]) -> Dict[str, Any]:
+    """Run auto-subagents on extracted content: language detection, translation, OCR enhancement.
+
+    Modifies *masked_docs* in-place by adding translated text and enhanced OCR text.
+    Returns the (possibly enriched) masked_docs.
+    """
+    for fname, content in masked_docs.items():
+        if not isinstance(content, dict):
+            continue
+
+        full_text = content.get("full_text") or content.get("text") or ""
+        if not full_text:
+            continue
+
+        # ── Subagent 1: Language Detection ──
+        detected_lang = _detect_document_language(full_text)
+        content["detected_language"] = detected_lang
+        logger.info("Document %s [%s]: detected language = %s", doc_id, fname, detected_lang)
+
+        # ── Subagent 2: Auto-Translation (non-English → English) ──
+        if detected_lang != "en":
+            translated_text = _translate_content(full_text, detected_lang)
+            if translated_text:
+                content["translated_text"] = translated_text
+                content["original_language"] = detected_lang
+                # Also translate section texts for chunk-level embedding
+                for sec in content.get("sections") or []:
+                    if isinstance(sec, dict) and sec.get("text"):
+                        sec_translated = _translate_content(sec["text"], detected_lang)
+                        if sec_translated:
+                            sec["translated_text"] = sec_translated
+                logger.info("Document %s [%s]: auto-translated from %s to en (%d chars)", doc_id, fname, detected_lang, len(translated_text))
+
+        # ── Subagent 3: OCR Enhancement (scanned documents) ──
+        enhanced_text = _run_ocr_enhancement(doc_id, content)
+        if enhanced_text:
+            content["ocr_enhanced_text"] = enhanced_text
+            # If OCR produced significantly better text, use it as primary
+            if len(enhanced_text) > len(full_text) * 1.5:
+                content["original_text"] = full_text
+                content["full_text"] = enhanced_text
+                if "text" in content:
+                    content["text"] = enhanced_text
+                logger.info("Document %s [%s]: OCR-enhanced text promoted to primary", doc_id, fname)
+
+                # Re-detect language on enhanced text and translate if needed
+                enhanced_lang = _detect_document_language(enhanced_text)
+                content["detected_language"] = enhanced_lang
+                if enhanced_lang != "en" and "translated_text" not in content:
+                    translated_text = _translate_content(enhanced_text, enhanced_lang)
+                    if translated_text:
+                        content["translated_text"] = translated_text
+                        content["original_language"] = enhanced_lang
+
+        break  # Process first document only (consistent with rest of pipeline)
+
+    return masked_docs
 
 
 def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -974,6 +1244,125 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
 
         emit_progress(doc_id, "extraction", 0.08, "Text extracted from document")
 
+        # ── Auto-subagents: Language Detection + Translation + OCR Enhancement ──
+        masked_docs = _run_extraction_subagents(doc_id, masked_docs)
+
+        # ── LLM Deep Knowledge Extraction → KG + Redis hot cache ──
+        try:
+            from src.intelligence.knowledge_extractor import get_knowledge_extractor
+            from src.intelligence.evidence_verifier import verify_knowledge_result
+            from src.intelligence.hot_cache import cache_document_knowledge, recompute_profile_domain
+
+            extractor = get_knowledge_extractor()
+            for fname, content in masked_docs.items():
+                full_text = ""
+                if isinstance(content, dict):
+                    full_text = content.get("translated_text") or content.get("full_text", "")
+                elif isinstance(content, str):
+                    full_text = content
+                if not full_text or len(full_text.strip()) < 100:
+                    continue
+
+                # Extract knowledge from sections or full text
+                sections_data = []
+                if isinstance(content, dict) and content.get("sections"):
+                    for sec in content["sections"]:
+                        if isinstance(sec, dict) and sec.get("text"):
+                            sections_data.append(sec)
+                if not sections_data:
+                    # Split into ~2000 char chunks for extraction
+                    chunk_size = 2000
+                    for i in range(0, len(full_text), chunk_size):
+                        sections_data.append({
+                            "text": full_text[i:i + chunk_size],
+                            "page": (i // chunk_size) + 1,
+                            "section_title": f"Section {(i // chunk_size) + 1}",
+                        })
+
+                all_entities = []
+                all_facts = []
+                all_relationships = []
+                all_claims = []
+
+                for sec in sections_data[:15]:  # Cap at 15 sections
+                    result = extractor.extract_section(
+                        text=sec.get("text", ""),
+                        page=sec.get("start_page", sec.get("page", 1)),
+                        section=sec.get("title", sec.get("section_title", "unknown")),
+                    )
+                    # Verify extractions against source text
+                    source_text = sec.get("text", "")
+                    result = verify_knowledge_result(result, source_text)
+
+                    for ent in result.entities:
+                        all_entities.append({
+                            "name": ent.name, "type": ent.type,
+                            "context": ent.context, "evidence": ent.evidence,
+                            "confidence": ent.confidence, "location": ent.location,
+                        })
+                    for fact in result.facts:
+                        all_facts.append({
+                            "statement": fact.statement, "evidence": fact.evidence,
+                            "confidence": fact.confidence, "location": fact.location,
+                        })
+                    for rel in result.relationships:
+                        all_relationships.append({
+                            "subject": rel.subject, "object": rel.object,
+                            "relation": rel.relation, "evidence": rel.evidence,
+                            "confidence": rel.confidence,
+                        })
+                    for claim in result.claims:
+                        all_claims.append({
+                            "claim": claim.claim, "evidence": claim.evidence,
+                            "confidence": claim.confidence,
+                        })
+
+                # Generate document summary
+                doc_summary = extractor.generate_document_summary(full_text)
+
+                # Store in content for downstream KG ingestion
+                if isinstance(content, dict):
+                    content["kg_entities"] = all_entities
+                    content["kg_facts"] = all_facts
+                    content["kg_relationships"] = all_relationships
+                    content["kg_claims"] = all_claims
+                    content["kg_summary"] = doc_summary
+                    content["detected_domain"] = doc_summary.get("domain", "general")
+
+                # Cache in Redis hot cache
+                try:
+                    from src.api.rag_state import get_app_state
+                    app_state = get_app_state()
+                    redis_client = getattr(app_state, "redis_client", None) if app_state else None
+                    if redis_client:
+                        cache_document_knowledge(
+                            redis_client=redis_client,
+                            profile_id=profile_id,
+                            doc_id=doc_id,
+                            entities=all_entities,
+                            facts=all_facts,
+                            claims=all_claims,
+                            relationships=all_relationships,
+                            domain=doc_summary.get("domain", "general"),
+                            summary=doc_summary.get("summary", ""),
+                        )
+                        recompute_profile_domain(redis_client, profile_id)
+                except Exception as cache_err:
+                    logger.debug("[EXTRACTION] Redis cache write failed (non-fatal): %s", cache_err)
+
+                logger.info(
+                    "[EXTRACTION] KG extraction for %s: entities=%d facts=%d rels=%d claims=%d domain=%s",
+                    doc_id, len(all_entities), len(all_facts),
+                    len(all_relationships), len(all_claims),
+                    doc_summary.get("domain", "general"),
+                )
+
+            emit_progress(doc_id, "extraction", 0.09, "Knowledge graph enriched")
+        except ImportError:
+            logger.debug("[EXTRACTION] Knowledge extractor not available — skipping KG enrichment")
+        except Exception as kg_err:
+            logger.warning("[EXTRACTION] KG enrichment failed (non-fatal): %s", kg_err)
+
         # Structured extraction: build structured JSON from masked/raw text and persist alongside raw extraction
         try:
             engine = get_extraction_engine()
@@ -1089,8 +1478,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                         bg = get_background_analyzer()
                         if bg and getattr(_Cfg.DeepAnalysis, "BACKGROUND_ENABLED", True):
                             bg.enqueue(doc_id, subscription_id, profile_id)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed to enqueue background analysis for connector %s", doc_id, exc_info=True)
                     break
         except Exception as exc:
             logger.warning("Deep analysis skipped for %s: %s", doc_id, exc)
@@ -1176,8 +1565,8 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             from src.profiles.profile_domain_tagger import refresh_profile_domain_on_document_change
             if subscription_id and profile_id:
                 refresh_profile_domain_on_document_change(subscription_id, profile_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to refresh profile domain tag after connector extraction", exc_info=True)
 
         summary = _build_extraction_summary(masked_docs)
         return {
@@ -1191,12 +1580,12 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         if lock.acquired:
             release_lock(lock)
 
-
-def extract_documents() -> Dict[str, Any]:
+def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
+    batch_start = time.time()
     try:
         doc_coll = extract_document_info()
         if not doc_coll:
-            return {"status": "no_documents", "message": "No documents found for extraction"}
+            return {"status": "no_documents", "message": "No documents found for extraction", "documents": []}
 
         allowed_statuses = {STATUS_UNDER_REVIEW, STATUS_EXTRACTION_FAILED}
         eligible_docs = {
@@ -1205,28 +1594,68 @@ def extract_documents() -> Dict[str, Any]:
             if doc_info.get("dataDict", {}).get("status") in allowed_statuses
         }
 
-        if not eligible_docs:
-            return {"status": "no_documents", "message": "No documents eligible for extraction"}
+        # Scope by subscription_id when provided
+        if subscription_id:
+            eligible_docs = {
+                doc_id: doc_info
+                for doc_id, doc_info in eligible_docs.items()
+                if doc_info.get("dataDict", {}).get("subscription_id") == subscription_id
+            }
 
-        results = {"successful": [], "failed": [], "total": len(eligible_docs)}
-        for doc_id, doc_info in eligible_docs.items():
+        if not eligible_docs:
+            return {"status": "no_documents", "message": "No documents eligible for extraction", "documents": []}
+
+        total = len(eligible_docs)
+        logger.info("Starting batch extraction: %d documents queued", total)
+        documents = []
+        for idx, (doc_id, doc_info) in enumerate(eligible_docs.items(), 1):
             if doc_info.get("dataDict", {}).get("status") == STATUS_DELETED:
                 continue
+            doc_start = time.time()
+            doc_name = doc_info.get("dataDict", {}).get("name", "Unknown")
+            logger.info(
+                "[EXTRACTION %d/%d] Starting: doc=%s name=%s",
+                idx, total, doc_id, doc_name,
+            )
             try:
                 res = _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
             except CredentialError as exc:
                 logger.error("Credential error during extraction; failing batch: %s", exc)
-                return {"status": "error", "message": f"CredentialError: {exc}", "results": None}
+                return {"status": "error", "message": f"CredentialError: {exc}", "documents": documents}
+            elapsed = round(time.time() - doc_start, 1)
+            res["elapsed_seconds"] = elapsed
+            res["doc_name"] = doc_name
+            res["index"] = f"{idx}/{total}"
             if res.get("status") == STATUS_EXTRACTION_COMPLETED:
-                results["successful"].append(res)
+                logger.info(
+                    "[EXTRACTION %d/%d] Completed: doc=%s in %.1fs",
+                    idx, total, doc_id, elapsed,
+                )
             else:
-                results["failed"].append(res)
+                logger.warning(
+                    "[EXTRACTION %d/%d] Failed: doc=%s in %.1fs error=%s",
+                    idx, total, doc_id, elapsed, res.get("error", "unknown"),
+                )
+            documents.append(res)
 
-        return {"status": "completed", "results": results}
+        successful = [d for d in documents if d.get("status") == STATUS_EXTRACTION_COMPLETED]
+        failed = [d for d in documents if d.get("status") != STATUS_EXTRACTION_COMPLETED]
+        batch_elapsed = round(time.time() - batch_start, 1)
+        logger.info(
+            "Batch extraction complete: %d succeeded, %d failed, %.1fs total",
+            len(successful), len(failed), batch_elapsed,
+        )
+        return {
+            "status": "completed",
+            "total": total,
+            "successful_count": len(successful),
+            "failed_count": len(failed),
+            "elapsed_seconds": batch_elapsed,
+            "documents": documents,
+        }
     except Exception as exc:  # noqa: BLE001
         logger.error("Extraction process failed: %s", exc, exc_info=True)
-        return {"status": "error", "message": str(exc), "results": None}
-
+        return {"status": "error", "message": str(exc), "documents": []}
 
 def extract_single_document(doc_id: str) -> Dict[str, Any]:
     doc_coll = extract_document_info()
@@ -1234,7 +1663,6 @@ def extract_single_document(doc_id: str) -> Dict[str, Any]:
         return {"status": "not_found", "message": f"Document {doc_id} not found"}
     doc_info = doc_coll[doc_id]
     return _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
-
 
 def extract_uploaded_document(
     *,
@@ -1268,7 +1696,7 @@ def extract_uploaded_document(
     emit_progress(document_id, "extraction", 0.05, "Starting document extraction")
 
     try:
-        extracted = fileProcessor(file_bytes, filename)
+        extracted = fileProcessor(file_bytes, filename, content_type=content_type or "")
         if not extracted:
             raise ValueError("No content extracted from file")
     except Exception as exc:  # noqa: BLE001
@@ -1318,7 +1746,8 @@ def extract_uploaded_document(
             except Exception as sexc:  # noqa: BLE001
                 logger.warning("Structured extraction failed for upload %s: %s", fname, sexc)
                 structured_docs[fname] = {"document_id": document_id, "original_filename": fname, "document_type": "GENERIC", "sections": [{"section_id": "section_0", "section_type": "content", "content": raw_text}], "extraction_quality_score": 0.0}
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to build structured documents for upload", exc_info=True)
         structured_docs = {}
 
     # Intelligence layer processing: entity extraction, Q&A generation
@@ -1389,8 +1818,8 @@ def extract_uploaded_document(
                     bg = get_background_analyzer()
                     if bg and getattr(_Cfg.DeepAnalysis, "BACKGROUND_ENABLED", True):
                         bg.enqueue(document_id, subscription_id, profile_id)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to enqueue background analysis for upload %s", document_id, exc_info=True)
                 break
     except Exception as exc:
         logger.warning("Deep analysis skipped for upload %s: %s", document_id, exc)
@@ -1475,8 +1904,8 @@ def extract_uploaded_document(
         from src.profiles.profile_domain_tagger import refresh_profile_domain_on_document_change
         if subscription_id and profile_id:
             refresh_profile_domain_on_document_change(subscription_id, profile_id)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Failed to refresh profile domain tag after upload extraction", exc_info=True)
 
     summary = _build_extraction_summary(extracted)
     return {

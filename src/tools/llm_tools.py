@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Per-Domain Generation Parameters ────────────────────────────────
 
@@ -41,7 +41,6 @@ _SOURCE_CONFIDENCE: Dict[str, float] = {
 # ── Markdown fence pattern ──────────────────────────────────────────
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*\n?(.*?)\n?\s*```$", re.DOTALL)
-
 
 # ── Gateway access ──────────────────────────────────────────────────
 
@@ -70,7 +69,6 @@ def get_tool_llm_client() -> Optional[Any]:
         return client
     except Exception:
         return None
-
 
 # ── Core generation ─────────────────────────────────────────────────
 
@@ -107,7 +105,6 @@ def tool_generate(
         logger.debug("tool_generate failed (domain=%s): %s", domain, exc)
         return None
 
-
 def _call_generate(client: Any, prompt: str, options: Dict[str, Any]) -> str:
     """Invoke the LLM client's generate method."""
     try:
@@ -126,7 +123,6 @@ def _call_generate(client: Any, prompt: str, options: Dict[str, Any]) -> str:
             return client.generate(prompt, options=options) or ""
         return ""
 
-
 def tool_generate_structured(
     prompt: str,
     domain: str = "general",
@@ -142,7 +138,6 @@ def tool_generate_structured(
     if not raw:
         return None
     return _parse_json_response(raw)
-
 
 def _parse_json_response(text: str) -> Optional[Dict[str, Any]]:
     """Best-effort JSON extraction from LLM output."""
@@ -175,7 +170,6 @@ def _parse_json_response(text: str) -> Optional[Dict[str, Any]]:
 
     return None
 
-
 # ── Tool IQ Score ───────────────────────────────────────────────────
 
 @dataclass
@@ -198,7 +192,6 @@ class ToolIQScore:
             "domain": self.domain,
             "field_coverage": self.field_coverage,
         }
-
 
 def score_tool_response(
     result: Dict[str, Any],
@@ -235,7 +228,6 @@ def score_tool_response(
         field_coverage=field_coverage,
     )
 
-
 def _is_field_present(val: Any) -> bool:
     """Check if a field value is meaningfully present."""
     if val is None:
@@ -245,7 +237,6 @@ def _is_field_present(val: Any) -> bool:
     if isinstance(val, (list, dict)):
         return len(val) > 0
     return True
-
 
 # ── Prompt building ─────────────────────────────────────────────────
 
@@ -292,7 +283,6 @@ def build_extraction_prompt(
     parts.append(f"\nExtract the requested information as JSON matching this schema:\n{json_schema}")
 
     return "\n".join(parts)
-
 
 def build_generation_prompt(
     tool_name: str,

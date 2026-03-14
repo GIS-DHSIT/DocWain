@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class EmbeddingCacheManager:
     """Manages embedding cache for queries and batch vectors with TTL and profile hints."""
@@ -266,7 +265,6 @@ class EmbeddingCacheManager:
             "redis_available": self.redis_client is not None,
             "profile_partitioning": self.profile_partition,
         }
-
 
 __all__ = ["EmbeddingCacheManager"]
 

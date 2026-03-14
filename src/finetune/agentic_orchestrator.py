@@ -1,6 +1,6 @@
 import hashlib
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import uuid
 from datetime import datetime
@@ -18,20 +18,16 @@ from src.finetune.unsloth_trainer import get_finetune_manager
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
 from src.utils.payload_utils import get_source_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class OllamaModelMissing(Exception):
     """Raised when the required Ollama model is not available locally."""
 
-
 class OllamaUnavailable(Exception):
     """Raised when the Ollama server is unreachable."""
 
-
 def _now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
-
 
 def create_nemotron_client(model_name: Optional[str] = None):
     """
@@ -61,14 +57,12 @@ def create_nemotron_client(model_name: Optional[str] = None):
 
     return _NemotronJSONClient(client, target_model)
 
-
 class DatasetPlan(BaseModel):
     sampling_strategy: Optional[str] = None
     max_points: int = Field(120, ge=1)
     questions_per_chunk: int = Field(2, ge=1, le=10)
     dedup_strategy: Optional[str] = None
     filters: Optional[Dict[str, Any]] = None
-
 
 class TrainingPlan(BaseModel):
     lora_r: int = Field(16, ge=1)
@@ -79,18 +73,15 @@ class TrainingPlan(BaseModel):
     learning_rate: float = Field(2e-4, gt=0)
     gradient_accumulation: int = Field(2, ge=1)
 
-
 class RiskFlag(BaseModel):
     code: str
     severity: str = Field("info", description="info|low|medium|high")
     mitigation: Optional[str] = None
 
-
 class AcceptanceCriteria(BaseModel):
     min_examples: int = Field(5, ge=1)
     duplicate_ratio_max: float = Field(0.5, ge=0.0, le=1.0)
     require_metadata: bool = True
-
 
 class FinetunePlan(BaseModel):
     dataset_plan: DatasetPlan = Field(default_factory=DatasetPlan)
@@ -98,20 +89,17 @@ class FinetunePlan(BaseModel):
     risk_flags: List[RiskFlag] = Field(default_factory=list)
     acceptance_criteria: AcceptanceCriteria = Field(default_factory=AcceptanceCriteria)
 
-
 class FinetuneState(BaseModel):
     stage: str
     notes: Optional[str] = None
     started_at: float = Field(default_factory=lambda: datetime.utcnow().timestamp())
     finished_at: Optional[float] = None
 
-
 class AgenticFinetuneRequest(BaseModel):
     collection_name: str
     profile_ids: Optional[List[str]] = None
     agentic: bool = False
     orchestrator_model: Optional[str] = None
-
 
 class NemotronOrchestratorAgent:
     """Lightweight planner using Nemotron-3-Nano via Ollama."""
@@ -127,7 +115,7 @@ class NemotronOrchestratorAgent:
             data = json.loads(raw)
             return FinetunePlan.model_validate(data)
         except (ValidationError, json.JSONDecodeError) as exc:
-            logger.warning("Nemotron plan parse failed; using defaults: %s | raw=%s", exc, raw)
+            logger.debug("Nemotron plan parse failed; using defaults: %s | raw=%s", exc, raw)
             return FinetunePlan()
 
     @staticmethod
@@ -157,7 +145,6 @@ class NemotronOrchestratorAgent:
                 },
             }
         )
-
 
 class AgenticFinetuneOrchestrator:
     """Agentic fine-tune runner scoped to a single Qdrant collection."""

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -9,19 +9,16 @@ from src.intelligence.deterministic_router import DeterministicRoute, route_quer
 from src.intelligence.formatter import format_facts_response, _collect_evidence_sources
 from src.intelligence.response_composer import build_greeting_response, compose_task_response
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _collect_evidence(facts: Iterable[Dict[str, Any]], catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
     return _collect_evidence_sources(facts, catalog)
-
 
 def _facts_for_section_focus(facts: List[Dict[str, Any]], section_focus: List[str]) -> List[Dict[str, Any]]:
     if not section_focus:
         return facts
     focus_set = {str(k) for k in section_focus if k}
     return [fact for fact in facts if str(fact.get("section_kind")) in focus_set]
-
 
 def answer_with_section_intelligence(
     *,
@@ -137,6 +134,5 @@ def answer_with_section_intelligence(
         "context_found": True,
         "metadata": metadata,
     }
-
 
 __all__ = ["answer_with_section_intelligence"]

@@ -17,15 +17,14 @@ Supported domains:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class DomainSignal:
@@ -37,7 +36,6 @@ class DomainSignal:
 
     def __repr__(self) -> str:
         return f"DomainSignal({self.domain}, {self.confidence:.2f}, {self.source})"
-
 
 @dataclass
 class DomainDecision:
@@ -54,7 +52,6 @@ class DomainDecision:
         if not self.signals:
             return None
         return max(self.signals, key=lambda s: s.confidence)
-
 
 # Keywords and patterns for domain detection
 DOMAIN_KEYWORDS: Dict[str, List[str]] = {
@@ -112,7 +109,6 @@ METADATA_DOMAIN_INDICATORS: Dict[str, Dict[str, str]] = {
         "engineering": "technical",
     },
 }
-
 
 class DomainRouter:
     """
@@ -363,7 +359,6 @@ class DomainRouter:
             is_ambiguous=is_ambiguous,
         )
 
-
 # ── Embedding-based zero-shot classification ─────────────────────────
 
 _DOMAIN_DESCRIPTIONS: Dict[str, str] = {
@@ -377,7 +372,6 @@ _DOMAIN_DESCRIPTIONS: Dict[str, str] = {
 }
 
 _CACHED_DOMAIN_EMBEDDINGS: Dict[str, Any] = {}
-
 
 def classify_by_embedding(text_sample: str, embedder: Any) -> Tuple[str, float]:
     """Zero-shot domain classification using embedding cosine similarity.
@@ -419,6 +413,5 @@ def classify_by_embedding(text_sample: str, embedder: Any) -> Tuple[str, float]:
             best_score, best_domain = sim, domain
 
     return best_domain, best_score
-
 
 __all__ = ["DomainRouter", "DomainDecision", "DomainSignal", "classify_by_embedding"]

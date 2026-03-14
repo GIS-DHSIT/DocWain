@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import time
 from typing import Dict, List, Optional, Tuple
@@ -11,27 +11,22 @@ from src.api.pipeline_models import ExtractedDocument
 
 from .models import Block, DocumentManifest, DocumentStatus, ExtractedDocumentJSON, Page, Section, Table, Image
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 _KEY_VALUE_RE = re.compile(r"^([A-Za-z0-9][^:]{1,64}):\s*(.+)$")
 _KEY_VALUE_DASH_RE = re.compile(r"^([A-Za-z0-9][^-]{1,64})\s+-\s+(.+)$")
 
-
 def _hash_text(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
-
 
 def _mk_block_id(document_id: str, page_number: Optional[int], text: str, index: int) -> str:
     base = f"{document_id}|{page_number or 0}|{index}|{text[:128]}"
     return f"blk_{_hash_text(base)}"
 
-
 def _normalize_text(text: str) -> str:
     if not text:
         return ""
     return " ".join(text.replace("\u00a0", " ").split()).strip()
-
 
 def _detect_block_type(text: str, fallback: str = "paragraph") -> str:
     if not text:
@@ -41,7 +36,6 @@ def _detect_block_type(text: str, fallback: str = "paragraph") -> str:
     if _KEY_VALUE_RE.match(text.strip()) or _KEY_VALUE_DASH_RE.match(text.strip()):
         return "key_value"
     return fallback
-
 
 def _split_blocks_from_text(text: str) -> List[Tuple[str, Optional[str], Optional[str]]]:
     blocks: List[Tuple[str, Optional[str], Optional[str]]] = []
@@ -55,7 +49,6 @@ def _split_blocks_from_text(text: str) -> List[Tuple[str, Optional[str], Optiona
         else:
             blocks.append((cleaned, None, None))
     return blocks
-
 
 def build_manifest(
     *,
@@ -91,7 +84,6 @@ def build_manifest(
         ingested_at=time.time(),
         status=status,
     )
-
 
 def extract_document_json(
     *,
@@ -136,7 +128,6 @@ def extract_document_json(
     )
     manifest.extracted_at = time.time()
     return document_json, manifest
-
 
 def build_document_json_from_extracted(extracted: ExtractedDocument, *, document_id: str) -> ExtractedDocumentJSON:
     pages: Dict[int, Page] = {}
@@ -204,7 +195,7 @@ def build_document_json_from_extracted(extracted: ExtractedDocument, *, document
 
     tables: List[Table] = []
     for idx, table in enumerate(extracted.tables or []):
-        table_id = f"tbl_{_hash_text(str(idx) + (table.text or ""))}"
+        table_id = f"tbl_{_hash_text(str(idx) + (table.text or ''))}"
         headers: List[str] = []
         rows: List[List[str]] = []
         if table.csv:
@@ -248,7 +239,6 @@ def build_document_json_from_extracted(extracted: ExtractedDocument, *, document
         raw_text=raw_text or None,
     )
 
-
 def attach_canonical_json(extracted: ExtractedDocument, *, document_id: str) -> ExtractedDocument:
     try:
         canonical = build_document_json_from_extracted(extracted, document_id=document_id)
@@ -256,7 +246,6 @@ def attach_canonical_json(extracted: ExtractedDocument, *, document_id: str) -> 
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to attach canonical JSON: %s", exc)
     return extracted
-
 
 __all__ = [
     "extract_document_json",

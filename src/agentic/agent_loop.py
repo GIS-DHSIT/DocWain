@@ -12,13 +12,12 @@ is True AND the request specifies ``agent_mode=True``.
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class AgentThought:
@@ -28,7 +27,6 @@ class AgentThought:
     action_input: Any = None            # Input to the tool
     final_answer: Optional[str] = None  # Set when agent decides to answer
 
-
 @dataclass
 class AgentStep:
     """One complete step in the reasoning loop."""
@@ -36,7 +34,6 @@ class AgentStep:
     thought: AgentThought
     observation: Optional[str] = None
     elapsed_ms: float = 0.0
-
 
 @dataclass
 class AgentResult:
@@ -46,7 +43,6 @@ class AgentResult:
     tool_calls_made: int = 0
     total_elapsed_ms: float = 0.0
     completed: bool = True
-
 
 _AGENT_SYSTEM_PROMPT = """You are a reasoning agent that solves queries step by step.
 
@@ -68,7 +64,6 @@ Rules:
 - If no tool is needed, provide final_answer directly
 - Be concise and factual in your final answer
 """
-
 
 class AgentLoop:
     """ReAct-style reasoning loop with tool chaining."""
@@ -163,7 +158,7 @@ class AgentLoop:
         """Ask the LLM to produce a reasoning step.
 
         Uses lfm2.5-thinking (fast, 731MB) when available for MoE routing,
-        falls back to gpt-oss (the base model) if unavailable.
+        falls back to DocWain-Agent (the base model) if unavailable.
         """
         client = self._thinking if self._thinking is not None else self._llm
         try:
@@ -254,6 +249,5 @@ class AgentLoop:
             total_elapsed_ms=(time.time() - start_time) * 1000,
             completed=completed,
         )
-
 
 __all__ = ["AgentLoop", "AgentResult", "AgentStep", "AgentThought"]

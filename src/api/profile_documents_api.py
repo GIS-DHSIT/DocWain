@@ -17,7 +17,7 @@ class UnderstandRequest(BaseModel):
     subscription_id: str = Field(..., description="Subscription identifier")
     profile_name: Optional[str] = Field(None, description="Profile display name")
     model_name: Optional[str] = Field(None, description="Ollama model name override")
-    embed_after: bool = Field(True, description="Whether to embed after understanding")
+    embed_after: bool = Field(False, description="Whether to embed after understanding (HITL: must be False by default)")
 
 
 class QueryRequest(BaseModel):
@@ -50,6 +50,7 @@ async def upload_document_for_profile(
         profile_name=profile_name,
         content_type=file.content_type,
         content_size=len(contents),
+        embed_after=False,
     )
     return {"document_id": doc_id, "status": "COMPLETED", "result": result}
 

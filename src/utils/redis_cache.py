@@ -1,12 +1,11 @@
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class CacheMetrics:
@@ -16,7 +15,6 @@ class CacheMetrics:
 
     def as_dict(self) -> Dict[str, int]:
         return {"hits": self.hits, "misses": self.misses, "errors": self.errors}
-
 
 class RedisJsonCache:
     def __init__(self, redis_client: Any, default_ttl: int = 600):
@@ -55,11 +53,9 @@ class RedisJsonCache:
             self._metric(feature).errors += 1
             logger.debug("Redis set failed for %s: %s", key, exc)
 
-
 def hash_query(value: str) -> str:
     normalized = " ".join((value or "").strip().lower().split())
     return sha256(normalized.encode("utf-8")).hexdigest()
-
 
 def stamp_cache_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     stamped = dict(payload)

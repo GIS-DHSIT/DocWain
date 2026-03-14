@@ -7,14 +7,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from .role_prompts import CLASSIFIER_INTENT_TEMPLATE, CLASSIFIER_SYSTEM
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _VALID_INTENTS = frozenset({
     "factual", "comparison", "summary", "ranking", "timeline",
@@ -67,7 +67,6 @@ _SCOPE_ALL_SIGNALS = [
     "how many", "which ones", "list all",
 ]
 
-
 def _heuristic_classify(query: str, profile_domain: Optional[str] = None) -> QueryClassification:
     """Keyword-based fallback when LLM classifier times out or fails."""
     q = query.lower()
@@ -112,7 +111,6 @@ def _heuristic_classify(query: str, profile_domain: Optional[str] = None) -> Que
         confidence=0.3,
     )
 
-
 @dataclass
 class QueryClassification:
     """Result of LLM-based query classification."""
@@ -130,7 +128,6 @@ class QueryClassification:
         if self.scope not in _VALID_SCOPES:
             self.scope = "targeted"
         self.confidence = max(0.0, min(1.0, float(self.confidence)))
-
 
 def _parse_classification(raw: str) -> Optional[QueryClassification]:
     """Parse JSON from LLM output into a QueryClassification."""
@@ -173,7 +170,6 @@ def _parse_classification(raw: str) -> Optional[QueryClassification]:
         scope=scope,
         confidence=confidence,
     )
-
 
 def classify_query(
     query: str,

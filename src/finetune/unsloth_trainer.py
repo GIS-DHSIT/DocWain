@@ -2,7 +2,7 @@ import contextlib
 import hashlib
 import inspect
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import math
 import os
 import shutil
@@ -23,10 +23,9 @@ from src.ollama_publisher import DEFAULT_PARAMS as OLLAMA_DEFAULT_PARAMS
 from src.ollama_publisher import DEFAULT_SYSTEM_PROMPT, OllamaPublisher
 from transformers import __version__ as transformers_version
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _MANAGER = None
-
 
 def build_training_arguments(request: FinetuneRequest, output_dir: Path, has_eval_dataset: bool):
     """
@@ -45,7 +44,8 @@ def build_training_arguments(request: FinetuneRequest, output_dir: Path, has_eva
             else:
                 major, minor = torch.cuda.get_device_capability()
                 bf16_supported = major >= 8  # Ampere+
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to detect BF16 support", exc_info=True)
             bf16_supported = False
 
     fp16_supported = has_cuda
@@ -103,13 +103,11 @@ def build_training_arguments(request: FinetuneRequest, output_dir: Path, has_eva
     )
     return TrainingArguments(**filtered_args)
 
-
 def get_finetune_manager():
     global _MANAGER
     if _MANAGER is None:
         _MANAGER = UnslothFinetuneManager()
     return _MANAGER
-
 
 class UnslothFinetuneManager:
     """Coordinates Unsloth fine-tune jobs and activates results per profile."""
@@ -268,8 +266,8 @@ class UnslothFinetuneManager:
         try:
             from unsloth import __version__ as unsloth_version
             manifest["versions"]["unsloth"] = unsloth_version
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to detect unsloth version", exc_info=True)
         eval_loss = None
         try:
             if torch.cuda.is_available():
@@ -337,8 +335,8 @@ class UnslothFinetuneManager:
                 try:
                     del model
                     del tokenizer
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to clean up model/tokenizer after OOM", exc_info=True)
                 request = self._memory_safe_request(request)
                 manifest["oom_retry_train"] = {
                     "batch_size": request.batch_size,
@@ -400,24 +398,25 @@ class UnslothFinetuneManager:
             try:
                 tb = traceback.TracebackException.from_exception(exc, capture_locals=True)
                 trace_text = "".join(tb.format())
-            except Exception:
+            except Exception as exc_tb:
+                logger.debug("Failed to format traceback with locals", exc_info=True)
                 trace_text = traceback.format_exc()
             manifest["traceback"] = trace_text
             manifest["finished_at"] = time.time()
             try:
                 self._write_error_debug(request, job_id, manifest["traceback"])
-            except Exception:
-                pass
+            except Exception as exc_debug:
+                logger.debug("Failed to write error debug file for job %s", job_id, exc_info=True)
             try:
                 self._persist_manifest(output_dir if 'output_dir' in locals() else Path(Config.Path.APP_HOME) / "finetune_artifacts", manifest)
-            except Exception:
-                pass
+            except Exception as exc_manifest:
+                logger.debug("Failed to persist manifest for failed job %s", job_id, exc_info=True)
             self._update_status(job_id, status="failed", message=str(exc))
         finally:
             try:
                 self._concurrency_sem.release()
-            except Exception:
-                pass
+            except Exception as exc_sem:
+                logger.debug("Failed to release concurrency semaphore", exc_info=True)
             if redis_lock not in {None, False}:
                 with contextlib.suppress(Exception):
                     redis_lock.release()
@@ -712,7 +711,8 @@ class UnslothFinetuneManager:
         """
         try:
             from unsloth import FastLanguageModel  # type: ignore
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to import FastLanguageModel from unsloth", exc_info=True)
             FastLanguageModel = None  # noqa: N806
 
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -913,8 +913,8 @@ class UnslothFinetuneManager:
             if model_path:
                 try:
                     shutil.rmtree(Path(model_path).parent, ignore_errors=True)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to remove old finetune run at %s", model_path, exc_info=True)
         entry["runs"] = to_keep
         self.state[profile_id] = entry
         self._persist_state()
@@ -959,7 +959,8 @@ class UnslothFinetuneManager:
             for profile_id, rec in raw.items():
                 rec.setdefault("runs", [])
             return raw
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to load finetune state from %s", self.state_path, exc_info=True)
             return {}
 
     def _persist_state(self):
@@ -973,7 +974,8 @@ class UnslothFinetuneManager:
             return {}
         try:
             return json.loads(self.run_index_path.read_text())
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to load run index from %s", self.run_index_path, exc_info=True)
             return {}
 
     def _persist_runs(self):
@@ -1050,7 +1052,8 @@ class UnslothFinetuneManager:
             free, total = torch.cuda.mem_get_info()
             free_gb = max(int((free / (1024**3)) * 0.8), 1)
             return {0: f"{free_gb}GiB", "cpu": "48GiB"}
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to query GPU memory info for max_memory", exc_info=True)
             return None
 
     @staticmethod
@@ -1062,7 +1065,8 @@ class UnslothFinetuneManager:
         try:
             free, total = torch.cuda.mem_get_info()
             return f"free={free/(1024**3):.2f}GiB total={total/(1024**3):.2f}GiB"
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to query GPU memory status", exc_info=True)
             return "unavailable"
 
     def _acquire_redis_lock(self, job_id: str):
@@ -1166,7 +1170,8 @@ class UnslothFinetuneManager:
             with path.open("rb") as f:
                 for chunk in iter(lambda: f.read(1024 * 1024), b""):
                     hasher.update(chunk)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Failed to compute file hash for %s", path, exc_info=True)
             return ""
         return hasher.hexdigest()
 

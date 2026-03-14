@@ -15,19 +15,18 @@ The key NLP signals used:
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 from functools import lru_cache
 from typing import List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── spaCy model (thread-safe lazy-loaded singleton) ──────────────────
 
 _nlp = None
 _nlp_load_attempted = False
 _nlp_lock = threading.Lock()
-
 
 def _get_nlp():
     """Lazy-load spaCy English model. Thread-safe; returns None if unavailable."""
@@ -50,11 +49,9 @@ def _get_nlp():
             logger.warning("spaCy model load failed (NLP entity extraction degraded): %s", exc)
             return None
 
-
 def preload_spacy():
     """Pre-load spaCy model at startup to avoid first-request latency."""
     return _get_nlp() is not None
-
 
 # ── Domain stopwords (never extracted as entity names) ───────────────
 
@@ -94,8 +91,12 @@ _DOMAIN_STOPWORDS = frozenset({
     # Tool-action words that should never be entities
     "draft", "compose", "generate", "create", "write", "build",
     "search", "internet", "online", "web",
-    # Adjectives/fragments that should never be entities
+    # Adjectives/fragments/generic words that should never be entities
     "non", "available", "highlevel", "high", "level", "brief",
+    "areas", "area", "response", "responses", "better", "worse", "good", "bad",
+    "understanding", "accuracy", "format", "table", "proper", "inline",
+    "same", "again", "much", "correct", "incorrect", "poor", "provided",
+    "generated", "mentioned", "specific", "specifically", "request", "asked",
     # Generic document/file nouns — never valid entity hints
     "file", "files", "product", "products", "manual", "manuals",
     "version", "versions", "page", "pages", "section", "sections",
@@ -120,6 +121,15 @@ _DOMAIN_STOPWORDS = frozenset({
     "vendor", "vendors", "supplier", "suppliers",
 })
 
+# Title words that precede names but are not part of the entity
+_TITLE_WORDS = frozenset({
+    "dr", "dr.", "prof", "prof.", "mr", "mr.", "mrs", "mrs.", "ms", "ms.",
+    "sir", "madam", "hon", "rev", "sgt", "capt", "lt", "col", "gen",
+})
+
+# Name suffixes to strip from entity names
+_NAME_SUFFIXES = frozenset({"jr", "jr.", "sr", "sr.", "ii", "iii", "iv", "esq", "esq."})
+
 # Dependency labels that indicate entity position
 _ENTITY_DEP_LABELS = frozenset({"pobj", "poss", "nsubj", "nsubjpass", "dobj", "attr"})
 
@@ -131,7 +141,6 @@ _ENTITY_VERBS = frozenset({
     "summarize", "summarise", "show", "get", "fetch", "find",
     "describe", "review", "contact", "reach",
 })
-
 
 def _is_likely_entity(token) -> bool:
     """Check if a spaCy token is a likely entity name (not a common word)."""
@@ -167,7 +176,6 @@ def _is_likely_entity(token) -> bool:
 
     return True
 
-
 def _extract_compound_noun_phrase(token) -> Optional[str]:
     """When a pobj is a stopword, look for prepositional children.
 
@@ -194,7 +202,6 @@ def _extract_compound_noun_phrase(token) -> Optional[str]:
                     if phrase.lower() not in _DOMAIN_STOPWORDS and len(phrase) > 2:
                         return phrase
     return None
-
 
 def _extract_via_dependency_parse(query: str) -> Optional[str]:
     """Extract entity name from query using spaCy dependency parsing.
@@ -260,7 +267,11 @@ def _extract_via_dependency_parse(query: str) -> Optional[str]:
                 for left in token.lefts:
                     if left.dep_ == "compound" and _is_likely_entity(left):
                         entity_parts.insert(0, left.text)
-                candidates.append(" ".join(entity_parts))
+                # Strip title words (Dr., Mr., etc.) and suffixes (Jr., III)
+                entity_parts = [p for p in entity_parts if p.lower().rstrip(".") not in _TITLE_WORDS]
+                entity_parts = [p for p in entity_parts if p.lower().rstrip(".") not in _NAME_SUFFIXES]
+                if entity_parts:
+                    candidates.append(" ".join(entity_parts))
 
     # Also check for PROPN tokens not caught by dependency rules
     if not candidates:
@@ -288,11 +299,203 @@ def _extract_via_dependency_parse(query: str) -> Optional[str]:
     # Return the first candidate (priority: dependency parse > PROPN > NER)
     return candidates[0]
 
+def _capitalized_word_fallback(query: str) -> Optional[str]:
+    """Last-resort fallback: extract capitalized multi-word sequences as entity hints.
+
+    Catches names the dependency parser misses (e.g., when spaCy tags a name
+    as NOUN instead of PROPN, or when the sentence structure is unusual).
+    """
+    import re
+    # Find capitalized words (2+ chars) that aren't at sentence start
+    words = query.split()
+    if len(words) < 2:
+        return None
+    # Skip first word (always capitalized in a sentence)
+    candidates: List[str] = []
+    i = 1
+    while i < len(words):
+        w = re.sub(r"[^\w'-]", "", words[i])
+        if w and w[0].isupper() and len(w) >= 2 and w.lower() not in _DOMAIN_STOPWORDS:
+            # Collect consecutive capitalized words (multi-word names)
+            parts = [w]
+            j = i + 1
+            while j < len(words):
+                nw = re.sub(r"[^\w'-]", "", words[j])
+                if nw and nw[0].isupper() and len(nw) >= 2 and nw.lower() not in _DOMAIN_STOPWORDS:
+                    parts.append(nw)
+                    j += 1
+                else:
+                    break
+            name = " ".join(parts)
+            if name.lower() not in _DOMAIN_STOPWORDS:
+                candidates.append(name)
+            i = j
+        else:
+            i += 1
+    return candidates[0] if candidates else None
+
+# ── Regex-based fallback when spaCy is unavailable ─────────────────────
+
+# Common English words that should never be extracted as entity names
+# (superset of _DOMAIN_STOPWORDS plus common verbs/adverbs/adjectives)
+_COMMON_WORDS = _DOMAIN_STOPWORDS | frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "can", "could", "must", "not", "no", "yes",
+    "this", "that", "these", "those", "it", "its", "my", "your", "his",
+    "her", "our", "their", "me", "him", "us", "them", "who", "what",
+    "which", "where", "when", "how", "why", "if", "then", "else", "also",
+    "just", "only", "very", "really", "quite", "here", "there", "now",
+    "any", "more", "less", "much", "many", "few", "own", "such", "than",
+    "too", "so", "but", "and", "or", "nor", "yet", "with", "without",
+    "about", "above", "below", "between", "into", "through", "during",
+    "before", "after", "since", "until", "while", "because", "although",
+    "though", "even", "whether", "ever", "never", "always", "often",
+    "sometimes", "already", "still", "yet", "please", "thanks", "okay",
+    "sure", "right", "left", "new", "old", "big", "small", "large",
+    "long", "short", "first", "last", "next", "previous", "main",
+    "worked", "working", "on", "in", "at", "to", "from", "up", "down",
+    "out", "over", "under", "off", "into",
+})
+
+def _regex_fallback(query: str) -> Optional[str]:
+    """Regex-based entity extraction fallback when spaCy is unavailable.
+
+    Handles common query patterns with lowercase or mixed-case person names:
+    - Preposition patterns: "of/for/about/from <name>"
+    - Possessive: "<name>'s"
+    - Verb + name: "summarize/find/contact <name>"
+    - Subject + verb: "<name> has/have/does/did/worked ..."
+    """
+    import re
+
+    q = query.strip()
+
+    # Pattern 1: possessive — "<name>'s" anywhere in query
+    m = re.search(r"(\b\w{3,}(?:\s+\w{3,})*?)\s*'s\b", q, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        # Take only the last word(s) that aren't stopwords
+        parts = candidate.split()
+        name_parts = []
+        for p in reversed(parts):
+            if p.lower() in _COMMON_WORDS:
+                break
+            name_parts.insert(0, p)
+        if name_parts:
+            name = " ".join(name_parts)
+            if name.lower() not in _COMMON_WORDS and len(name) >= 3:
+                return name
+
+    # Pattern 2: preposition + name at end — "of/for/about/from <name>"
+    m = re.search(
+        r"\b(?:of|for|about|from|by)\s+((?:\w{3,}\s+)*\w{3,})\s*$",
+        q, re.IGNORECASE,
+    )
+    if m:
+        tail = m.group(1).strip()
+        # Walk from end, collect non-stopword tokens
+        parts = tail.split()
+        name_parts = []
+        for p in reversed(parts):
+            if p.lower() in _COMMON_WORDS:
+                break
+            name_parts.insert(0, p)
+        if name_parts:
+            name = " ".join(name_parts)
+            if name.lower() not in _COMMON_WORDS and len(name) >= 3:
+                return name
+
+    # Pattern 3: preposition + name NOT at end — "of/for/about/from <name> <stopwords>"
+    m = re.search(
+        r"\b(?:of|for|about|from|by)\s+(\w{3,}(?:\s+\w{3,})*)",
+        q, re.IGNORECASE,
+    )
+    if m:
+        tail = m.group(1).strip()
+        parts = tail.split()
+        name_parts = []
+        for p in parts:
+            if p.lower() in _COMMON_WORDS:
+                break
+            name_parts.append(p)
+        if name_parts:
+            name = " ".join(name_parts)
+            if name.lower() not in _COMMON_WORDS and len(name) >= 3:
+                return name
+
+    # Pattern 4: action verb + name — "summarize/find/show/get/contact <name>"
+    _verb_pattern = "|".join(_ENTITY_VERBS)
+    m = re.search(
+        rf"\b(?:{_verb_pattern})\s+((?:\w{3,}\s+)*\w{3,})",
+        q, re.IGNORECASE,
+    )
+    if m:
+        tail = m.group(1).strip()
+        parts = tail.split()
+        name_parts = []
+        for p in parts:
+            if p.lower() in _COMMON_WORDS:
+                break
+            name_parts.append(p)
+        if name_parts:
+            name = " ".join(name_parts)
+            if name.lower() not in _COMMON_WORDS and len(name) >= 3:
+                return name
+
+    # Pattern 5: subject + aux/verb — "<name> has/have/does/did/is/worked ..."
+    m = re.match(
+        r"(?:does|has|have|did|is|was)\s+(\w{3,}(?:\s+\w{3,})*?)(?:\s+(?:have|has|had|do|does|did|is|was|were|been|worked|work|know|any|the|a)\b)",
+        q, re.IGNORECASE,
+    )
+    if m:
+        tail = m.group(1).strip()
+        parts = tail.split()
+        name_parts = []
+        for p in parts:
+            if p.lower() in _COMMON_WORDS:
+                break
+            name_parts.append(p)
+        if name_parts:
+            name = " ".join(name_parts)
+            if name.lower() not in _COMMON_WORDS and len(name) >= 3:
+                return name
+
+    # Pattern 6: "between X and Y" — comparison entity extraction
+    m = re.search(
+        r"\bbetween\s+(\w{3,}(?:\s+\w{3,})*?)\s+and\s+(\w{3,}(?:\s+\w{3,})*?)(?:\s|[.?!,]|$)",
+        q, re.IGNORECASE,
+    )
+    if m:
+        name1 = m.group(1).strip()
+        name2 = m.group(2).strip()
+        # Return first non-stopword entity
+        for name in (name1, name2):
+            parts = [p for p in name.split() if p.lower() not in _COMMON_WORDS]
+            if parts:
+                result = " ".join(parts)
+                if result.lower() not in _COMMON_WORDS and len(result) >= 3:
+                    return result
+
+    # Pattern 7: last word if OOV-like (not in common words, 3+ chars)
+    # Only for short queries (<=5 words) where the last word is likely a name
+    words = q.split()
+    if 2 <= len(words) <= 5:
+        last = re.sub(r"[^\w'-]", "", words[-1])
+        if last and len(last) >= 3 and last.lower() not in _COMMON_WORDS:
+            # Verify the query has an action word before this
+            prefix_lower = " ".join(words[:-1]).lower()
+            action_indicators = {"summarize", "summarise", "find", "show", "get",
+                                 "contact", "reach", "describe", "review", "fetch"}
+            if any(v in prefix_lower for v in action_indicators):
+                return last
+
+    return None
 
 def extract_entity_from_query(query: str) -> Optional[str]:
     """Extract the target entity name from a user query.
 
-    Uses spaCy dependency parsing.
+    Uses spaCy dependency parsing with regex and capitalized-word fallbacks.
 
     Returns the entity name string or None if no entity detected.
     """
@@ -303,39 +506,76 @@ def extract_entity_from_query(query: str) -> Optional[str]:
     if entity:
         return entity
 
-    return None
+    # Fallback: regex-based pattern matching (handles lowercase names when
+    # spaCy is unavailable)
+    entity = _regex_fallback(query)
+    if entity:
+        return entity
 
+    # Last resort: look for capitalized multi-word sequences
+    return _capitalized_word_fallback(query)
 
 def extract_all_entities(query: str) -> List[str]:
     """Extract all entity mentions from a query (for multi-entity queries).
 
     Returns a list of entity name strings. Used for comparison/ranking queries
-    that mention multiple people.
+    that mention multiple people. Handles compound names (first+last) and
+    deduplicates overlapping mentions.
     """
     if not query or not query.strip():
         return []
 
     entities: List[str] = []
 
-    # spaCy
     nlp = _get_nlp()
     if nlp is None:
-        return entities
+        # Fallback chain: regex first (handles lowercase names), then capitalized words
+        regex_entity = _regex_fallback(query)
+        if regex_entity:
+            return [regex_entity]
+        fallback = _capitalized_word_fallback(query)
+        return [fallback] if fallback else []
 
     doc = nlp(query)
 
-    # Collect all entity-like tokens
+    # Collect compound entity names (multi-word proper nouns)
     for token in doc:
         if token.pos_ in ("PUNCT", "SPACE"):
             continue
         if _is_likely_entity(token):
             dep = token.dep_
             if dep in _ENTITY_DEP_LABELS or token.pos_ == "PROPN":
-                entities.append(token.text)
+                # Build compound name from adjacent proper nouns
+                parts = [token.text]
+                for right in token.rights:
+                    if right.dep_ in ("compound", "flat", "flat:name") and _is_likely_entity(right):
+                        parts.append(right.text)
+                for left in token.lefts:
+                    if left.dep_ == "compound" and _is_likely_entity(left):
+                        parts.insert(0, left.text)
+                name = " ".join(parts)
+                # Avoid duplicates and substrings
+                if name not in entities and not any(name in e for e in entities):
+                    # Remove any existing entries that are substrings of this name
+                    entities = [e for e in entities if e not in name]
+                    entities.append(name)
 
-    # Also NER
+    # Also NER (prefer multi-word NER entities over single-token matches)
     for ent in doc.ents:
-        if ent.label_ in ("PERSON", "ORG") and ent.text not in entities:
-            entities.append(ent.text)
+        if ent.label_ in ("PERSON", "ORG"):
+            name = ent.text
+            if name not in entities and not any(name in e for e in entities):
+                entities = [e for e in entities if e not in name]
+                entities.append(name)
+
+    # If spaCy found nothing, try regex + capitalized word fallbacks
+    if not entities:
+        regex_entity = _regex_fallback(query)
+        if regex_entity:
+            entities.append(regex_entity)
+        else:
+            cap_entity = _capitalized_word_fallback(query)
+            if cap_entity:
+                entities.append(cap_entity)
 
     return entities

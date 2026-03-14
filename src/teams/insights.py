@@ -7,11 +7,11 @@ during file upload.
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Domain prompt templates
@@ -120,7 +120,6 @@ _DEFAULT_ACTIONS = [
     {"title": "Key findings", "action": "domain_query", "query": "What are the key findings and important details?"},
 ]
 
-
 @dataclass
 class ProactiveInsights:
     """Results from proactive document analysis."""
@@ -129,7 +128,6 @@ class ProactiveInsights:
     suggested_questions: List[str] = field(default_factory=list)
     domain_actions: List[Dict[str, str]] = field(default_factory=list)
     domain: str = "general"
-
 
 def _normalize_domain(doc_type: str) -> str:
     """Map document type variations to canonical domain keys."""
@@ -155,12 +153,10 @@ def _normalize_domain(doc_type: str) -> str:
             return domain
     return "general"
 
-
 def get_domain_actions(doc_type: str) -> List[Dict[str, str]]:
     """Get domain-specific quick actions for a document type."""
     domain = _normalize_domain(doc_type)
     return _DOMAIN_ACTIONS.get(domain, _DEFAULT_ACTIONS)
-
 
 def generate_proactive_insights(
     doc_type: str,
@@ -241,7 +237,6 @@ Respond ONLY with valid JSON:
 
     return result
 
-
 def _fallback_insights(
     result: ProactiveInsights,
     doc_type: str,
@@ -260,7 +255,6 @@ def _fallback_insights(
     if not result.suggested_questions:
         result.suggested_questions = _fallback_questions(result.domain)
     return result
-
 
 def _fallback_questions(domain: str) -> List[str]:
     """Domain-specific fallback questions when LLM is unavailable."""
@@ -306,7 +300,6 @@ def _fallback_questions(domain: str) -> List[str]:
         "What are the most important dates?",
         "Extract the key details",
     ])
-
 
 def generate_followup_suggestions(
     query: str,

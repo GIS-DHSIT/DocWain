@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -9,8 +9,7 @@ from src.api.config import Config
 from src.kg.entity_extractor import EntityExtractor
 from src.kg.neo4j_store import Neo4jStore
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class KGChunk:
@@ -23,7 +22,6 @@ class KGChunk:
     subscription_id: str
     profile_id: str
 
-
 @dataclass
 class KGEntity:
     entity_id: str
@@ -33,7 +31,6 @@ class KGEntity:
     subscription_id: str
     profile_id: str
 
-
 @dataclass
 class KGMention:
     chunk_id: str
@@ -42,7 +39,6 @@ class KGMention:
     span: Optional[str]
     subscription_id: str
     profile_id: str
-
 
 class KGStoreBase:
     def ingest(
@@ -55,7 +51,6 @@ class KGStoreBase:
         about: List[Dict[str, Any]],
     ) -> None:
         raise NotImplementedError
-
 
 class Neo4jKGStore(KGStoreBase):
     def __init__(self) -> None:
@@ -135,7 +130,6 @@ class Neo4jKGStore(KGStoreBase):
             )
             self.store.run_query(about_query, {"about": about})
 
-
 class MemoryKGStore(KGStoreBase):
     def __init__(self) -> None:
         self.documents: Dict[str, Dict[str, Any]] = {}
@@ -162,9 +156,7 @@ class MemoryKGStore(KGStoreBase):
             if mention.entity_id not in self.mentions[mention.chunk_id]:
                 self.mentions[mention.chunk_id].append(mention.entity_id)
 
-
 _MEMORY_STORE: Optional[MemoryKGStore] = None
-
 
 def get_kg_store() -> KGStoreBase:
     global _MEMORY_STORE
@@ -172,11 +164,10 @@ def get_kg_store() -> KGStoreBase:
         try:
             return Neo4jKGStore()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Neo4j unavailable; falling back to memory KG store: %s", exc)
+            logger.debug("Neo4j unavailable; falling back to memory KG store: %s", exc)
     if _MEMORY_STORE is None:
         _MEMORY_STORE = MemoryKGStore()
     return _MEMORY_STORE
-
 
 class KGBuilder:
     def __init__(
@@ -281,7 +272,6 @@ class KGBuilder:
             "mentions_ingested": len(mentions),
         }
 
-
 def _extract_span(text: str, name: str, window: int = 40) -> Optional[str]:
     if not text or not name:
         return None
@@ -293,6 +283,5 @@ def _extract_span(text: str, name: str, window: int = 40) -> Optional[str]:
     start = max(0, idx - window)
     end = min(len(text), idx + len(needle) + window)
     return text[start:end].strip()
-
 
 __all__ = ["KGBuilder", "get_kg_store", "KGStoreBase", "Neo4jKGStore", "MemoryKGStore"]

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import contextlib
-import logging
+import warnings
+from src.utils.logging_utils import get_logger
 import os
 import threading
 from typing import Any, Dict, Optional, Tuple
+
+# Suppress SentenceTransformer._target_device deprecation warning.
+# This is a library-internal deprecation (replaced by .device) that
+# fires on model instantiation — no action needed on our side.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*_target_device.*has been deprecated",
+    category=FutureWarning,
+)
 
 # Suppress tqdm progress bars globally — they spam logs with
 # "Batches: 1/1" for every encode call in sentence-transformers and
@@ -16,7 +26,7 @@ from sentence_transformers import SentenceTransformer
 
 from src.api.config import Config
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _MODEL: Optional[SentenceTransformer] = None
 _MODEL_NAME: Optional[str] = None
@@ -28,7 +38,6 @@ _FALLBACK_NAME = "sentence-transformers/all-mpnet-base-v2"
 _FALLBACK_USED = False
 _FORCED_CPU_CANDIDATES: set[str] = set()
 _REQUEST_CONTEXT = threading.local()
-
 
 @contextlib.contextmanager
 def embed_request_context(request_id: Optional[str]):
@@ -45,18 +54,15 @@ def embed_request_context(request_id: Optional[str]):
         elif hasattr(_REQUEST_CONTEXT, "embed_request_id"):
             delattr(_REQUEST_CONTEXT, "embed_request_id")
 
-
 def _preferred_device() -> str:
-    # Always default to CPU for embeddings — GPU is reserved for the LLM (gpt-oss).
+    # Always default to CPU for embeddings — GPU is reserved for the LLM (DocWain-Agent).
     # bge-large-en-v1.5 (335M params) runs efficiently on CPU.
     env_device = (os.getenv("EMBEDDING_DEVICE") or "cpu").strip().lower()
     return env_device
 
-
 def _is_meta_tensor_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return "meta tensor" in msg or "cannot copy out of meta tensor" in msg
-
 
 def _is_cuda_oom(exc: Exception) -> bool:
     if isinstance(exc, torch.cuda.OutOfMemoryError):
@@ -69,14 +75,11 @@ def _is_cuda_oom(exc: Exception) -> bool:
         or ("cuda error" in msg and "alloc" in msg)
     )
 
-
 def _request_prefix() -> str:
     request_id = getattr(_REQUEST_CONTEXT, "embed_request_id", None)
     return f"[embed_request_id={request_id}] " if request_id else ""
 
-
 _GPU_MIN_FREE_MB = int(os.getenv("EMBEDDING_GPU_MIN_FREE_MB", "1500"))
-
 
 def _has_sufficient_gpu_memory(min_mb: int = 0) -> bool:
     """Check if GPU has enough free memory for embedding."""
@@ -90,7 +93,6 @@ def _has_sufficient_gpu_memory(min_mb: int = 0) -> bool:
     except Exception:  # noqa: BLE001
         return False
 
-
 def _candidates() -> list[str]:
     candidates: list[str] = []
     for name in getattr(Config.Model, "SENTENCE_TRANSFORMERS_CANDIDATES", []) or []:
@@ -102,7 +104,6 @@ def _candidates() -> list[str]:
         )
         candidates.append(str(fallback))
     return candidates
-
 
 def _load_on_cpu(name: str) -> SentenceTransformer:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -117,7 +118,6 @@ def _load_on_cpu(name: str) -> SentenceTransformer:
         local_files_only=True,
     )
 
-
 def _has_meta_tensors(model: SentenceTransformer) -> bool:
     try:
         params = model.parameters()
@@ -128,15 +128,12 @@ def _has_meta_tensors(model: SentenceTransformer) -> bool:
             return True
     return False
 
-
 def _ensure_not_meta(model: SentenceTransformer, stage: str) -> None:
     if _has_meta_tensors(model):
         raise RuntimeError(f"Model contains meta tensors after {stage}")
 
-
 def _health_check(model: SentenceTransformer) -> None:
     model.encode(["health check"], convert_to_numpy=True, normalize_embeddings=False, batch_size=1, show_progress_bar=False)
-
 
 def get_embedding_model(
     model_name: Optional[str] = None,
@@ -289,7 +286,6 @@ def get_embedding_model(
         raise last_error
     raise RuntimeError("No embedding models available")
 
-
 def _optimal_batch_size(device: str, requested: Optional[int], num_texts: int) -> int:
     """Select batch size based on device and workload."""
     if requested:
@@ -299,7 +295,6 @@ def _optimal_batch_size(device: str, requested: Optional[int], num_texts: int) -
         # Smaller batches improve CPU cache locality — 2-3x faster
         return min(default, 16)
     return default
-
 
 def encode_with_fallback(
     texts: list[str],
@@ -333,14 +328,14 @@ def encode_with_fallback(
     except Exception as exc:  # noqa: BLE001
         if _is_meta_tensor_error(exc) or _is_cuda_oom(exc):
             if _is_cuda_oom(exc):
-                logger.warning("%sCUDA OOM during encode; falling back to cpu model: %s", _request_prefix(), exc)
+                logger.debug("%sCUDA OOM during encode; falling back to cpu model: %s", _request_prefix(), exc)
                 try:
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except Exception:  # noqa: BLE001
                     pass
             else:
-                logger.warning("%sMeta tensor error during encode; falling back to cpu model: %s", _request_prefix(), exc)
+                logger.debug("%sMeta tensor error during encode; falling back to cpu model: %s", _request_prefix(), exc)
             model, _ = get_embedding_model(reload=True, device="cpu")
             cpu_batch = _optimal_batch_size("cpu", batch_size, len(texts))
             return model.encode(
@@ -352,9 +347,7 @@ def encode_with_fallback(
             )
         raise
 
-
 def get_model_info() -> Tuple[Optional[str], Optional[int], Optional[str]]:
     return _MODEL_NAME, _MODEL_DIM, _MODEL_DEVICE
-
 
 __all__ = ["get_embedding_model", "encode_with_fallback", "get_model_info", "embed_request_context"]

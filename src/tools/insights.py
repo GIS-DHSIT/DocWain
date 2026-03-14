@@ -7,7 +7,7 @@ risk identification across document domains.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import statistics
 from dataclasses import dataclass, field
@@ -15,8 +15,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from src.tools.base import register_tool, standard_response
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class Insight:
@@ -41,7 +40,6 @@ class Insight:
             result["evidence"] = self.evidence
         return result
 
-
 # ── Number extraction ─────────────────────────────────────────────────────
 
 _CURRENCY_RE = re.compile(
@@ -58,7 +56,6 @@ _DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-
 def _parse_currency(text: str) -> float:
     """Parse a currency string to float."""
     cleaned = re.sub(r"[^\d.]", "", text.replace(",", ""))
@@ -66,7 +63,6 @@ def _parse_currency(text: str) -> float:
         return float(cleaned)
     except (ValueError, TypeError):
         return 0.0
-
 
 # ── Statistical helpers ───────────────────────────────────────────────────
 
@@ -89,7 +85,6 @@ def _find_outliers(values: List[float], multiplier: float = 1.5) -> List[tuple[i
         if v < lower or v > upper:
             outliers.append((i, v))
     return outliers
-
 
 # ── Domain-specific insight generators ────────────────────────────────────
 
@@ -178,7 +173,6 @@ def _hr_insights(text: str, chunks: List[str]) -> List[Insight]:
 
     return insights
 
-
 def _invoice_insights(text: str, chunks: List[str]) -> List[Insight]:
     """Generate invoice-specific insights."""
     insights: List[Insight] = []
@@ -240,7 +234,6 @@ def _invoice_insights(text: str, chunks: List[str]) -> List[Insight]:
 
     return insights
 
-
 def _legal_insights(text: str, chunks: List[str]) -> List[Insight]:
     """Generate legal/contract-specific insights."""
     insights: List[Insight] = []
@@ -296,7 +289,6 @@ def _legal_insights(text: str, chunks: List[str]) -> List[Insight]:
         ))
 
     return insights
-
 
 def _medical_insights(text: str, chunks: List[str]) -> List[Insight]:
     """Generate medical-specific insights."""
@@ -368,7 +360,6 @@ def _medical_insights(text: str, chunks: List[str]) -> List[Insight]:
         ))
 
     return insights
-
 
 def _generic_insights(text: str, chunks: List[str]) -> List[Insight]:
     """Generate domain-agnostic insights."""
@@ -442,7 +433,6 @@ def _generic_insights(text: str, chunks: List[str]) -> List[Insight]:
 
     return insights
 
-
 # ── Main insight generation ───────────────────────────────────────────────
 
 def generate_insights(
@@ -499,7 +489,6 @@ def generate_insights(
 
     return unique
 
-
 def render_insights(insights: List[Insight], domain: Optional[str] = None) -> str:
     """Render insights into a readable format."""
     if not insights:
@@ -529,7 +518,6 @@ def render_insights(insights: List[Insight], domain: Optional[str] = None) -> st
         lines.append("")
 
     return "\n".join(lines)
-
 
 @register_tool("insights")
 async def insights_handler(

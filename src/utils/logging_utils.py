@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import uuid
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any, Dict, Mapping, MutableMapping, Optional, Tuple
 
 
@@ -253,6 +256,9 @@ def configure_logging(
     log_level: str = "INFO",
     json_format: bool = False,
     include_correlation_id: bool = True,
+    log_dir: Optional[str] = None,
+    max_bytes: int = 50 * 1024 * 1024,
+    backup_count: int = 5,
 ) -> None:
     """
     Configure application-wide logging.
@@ -261,35 +267,62 @@ def configure_logging(
         log_level: Root log level (DEBUG, INFO, WARNING, ERROR, CRITICAL).
         json_format: Use JSON formatter for structured logging.
         include_correlation_id: Include correlation ID in log output.
+        log_dir: Directory for log files. Defaults to LOG_DIR env var or "logs/".
+        max_bytes: Max size per log file before rotation (default 50MB).
+        backup_count: Number of rotated log files to keep (default 5).
     """
+    level = getattr(logging, log_level.upper(), logging.INFO)
+
     # Get root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
+    root_logger.setLevel(level)
 
     # Remove existing handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
-    # Create console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
-
-    # Set formatter
+    # Choose formatter
     if json_format:
         formatter = JSONFormatter(include_extra=True)
     else:
         formatter = ConsoleFormatter(include_correlation_id=include_correlation_id)
 
-    console_handler.setFormatter(formatter)
-
-    # Add correlation ID filter
+    # Resolve correlation ID filter (shared across handlers)
+    correlation_filter = None
     try:
         from src.middleware.correlation import CorrelationIdFilter
-        console_handler.addFilter(CorrelationIdFilter())
+        correlation_filter = CorrelationIdFilter()
     except ImportError:
         pass
 
+    # --- Console handler ---
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    if correlation_filter:
+        console_handler.addFilter(correlation_filter)
     root_logger.addHandler(console_handler)
+
+    # --- Rotating file handler ---
+    log_dir = log_dir or os.getenv("LOG_DIR", "logs")
+    try:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path / "docwain.log",
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(level)
+        # Always use JSON for file logs (easier to parse/aggregate)
+        file_handler.setFormatter(JSONFormatter(include_extra=True))
+        if correlation_filter:
+            file_handler.addFilter(correlation_filter)
+        root_logger.addHandler(file_handler)
+    except OSError as exc:
+        # Don't fail startup if log dir is unwritable (e.g. read-only container)
+        root_logger.warning("Could not create file log handler at %s: %s", log_dir, exc)
 
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)

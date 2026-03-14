@@ -104,6 +104,102 @@ class EntityFactBundle(BaseModel):
     facts: List[Fact] = Field(default_factory=list)
 
 
+class UnitType(str, enum.Enum):
+    HEADING = "heading"
+    PARAGRAPH = "paragraph"
+    TABLE = "table"
+    LIST = "list"
+    KV_GROUP = "kv_group"
+    FIGURE_CAPTION = "figure_caption"
+    FRAGMENT = "fragment"
+
+
+class SemanticUnit(BaseModel):
+    unit_id: str
+    unit_type: UnitType
+    text: str
+    page_start: int
+    page_end: int
+    heading_path: List[str] = Field(default_factory=list)
+    parent_unit_id: Optional[str] = None
+    children_ids: List[str] = Field(default_factory=list)
+    confidence: float = 1.0
+    table_headers: Optional[List[str]] = None
+    table_rows: Optional[List[Dict[str, Any]]] = None
+    kv_pairs: Optional[Dict[str, str]] = None
+    raw_spans: List[Dict[str, Any]] = Field(default_factory=list)
+    is_ocr: bool = False
+    is_uncertain: bool = False
+
+
+class EntitySpan(BaseModel):
+    entity_id: str
+    text: str
+    normalized: str
+    label: str
+    unit_id: str
+    char_start: int = 0
+    char_end: int = 0
+    confidence: float = 0.0
+    source: str = "unknown"
+    aliases: List[str] = Field(default_factory=list)
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+
+class FactTriple(BaseModel):
+    fact_id: str
+    subject_id: str
+    predicate: str
+    object_id: Optional[str] = None
+    object_value: Optional[str] = None
+    unit_id: str
+    raw_text: str
+    confidence: float = 0.0
+    extraction_method: str = "unknown"
+    is_uncertain: bool = False
+
+
+class ConflictRecord(BaseModel):
+    fact_id_1: str
+    fact_id_2: str
+    conflict_type: str
+    description: str
+
+
+class StructuredDocument(BaseModel):
+    document_id: str
+    units: List[SemanticUnit] = Field(default_factory=list)
+    unit_count: int = 0
+    total_chars: int = 0
+
+
+class ExtractionResult(BaseModel):
+    document_id: str
+    entities: List[EntitySpan] = Field(default_factory=list)
+    facts: List[FactTriple] = Field(default_factory=list)
+    tables_structured: List[Dict[str, Any]] = Field(default_factory=list)
+    kv_pairs: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class DocumentFingerprint(BaseModel):
+    entity_distribution: Dict[str, int] = Field(default_factory=dict)
+    structure_profile: Dict[str, int] = Field(default_factory=dict)
+    topic_vectors: List[List[float]] = Field(default_factory=list)
+    numeric_density: float = 0.0
+    entity_density: float = 0.0
+    formality_score: float = 0.5
+    structure_complexity: float = 0.0
+    relational_density: float = 0.0
+    auto_tags: List[str] = Field(default_factory=list)
+
+
+class VerificationResult(BaseModel):
+    is_valid: bool = True
+    conflicts: List[ConflictRecord] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    quality_score: float = 1.0
+
+
 __all__ = [
     "DocumentManifest",
     "DocumentStatus",
@@ -116,4 +212,13 @@ __all__ = [
     "Entity",
     "Fact",
     "EntityFactBundle",
+    "UnitType",
+    "SemanticUnit",
+    "EntitySpan",
+    "FactTriple",
+    "ConflictRecord",
+    "StructuredDocument",
+    "ExtractionResult",
+    "DocumentFingerprint",
+    "VerificationResult",
 ]

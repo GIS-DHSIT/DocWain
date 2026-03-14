@@ -1,30 +1,35 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import time
 from typing import Any, Dict, Optional, Tuple
 
 from src.api.content_store import load_extracted_pickle
 from src.api.document_status import set_error, update_document_fields, update_stage
 from src.api.embedding_service import embed_documents
+from src.api.screening_service import promote_to_screening_completed
 from src.api.extraction_service import extract_uploaded_document
-from src.doc_understanding import build_content_map, identify_document, understand_document
+from src.doc_understanding import build_content_map, identify_document
 from src.metadata.normalizer import MetadataNormalizationError, normalize_document_metadata
 from src.profiles.profile_store import resolve_profile_name
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class UnderstandingError(Exception):
     pass
 
-
 def _select_extracted(extracted_payload: Any) -> Tuple[str, Any]:
     if isinstance(extracted_payload, dict) and extracted_payload:
+        # Enriched pickle format: {raw: {filename: content}, structured: ..., ...}
+        # Navigate into 'raw' to find the actual extracted document.
+        raw = extracted_payload.get("raw")
+        if isinstance(raw, dict) and raw:
+            filename, content = next(iter(raw.items()))
+            return filename, content
+        # Legacy format: {filename: content} directly
         filename, content = next(iter(extracted_payload.items()))
         return filename, content
     raise UnderstandingError("No extracted content available")
-
 
 def _update_metadata(document_id: str, metadata: Dict[str, Any]) -> None:
     update_fields: Dict[str, Any] = {}
@@ -46,7 +51,6 @@ def _update_metadata(document_id: str, metadata: Dict[str, Any]) -> None:
         update_fields[key] = value
         update_fields[f"metadata.{key}"] = value
     update_document_fields(document_id, update_fields)
-
 
 def run_document_understanding(
     *,
@@ -92,17 +96,55 @@ def run_document_understanding(
     content_map = build_content_map(extracted)
     update_document_fields(document_id, {"content_map": content_map})
 
-    understanding = understand_document(extracted=extracted, doc_type=identification.document_type, model_name=model_name)
+    # Deep intelligence analysis (replaces legacy understand_document)
+    from src.intelligence_v2.analyzer import DocumentAnalyzer
+    from src.llm.gateway import get_llm_gateway
+    from src.api.config import Config
+    from pymongo import MongoClient
 
-    understanding_update = {
-        "document_summary": understanding.get("document_summary"),
-        "section_summaries": understanding.get("section_summaries"),
-        "key_entities": understanding.get("key_entities"),
-        "key_facts": understanding.get("key_facts"),
-        "doc_intent_tags": understanding.get("intent_tags"),
-        "understanding_json": understanding,
-    }
-    update_document_fields(document_id, understanding_update)
+    llm = get_llm_gateway()
+    mongo_client = MongoClient(Config.MongoDB.URI)
+    mongodb = mongo_client[Config.MongoDB.DB][Config.MongoDB.DOCUMENTS]
+
+    try:
+        from src.kg.neo4j_store import Neo4jStore
+        neo4j = Neo4jStore()
+    except Exception:
+        neo4j = None
+
+    if neo4j is not None:
+        analyzer = DocumentAnalyzer(llm_gateway=llm, neo4j_store=neo4j, mongodb=mongodb)
+        intel_result = analyzer.analyze(
+            document_id=document_id,
+            extracted=extracted,
+            subscription_id=subscription_id,
+            profile_id=profile_id,
+            filename=filename,
+            doc_type=identification.document_type,
+        )
+        understanding = intel_result["intelligence"]
+    else:
+        # Fallback: LLM analysis without KG
+        from src.intelligence_v2.summarizer import DocumentSummarizer
+        from src.intelligence_v2.analyzer import _get_text
+        logger.info("[UNDERSTANDING] Neo4j unavailable, using fallback LLM analysis for doc=%s", document_id)
+        summarizer = DocumentSummarizer(llm_gateway=llm)
+        text = _get_text(extracted)
+        logger.info("[UNDERSTANDING] Extracted text length=%d for doc=%s", len(text), document_id)
+        try:
+            analysis = summarizer.analyze(text=text, filename=filename, doc_type=identification.document_type)
+            understanding = analysis.to_dict()
+            logger.info(
+                "[UNDERSTANDING] Analysis complete for doc=%s: entities=%d, facts=%d, summary_len=%d",
+                document_id, len(analysis.entities), len(analysis.facts), len(analysis.summary),
+            )
+        except Exception:
+            logger.error("[UNDERSTANDING] Summarizer failed for doc=%s", document_id, exc_info=True)
+            understanding = {"document_type": identification.document_type, "summary": text[:500]}
+        mongodb.update_one(
+            {"document_id": document_id},
+            {"$set": {"intelligence": understanding, "intelligence_ready": True}},
+        )
 
     update_stage(
         document_id,
@@ -118,6 +160,7 @@ def run_document_understanding(
 
     embed_result = None
     if embed_after:
+        promote_to_screening_completed(document_id)
         embed_result = embed_documents(
             document_id=document_id,
             subscription_id=subscription_id,
@@ -133,7 +176,6 @@ def run_document_understanding(
         "understanding": understanding,
         "embedding": embed_result,
     }
-
 
 def extract_and_understand(
     *,

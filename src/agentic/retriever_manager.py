@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -9,8 +9,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from src.agentic.memory import AgentMemory
 from src.agentic.verification_agent import VerificationAgent
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class RetrievalAttempt:
@@ -20,7 +19,6 @@ class RetrievalAttempt:
     top_score: float
     strategy: str
 
-
 @dataclass
 class RetrievalPlan:
     chunks: List[Any]
@@ -29,7 +27,6 @@ class RetrievalPlan:
     metadata: Dict[str, Any]
     selected_strategy: str = "parallel_hybrid"
     profile_context: Dict[str, Any] = field(default_factory=dict)
-
 
 class RetrieverManager:
     """Orchestrates parallel retrieval strategies and merges results."""

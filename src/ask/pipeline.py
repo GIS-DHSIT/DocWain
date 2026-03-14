@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, List, Optional
 
 from src.api.vector_store import build_collection_name
@@ -12,8 +12,7 @@ from src.ask.synthesizer import EvidenceSynthesizer
 from src.ask.verifier import EvidenceVerifier
 from src.services.retrieval.reranker import Reranker, RerankerConfig
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def run_docwain_rag_v2(
     *,
@@ -132,7 +131,6 @@ def run_docwain_rag_v2(
         metadata=metadata,
     )
 
-
 def _collect_sources(evidence: List[Any]) -> List[Dict[str, Any]]:
     sources: List[Dict[str, Any]] = []
     seen = set()
@@ -144,7 +142,6 @@ def _collect_sources(evidence: List[Any]) -> List[Dict[str, Any]]:
         sources.append({"file_name": chunk.file_name, "page": chunk.page, "snippet": chunk.snippet})
     return sources
 
-
 def _build_answer(response_text: str, sources: List[Dict[str, Any]], request_id: Optional[str], metadata: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "response": response_text,
@@ -154,7 +151,6 @@ def _build_answer(response_text: str, sources: List[Dict[str, Any]], request_id:
         "grounded": bool(sources),
         "metadata": metadata,
     }
-
 
 def _filter_by_hints(evidence: List[Any], hints: List[str]) -> List[Any]:
     if not evidence or not hints:
@@ -166,7 +162,6 @@ def _filter_by_hints(evidence: List[Any], hints: List[str]) -> List[Any]:
             filtered.append(chunk)
     return filtered
 
-
 def _quality(level: str):
     class _Q:
         def __init__(self, level: str):
@@ -174,6 +169,5 @@ def _quality(level: str):
             self.stats = {}
 
     return _Q(level)
-
 
 __all__ = ["run_docwain_rag_v2"]

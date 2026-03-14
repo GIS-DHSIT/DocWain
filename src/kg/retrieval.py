@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -6,8 +6,7 @@ from src.api.config import Config
 from src.kg.entity_extractor import EntityExtractor, ExtractedEntity, normalize_entity_name
 from src.kg.neo4j_store import Neo4jStore
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class GraphEntityHint:
@@ -16,7 +15,6 @@ class GraphEntityHint:
     node_id: str
     confidence: float
 
-
 @dataclass
 class GraphSnippet:
     text: str
@@ -24,7 +22,6 @@ class GraphSnippet:
     doc_name: Optional[str]
     chunk_id: str
     relation: str
-
 
 @dataclass
 class GraphHints:
@@ -35,7 +32,6 @@ class GraphHints:
     query_expansion_terms: List[str] = field(default_factory=list)
     evidence_chunk_ids: List[str] = field(default_factory=list)
     doc_ids: List[str] = field(default_factory=list)
-
 
 class GraphAugmenter:
     def __init__(
@@ -277,6 +273,5 @@ class GraphAugmenter:
             seen.add(key)
             deduped.append(ent)
         return deduped
-
 
 __all__ = ["GraphAugmenter", "GraphHints", "GraphSnippet", "GraphEntityHint"]

@@ -1,11 +1,10 @@
-import logging
+from src.utils.logging_utils import get_logger
 from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 class UnslothLLMClient:
     """Lightweight inference client for Unsloth fine-tuned models."""

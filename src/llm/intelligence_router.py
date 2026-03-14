@@ -4,7 +4,7 @@ Implements a three-tier fallback chain:
 
 | Tier | Provider        | When                                          |
 |------|-----------------|-----------------------------------------------|
-| T1   | gpt-oss (local) | Simple: factual, extraction, classification   |
+| T1   | DocWain-Agent (local) | Simple: factual, extraction, classification   |
 | T2   | Gemini Flash    | Medium: summaries, comparisons, tool exec      |
 | T3   | GPT-4o/Claude   | Complex: multi-doc reasoning, ranking, agentic |
 
@@ -15,12 +15,12 @@ to lower tiers when a provider is unavailable.
 """
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 import threading
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 __all__ = [
     "IntelligenceRouter",
@@ -49,7 +49,6 @@ _MEDIUM_INTENTS = frozenset({"summary", "comparison"})
 # Intents that are inherently simple regardless of score
 _SIMPLE_INTENTS = frozenset({"factual", "extraction", "classification"})
 
-
 class ComplexityScorer:
     """Scores query complexity on a 0-to-1 scale.
 
@@ -62,6 +61,7 @@ class ComplexityScorer:
         query: str,
         intent: Optional[str] = None,
         entity_count: int = 0,
+        task_spec_complexity: Optional[str] = None,
     ) -> float:
         """Return a complexity score in ``[0, 1]``.
 
@@ -73,6 +73,10 @@ class ComplexityScorer:
             Parsed intent label (e.g. ``"compare"``, ``"factual"``).
         entity_count:
             Number of named entities detected in the query.
+        task_spec_complexity:
+            When provided by the fine-tuned model (``"simple"``/``"medium"``
+            /``"complex"``), biases the heuristic score toward the model's
+            classification.
         """
         s = 0.0
 
@@ -110,13 +114,21 @@ class ComplexityScorer:
         if len(sentences) > 3:
             s += 0.1
 
-        return min(max(s, 0.0), 1.0)
+        s = min(max(s, 0.0), 1.0)
 
+        # -- TaskSpec complexity override -----------------------------------
+        # The fine-tuned model's complexity classification biases the score
+        # to ensure complex queries reach T2/T3 and simple ones stay on T1.
+        if task_spec_complexity == "complex":
+            s = max(s, 0.75)
+        elif task_spec_complexity == "simple":
+            s = min(s, 0.35)
+
+        return s
 
 # ---------------------------------------------------------------------------
 # Intelligence router
 # ---------------------------------------------------------------------------
-
 
 class IntelligenceRouter:
     """Three-tier fallback chain with complexity-based routing.
@@ -180,6 +192,7 @@ class IntelligenceRouter:
         query: str,
         intent: Optional[str] = None,
         entity_count: int = 0,
+        task_spec_complexity: Optional[str] = None,
     ) -> Any:
         """Return the appropriate LLM client for the query complexity.
 
@@ -188,7 +201,7 @@ class IntelligenceRouter:
         if not self._enabled:
             return self.local
 
-        score = self.scorer.score(query, intent, entity_count)
+        score = self.scorer.score(query, intent, entity_count, task_spec_complexity)
         tier = self._select_tier(intent, score)
         client = self._get_client(tier)
         logger.debug(
@@ -214,7 +227,12 @@ class IntelligenceRouter:
         return 2
 
     def _get_client(self, tier: int) -> Any:
-        """Get client for *tier* with automatic fallback to lower tiers."""
+        """Get client for *tier* with automatic fallback.
+
+        Fallback prefers escalation to a higher-capability cloud provider
+        before falling back to local.  E.g. if Gemini (T2) is unavailable,
+        try Azure OpenAI / Claude (T3) before dropping to local (T1).
+        """
         if tier >= 2:
             if self.openai:
                 return self.openai
@@ -225,7 +243,11 @@ class IntelligenceRouter:
         if tier >= 1:
             if self.gemini:
                 return self.gemini
-            tier = 0  # fallback
+            # Escalate to T3 cloud if T2 is unavailable
+            if self.openai:
+                return self.openai
+            if self.claude:
+                return self.claude
 
         return self.local
 
@@ -236,14 +258,15 @@ class IntelligenceRouter:
         query: str,
         intent: Optional[str] = None,
         entity_count: int = 0,
+        task_spec_complexity: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Return debug info about the routing decision.
 
         Useful for logging and the ``/api/admin`` diagnostic endpoints.
         """
-        score = self.scorer.score(query, intent, entity_count)
+        score = self.scorer.score(query, intent, entity_count, task_spec_complexity)
         tier = self._select_tier(intent, score) if self._enabled else 0
-        client = self.route(query, intent, entity_count)
+        client = self.route(query, intent, entity_count, task_spec_complexity)
         return {
             "complexity_score": round(score, 3),
             "tier": tier,
@@ -253,7 +276,6 @@ class IntelligenceRouter:
             "client_model": getattr(client, "model_name", "unknown"),
         }
 
-
 # ---------------------------------------------------------------------------
 # Singleton accessor
 # ---------------------------------------------------------------------------
@@ -261,11 +283,9 @@ class IntelligenceRouter:
 _ROUTER: Optional[IntelligenceRouter] = None
 _ROUTER_LOCK = threading.Lock()
 
-
 def get_intelligence_router() -> Optional[IntelligenceRouter]:
     """Return the global ``IntelligenceRouter`` instance, or ``None``."""
     return _ROUTER
-
 
 def set_intelligence_router(router: IntelligenceRouter) -> None:
     """Install *router* as the global ``IntelligenceRouter`` singleton."""

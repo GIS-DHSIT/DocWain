@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.api.reasoning_layer import AnswerVerifier, ConfidenceScorer, VerificationReport
 from src.chat.opener_generator import contains_banned_opener
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -40,6 +43,8 @@ class PostProcessor:
         confidence_threshold: float,
         opener: Optional[str] = None,
     ) -> PostProcessResult:
+        logger.debug("select_best called with candidates=%s, sources=%s, threshold=%s",
+                     len(candidates), len(sources), confidence_threshold)
         scored: List[CandidateScore] = []
         best_answer = ""
         best_confidence = 0.0
@@ -121,6 +126,7 @@ class PostProcessor:
                 numeric_support_rate=0.0,
                 overall_grounded=False,
             )
+            logger.debug("select_best returning empty answer, no grounded candidate found")
             return PostProcessResult(
                 answer="",
                 confidence=best_confidence,
@@ -130,6 +136,8 @@ class PostProcessor:
 
         best_answer = self._rewrite_banned_opener(best_answer, opener=opener)
 
+        logger.debug("select_best returning confidence=%.3f, grounded=%s, scored_count=%s",
+                     best_confidence, best_verification.overall_grounded if best_verification else None, len(scored))
         return PostProcessResult(
             answer=best_answer,
             confidence=best_confidence,
@@ -189,9 +197,7 @@ class PostProcessor:
         name = str(source.get("source_name") or "").strip()
         if not name:
             return ""
-        page = source.get("page") or "N/A"
-        section = source.get("section") or "Section"
-        return f"({name}, Page {page}, Section: {section})"
+        return f"(Source: {name})"
 
     @staticmethod
     def _rewrite_banned_opener(text: str, *, opener: Optional[str] = None) -> str:

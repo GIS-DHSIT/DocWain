@@ -2,19 +2,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+from src.utils.logging_utils import get_logger
 import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Response builder
 # ---------------------------------------------------------------------------
-
 
 def _build_response(
     *,
@@ -45,11 +43,9 @@ def _build_response(
         "metadata": metadata,
     }
 
-
 # ---------------------------------------------------------------------------
 # ScreeningExecutor
 # ---------------------------------------------------------------------------
-
 
 class ScreeningExecutor:
     """Dedicated screening dispatcher for document analysis operations.
@@ -279,6 +275,21 @@ class ScreeningExecutor:
                     logger.error("Screening failed for doc_id=%s category=%s: %s", doc_id, category, exc)
                     doc_entry["categories"][category] = {"status": "failed", "error": str(exc)}
                     doc_failed = True
+
+            # Apply security-specific results (stores security_screening in doc record)
+            if "security" in doc_entry["categories"]:
+                sec_data = doc_entry["categories"]["security"]
+                if sec_data.get("status") == "success" and sec_data.get("result"):
+                    try:
+                        from src.api.screening_service import apply_security_result
+                        sec_result = sec_data["result"]
+                        # The security result may be nested under 'results'
+                        if isinstance(sec_result, dict) and "results" in sec_result:
+                            apply_security_result(doc_id, sec_result)
+                        else:
+                            apply_security_result(doc_id, sec_result)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Failed to apply security result for doc_id=%s: %s", doc_id, exc)
 
             # Persist screening results to the screening collection
             self._persist_screening_results(

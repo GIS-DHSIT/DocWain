@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from src.prompting.persona import sanitize_response
 
 _FORBIDDEN_MODEL_TERMS = re.compile(
-    r"\b(ollama|llama|gpt-oss|gpt|openai|anthropic|gemini|claude)\b",
+    r"\b(ollama|llama|gpt-oss|gpt|openai|anthropic|gemini|claude|qwen)\b",
     re.IGNORECASE,
 )
 

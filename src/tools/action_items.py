@@ -8,14 +8,14 @@ LLM enhancement for contextual priority and implicit deadlines.
 
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.tools.base import register_tool, standard_response
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # ── Modal verb patterns ──────────────────────────────────────────────────
 
@@ -97,7 +97,6 @@ _DOMAIN_CATEGORIES: Dict[str, List[tuple[re.Pattern, str]]] = {
     ],
 }
 
-
 @dataclass
 class ActionItem:
     """An extracted action item from a document."""
@@ -124,7 +123,6 @@ class ActionItem:
             result["source_document"] = self.source_document
         return result
 
-
 def _extract_deadline(text: str) -> Optional[str]:
     """Extract deadline phrase from text."""
     m = _DEADLINE_RE.search(text)
@@ -134,7 +132,6 @@ def _extract_deadline(text: str) -> Optional[str]:
     if m2:
         return m2.group(1).strip()
     return None
-
 
 def _extract_assignee(text: str) -> Optional[str]:
     """Extract assignee from text."""
@@ -148,7 +145,6 @@ def _extract_assignee(text: str) -> Optional[str]:
                 return assignee
     return None
 
-
 def _determine_priority(text: str) -> str:
     """Determine priority from urgency indicators."""
     if _HIGH_PRIORITY_RE.search(text):
@@ -156,7 +152,6 @@ def _determine_priority(text: str) -> str:
     if _LOW_PRIORITY_RE.search(text):
         return "low"
     return "medium"
-
 
 def _determine_category(text: str, domain: Optional[str] = None) -> str:
     """Determine action item category based on content and domain."""
@@ -172,7 +167,6 @@ def _determine_category(text: str, domain: Optional[str] = None) -> str:
 
     return "general"
 
-
 def _clean_description(text: str) -> str:
     """Clean extracted text into a concise action description."""
     text = text.strip()
@@ -181,12 +175,10 @@ def _clean_description(text: str) -> str:
         text = text[:197] + "..."
     return text
 
-
 def _split_into_sentences(text: str) -> List[str]:
     """Split text into sentences for action item extraction."""
     parts = re.split(r"(?<=[.!?;])\s+|\n+", text)
     return [s.strip() for s in parts if s and len(s.strip()) > 10]
-
 
 def extract_action_items(
     text: str,
@@ -238,7 +230,6 @@ def extract_action_items(
 
     return items
 
-
 def render_action_items(items: List[ActionItem]) -> str:
     """Render action items into a readable format."""
     if not items:
@@ -275,7 +266,6 @@ def render_action_items(items: List[ActionItem]) -> str:
             lines.append("\n".join(parts))
 
     return "\n".join(lines)
-
 
 @register_tool("action_items")
 async def action_items_handler(

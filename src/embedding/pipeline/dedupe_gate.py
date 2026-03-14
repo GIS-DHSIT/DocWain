@@ -1,25 +1,22 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class DedupeConfig:
     similarity_threshold: float = 0.92
     max_overlap_ratio: float = 0.20
 
-
 def _normalize_text(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", text.lower()).strip()
     cleaned = re.sub(r"[^\w\s]", "", cleaned)
     return cleaned
-
 
 def _simhash64(text: str) -> int:
     tokens = _normalize_text(text).split()
@@ -38,10 +35,8 @@ def _simhash64(text: str) -> int:
             result |= 1 << i
     return result
 
-
 def _hamming_distance(left: int, right: int) -> int:
     return (left ^ right).bit_count()
-
 
 def _overlap_prefix_tokens(prev_tokens: List[str], curr_tokens: List[str]) -> int:
     max_overlap = min(len(prev_tokens), len(curr_tokens))
@@ -49,7 +44,6 @@ def _overlap_prefix_tokens(prev_tokens: List[str], curr_tokens: List[str]) -> in
         if prev_tokens[-overlap:] == curr_tokens[:overlap]:
             return overlap
     return 0
-
 
 def _trim_overlap(prev_tokens: List[str], curr_tokens: List[str], max_ratio: float) -> List[str]:
     if not curr_tokens:
@@ -66,7 +60,6 @@ def _trim_overlap(prev_tokens: List[str], curr_tokens: List[str], max_ratio: flo
         remove = max(1, overlap - allowed)
         curr_tokens = curr_tokens[remove:]
     return curr_tokens
-
 
 def apply_dedupe_gate(
     chunks: List[str],
@@ -162,6 +155,5 @@ def apply_dedupe_gate(
     if dropped or merged:
         logger.warning("Dedupe gate dropped=%s merged=%s", dropped, merged)
     return deduped_chunks, deduped_meta, stats
-
 
 __all__ = ["DedupeConfig", "apply_dedupe_gate"]

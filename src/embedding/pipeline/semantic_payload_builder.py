@@ -6,12 +6,11 @@ traceability back to source documents.
 """
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class SemanticPayload:
@@ -96,7 +95,6 @@ class SemanticPayload:
             "chunk_length": self.chunk_length,
             "language": self.language,
         }
-
 
 class SemanticPayloadBuilder:
     """Build intelligent Qdrant payloads from structured documents."""
@@ -313,10 +311,8 @@ class SemanticPayloadBuilder:
 
         return payloads
 
-
 # Singleton instance
 _payload_builder = None
-
 
 def get_semantic_payload_builder() -> SemanticPayloadBuilder:
     """Get or create payload builder singleton."""

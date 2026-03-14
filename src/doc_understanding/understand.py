@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from typing import Any, Dict, List, Optional
 
 from src.api.context_understanding import ContextUnderstanding
 from src.doc_understanding.structure_inference import infer_structure
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _get(obj: Any, key: str, default: Any = None) -> Any:
     """Access attribute or dict key — supports both objects and dicts."""
@@ -17,13 +16,11 @@ def _get(obj: Any, key: str, default: Any = None) -> Any:
         return obj.get(key, default)
     return getattr(obj, key, default)
 
-
 _ENTITY_PATTERNS = {
     "EMAIL": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.IGNORECASE),
     "DATE": re.compile(r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"),
     "AMOUNT": re.compile(r"\b\$\d{1,3}(?:,\d{3})*(?:\.\d{2})?\b"),
 }
-
 
 def _fallback_entities(text: str) -> List[Dict[str, str]]:
     entities: List[Dict[str, str]] = []
@@ -31,7 +28,6 @@ def _fallback_entities(text: str) -> List[Dict[str, str]]:
         for match in pattern.findall(text or ""):
             entities.append({"type": ent_type, "text": match})
     return entities
-
 
 def _ollama_understand(
     text: str,
@@ -88,7 +84,6 @@ def _ollama_understand(
         logger.debug("Ollama understanding failed: %s", exc)
         return None
 
-
 def _extractive_section_summaries(extracted: Any) -> Dict[str, str]:
     summaries = {}
     for section in _get(extracted, "sections", []) or []:
@@ -98,7 +93,6 @@ def _extractive_section_summaries(extracted: Any) -> Dict[str, str]:
             sentences = [s.strip() for s in text.split(".") if s.strip()]
             summaries[title] = ". ".join(sentences[:3]) + "." if sentences else text[:200]
     return summaries
-
 
 def _verify_facts(text: str, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not text or not facts:
@@ -113,7 +107,6 @@ def _verify_facts(text: str, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]
             verified.append(fact)
     return verified
 
-
 def _normalize_section_summaries(raw: Any) -> Dict[str, str]:
     if isinstance(raw, dict):
         return {str(k): str(v) for k, v in raw.items() if v}
@@ -127,7 +120,6 @@ def _normalize_section_summaries(raw: Any) -> Dict[str, str]:
             if title and summary:
                 summaries[str(title)] = str(summary)
     return summaries
-
 
 def understand_document(
     *,
@@ -177,6 +169,5 @@ def understand_document(
         "intent_tags": intent_tags,
         "structure_inference": structure_signals,
     }
-
 
 __all__ = ["understand_document"]

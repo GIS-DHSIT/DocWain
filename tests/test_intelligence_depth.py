@@ -123,13 +123,13 @@ class TestLLMContextScaling:
 
     def test_single_doc_limits(self):
         from src.rag_v3.llm_extract import _effective_max_chunks, _effective_context_chars
-        assert _effective_max_chunks(1) == 8
-        assert _effective_context_chars(1) == 6144
+        assert _effective_max_chunks(1) == 10
+        assert _effective_context_chars(1) == 8192
 
     def test_multi_doc_limits(self):
         from src.rag_v3.llm_extract import _effective_max_chunks, _effective_context_chars
-        assert _effective_max_chunks(2) == 16
-        assert _effective_context_chars(3) == 12288
+        assert _effective_max_chunks(2) == 20
+        assert _effective_context_chars(3) == 16384
 
     def test_build_grouped_evidence_respects_limit(self):
         from src.rag_v3.llm_extract import _build_grouped_evidence

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import os
 import re
 from collections import Counter, defaultdict
@@ -8,8 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.payload_utils import get_source_name
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class ContextBuildResult:
@@ -17,7 +16,6 @@ class ContextBuildResult:
     sources: List[Dict[str, Any]]
     selected_chunks: List[Dict[str, Any]]
     token_count: int
-
 
 class ContextAssembler:
     """Builds section-aware context with safe citations and deduplication."""

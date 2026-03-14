@@ -1,4 +1,4 @@
-import logging
+from src.utils.logging_utils import get_logger
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
@@ -8,8 +8,7 @@ from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 def _messages_to_text(messages):
     parts = []
@@ -18,7 +17,6 @@ def _messages_to_text(messages):
         parts.append(f"{role}: {msg.get('content','')}")
     parts.append("Assistant:")
     return "\n".join(parts)
-
 
 def _build_training_args(output_dir: Path, steps: int, batch_size: int, learning_rate: float, eval_steps: int = 0):
     from transformers import TrainingArguments
@@ -44,7 +42,6 @@ def _build_training_args(output_dir: Path, steps: int, batch_size: int, learning
             kwargs["eval_steps"] = eval_steps
     return TrainingArguments(**{k: v for k, v in kwargs.items() if k in sig})
 
-
 @dataclass
 class FinetuneConfig:
     base_model: str = "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
@@ -55,7 +52,6 @@ class FinetuneConfig:
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     min_pairs: int = 1
-
 
 class FinetuneRunner:
     def __init__(self, config: FinetuneConfig):
@@ -133,6 +129,5 @@ class FinetuneRunner:
         }
         (run_dir / "finetune_manifest.json").write_text(json.dumps(manifest, indent=2))
         return {"status": "success", "adapter_dir": str(adapter_dir), "pairs": pair_count}
-
 
 __all__ = ["FinetuneRunner", "FinetuneConfig"]

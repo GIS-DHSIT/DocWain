@@ -1,5 +1,5 @@
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import threading
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
@@ -22,20 +22,17 @@ from src.api.config import Config
 from src.api.pipeline_models import ChunkRecord
 from src.api.qdrant_indexes import REQUIRED_PAYLOAD_INDEX_FIELDS, ensure_payload_indexes, list_payload_indexes
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # Per-collection creation locks to prevent parallel creation attempts
 _collection_locks: Dict[str, threading.Lock] = {}
 _collection_locks_guard = threading.Lock()
-
 
 def _get_collection_lock(collection_name: str) -> threading.Lock:
     with _collection_locks_guard:
         if collection_name not in _collection_locks:
             _collection_locks[collection_name] = threading.Lock()
         return _collection_locks[collection_name]
-
 
 class QdrantCollectionSchemaMismatch(ValueError):
     def __init__(self, details: Dict[str, Any]):
@@ -51,7 +48,6 @@ class QdrantCollectionSchemaMismatch(ValueError):
 
 PAYLOAD_INDEX_FIELDS = list(REQUIRED_PAYLOAD_INDEX_FIELDS)
 
-
 def build_collection_name(subscription_id: str, profile_id: Optional[str] = None) -> str:
     """Collection name scoped only by subscription; profile isolation is enforced via payload filters."""
     if not subscription_id:
@@ -59,7 +55,6 @@ def build_collection_name(subscription_id: str, profile_id: Optional[str] = None
 
     safe_sub = str(subscription_id).strip().replace(" ", "_")
     return f"{safe_sub}"
-
 
 def compute_chunk_id(
     subscription_id: str,
@@ -88,7 +83,6 @@ def compute_chunk_id(
     digest = hashlib.sha1(base.encode("utf-8")).hexdigest()
     return f"{prefix}_{digest}"
 
-
 def build_qdrant_filter(
     subscription_id: str,
     profile_id: str,
@@ -115,7 +109,7 @@ def build_qdrant_filter(
         FieldCondition(key="profile_id", match=MatchValue(value=str(profile_id))),
     ]
 
-    logger = logging.getLogger(__name__)
+    logger = get_logger(__name__)
     logger.debug(
         "build_qdrant_filter: subscription_id=%s profile_id=%s document_id=%s",
         subscription_id, profile_id, document_id,
@@ -166,7 +160,6 @@ def build_qdrant_filter(
         },
     )
     return Filter(must=must)
-
 
 class QdrantVectorStore:
     """Encapsulates Qdrant collection lifecycle and scoped operations."""

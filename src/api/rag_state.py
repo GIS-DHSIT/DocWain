@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _APP_STATE: Optional["AppState"] = None
 _SINGLETON_GUARD = False
-
 
 @dataclass
 class AppState:
@@ -24,7 +23,6 @@ class AppState:
     graph_augmenter: Any = None  # src.kg.retrieval.GraphAugmenter — KG-augmented retrieval
     instance_ids: Dict[str, str] = field(default_factory=dict)
     qdrant_index_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-
 
 def _assign_instance_id(name: str, instance: Any, registry: Dict[str, str]) -> str:
     if instance is None:
@@ -41,31 +39,25 @@ def _assign_instance_id(name: str, instance: Any, registry: Dict[str, str]) -> s
     registry[name] = instance_id
     return instance_id
 
-
 def set_app_state(state: AppState) -> AppState:
     global _APP_STATE
     _APP_STATE = state
     return state
 
-
 def get_app_state() -> Optional[AppState]:
     return _APP_STATE
-
 
 def require_app_state() -> AppState:
     if _APP_STATE is None:
         raise RuntimeError("AppState not initialized")
     return _APP_STATE
 
-
 def activate_singleton_guard() -> None:
     global _SINGLETON_GUARD
     _SINGLETON_GUARD = True
 
-
 def singleton_guard_active() -> bool:
     return _SINGLETON_GUARD
-
 
 def register_instance_ids(state: AppState) -> None:
     _assign_instance_id("embedding_model", state.embedding_model, state.instance_ids)
@@ -76,7 +68,6 @@ def register_instance_ids(state: AppState) -> None:
     _assign_instance_id("llm_gateway", state.llm_gateway, state.instance_ids)
     _assign_instance_id("rag_system", state.rag_system, state.instance_ids)
     logger.info("Singleton instance IDs: %s", state.instance_ids)
-
 
 __all__ = [
     "AppState",

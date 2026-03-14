@@ -5,13 +5,12 @@ and extracts structured node/edge representations using LLM reasoning.
 """
 
 import json
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 @dataclass
 class DiagramNode:
@@ -19,14 +18,12 @@ class DiagramNode:
     label: str
     node_type: str = "process"  # decision, process, start_end, io, connector
 
-
 @dataclass
 class DiagramEdge:
     """An edge connecting two nodes."""
     from_label: str
     to_label: str
     edge_label: Optional[str] = None
-
 
 @dataclass
 class DiagramStructure:
@@ -63,7 +60,6 @@ class DiagramStructure:
                 parts.append(f"  {e.from_label} → {e.to_label}{label_part}")
         return "\n".join(parts)
 
-
 # ── Detection heuristics ────────────────────────────────────────────
 
 _ARROW_CHARS = {"→", "←", "↑", "↓", "↔", "⟶", "⟵", "▶", "◀", "➜", "➔"}
@@ -81,7 +77,6 @@ _FLOW_KEYWORDS = re.compile(
 _SHAPE_INDICATORS = re.compile(
     r"(?:\[.*?\]|\(.*?\)|<.*?>|\{.*?\})",
 )
-
 
 def is_likely_diagram(ocr_text: str, image_dims: Tuple[int, int] = (0, 0)) -> bool:
     """Cheap heuristic: detect whether OCR text likely came from a diagram.
@@ -142,7 +137,6 @@ def is_likely_diagram(ocr_text: str, image_dims: Tuple[int, int] = (0, 0)) -> bo
 
     return (score / total_checks) >= threshold
 
-
 # ── LLM-based structure extraction ──────────────────────────────────
 
 _DIAGRAM_EXTRACTION_PROMPT = """Analyze this text that was OCR'd from a flow diagram/process chart image.
@@ -168,7 +162,6 @@ Rules:
 - Infer edges from the spatial and textual flow even if arrows are not explicit
 - description should explain the overall process in plain language
 - Return ONLY valid JSON, no markdown fencing"""
-
 
 def extract_diagram_with_vision(
     image: Any,
@@ -202,7 +195,6 @@ def extract_diagram_with_vision(
         logger.debug("Vision diagram extraction failed: %s", exc)
         return None
 
-
 def extract_diagram_structure(
     ocr_text: str,
     use_thinking: bool = False,
@@ -213,7 +205,7 @@ def extract_diagram_structure(
     MoE routing:
       1. If ``image`` provided → try glm-ocr vision-first (rich visual analysis)
       2. If vision fails or no image → use lfm2.5-thinking for text-based extraction
-         (faster reasoning than gpt-oss for structure extraction)
+         (faster reasoning than DocWain-Agent for structure extraction)
       3. Fallback to pattern-based text extraction
 
     Args:
@@ -271,7 +263,6 @@ def extract_diagram_structure(
 
     return _parse_diagram_response(response, ocr_text)
 
-
 def _parse_diagram_response(response: str, ocr_text: str) -> Optional[DiagramStructure]:
     """Parse LLM JSON response into DiagramStructure."""
     # Strip markdown fencing if present
@@ -327,7 +318,6 @@ def _parse_diagram_response(response: str, ocr_text: str) -> Optional[DiagramStr
         raw_ocr_text=ocr_text,
         confidence=confidence,
     )
-
 
 def _fallback_text_extraction(ocr_text: str) -> Optional[DiagramStructure]:
     """Fallback: extract basic structure from text patterns without LLM."""

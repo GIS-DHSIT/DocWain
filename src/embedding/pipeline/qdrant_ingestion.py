@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+from src.utils.logging_utils import get_logger
 from typing import Any, Dict, Iterable, List, Optional
 
 import ollama
@@ -12,12 +12,11 @@ from src.api.vector_store import QdrantVectorStore, build_collection_name, compu
 from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
 from src.utils.payload_utils import get_canonical_text, token_count
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _DOC_TYPE_MAP = {
     "report_table_heavy": "resume",
 }
-
 
 def _stringify(value: Any) -> Optional[str]:
     if value is None:
@@ -25,14 +24,12 @@ def _stringify(value: Any) -> Optional[str]:
     text = str(value).strip()
     return text or None
 
-
 def _first_present(*values: Any) -> Optional[str]:
     for value in values:
         text = _stringify(value)
         if text:
             return text
     return None
-
 
 def _merge_texts(raw_data: Dict[str, Any]) -> str:
     candidates = [
@@ -54,18 +51,15 @@ def _merge_texts(raw_data: Dict[str, Any]) -> str:
         seen.add(text)
     return "\n\n".join(merged).strip()
 
-
 def _map_doc_type(raw_doc_type: Optional[str]) -> Optional[str]:
     if not raw_doc_type:
         return None
     return _DOC_TYPE_MAP.get(raw_doc_type, raw_doc_type)
 
-
 def extract_skills_stub(content: str) -> List[str]:
     """Placeholder for future skill extraction; returns empty list for now."""
     _ = content
     return []
-
 
 def transform_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize messy payloads into a retrieval-ready schema."""
@@ -169,7 +163,6 @@ def transform_payload(raw_data: Dict[str, Any]) -> Dict[str, Any]:
 
     return {k: v for k, v in payload.items() if v is not None}
 
-
 def _ollama_embed(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
     model_name = model or getattr(Config.Model, "OLLAMA_EMBEDDING_MODEL", "bge-m3")
     vectors: List[List[float]] = []
@@ -186,7 +179,6 @@ def _ollama_embed(texts: List[str], model: Optional[str] = None) -> List[List[fl
         vectors.append([float(x) for x in embedding])
     return vectors
 
-
 def ingest_payloads(
     raw_payloads: Iterable[Dict[str, Any]],
     *,
@@ -199,11 +191,58 @@ def ingest_payloads(
     for raw in raw_payloads:
         payload = transform_payload(raw)
         if not payload.get("canonical_text") and not payload.get("content"):
-            logger.warning("Skipping payload without content (document_id=%s)", payload.get("document_id"))
+            logger.debug("Skipping payload without content (document_id=%s)", payload.get("document_id"))
             continue
         if not payload.get("subscription_id"):
             raise ValueError("subscription_id is required for Qdrant ingestion")
         transformed.append(payload)
+
+    # --- Document profiling: learn domain from content at ingestion ---
+    _profiler_enabled = getattr(Config, "DocumentProfiler", None) and getattr(Config.DocumentProfiler, "ENABLED", False)
+    if _profiler_enabled:
+        try:
+            from src.intelligence.document_profiler import DocumentProfiler
+            from src.llm.gateway import get_llm_gateway
+
+            _profiler = DocumentProfiler(get_llm_gateway())
+            # Group chunks by document_id, profile first 5 chunks per doc
+            _doc_chunks: Dict[str, List[str]] = {}
+            _doc_filenames: Dict[str, str] = {}
+            for p in transformed:
+                doc_id = p.get("document_id", "unknown")
+                text = p.get("canonical_text") or p.get("content") or ""
+                if text and doc_id not in _doc_filenames:
+                    _doc_chunks.setdefault(doc_id, [])
+                    _doc_filenames[doc_id] = p.get("source_name") or (p.get("metadata") or {}).get("source_file") or "document"
+                if text and len(_doc_chunks.get(doc_id, [])) < 5:
+                    _doc_chunks.setdefault(doc_id, []).append(text)
+
+            _profiles: Dict[str, Dict[str, Any]] = {}
+            for doc_id, chunks in _doc_chunks.items():
+                try:
+                    profile = _profiler.profile(chunks, _doc_filenames.get(doc_id, "document"))
+                    _profiles[doc_id] = {
+                        "domain": profile.domain,
+                        "document_type": profile.document_type,
+                        "key_terminology": profile.key_terminology,
+                        "field_types": profile.field_types,
+                        "structure_pattern": profile.structure_pattern,
+                        "language_register": profile.language_register,
+                    }
+                    logger.info("Document profiled: %s → %s (%s)", doc_id, profile.domain, profile.document_type)
+                except Exception as exc:
+                    logger.debug("Document profiling failed for %s: %s", doc_id, exc)
+
+            # Inject profiles into payloads
+            for p in transformed:
+                doc_id = p.get("document_id", "unknown")
+                if doc_id in _profiles:
+                    p["domain_profile"] = _profiles[doc_id]
+                    # Also set doc_domain for backward compat
+                    p["doc_domain"] = _profiles[doc_id].get("domain", "generic")
+
+        except Exception as exc:
+            logger.warning("Document profiling skipped: %s", exc)
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for payload in transformed:
@@ -256,6 +295,5 @@ def ingest_payloads(
         results[collection_name] = saved
 
     return results
-
 
 __all__ = ["transform_payload", "ingest_payloads"]

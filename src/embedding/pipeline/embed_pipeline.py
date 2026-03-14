@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import logging
+from src.utils.logging_utils import get_logger
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -15,8 +15,7 @@ from src.embedding.pipeline.chunk_integrity import (
 from src.embedding.pipeline.embedding_text_normalizer import ensure_embedding_text
 from src.embedding.pipeline.dedupe_gate import DedupeConfig, apply_dedupe_gate
 
-logger = logging.getLogger(__name__)
-
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Text salvage for ExtractedDocument repr strings
@@ -30,7 +29,6 @@ _EXTRACTED_DOC_FULLTEXT_RE = re.compile(
 _EXTRACTED_DOC_PREFIX_RE = re.compile(
     r"^Extracted\s+Document\s+(?:full_text|[\w.]+)\s*", re.IGNORECASE,
 )
-
 
 def _salvage_chunk_text(text: str) -> str:
     """Try to extract real document content from garbage/metadata-contaminated text.
@@ -70,7 +68,6 @@ def _salvage_chunk_text(text: str) -> str:
 
     return ""
 
-
 @dataclass(frozen=True)
 class ChunkPrepStats:
     dropped_quality: int = 0
@@ -78,7 +75,6 @@ class ChunkPrepStats:
     merged_dedupe: int = 0
     merged_small: int = 0
     rescued_fragments: int = 0
-
 
 def compute_stable_chunk_id(
     subscription_id: str,
@@ -100,7 +96,6 @@ def compute_stable_chunk_id(
     )
     digest = hashlib.sha256(base.encode("utf-8")).hexdigest()
     return f"chunk_{digest}"
-
 
 def normalize_chunk_chain(
     chunk_metadata: List[Dict[str, Any]],
@@ -137,7 +132,6 @@ def normalize_chunk_chain(
         meta["document_id"] = document_id
 
     return normalized
-
 
 def prepare_embedding_chunks(
     chunks: List[str],
@@ -280,7 +274,6 @@ def prepare_embedding_chunks(
         stats.rescued_fragments,
     )
     return prepared_chunks, prepared_meta, stats, rescued_fragments
-
 
 __all__ = [
     "ChunkPrepStats",
