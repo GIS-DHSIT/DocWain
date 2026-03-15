@@ -998,14 +998,6 @@ def ask_question_api(
         debug=result.debug or {},
     )
 
-@api_router.post("/askStream", tags=["Default"], deprecated=True)
-def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
-    """
-    Backward-compatible alias for streaming; prefer /ask with `stream=true`.
-    """
-    object.__setattr__(request, "stream", True)
-    return ask_question_api(request, agent_mode=agent_mode, stream=True)
-
 @api_router.post("/extract/{doc_id}", tags=["Default"])
 def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
     """API endpoint to extract a single document by its document ID."""
@@ -1911,7 +1903,6 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 app.include_router(api_router)
 app.include_router(knowledge_graph_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
-app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)
 
 if __name__ == "__main__":
