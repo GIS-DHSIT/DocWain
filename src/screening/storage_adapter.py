@@ -291,7 +291,44 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
             raise
 
     record = _get_document_record(doc_id)
-    texts = _extract_text_from_record(record)
+
+    # Try Azure Blob extraction results first (new pipeline stores content there)
+    texts = []
+    blob_path = (record.get("extraction", {}).get("summary") or {}).get("blob_path")
+    if not blob_path:
+        # Also try direct blob_url for raw file content
+        blob_url = record.get("blob_url")
+        if blob_url:
+            blob_path = f"raw/{doc_id}/{record.get('source_file', 'document')}"
+
+    if blob_path:
+        try:
+            from src.api.blob_content_store import get_blob_client
+            import json as _json
+            container = get_blob_client()
+            blob_client = container.get_blob_client(blob_path)
+            blob_data = blob_client.download_blob().readall()
+            # Try JSON (extraction result)
+            try:
+                extraction_json = _json.loads(blob_data)
+                clean_text = extraction_json.get("clean_text", "")
+                if clean_text:
+                    texts = [clean_text]
+                    logger.info("Loaded extraction text from blob for doc_id=%s (%d chars)", doc_id, len(clean_text))
+            except (_json.JSONDecodeError, UnicodeDecodeError):
+                # Raw file content (text)
+                try:
+                    raw_text = blob_data.decode("utf-8", errors="ignore")
+                    if raw_text.strip():
+                        texts = [raw_text.strip()]
+                        logger.info("Loaded raw text from blob for doc_id=%s (%d chars)", doc_id, len(raw_text))
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("Blob text load failed for doc_id=%s: %s", doc_id, exc)
+
+    if not texts:
+        texts = _extract_text_from_record(record)
 
     subscription_id = get_document_subscription_id(doc_id)
     profile_id = record.get("profileId") or record.get("profile_id") or record.get("profile")

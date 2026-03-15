@@ -80,22 +80,46 @@ async def trigger_screening(document_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    if record.get("pipeline_status") != PIPELINE_EXTRACTION_COMPLETED:
+    # Accept either new pipeline_status or legacy status field
+    pipeline_status = record.get("pipeline_status", "")
+    legacy_status = record.get("status", "")
+    extraction_stage = record.get("extraction", {}).get("status", "")
+    extraction_done = (
+        pipeline_status == PIPELINE_EXTRACTION_COMPLETED
+        or legacy_status == "EXTRACTION_COMPLETED"
+        or extraction_stage == "COMPLETED"
+    )
+    if not extraction_done:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot screen: pipeline_status is {record.get('pipeline_status')}, "
-                   f"expected EXTRACTION_COMPLETED"
+            detail=f"Cannot screen: extraction not complete "
+                   f"(pipeline_status={pipeline_status}, status={legacy_status}, "
+                   f"extraction.status={extraction_stage})"
         )
 
     subscription_id = record["subscription_id"]
     profile_id = record["profile_id"]
 
-    task = screen_document.delay(document_id, subscription_id, profile_id)
+    # Try Celery, fallback to sync screening via existing gateway
+    task_id = None
+    mode = "queued"
+    try:
+        task = screen_document.delay(document_id, subscription_id, profile_id)
+        task_id = task.id
+    except Exception:
+        mode = "sync"
+        try:
+            from src.api.extraction_service import _run_auto_screening
+            _run_auto_screening(document_id, doc_type=record.get("doc_type"))
+        except Exception as exc:
+            logger.error("Sync screening failed for doc=%s: %s", document_id, exc)
+            mode = "failed"
+
     append_audit_log(document_id, "SCREENING_TRIGGERED", by="user",
-                    celery_task_id=task.id)
+                    celery_task_id=task_id)
 
     return {"document_id": document_id, "status": "SCREENING_IN_PROGRESS",
-            "task_id": task.id}
+            "task_id": task_id, "mode": mode}
 
 
 @pipeline_router.get("/{document_id}/screening")
@@ -131,11 +155,20 @@ async def trigger_embedding(document_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    if record.get("pipeline_status") != PIPELINE_SCREENING_COMPLETED:
+    # Accept either new pipeline_status or legacy status field
+    pipeline_status = record.get("pipeline_status", "")
+    legacy_status = record.get("status", "")
+    screening_stage = record.get("screening", {}).get("status", "")
+    screening_done = (
+        pipeline_status == PIPELINE_SCREENING_COMPLETED
+        or legacy_status == "SCREENING_COMPLETED"
+        or screening_stage == "COMPLETED"
+    )
+    if not screening_done:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot embed: pipeline_status is {record.get('pipeline_status')}, "
-                   f"expected SCREENING_COMPLETED"
+            detail=f"Cannot embed: screening not complete "
+                   f"(pipeline_status={pipeline_status}, screening.status={screening_stage})"
         )
 
     subscription_id = record["subscription_id"]
