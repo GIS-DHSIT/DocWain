@@ -135,6 +135,7 @@ import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
 import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
 from src.gateway.api import gateway_router
 from src.screening.api import screening_router
+from src.api.pipeline_api import pipeline_router
 from src.tools.router import tools_router
 from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
@@ -175,6 +176,7 @@ api_router.include_router(profiles_router)
 api_router.include_router(profile_docs_router)
 api_router.include_router(gateway_router, tags=["Gateway"])
 api_router.include_router(screening_router)
+api_router.include_router(pipeline_router)
 api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
 api_router.include_router(tools_router, tags=["Agents"])
