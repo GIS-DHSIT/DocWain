@@ -83,21 +83,40 @@ async def upload_document_for_profile(
         created_by="user",
     )
 
-    # ── 3. Auto-dispatch extraction via Celery ───────────────────────
+    # ── 3. Auto-dispatch extraction via Celery (fallback: synchronous) ─
     celery_task_id: Optional[str] = None
+    extraction_mode = "queued"
     try:
         from src.tasks.extraction import extract_document
         task = extract_document.delay(document_id, subscription_id, profile_id)
         celery_task_id = task.id
         logger.info("Dispatched extraction task: doc=%s task_id=%s", document_id, celery_task_id)
     except Exception:
-        logger.warning("Celery dispatch failed for doc=%s; extraction must be triggered manually", document_id, exc_info=True)
+        logger.warning("Celery unavailable for doc=%s; falling back to synchronous extraction", document_id, exc_info=True)
+        extraction_mode = "sync"
+        try:
+            from src.api.extraction_service import extract_uploaded_document
+            extract_uploaded_document(
+                document_id=document_id,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                profile_name=profile_name,
+                file_bytes=file_bytes,
+                filename=filename,
+                content_type=content_type,
+                content_size=len(file_bytes),
+                doc_type=file_type,
+            )
+        except Exception:
+            logger.error("Synchronous extraction also failed for doc=%s", document_id, exc_info=True)
+            extraction_mode = "failed"
 
     return {
         "document_id": document_id,
-        "status": "EXTRACTION_QUEUED",
+        "status": "EXTRACTION_QUEUED" if extraction_mode == "queued" else "EXTRACTION_IN_PROGRESS" if extraction_mode == "sync" else "UPLOADED",
         "celery_task_id": celery_task_id,
         "blob_url": blob_url,
+        "extraction_mode": extraction_mode,
     }
 
 

@@ -294,6 +294,23 @@ class LLMGateway:
 
         answer, thinking = _split_thinking(raw)
 
+        # If thinking consumed all tokens and answer is empty, extract key points from thinking
+        if not answer.strip() and thinking and len(thinking) > 50:
+            logger.warning("LLM response empty (thinking consumed all tokens) — extracting from thinking block")
+            # Try to find the last substantive paragraph in thinking
+            lines = [l.strip() for l in thinking.split('\n') if l.strip() and not l.strip().startswith('*')]
+            # Look for draft/final sections in thinking
+            for marker in ['Draft:', 'Final', 'Response:', 'Answer:']:
+                for i, line in enumerate(lines):
+                    if marker.lower() in line.lower():
+                        answer = '\n'.join(lines[i:])
+                        break
+                if answer.strip():
+                    break
+            if not answer.strip():
+                # Fallback: use last portion of thinking as the answer
+                answer = '\n'.join(lines[-10:]) if len(lines) > 10 else '\n'.join(lines)
+
         meta: Dict[str, Any] = {
             "usage": usage_meta,
             "backend": self._active_backend_name(),

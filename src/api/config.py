@@ -332,7 +332,7 @@ class Config:
     class LLM:
         TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
         TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
-        MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "4096"))
+        MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
         MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "8"))
         DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
 

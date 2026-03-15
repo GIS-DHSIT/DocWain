@@ -100,11 +100,17 @@ def initialize_app_state(app: FastAPI) -> AppState:
         ollama_client = llm_gateway
         # Warm up Ollama so the model is loaded before the first query
         if hasattr(llm_gateway, "warm_up"):
-            try:
-                llm_gateway.warm_up()
-                logger.info("LLM model warm-up completed")
-            except Exception:  # noqa: BLE001
-                logger.debug("LLM warm-up skipped (model will load on first query)")
+            def _do_warmup():
+                try:
+                    llm_gateway.warm_up()
+                    logger.info("LLM model warm-up completed")
+                except Exception:  # noqa: BLE001
+                    logger.debug("LLM warm-up skipped (model will load on first query)")
+            _warmup_thread = threading.Thread(target=_do_warmup, daemon=True)
+            _warmup_thread.start()
+            _warmup_thread.join(timeout=30)
+            if _warmup_thread.is_alive():
+                logger.warning("LLM warm-up timed out after 30s — model will load on first query")
     except Exception as exc:  # noqa: BLE001
         logger.error("LLM gateway init failed, trying direct Ollama: %s", exc)
         try:

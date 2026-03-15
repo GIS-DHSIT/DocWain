@@ -3,11 +3,30 @@
 import os
 from celery import Celery
 
+
+def _build_redis_url(db: int = 0) -> str:
+    """Build Redis URL from existing Config.Redis settings."""
+    try:
+        from src.api.config import Config
+        host = Config.Redis.HOST
+        port = Config.Redis.PORT
+        ssl = Config.Redis.SSL
+        pwd = getattr(Config.Redis, 'PASSWORD', '') or getattr(Config.Redis, 'KEY', '')
+        scheme = 'rediss' if ssl else 'redis'
+        if pwd:
+            return f"{scheme}://:{pwd}@{host}:{port}/{db}"
+        return f"{scheme}://{host}:{port}/{db}"
+    except Exception:
+        return f"redis://localhost:6379/{db}"
+
+
 app = Celery("docwain")
 
 app.config_from_object({
-    "broker_url": os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0"),
-    "result_backend": os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1"),
+    "broker_url": os.getenv("CELERY_BROKER_URL", _build_redis_url(0)),
+    "result_backend": os.getenv("CELERY_RESULT_BACKEND", _build_redis_url(1)),
+    "broker_use_ssl": {"ssl_cert_reqs": __import__('ssl').CERT_NONE},
+    "redis_backend_use_ssl": {"ssl_cert_reqs": __import__('ssl').CERT_NONE},
 
     "task_serializer": "json",
     "result_serializer": "json",
