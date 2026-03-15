@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import os
 import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from src.api.document_understanding_service import extract_and_understand, run_document_understanding
+from src.api.document_understanding_service import run_document_understanding
+from src.api.document_status import init_document_record
 from src.profiles.profile_store import resolve_profile_name
 from src.retrieval.profile_query import query_profile
+from src.utils.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 profile_docs_router = APIRouter(prefix="/profiles", tags=["Profiles"])
 
@@ -34,25 +39,66 @@ async def upload_document_for_profile(
     profile_name: Optional[str] = Form(None),
     file: UploadFile = File(...),
 ):
-    doc_id = str(uuid.uuid4())
-    contents = await file.read()
-    if not contents:
+    document_id = str(uuid.uuid4())
+    file_bytes = await file.read()
+    if not file_bytes:
         raise HTTPException(status_code=400, detail={"error": {"code": "empty_file", "message": "Empty file"}})
 
+    filename = file.filename or "document"
+    content_type = file.content_type or "application/octet-stream"
+    file_type = os.path.splitext(filename)[1].lstrip(".").lower() or "bin"
+
+    # ── 1. Store raw file to Azure Blob ──────────────────────────────
+    blob_url: Optional[str] = None
+    try:
+        from src.api.blob_content_store import get_blob_client
+        from azure.storage.blob import ContentSettings
+
+        container = get_blob_client()
+        blob_name = f"raw/{document_id}/{filename}"
+        blob_client = container.get_blob_client(blob_name)
+        blob_client.upload_blob(
+            file_bytes,
+            overwrite=True,
+            metadata={"document_id": document_id, "type": "raw_upload"},
+            content_settings=ContentSettings(content_type=content_type),
+        )
+        blob_url = blob_client.url
+        logger.info("Stored raw upload to blob: doc=%s blob=%s size=%d", document_id, blob_name, len(file_bytes))
+    except Exception:
+        logger.warning("Blob storage unavailable for doc=%s; proceeding without blob_url", document_id, exc_info=True)
+
+    # ── 2. Create MongoDB document record ────────────────────────────
     profile_name = profile_name or resolve_profile_name(subscription_id=subscription_id, profile_id=profile_id)
 
-    result = extract_and_understand(
-        document_id=doc_id,
-        file_bytes=contents,
-        filename=file.filename or "document",
+    init_document_record(
+        document_id=document_id,
         subscription_id=subscription_id,
         profile_id=profile_id,
-        profile_name=profile_name,
-        content_type=file.content_type,
-        content_size=len(contents),
-        embed_after=False,
+        source_file=filename,
+        file_type=file_type,
+        content_type=content_type,
+        content_size=len(file_bytes),
+        blob_url=blob_url,
+        created_by="user",
     )
-    return {"document_id": doc_id, "status": "COMPLETED", "result": result}
+
+    # ── 3. Auto-dispatch extraction via Celery ───────────────────────
+    celery_task_id: Optional[str] = None
+    try:
+        from src.tasks.extraction import extract_document
+        task = extract_document.delay(document_id, subscription_id, profile_id)
+        celery_task_id = task.id
+        logger.info("Dispatched extraction task: doc=%s task_id=%s", document_id, celery_task_id)
+    except Exception:
+        logger.warning("Celery dispatch failed for doc=%s; extraction must be triggered manually", document_id, exc_info=True)
+
+    return {
+        "document_id": document_id,
+        "status": "EXTRACTION_QUEUED",
+        "celery_task_id": celery_task_id,
+        "blob_url": blob_url,
+    }
 
 
 @profile_docs_router.post("/{profile_id}/documents/{document_id}/understand", summary="Run understanding on a document")
