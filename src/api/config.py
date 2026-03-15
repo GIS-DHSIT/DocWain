@@ -287,6 +287,7 @@ class Config:
         METADATA_FALLBACK_MIN_SCORE = float(os.getenv("RETRIEVAL_METADATA_FALLBACK_MIN_SCORE", "0.02"))
         MIN_QUERY_OVERLAP = float(os.getenv("RETRIEVAL_MIN_QUERY_OVERLAP", "0.06"))
         RELEVANCE_KEEP_TOP_K = int(os.getenv("RETRIEVAL_RELEVANCE_KEEP_TOP_K", "12"))
+        USE_UNIFIED_RETRIEVER = os.getenv("USE_UNIFIED_RETRIEVER", "false").lower() in {"1", "true", "yes", "on"}
         MIN_COMPARISON_DOCS = int(os.getenv("RETRIEVAL_MIN_COMPARISON_DOCS", "2"))
         RETRIEVAL_GUARD_BUDGET_MS = int(os.getenv("RETRIEVAL_GUARD_BUDGET_MS", "40"))
         RETRIEVAL_QUALITY_THRESH_HIGH = float(os.getenv("RETRIEVAL_QUALITY_THRESH_HIGH", "0.75"))
