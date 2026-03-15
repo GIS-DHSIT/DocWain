@@ -546,6 +546,15 @@ class Config:
         MEDICAL_NICE_ENABLED = os.getenv("DOCWAIN_MEDICAL_NICE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         MEDICAL_NICE_MAX_LOOKUPS = int(os.getenv("DOCWAIN_MEDICAL_NICE_MAX_LOOKUPS", "3"))
 
+    class Celery:
+        BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+        RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+        EXTRACTION_CONCURRENCY = int(os.getenv("CELERY_EXTRACTION_CONCURRENCY", "2"))
+        SCREENING_CONCURRENCY = int(os.getenv("CELERY_SCREENING_CONCURRENCY", "4"))
+        KG_CONCURRENCY = int(os.getenv("CELERY_KG_CONCURRENCY", "4"))
+        EMBEDDING_CONCURRENCY = int(os.getenv("CELERY_EMBEDDING_CONCURRENCY", "2"))
+        BACKFILL_CONCURRENCY = int(os.getenv("CELERY_BACKFILL_CONCURRENCY", "4"))
+
     class CloudPlatform:
         """SharePoint + cloud platform integration settings."""
         SHAREPOINT_ENABLED = os.getenv("DOCWAIN_SHAREPOINT_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
