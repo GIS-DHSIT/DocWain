@@ -50,6 +50,12 @@ class FeedbackTracker:
     ) -> None:
         """Record a query signal to Redis for aggregation."""
         try:
+            # Guard all inputs — Redis rejects None values
+            confidence = confidence if confidence is not None else 0.0
+            task_type = task_type or "unknown"
+            query = query or ""
+            grounded = bool(grounded)
+
             pipe = self._r.pipeline(transaction=False)
 
             # Total query count
@@ -59,7 +65,7 @@ class FeedbackTracker:
 
             # Confidence distribution
             k_conf_sum = _key(profile_id, "confidence_sum")
-            pipe.incrbyfloat(k_conf_sum, confidence)
+            pipe.incrbyfloat(k_conf_sum, float(confidence))
             pipe.expire(k_conf_sum, _TTL_SECONDS)
 
             k_conf_count = _key(profile_id, "confidence_count")
@@ -74,17 +80,17 @@ class FeedbackTracker:
 
             # Task type distribution
             k_task_types = _key(profile_id, "task_types")
-            pipe.hincrby(k_task_types, task_type or "unknown", 1)
+            pipe.hincrby(k_task_types, str(task_type), 1)
             pipe.expire(k_task_types, _TTL_SECONDS)
 
             # Low-confidence queries
-            if confidence is not None and confidence < _LOW_CONFIDENCE_THRESHOLD:
+            if confidence < _LOW_CONFIDENCE_THRESHOLD:
                 k_low = _key(profile_id, "low_confidence_queries")
                 entry = json.dumps({
-                    "query": query,
-                    "confidence": confidence,
-                    "task_type": task_type,
-                    "grounded": grounded,
+                    "query": str(query),
+                    "confidence": float(confidence),
+                    "task_type": str(task_type),
+                    "grounded": bool(grounded),
                     "ts": time.time(),
                 })
                 pipe.lpush(k_low, entry)
