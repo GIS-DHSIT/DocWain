@@ -15,11 +15,46 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 _FORMAT_INSTRUCTIONS = {
-    "table": "Present as markdown table with appropriate columns, cite sources per row",
-    "bullets": "Present as bulleted list, each with citation, most important first",
-    "sections": "Organize with ## headers, bullets within, end with synthesis",
-    "numbered": "Numbered list in sequential order",
-    "prose": "Clear paragraphs, lead with answer, then evidence",
+    "table": (
+        "Present data in a clean markdown table.\n"
+        "- Use | column | headers | with alignment\n"
+        "- One data point per row, no merged cells\n"
+        "- Bold key values: **$9,000.00**, **Jessica Jones**\n"
+        "- Add a brief summary sentence above the table"
+    ),
+    "bullets": (
+        "Present as a structured bulleted list.\n"
+        "- Lead with a one-line summary sentence\n"
+        "- Group related bullets under **bold category headers**\n"
+        "- Each bullet: **Label:** value or description\n"
+        "- Bold key names, amounts, dates, entities\n"
+        "- Most important items first"
+    ),
+    "sections": (
+        "Organize the response with clear visual hierarchy.\n"
+        "- Start with a one-line executive summary\n"
+        "- Use ## for major sections, ### for subsections\n"
+        "- Within sections, use bullet points with **bold labels**\n"
+        "- Format: **Field Name:** extracted value or insight\n"
+        "- Bold all key values: names, amounts, dates, identifiers\n"
+        "- Use markdown tables for tabular data (line items, comparisons)\n"
+        "- Never leave headers as plain text — always use ## or ###\n"
+        "- Keep bullets self-contained — each makes sense alone\n"
+        "- End with a brief synthesis or key takeaway if appropriate"
+    ),
+    "numbered": (
+        "Present as a numbered list.\n"
+        "- Each item: **Label** — description with **bold key values**\n"
+        "- Sequential order, one point per number\n"
+        "- Brief summary before the list"
+    ),
+    "prose": (
+        "Write clear, structured paragraphs.\n"
+        "- Lead with the direct answer in the first sentence\n"
+        "- Bold key values: **$9,000.00**, **Jessica Jones**, **Document 0522**\n"
+        "- Use short paragraphs (2-3 sentences each)\n"
+        "- For any tabular data, use a markdown table instead of inline text"
+    ),
 }
 
 _COMPLEXITY_BASE_TOKENS = {
@@ -64,10 +99,17 @@ class IntelligentGenerator:
 
         # ----- system prompt -----
         system_parts = [
-            "You are a precise document-intelligence assistant.",
-            "Answer the user query using ONLY the evidence below.",
-            "Cite evidence as [SOURCE-N] inline.",
-            "If the evidence does not support an answer, say so explicitly.",
+            "You are a senior document-intelligence analyst providing structured, actionable insights.",
+            "",
+            "RULES:",
+            "1. Answer ONLY from the evidence below — never fabricate data.",
+            "2. Lead with a one-sentence executive summary.",
+            "3. Use proper markdown: ## headers, ### subheaders, **bold** key values.",
+            "4. Bold ALL extracted values: names, amounts, dates, IDs, entities.",
+            "5. Use tables for line items, comparisons, or structured data.",
+            "6. Keep each bullet self-contained and informative.",
+            "7. If evidence is insufficient, state what is missing.",
+            "8. Do NOT include [SOURCE-N] tags in the response.",
             "",
             "--- EVIDENCE ---",
             evidence_block,
@@ -191,4 +233,4 @@ class IntelligentGenerator:
         if getattr(understanding, "thinking_required", False):
             budget = int(budget * 1.4)
 
-        return min(budget, 4096)
+        return min(budget, 8192)
