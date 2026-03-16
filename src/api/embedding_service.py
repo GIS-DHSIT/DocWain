@@ -2176,6 +2176,18 @@ def _process_blob(
                 },
             )
             _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+            # Profile intelligence: auto-generate insights (background, non-blocking)
+            try:
+                from src.intelligence.profile_intelligence import generate_profile_intelligence
+                import threading as _threading
+                _threading.Thread(
+                    target=generate_profile_intelligence,
+                    args=(doc_id, profile_id, subscription_id),
+                    daemon=True,
+                    name=f"profile-intel-{doc_id[:12]}",
+                ).start()
+            except Exception:
+                logger.debug("Profile intelligence trigger skipped", exc_info=True)
             deleted = False
             logger.info("Preserving pickle for %s after embedding (cleanup disabled)", doc_id)
             if telemetry:
@@ -2625,6 +2637,18 @@ def _process_blob(
                 )
 
         _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        # Profile intelligence: auto-generate insights (background, non-blocking)
+        try:
+            from src.intelligence.profile_intelligence import generate_profile_intelligence
+            import threading as _threading
+            _threading.Thread(
+                target=generate_profile_intelligence,
+                args=(doc_id, profile_id, subscription_id),
+                daemon=True,
+                name=f"profile-intel-{doc_id[:12]}",
+            ).start()
+        except Exception:
+            logger.debug("Profile intelligence trigger skipped", exc_info=True)
         emit_progress(doc_id, "completed", 1.0,
                       f"Training completed — {total_upserted} chunks stored",
                       extra={"chunks_stored": total_upserted, "collection": collection_name})
@@ -3284,6 +3308,18 @@ def _process_local_document(
                 )
 
         _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        # Profile intelligence: auto-generate insights (background, non-blocking)
+        try:
+            from src.intelligence.profile_intelligence import generate_profile_intelligence
+            import threading as _threading
+            _threading.Thread(
+                target=generate_profile_intelligence,
+                args=(document_id, profile_id, subscription_id),
+                daemon=True,
+                name=f"profile-intel-{document_id[:12]}",
+            ).start()
+        except Exception:
+            logger.debug("Profile intelligence trigger skipped", exc_info=True)
         emit_progress(document_id, "completed", 1.0,
                       f"Training completed — {total_upserted} chunks stored",
                       extra={"chunks_stored": total_upserted, "collection": collection_name})
