@@ -158,44 +158,118 @@ def generate_profile_intelligence(
 # ---------------------------------------------------------------------------
 
 def _load_document_data(document_id: str):
-    """Load document record and extraction pickle."""
+    """Load document record and content from best available source."""
     from src.api.document_status import get_document_record
     record = get_document_record(document_id) or {}
 
+    # Try pickle first (available if embedding just completed)
     try:
         from src.api.content_store import load_extracted_pickle
         extraction = load_extracted_pickle(document_id)
+        return record, extraction
     except Exception:
-        # Pickle may have been purged after embedding — use doc_facts instead
+        pass
+
+    # Pickle purged — build content from MongoDB record + Qdrant chunks
+    extraction = {"from_fallback": True}
+
+    # Get document summary and entities from MongoDB record
+    summary = record.get("document_summary", "")
+    entities = record.get("key_entities", [])
+    doc_domain = record.get("document_domain") or record.get("doc_domain", "")
+
+    # Get actual text from Qdrant chunks
+    chunks_text = _load_chunks_from_qdrant(
+        document_id,
+        str(record.get("subscription_id") or record.get("subscription") or ""),
+        str(record.get("profile_id") or record.get("profile") or ""),
+    )
+
+    # Get facts from doc_facts collection
+    try:
         from pymongo import MongoClient
         from src.api.config import Config
         client = MongoClient(Config.MongoDB.URI, serverSelectionTimeoutMS=5000)
         db = client[Config.MongoDB.DB]
-        facts = db["doc_facts"].find_one({"document_id": document_id})
-        if facts:
-            extraction = {"facts": facts.get("facts_json", []), "from_facts_store": True}
-        else:
-            extraction = None
+        facts_doc = db["doc_facts"].find_one({"document_id": document_id})
+        facts = facts_doc.get("facts_json", []) if facts_doc else []
+    except Exception:
+        facts = []
+
+    extraction["chunks_text"] = chunks_text
+    extraction["summary"] = summary
+    extraction["entities"] = entities
+    extraction["facts"] = facts
+    extraction["doc_domain"] = doc_domain
 
     return record, extraction
 
 
+def _load_chunks_from_qdrant(document_id: str, subscription_id: str, profile_id: str) -> str:
+    """Load canonical text from Qdrant chunks for a document."""
+    try:
+        from qdrant_client import QdrantClient
+        from src.api.config import Config
+        qc = QdrantClient(url=Config.Qdrant.URL, api_key=Config.Qdrant.API)
+
+        filters = {"must": [{"key": "document_id", "match": {"value": document_id}}]}
+        if profile_id:
+            filters["must"].append({"key": "profile_id", "match": {"value": profile_id}})
+
+        points, _ = qc.scroll(
+            collection_name=subscription_id,
+            scroll_filter=filters,
+            limit=50,
+            with_payload=True,
+        )
+
+        texts = []
+        for p in sorted(points, key=lambda x: x.payload.get("chunk_index", 0)):
+            text = (p.payload.get("canonical_text")
+                    or p.payload.get("embedding_text")
+                    or p.payload.get("text")
+                    or "")
+            if text.strip():
+                texts.append(text.strip())
+
+        return "\n\n".join(texts)
+    except Exception as e:
+        logger.debug("Qdrant chunk load failed for %s: %s", document_id, e)
+        return ""
+
+
 def _extract_text(extraction_data: dict) -> str:
-    """Get clean text from extraction data."""
+    """Get clean text from extraction data — best source wins."""
     if not extraction_data:
         return ""
 
-    # From pickle
+    # From pickle (raw field)
     raw = extraction_data.get("raw")
     if raw:
         if isinstance(raw, dict):
-            return raw.get("full_text") or raw.get("text") or raw.get("content") or ""
-        if hasattr(raw, "full_text"):
-            return raw.full_text or ""
-        if isinstance(raw, str):
+            text = raw.get("full_text") or raw.get("text") or raw.get("content") or ""
+            if text:
+                return text
+        if hasattr(raw, "full_text") and raw.full_text:
+            return raw.full_text
+        if isinstance(raw, str) and raw.strip():
             return raw
 
-    # From facts store fallback
+    # From Qdrant chunks (fallback after pickle purge)
+    chunks = extraction_data.get("chunks_text", "")
+    if chunks and len(chunks) > 50:
+        # Enrich with summary and entities if available
+        parts = []
+        summary = extraction_data.get("summary", "")
+        if summary:
+            parts.append(f"Document Summary: {summary}")
+        entities = extraction_data.get("entities", [])
+        if entities:
+            parts.append(f"Key Entities: {', '.join(str(e) for e in entities[:20])}")
+        parts.append(chunks)
+        return "\n\n".join(parts)
+
+    # From facts store
     facts = extraction_data.get("facts", [])
     if facts:
         return "\n".join(
@@ -203,7 +277,7 @@ def _extract_text(extraction_data: dict) -> str:
             for f in facts if isinstance(f, dict)
         )
 
-    return str(extraction_data)[:3000]
+    return ""
 
 
 # ---------------------------------------------------------------------------
