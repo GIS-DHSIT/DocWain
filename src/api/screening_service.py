@@ -26,8 +26,9 @@ DONT_DOWNGRADE_STATUSES = {
     STATUS_TRAINING_FAILED,
 }
 
+# Only allow screening AFTER extraction completes — never bypass extraction.
+# UNDER_REVIEW excluded: extraction must run first to create the pickle.
 SCREENING_ELIGIBLE_STATUSES = {
-    STATUS_UNDER_REVIEW,
     STATUS_EXTRACTION_COMPLETED,
     STATUS_SCREENING_COMPLETED,
 }
