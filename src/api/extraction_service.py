@@ -1611,12 +1611,14 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
 
         # Scope by subscription_id when provided
         if subscription_id:
+            sub_str = str(subscription_id)
             eligible_docs = {
                 doc_id: doc_info
                 for doc_id, doc_info in eligible_docs.items()
-                if (doc_info.get("dataDict", {}).get("subscription_id")
-                    or doc_info.get("dataDict", {}).get("subscription")
-                    or doc_info.get("dataDict", {}).get("subscriptionId")) == subscription_id
+                if str(doc_info.get("dataDict", {}).get("subscription_id")
+                       or doc_info.get("dataDict", {}).get("subscription")
+                       or doc_info.get("dataDict", {}).get("subscriptionId")
+                       or "") == sub_str
             }
 
         if not eligible_docs:
