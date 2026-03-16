@@ -1678,20 +1678,34 @@ def extract_single_document(doc_id: str) -> Dict[str, Any]:
         doc_info = doc_coll[doc_id]
         return _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
 
-    # Fallback: profile-uploaded document (no connector, content in Azure Blob)
+    # Fallback: profile-uploaded document (content in Azure Blob)
     from src.api.document_status import get_document_record
     record = get_document_record(doc_id)
     if not record:
         return {"status": "not_found", "message": f"Document {doc_id} not found"}
 
-    blob_url = record.get("blob_url")
-    source_file = record.get("source_file", "document")
+    # Resolve blob location: try blob_url (new pipeline) or location (UI connector)
+    blob_url = record.get("blob_url") or record.get("location", "")
+    source_file = record.get("source_file") or record.get("name", "document")
+    subscription_id = record.get("subscription_id") or record.get("subscription")
+    profile_id = record.get("profile_id") or record.get("profile")
+
     if blob_url:
         try:
-            from src.api.blob_content_store import get_blob_client
-            container = get_blob_client()
-            blob_name = f"raw/{doc_id}/{source_file}"
-            blob_client = container.get_blob_client(blob_name)
+            if blob_url.startswith("az://"):
+                # UI connector format: az://container/path
+                from src.storage.azure_blob_client import get_blob_service_client
+                svc = get_blob_service_client()
+                parts = blob_url.replace("az://", "", 1).split("/", 1)
+                container_name, blob_name = parts[0], parts[1] if len(parts) > 1 else ""
+                container = svc.get_container_client(container_name)
+                blob_client = container.get_blob_client(blob_name)
+            else:
+                from src.api.blob_content_store import get_blob_client
+                container = get_blob_client()
+                blob_name = f"raw/{doc_id}/{source_file}"
+                blob_client = container.get_blob_client(blob_name)
+
             file_bytes = blob_client.download_blob().readall()
             logger.info("Loaded %d bytes from blob for doc=%s", len(file_bytes), doc_id)
         except Exception as exc:
@@ -1704,9 +1718,9 @@ def extract_single_document(doc_id: str) -> Dict[str, Any]:
         document_id=doc_id,
         file_bytes=file_bytes,
         filename=source_file,
-        subscription_id=record.get("subscription_id"),
-        profile_id=record.get("profile_id"),
-        doc_type=record.get("doc_type") or record.get("file_type"),
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        doc_type=record.get("doc_type") or record.get("file_type") or record.get("type"),
         content_type=record.get("content_type"),
         content_size=len(file_bytes),
     )

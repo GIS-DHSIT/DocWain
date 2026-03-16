@@ -296,10 +296,19 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
     texts = []
     blob_path = (record.get("extraction", {}).get("summary") or {}).get("blob_path")
     if not blob_path:
-        # Also try direct blob_url for raw file content
-        blob_url = record.get("blob_url")
+        # Try direct blob_url (new pipeline) or location (UI connector uploads)
+        blob_url = record.get("blob_url") or record.get("location", "")
         if blob_url:
-            blob_path = f"raw/{doc_id}/{record.get('source_file', 'document')}"
+            if blob_url.startswith("az://"):
+                # UI connector format: az://container/path
+                blob_path = blob_url.replace("az://", "", 1)
+            elif "blob.core.windows.net" in blob_url:
+                # Full Azure URL — extract path after container
+                from urllib.parse import urlparse
+                parsed = urlparse(blob_url)
+                blob_path = parsed.path.lstrip("/").split("/", 1)[-1] if "/" in parsed.path.lstrip("/") else None
+            else:
+                blob_path = f"raw/{doc_id}/{record.get('source_file', record.get('name', 'document'))}"
 
     if blob_path:
         try:

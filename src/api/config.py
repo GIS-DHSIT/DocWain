@@ -146,7 +146,7 @@ class Config:
         DEFAULT_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
         URI = DEFAULT_URI
         FALLBACK_URI = os.getenv("MONGODB_FALLBACK_URI", "mongodb://localhost:27017")
-        DB = os.getenv("MONGODB_DB", 'docwain')
+        DB = os.getenv("MONGODB_DB", 'test')
         CONNECTOR = os.getenv("MONGODB_CONNECTORS", 'connectors')
         DOCUMENTS = os.getenv("MONGODB_DOCUMENTS", 'documents')
         PROFILES = os.getenv("MONGODB_PROFILES", 'profiles')
