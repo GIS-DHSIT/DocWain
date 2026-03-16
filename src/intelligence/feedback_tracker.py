@@ -74,7 +74,7 @@ class FeedbackTracker:
 
             # Task type distribution
             k_task_types = _key(profile_id, "task_types")
-            pipe.hincrby(k_task_types, task_type, 1)
+            pipe.hincrby(k_task_types, task_type or "unknown", 1)
             pipe.expire(k_task_types, _TTL_SECONDS)
 
             # Low-confidence queries

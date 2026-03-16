@@ -128,9 +128,9 @@ class IntentAnalyzer:
         try:
             raw = self._llm.generate(
                 prompt,
-                system="You are a document intelligence query analyzer. Respond ONLY with JSON.",
+                system="You are a document intelligence query analyzer. Respond with valid JSON only.",
                 temperature=0.1,
-                max_tokens=256,
+                max_tokens=1024,
             )
         except Exception:
             logger.exception("LLM call failed for intent analysis")
