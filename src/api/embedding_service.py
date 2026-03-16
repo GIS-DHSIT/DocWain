@@ -21,7 +21,7 @@ from src.api.blob_store import (
     is_trusted_blob,
 )
 from src.api.config import Config
-from src.api.content_store import build_pickle_path, load_extracted_pickle, save_extracted_pickle
+from src.api.content_store import load_extracted_pickle, save_extracted_pickle
 try:
     from src.api.dataHandler import (
         ChunkingDiagnosticError,
@@ -413,28 +413,22 @@ def _fetch_document_ids_for_integrity(
 
 def _load_extracted_for_doc(document_id: str) -> Tuple[Optional[Any], Dict[str, Any]]:
     details: Dict[str, Any] = {"source": "missing"}
-    if blob_storage_configured():
-        store = _build_blob_store()
-        for ext in (".pkl", ".pickle"):
-            blob_name = store.build_blob_name(document_id, extension=ext)
-            payload = load_blob_pickle(blob_name)
-            if payload:
-                details.update(
-                    {
-                        "source": "blob",
-                        "blob_name": blob_name,
-                        "bytes": len(payload or b""),
-                    }
-                )
-                return pickle.loads(payload), details
+    if not blob_storage_configured():
         return None, details
-
-    path = build_pickle_path(document_id)
-    if not path.exists():
-        return None, details
-    payload = path.read_bytes()
-    details.update({"source": "local", "path": str(path), "bytes": len(payload or b"")})
-    return pickle.loads(payload), details
+    store = _build_blob_store()
+    for ext in (".pkl", ".pickle"):
+        blob_name = store.build_blob_name(document_id, extension=ext)
+        payload = load_blob_pickle(blob_name)
+        if payload:
+            details.update(
+                {
+                    "source": "blob",
+                    "blob_name": blob_name,
+                    "bytes": len(payload or b""),
+                }
+            )
+            return pickle.loads(payload), details
+    return None, details
 
 def _min_chars_threshold() -> int:
     raw = os.getenv("EMBEDDING_MIN_CHARS", "50")
