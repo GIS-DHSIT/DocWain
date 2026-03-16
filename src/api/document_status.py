@@ -1,14 +1,22 @@
 import json
+from datetime import datetime
 from src.utils.logging_utils import get_logger
 import time
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pymongo import ReturnDocument
 from bson import ObjectId
 
 from src.api.config import Config
-from src.api.statuses import STATUS_UNDER_REVIEW
+from src.api.statuses import (
+    STATUS_UNDER_REVIEW,
+    PIPELINE_UPLOADED,
+    STAGE_PENDING,
+    STAGE_IN_PROGRESS,
+    STAGE_COMPLETED,
+    STAGE_FAILED,
+)
 
 logger = get_logger(__name__)
 
@@ -158,27 +166,76 @@ def _doc_filter(document_id: str) -> Dict[str, Any]:
 
 def init_document_record(
     document_id: str,
-    subscription_id: Optional[str],
-    profile_id: Optional[str],
-    doc_type: Optional[str],
-    filename: Optional[str],
-    content_type: Optional[str],
-    size: Optional[int],
+    subscription_id: Optional[str] = None,
+    profile_id: Optional[str] = None,
+    doc_type: Optional[str] = None,
+    filename: Optional[str] = None,
+    content_type: Optional[str] = None,
+    size: Optional[int] = None,
+    # New pipeline-schema parameters (with defaults for backward compat)
+    source_file: Optional[str] = None,
+    file_type: Optional[str] = None,
+    content_size: Optional[int] = None,
+    blob_url: Optional[str] = None,
+    created_by: str = "system",
 ):
+    """Create or update a document record with full pipeline schema.
+
+    Backward compatible: existing callers using (doc_type, filename, size)
+    continue to work.  New callers can use (source_file, file_type,
+    content_size, blob_url, created_by) for the enriched schema.
+    """
     now = time.time()
+    utcnow = datetime.utcnow()
+
+    # Resolve aliased parameters (new names take precedence)
+    resolved_source_file = source_file or filename
+    resolved_file_type = file_type or doc_type
+    resolved_content_size = content_size if content_size is not None else size
+
     update: Dict[str, Any] = {"document_id": str(document_id), "updated_at": now}
     if subscription_id:
         update["subscription_id"] = str(subscription_id)
     if profile_id:
         update["profile_id"] = str(profile_id)
-    if doc_type:
-        update["doc_type"] = str(doc_type)
-    if filename:
-        update["source_file"] = filename
+    if resolved_file_type:
+        update["doc_type"] = str(resolved_file_type)
+    if resolved_source_file:
+        update["source_file"] = resolved_source_file
     if content_type:
         update["content_type"] = content_type
-    if size is not None:
-        update["content_size"] = int(size)
+    if resolved_content_size is not None:
+        update["content_size"] = int(resolved_content_size)
+    if blob_url:
+        update["blob_url"] = blob_url
+
+    # Pipeline status and per-stage tracking
+    update["pipeline_status"] = PIPELINE_UPLOADED
+    update["created_by"] = created_by
+
+    _pending_stage = lambda: {
+        "status": STAGE_PENDING,
+        "started_at": None,
+        "completed_at": None,
+        "celery_task_id": None,
+        "error": None,
+        "summary": None,
+    }
+
+    update["extraction"] = _pending_stage()
+    update["screening"] = {**_pending_stage(), "plugins_run": None}
+    update["knowledge_graph"] = {
+        "status": STAGE_PENDING,
+        "started_at": None,
+        "completed_at": None,
+        "node_count": 0,
+        "edge_count": 0,
+        "neo4j_subgraph_id": None,
+    }
+    update["embedding"] = _pending_stage()
+
+    # Audit log
+    update["audit_log"] = [{"action": "UPLOADED", "by": created_by, "at": utcnow}]
 
     collection = get_documents_collection()
     # Two-step: find existing doc first, then update with exact _id filter.
@@ -194,7 +251,11 @@ def init_document_record(
             {"_id": _doc_id_value(document_id)},
             {
                 "$set": update,
-                "$setOnInsert": {"created_at": now, "_id": _doc_id_value(document_id), "status": STATUS_UNDER_REVIEW},
+                "$setOnInsert": {
+                    "created_at": now,
+                    "_id": _doc_id_value(document_id),
+                    "status": STATUS_UNDER_REVIEW,
+                },
             },
             upsert=True,
             return_document=ReturnDocument.AFTER,
@@ -277,12 +338,47 @@ def update_document_fields(document_id: str, fields: Dict[str, Any]):
         )
     return result
 
-def update_stage(document_id: str, stage: str, patch: Dict[str, Any]):
+def update_stage(document_id: str, stage: str, patch: Optional[Dict[str, Any]] = None,
+                 status: Optional[str] = None,
+                 celery_task_id: Optional[str] = None,
+                 error: object = _MISSING,
+                 summary: Optional[Dict[str, Any]] = None,
+                 blob_path: Optional[str] = None,
+                 **extra):
+    """Update a specific pipeline stage's status and metadata.
+
+    Supports two calling conventions:
+      - Legacy dict style:  update_stage(doc_id, "extraction", {"status": "IN_PROGRESS", ...})
+      - New keyword style:  update_stage(doc_id, "extraction", status="IN_PROGRESS", celery_task_id="abc")
+
+    When *patch* is provided (legacy style), keyword arguments are ignored.
+    """
     now = time.time()
-    patch_copy = dict(patch)
-    error_value = patch_copy.pop("error", _MISSING)
-    flat = _flatten(stage, patch_copy)
-    flat["updated_at"] = now
+
+    if patch is not None:
+        # --- Legacy dict-based path (backward compatible) ---
+        patch_copy = dict(patch)
+        error_value = patch_copy.pop("error", _MISSING)
+        flat = _flatten(stage, patch_copy)
+        flat["updated_at"] = now
+    else:
+        # --- New keyword-based path ---
+        flat: Dict[str, Any] = {"updated_at": now}
+        if status is not None:
+            flat[f"{stage}.status"] = status
+            if status == STAGE_IN_PROGRESS:
+                flat[f"{stage}.started_at"] = now
+            elif status in (STAGE_COMPLETED, STAGE_FAILED):
+                flat[f"{stage}.completed_at"] = now
+        if celery_task_id is not None:
+            flat[f"{stage}.celery_task_id"] = celery_task_id
+        if summary is not None:
+            flat[f"{stage}.summary"] = summary
+        if blob_path is not None:
+            flat[f"{stage}.summary.blob_path"] = blob_path
+        for key, value in extra.items():
+            flat[f"{stage}.{key}"] = value
+        error_value = error
 
     set_error: Dict[str, Any] = {}
     unset_error: Dict[str, Any] = {}
@@ -335,6 +431,47 @@ def set_error(document_id: str, stage: str, exc: Exception):
             "error": {"message": message, "trace": trace, "code": code},
         },
     )
+
+def append_audit_log(document_id: str, action: str, by: str = "system", **extra):
+    """Append an entry to the document's audit log."""
+    entry: Dict[str, Any] = {"action": action, "by": by, "at": datetime.utcnow()}
+    entry.update(extra)
+    collection = get_documents_collection()
+    existing = collection.find_one(_doc_filter(document_id), {"_id": 1})
+    if existing:
+        collection.update_one(
+            {"_id": existing["_id"]},
+            {
+                "$push": {"audit_log": entry},
+                "$set": {"updated_at": time.time()},
+            },
+        )
+    else:
+        collection.update_one(
+            {"_id": _doc_id_value(document_id)},
+            {
+                "$push": {"audit_log": entry},
+                "$set": {"updated_at": time.time()},
+            },
+        )
+
+
+def update_pipeline_status(document_id: str, pipeline_status: str):
+    """Update the top-level pipeline status."""
+    collection = get_documents_collection()
+    now = time.time()
+    existing = collection.find_one(_doc_filter(document_id), {"_id": 1})
+    if existing:
+        collection.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {"pipeline_status": pipeline_status, "updated_at": now}},
+        )
+    else:
+        collection.update_one(
+            {"_id": _doc_id_value(document_id)},
+            {"$set": {"pipeline_status": pipeline_status, "updated_at": now}},
+        )
+
 
 def upsert_screening_report(
     run_id: str,

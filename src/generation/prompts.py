@@ -33,15 +33,15 @@ _SYSTEM_PROMPT = (
     "If they ask for a list, give a list. If they ask to compare, use a table. "
     "Mirror the format the user implicitly or explicitly expects.\n\n"
     "FORMATTING:\n"
-    "- Structure responses with clear sections (### headers) when covering multiple topics or documents.\n"
+    "- Use ## headers for sections, ### for subsections — never plain text headers.\n"
     "- Use numbered lists for procedures, steps, and sequential processes.\n"
     "- Use bullet points (- ) for non-sequential lists of 3+ items.\n"
-    "- Use markdown tables when comparing items across multiple dimensions. "
-    "Keep tables focused — max 4-5 columns. Never include internal scores or metadata.\n"
-    "- Use **bold** for key terms, values, and important findings.\n"
-    "- For broad/vague questions about a collection, provide a structured overview: "
-    "start with a one-line summary, then a section per document/topic with key highlights.\n"
-    "- For simple factual questions, use clean prose — no headers needed.\n"
+    "- Format each bullet as: **Label:** value — keep the ENTIRE bullet on ONE line.\n"
+    "- CRITICAL: Never split **bold** markers across lines. Write **$8,500.00** not **\\n8,500.00**.\n"
+    "- Bold ALL key values inline: **$9,000.00**, **Jessica Jones**, **Document 0522**, **01-Aug-2022**.\n"
+    "- Use markdown tables for line items, comparisons, and multi-column data. Max 4-5 columns.\n"
+    "- For broad/vague questions: one-line summary → section per document/topic.\n"
+    "- For simple factual questions: clean prose, no headers needed.\n"
     "- Never output raw internal data like relevance scores, source indices, or system metadata.\n"
 )
 
@@ -77,10 +77,11 @@ TASK_FORMATS: Dict[str, str] = {
     "extract": (
         "TASK: Extract the requested information precisely.\n"
         "- Present exact values from the documents.\n"
-        "- Use a table if multiple fields are requested, key-value pairs if few.\n"
-        "- **Bold** the extracted values.\n"
+        "- Use a markdown table for line items or multi-field data.\n"
+        "- Bold ALL extracted values inline: **$720.00**, **Super Widget Industries**, **5 mockups**.\n"
+        "- Keep each bullet on ONE line — never break **bold** markers across lines.\n"
         "- If a requested field is not found, state: 'Not found in provided documents.'\n"
-        "- For procedural extractions (steps, protocols), use numbered lists preserving the original order.\n"
+        "- For procedural extractions (steps, protocols), use numbered lists.\n"
     ),
     "compare": (
         "TASK: Compare the subjects systematically.\n"
@@ -93,11 +94,13 @@ TASK_FORMATS: Dict[str, str] = {
     ),
     "summarize": (
         "TASK: Provide a structured summary.\n"
-        "- Start with a one-line overview.\n"
-        "- Use ### section headers if covering multiple documents or topics.\n"
-        "- Within each section, use bullet points with **bold** lead-ins for key highlights.\n"
-        "- Include specific values, counts, and details — not vague generalities.\n"
-        "- End with a brief conclusion or 'Key Takeaway' line.\n"
+        "- Start with a one-line executive summary.\n"
+        "- Use ## section headers for major topics, ### for subtopics.\n"
+        "- Bullets: **Label:** value — keep each on ONE line.\n"
+        "- Bold all key values: amounts, names, dates, identifiers.\n"
+        "- Use a table for any tabular data (line items, comparisons).\n"
+        "- Include specific values and counts — not vague generalities.\n"
+        "- End with a Key Takeaway.\n"
     ),
     "overview": (
         "TASK: Provide a structured overview of the document collection.\n"
@@ -145,11 +148,41 @@ TASK_FORMATS: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 _OUTPUT_FORMATS: Dict[str, str] = {
-    "table": "Present results as a markdown table. All rows must have the same columns. Use 'N/A' for missing cells.",
-    "bullets": "Present as a bulleted list. Most important items first. Each bullet should be self-contained.",
-    "sections": "Organize with ## headers. Use bullets within sections. End with a synthesis.",
-    "numbered": "Use a numbered list in sequential order.",
-    "prose": "Write clear paragraphs. Lead with the answer, then supporting evidence.",
+    "table": (
+        "Present data in a clean markdown table.\n"
+        "- Use | Column | Headers | with alignment\n"
+        "- One data point per row, bold key values in cells\n"
+        "- Add a summary sentence above the table"
+    ),
+    "bullets": (
+        "Present as a structured bulleted list.\n"
+        "- Group related items under **bold category labels** on their own line\n"
+        "- Each bullet: **Label:** value or description — keep on ONE line\n"
+        "- Bold key values inline: costs, names, dates, IDs\n"
+        "- Most important items first"
+    ),
+    "sections": (
+        "Organize with clear visual hierarchy.\n"
+        "- Use ## for major sections, ### for subsections\n"
+        "- Within sections, use bullet points: **Label:** value\n"
+        "- Bold ALL key values: **$9,000.00**, **Jessica Jones**, **Document 0522**\n"
+        "- Use markdown tables for line items or comparisons\n"
+        "- Keep each bullet on a SINGLE line — never split bold markers across lines\n"
+        "- End with a key takeaway"
+    ),
+    "numbered": (
+        "Use a numbered list.\n"
+        "- Each item: **Label** — description with bold key values\n"
+        "- Keep each item on one line\n"
+        "- Brief summary before the list"
+    ),
+    "prose": (
+        "Write clear paragraphs.\n"
+        "- Lead with the direct answer\n"
+        "- Bold key values inline: **$9,000.00**, **Jessica Jones**\n"
+        "- Short paragraphs (2-3 sentences)\n"
+        "- Use a table for any tabular data"
+    ),
 }
 
 # ---------------------------------------------------------------------------

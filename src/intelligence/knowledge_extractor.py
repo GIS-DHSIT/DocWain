@@ -164,7 +164,7 @@ class KnowledgeExtractor:
         self,
         llm_gateway=None,
         confidence_threshold: float = 0.7,
-        max_tokens: int = 2000,
+        max_tokens: int = 4096,
         timeout_per_chunk: float = 30.0,
     ):
         self._llm = llm_gateway
@@ -227,8 +227,18 @@ class KnowledgeExtractor:
                 extraction_time_ms=(time.monotonic() - start) * 1000
             )
 
-        # Parse JSON response
+        # Parse JSON response — try answer first, then thinking block
         parsed = self._parse_json(raw_text)
+        if not parsed:
+            # Thinking model may have put JSON in thinking block
+            thinking = (_meta or {}).get("thinking", "")
+            if thinking:
+                parsed = self._parse_json(thinking)
+                if parsed:
+                    logger.info(
+                        "[KnowledgeExtractor] Recovered JSON from thinking block for page=%s section=%s",
+                        page, section,
+                    )
         if not parsed:
             logger.warning(
                 "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s",

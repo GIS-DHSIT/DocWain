@@ -156,9 +156,10 @@ def classify_document_type(
     tables_sample: str,
     filename: str,
     model_name: Optional[str] = None,
+    llm_client=None,
 ) -> tuple[str, float]:
     # LLM-first: DocWain-Agent provides accurate classification with full context understanding
-    llm = _ollama_classify(text_sample, tables_sample, filename, model_name)
+    llm = _ollama_classify(text_sample, tables_sample, filename, model_name, llm_client=llm_client)
     if llm:
         doc_type, conf = llm
         logger.info("LLM classified document '%s' as %s (confidence=%.2f)", filename, doc_type, conf)
@@ -178,6 +179,7 @@ def identify_document(
     filename: str,
     profile_name: Optional[str] = None,
     model_name: Optional[str] = None,
+    llm_client=None,
 ) -> DocumentIdentification:
     text_sample = ""
     tables_sample = ""
@@ -194,7 +196,7 @@ def identify_document(
     except Exception:  # noqa: BLE001
         text_sample = text_sample or ""
 
-    doc_type, confidence = classify_document_type(text_sample, tables_sample, filename, model_name=model_name)
+    doc_type, confidence = classify_document_type(text_sample, tables_sample, filename, model_name=model_name, llm_client=llm_client)
 
     # Normalize to canonical domain labels for consistency across all classifiers
     try:

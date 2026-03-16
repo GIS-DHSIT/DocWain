@@ -114,6 +114,63 @@ def _check_ollama_connection() -> Dict[str, Any]:
             "error": str(e)[:100],
         }
 
+def _check_neo4j_connection() -> Dict[str, Any]:
+    """Check Neo4j graph database connectivity."""
+    try:
+        from src.api.config import Config
+        from neo4j import GraphDatabase
+
+        driver = GraphDatabase.driver(
+            Config.Neo4j.URI,
+            auth=(Config.Neo4j.USER, Config.Neo4j.PASSWORD),
+        )
+        driver.verify_connectivity()
+        driver.close()
+        return {
+            "status": "healthy",
+            "uri": Config.Neo4j.URI,
+        }
+    except Exception as e:
+        logger.warning("Neo4j health check failed: %s", e)
+        return {
+            "status": "unhealthy",
+            "error": str(e)[:100],
+        }
+
+def _get_celery_queue_stats() -> Dict[str, Any]:
+    """Get Celery worker and queue statistics."""
+    try:
+        from src.celery_app import app as celery_app
+
+        inspect = celery_app.control.inspect(timeout=3.0)
+        stats = inspect.stats()
+        if stats is None:
+            return {"status": "unavailable", "reason": "no workers responding"}
+
+        active_queues = inspect.active_queues() or {}
+        active_tasks = inspect.active() or {}
+
+        worker_count = len(stats)
+        queue_names = set()
+        for worker_queues in active_queues.values():
+            for q in worker_queues:
+                queue_names.add(q.get("name", "unknown"))
+
+        total_active = sum(len(tasks) for tasks in active_tasks.values())
+
+        return {
+            "status": "ok",
+            "workers": worker_count,
+            "queues": sorted(queue_names),
+            "active_tasks": total_active,
+        }
+    except Exception as e:
+        logger.warning("Celery health check failed: %s", e)
+        return {
+            "status": "unavailable",
+            "error": str(e)[:100],
+        }
+
 def _validate_configuration() -> Dict[str, Any]:
     """Validate critical configuration settings."""
     issues: List[str] = []
@@ -135,26 +192,40 @@ def _validate_configuration() -> Dict[str, Any]:
 @health_router.get("/health")
 def health_check(request: Request) -> Dict[str, Any]:
     """
-    Basic health check endpoint.
+    Production health check endpoint.
 
-    Returns overall health status based on app state.
+    Checks all backend services and returns per-component status.
+    Each check is independent — one failing service will not prevent
+    the others from being reported.
     """
-    state = getattr(request.app.state, "rag_state", None)
-    index_status = getattr(request.app.state, "qdrant_index_status", {}) if state else {}
-    overall = "healthy"
+    def _safe_check(fn):
+        try:
+            result = fn()
+            return result.get("status", "ok") if isinstance(result, dict) else "ok"
+        except Exception as e:
+            return f"error: {str(e)[:80]}"
 
-    for entry in (index_status or {}).values():
-        if isinstance(entry, dict) and entry.get("status") == "unhealthy":
-            overall = "degraded"
-            break
+    def _safe_check_full(fn):
+        try:
+            return fn()
+        except Exception as e:
+            return {"status": "error", "error": str(e)[:80]}
 
-    if state is None:
-        overall = "unhealthy"
+    redis_status = _safe_check(_check_redis_connection)
+    mongodb_status = _safe_check(_check_mongodb_connection)
+    qdrant_status = _safe_check(_check_qdrant_connection)
+    neo4j_status = _safe_check(_check_neo4j_connection)
+    ollama_status = _safe_check(_check_ollama_connection)
+    celery_stats = _safe_check_full(_get_celery_queue_stats)
 
     return {
-        "status": overall,
-        "qdrant_indexes": index_status,
-        "instance_ids": getattr(request.app.state, "instance_ids", {}),
+        "api": "ok",
+        "redis": redis_status,
+        "mongodb": mongodb_status,
+        "qdrant": qdrant_status,
+        "neo4j": neo4j_status,
+        "ollama_local": ollama_status,
+        "celery": celery_stats,
     }
 
 @health_router.get("/health/detailed")

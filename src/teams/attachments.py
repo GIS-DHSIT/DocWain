@@ -286,9 +286,11 @@ def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: 
         from src.doc_understanding.identify import identify_document
         from src.doc_understanding.content_map import build_content_map
         from src.doc_understanding.understand import understand_document
+        from src.llm.gateway import get_llm_gateway
+        cloud_llm = get_llm_gateway()
 
-        # Stage 1: Identify document type
-        id_result = identify_document(extracted=extracted, filename=filename)
+        # Stage 1: Identify document type (Teams uses cloud models)
+        id_result = identify_document(extracted=extracted, filename=filename, llm_client=cloud_llm)
         doc_type = getattr(id_result, "document_type", None) or (
             id_result.get("document_type", "other") if isinstance(id_result, dict) else "other"
         )
@@ -297,10 +299,11 @@ def _run_document_intelligence(extracted, filename: str, doc_tag: str, context: 
         # Stage 2: Build content map
         content_map = build_content_map(extracted)
 
-        # Stage 3: Understand document (extract key entities, facts, summary)
+        # Stage 3: Understand document (Teams uses cloud models)
         understanding = understand_document(
             extracted=extracted,
             doc_type=doc_type,
+            llm_client=cloud_llm,
         )
         summary = ""
         key_entities: List[str] = []

@@ -21,7 +21,7 @@ from src.api.blob_store import (
     is_trusted_blob,
 )
 from src.api.config import Config
-from src.api.content_store import build_pickle_path, load_extracted_pickle, save_extracted_pickle
+from src.api.content_store import load_extracted_pickle, save_extracted_pickle
 try:
     from src.api.dataHandler import (
         ChunkingDiagnosticError,
@@ -413,28 +413,22 @@ def _fetch_document_ids_for_integrity(
 
 def _load_extracted_for_doc(document_id: str) -> Tuple[Optional[Any], Dict[str, Any]]:
     details: Dict[str, Any] = {"source": "missing"}
-    if blob_storage_configured():
-        store = _build_blob_store()
-        for ext in (".pkl", ".pickle"):
-            blob_name = store.build_blob_name(document_id, extension=ext)
-            payload = load_blob_pickle(blob_name)
-            if payload:
-                details.update(
-                    {
-                        "source": "blob",
-                        "blob_name": blob_name,
-                        "bytes": len(payload or b""),
-                    }
-                )
-                return pickle.loads(payload), details
+    if not blob_storage_configured():
         return None, details
-
-    path = build_pickle_path(document_id)
-    if not path.exists():
-        return None, details
-    payload = path.read_bytes()
-    details.update({"source": "local", "path": str(path), "bytes": len(payload or b"")})
-    return pickle.loads(payload), details
+    store = _build_blob_store()
+    for ext in (".pkl", ".pickle"):
+        blob_name = store.build_blob_name(document_id, extension=ext)
+        payload = load_blob_pickle(blob_name)
+        if payload:
+            details.update(
+                {
+                    "source": "blob",
+                    "blob_name": blob_name,
+                    "bytes": len(payload or b""),
+                }
+            )
+            return pickle.loads(payload), details
+    return None, details
 
 def _min_chars_threshold() -> int:
     raw = os.getenv("EMBEDDING_MIN_CHARS", "50")
@@ -2913,17 +2907,14 @@ def _process_local_document(
             error_message = _truncate_error_message(str(exc) or repr(exc))
             logger.error(
                 "embed_request_id=%s doc=%s load pickle failed: %s",
-                embed_request_id,
-                document_id,
-                exc,
-                exc_info=True,
+                embed_request_id, document_id, exc, exc_info=True,
             )
             error_payload = _build_error_payload(
                 stage="embedding",
                 message=error_message,
                 exc=exc,
                 run_id=embed_request_id,
-                code="blob_read_failed",
+                code="pickle_not_found",
             )
             _safe_update_stage(
                 document_id,
@@ -2934,13 +2925,13 @@ def _process_local_document(
             _safe_set_document_status(
                 document_id,
                 STATUS_TRAINING_FAILED,
-                error_message,
-                error_summary="blob_read_failed",
+                f"Extraction pickle not found — run extraction before embedding. {error_message}",
+                error_summary="pickle_not_found",
                 cause=exc,
             )
-            result["error"] = "blob_read_failed"
+            result["error"] = "pickle_not_found"
             result["error_message"] = error_message
-            result["failed_reason"] = "blob_read_failed"
+            result["failed_reason"] = "pickle_not_found"
             return result
 
         extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(

@@ -135,13 +135,15 @@ class OllamaClient:
                 "host": ollama_host,
                 "timeout": _httpx.Timeout(self._OLLAMA_HTTP_TIMEOUT_S),
             }
+            self._is_cloud = bool(ollama_api_key)
             if ollama_api_key:
                 client_kwargs["headers"] = {"Authorization": f"Bearer {ollama_api_key}"}
                 logger.info("Ollama Cloud mode enabled (host=%s)", ollama_host)
             self._client = _ollama.Client(**client_kwargs)
         except Exception:
             self._client = None
-        logger.info("Initialized OllamaClient with model: %s", self.model_name)
+            self._is_cloud = False
+        logger.info("Initialized OllamaClient with model: %s (cloud=%s)", self.model_name, self._is_cloud)
 
     def generate_with_metadata(
         self,
@@ -185,22 +187,19 @@ class OllamaClient:
         for attempt in range(1, max_retries + 1):
             try:
                 _gen_fn = self._client.generate if self._client else ollama.generate
+                call_kwargs: Dict[str, Any] = {
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "options": generation_options,
+                }
+                # keep_alive is only for local Ollama — cloud returns 500
+                if not self._is_cloud:
+                    call_kwargs["keep_alive"] = "24h"
                 try:
-                    response = _gen_fn(
-                        model=self.model_name,
-                        prompt=prompt,
-                        options=generation_options,
-                        keep_alive="24h",
-                        **extra_kwargs,
-                    )
+                    response = _gen_fn(**call_kwargs, **extra_kwargs)
                 except TypeError:
                     # Older ollama client doesn't support 'think' param
-                    response = _gen_fn(
-                        model=self.model_name,
-                        prompt=prompt,
-                        options=generation_options,
-                        keep_alive="24h",
-                    )
+                    response = _gen_fn(**call_kwargs)
                 last_response = response or {}
                 # Handle both dict and Pydantic GenerateResponse objects
                 if hasattr(last_response, "response"):
@@ -330,21 +329,17 @@ class OllamaClient:
         for attempt in range(1, max_retries + 1):
             try:
                 _chat_fn = self._client.chat if self._client else ollama.chat
+                call_kwargs: Dict[str, Any] = {
+                    "model": self.model_name,
+                    "messages": messages,
+                    "options": generation_options,
+                }
+                if not self._is_cloud:
+                    call_kwargs["keep_alive"] = "24h"
                 try:
-                    response = _chat_fn(
-                        model=self.model_name,
-                        messages=messages,
-                        options=generation_options,
-                        keep_alive="24h",
-                        **extra_kwargs,
-                    )
+                    response = _chat_fn(**call_kwargs, **extra_kwargs)
                 except TypeError:
-                    response = _chat_fn(
-                        model=self.model_name,
-                        messages=messages,
-                        options=generation_options,
-                        keep_alive="24h",
-                    )
+                    response = _chat_fn(**call_kwargs)
                 last_response = response or {}
                 # Chat API returns message.content instead of response
                 # Handle both dict and Pydantic ChatResponse objects

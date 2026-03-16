@@ -2547,6 +2547,64 @@ def _run_all_profile_analysis(
         llm_client=llm_client,
     )
 
+def _unified_retriever_retrieve(
+    *,
+    query: str,
+    subscription_id: str,
+    profile_id: str,
+    qdrant_client: Any,
+    embedder: Any,
+    document_id: Optional[str] = None,
+    top_k: int = 30,
+    correlation_id: Optional[str] = None,
+) -> List[Chunk]:
+    """Retrieve via the three-layer UnifiedRetriever and adapt results to Chunk format.
+
+    This is an optional retrieval path enabled by Config.Retrieval.USE_UNIFIED_RETRIEVER.
+    It uses the unified dense + keyword fallback retriever from src.retrieval.retriever
+    and converts EvidenceChunk results to the rag_v3 Chunk type.
+    """
+    from src.retrieval.retriever import UnifiedRetriever
+
+    retriever = UnifiedRetriever(qdrant_client=qdrant_client, embedder=embedder)
+    profile_ids = [profile_id] if profile_id else []
+    document_ids = None
+    if document_id:
+        document_ids = [document_id] if isinstance(document_id, str) else list(document_id)
+
+    result = retriever.retrieve(
+        query,
+        subscription_id,
+        profile_ids,
+        document_ids=document_ids,
+        top_k=top_k,
+        correlation_id=correlation_id,
+    )
+
+    # Convert EvidenceChunk -> rag_v3 Chunk
+    chunks: List[Chunk] = []
+    for ec in result.chunks:
+        chunks.append(Chunk(
+            id=ec.chunk_id or "",
+            text=ec.text or "",
+            score=ec.score,
+            source=ChunkSource(
+                document_name=ec.source_name or "",
+                page=ec.page_start if ec.page_start else None,
+            ),
+            meta={
+                "document_id": ec.document_id,
+                "profile_id": ec.profile_id,
+                "section": ec.section,
+                "page_start": ec.page_start,
+                "page_end": ec.page_end,
+                "chunk_type": ec.chunk_type,
+                "retriever": "unified",
+            },
+        ))
+    return chunks
+
+
 def run(
     *,
     query: str,
@@ -3331,17 +3389,47 @@ def run(
         _log_stage("decomposed_retrieve", stage_start, correlation_id)
     else:
         stage_start = time.time()
-        retrieved = retrieve(
-            query=rewritten,
-            raw_query=original_query,
-            subscription_id=subscription_id,
-            profile_id=profile_id,
-            qdrant_client=qdrant_client,
-            embedder=embedder,
-            document_id=scope_document_id,
-            correlation_id=correlation_id,
-            intent_type=intent_type,
-        )
+
+        # ── Optional unified three-layer retriever ────────────────────────
+        # When USE_UNIFIED_RETRIEVER is enabled, use the dense + keyword
+        # fallback retriever from src.retrieval.retriever.  Falls back to
+        # the standard rag_v3 retrieve path on failure or when disabled.
+        _used_unified = False
+        if getattr(Config.RagV3, 'USE_UNIFIED_RETRIEVER', False):
+            try:
+                retrieved = _unified_retriever_retrieve(
+                    query=rewritten,
+                    subscription_id=subscription_id,
+                    profile_id=profile_id,
+                    qdrant_client=qdrant_client,
+                    embedder=embedder,
+                    document_id=scope_document_id,
+                    top_k=50,
+                    correlation_id=correlation_id,
+                )
+                _used_unified = True
+                logger.info(
+                    "Unified retriever returned %d chunks | cid=%s",
+                    len(retrieved) if retrieved else 0, correlation_id,
+                )
+            except Exception as _ur_exc:
+                logger.warning(
+                    "Unified retriever failed, falling back to standard: %s | cid=%s",
+                    _ur_exc, correlation_id,
+                )
+
+        if not _used_unified:
+            retrieved = retrieve(
+                query=rewritten,
+                raw_query=original_query,
+                subscription_id=subscription_id,
+                profile_id=profile_id,
+                qdrant_client=qdrant_client,
+                embedder=embedder,
+                document_id=scope_document_id,
+                correlation_id=correlation_id,
+                intent_type=intent_type,
+            )
         _log_stage("retrieve", stage_start, correlation_id)
 
         # ── Post-retrieval evidence sufficiency check ────────────────────

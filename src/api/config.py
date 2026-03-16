@@ -146,7 +146,7 @@ class Config:
         DEFAULT_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
         URI = DEFAULT_URI
         FALLBACK_URI = os.getenv("MONGODB_FALLBACK_URI", "mongodb://localhost:27017")
-        DB = os.getenv("MONGODB_DB", 'docwain')
+        DB = os.getenv("MONGODB_DB", 'test')
         CONNECTOR = os.getenv("MONGODB_CONNECTORS", 'connectors')
         DOCUMENTS = os.getenv("MONGODB_DOCUMENTS", 'documents')
         PROFILES = os.getenv("MONGODB_PROFILES", 'profiles')
@@ -287,6 +287,7 @@ class Config:
         METADATA_FALLBACK_MIN_SCORE = float(os.getenv("RETRIEVAL_METADATA_FALLBACK_MIN_SCORE", "0.02"))
         MIN_QUERY_OVERLAP = float(os.getenv("RETRIEVAL_MIN_QUERY_OVERLAP", "0.06"))
         RELEVANCE_KEEP_TOP_K = int(os.getenv("RETRIEVAL_RELEVANCE_KEEP_TOP_K", "12"))
+        USE_UNIFIED_RETRIEVER = os.getenv("USE_UNIFIED_RETRIEVER", "false").lower() in {"1", "true", "yes", "on"}
         MIN_COMPARISON_DOCS = int(os.getenv("RETRIEVAL_MIN_COMPARISON_DOCS", "2"))
         RETRIEVAL_GUARD_BUDGET_MS = int(os.getenv("RETRIEVAL_GUARD_BUDGET_MS", "40"))
         RETRIEVAL_QUALITY_THRESH_HIGH = float(os.getenv("RETRIEVAL_QUALITY_THRESH_HIGH", "0.75"))
@@ -331,7 +332,7 @@ class Config:
     class LLM:
         TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
         TOP_P = float(os.getenv("LLM_TOP_P", "0.85"))
-        MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+        MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8192"))
         MAX_CONCURRENCY = int(os.getenv("LLM_MAX_CONCURRENCY", "8"))
         DISABLE_EXTERNAL = os.getenv("LLM_DISABLE_EXTERNAL", "true").lower() in {"1", "true", "yes", "on"}
 
@@ -545,6 +546,15 @@ class Config:
         RESUMES_INTERNET_ENABLED = os.getenv("DOCWAIN_RESUMES_INTERNET_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         MEDICAL_NICE_ENABLED = os.getenv("DOCWAIN_MEDICAL_NICE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         MEDICAL_NICE_MAX_LOOKUPS = int(os.getenv("DOCWAIN_MEDICAL_NICE_MAX_LOOKUPS", "3"))
+
+    class Celery:
+        BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+        RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+        EXTRACTION_CONCURRENCY = int(os.getenv("CELERY_EXTRACTION_CONCURRENCY", "2"))
+        SCREENING_CONCURRENCY = int(os.getenv("CELERY_SCREENING_CONCURRENCY", "4"))
+        KG_CONCURRENCY = int(os.getenv("CELERY_KG_CONCURRENCY", "4"))
+        EMBEDDING_CONCURRENCY = int(os.getenv("CELERY_EMBEDDING_CONCURRENCY", "2"))
+        BACKFILL_CONCURRENCY = int(os.getenv("CELERY_BACKFILL_CONCURRENCY", "4"))
 
     class CloudPlatform:
         """SharePoint + cloud platform integration settings."""

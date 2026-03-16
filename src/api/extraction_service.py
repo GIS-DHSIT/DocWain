@@ -838,6 +838,21 @@ def _set_document_status(
     extra_fields: Optional[Dict[str, Any]] = None,
 ) -> None:
     fields: Dict[str, Any] = {"status": status, "updated_at": time.time()}
+    # Sync pipeline_status with legacy status for new pipeline compatibility
+    from src.api.statuses import (
+        STATUS_EXTRACTION_COMPLETED as _SEC, STATUS_SCREENING_COMPLETED as _SSC,
+        STATUS_TRAINING_SUCCEEDED as _STS, STATUS_TRAINING_FAILED as _STF,
+        PIPELINE_EXTRACTION_COMPLETED, PIPELINE_SCREENING_COMPLETED,
+        PIPELINE_TRAINING_COMPLETED, PIPELINE_EMBEDDING_FAILED,
+    )
+    _pipeline_map = {
+        _SEC: PIPELINE_EXTRACTION_COMPLETED,
+        _SSC: PIPELINE_SCREENING_COMPLETED,
+        _STS: PIPELINE_TRAINING_COMPLETED,
+        _STF: PIPELINE_EMBEDDING_FAILED,
+    }
+    if status in _pipeline_map:
+        fields["pipeline_status"] = _pipeline_map[status]
     if error_msg:
         fields["training_error"] = error_msg
         fields["training_failed_at"] = time.time()
@@ -1596,14 +1611,33 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
 
         # Scope by subscription_id when provided
         if subscription_id:
+            sub_str = str(subscription_id)
             eligible_docs = {
                 doc_id: doc_info
                 for doc_id, doc_info in eligible_docs.items()
-                if doc_info.get("dataDict", {}).get("subscription_id") == subscription_id
+                if str(doc_info.get("dataDict", {}).get("subscription_id")
+                       or doc_info.get("dataDict", {}).get("subscription")
+                       or doc_info.get("dataDict", {}).get("subscriptionId")
+                       or "") == sub_str
             }
 
         if not eligible_docs:
-            return {"status": "no_documents", "message": "No documents eligible for extraction", "documents": []}
+            # Report why no documents are eligible
+            total_with_connectors = len(doc_coll)
+            all_statuses = {}
+            for _did, _di in doc_coll.items():
+                s = _di.get("dataDict", {}).get("status", "unknown")
+                all_statuses[s] = all_statuses.get(s, 0) + 1
+            return {
+                "status": "no_documents",
+                "message": (
+                    f"No documents eligible for extraction. "
+                    f"Found {total_with_connectors} documents with valid connectors. "
+                    f"Status breakdown: {all_statuses}. "
+                    f"Only UNDER_REVIEW or EXTRACTION_FAILED documents can be extracted."
+                ),
+                "documents": [],
+            }
 
         total = len(eligible_docs)
         logger.info("Starting batch extraction: %d documents queued", total)
@@ -1626,15 +1660,21 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
             res["elapsed_seconds"] = elapsed
             res["doc_name"] = doc_name
             res["index"] = f"{idx}/{total}"
-            if res.get("status") == STATUS_EXTRACTION_COMPLETED:
+            status = res.get("status", "")
+            if status == STATUS_EXTRACTION_COMPLETED:
                 logger.info(
                     "[EXTRACTION %d/%d] Completed: doc=%s in %.1fs",
                     idx, total, doc_id, elapsed,
                 )
+            elif status == "CONFLICT":
+                logger.info(
+                    "[EXTRACTION %d/%d] Skipped: doc=%s reason=%s",
+                    idx, total, doc_id, res.get("reason", "conflict"),
+                )
             else:
                 logger.warning(
                     "[EXTRACTION %d/%d] Failed: doc=%s in %.1fs error=%s",
-                    idx, total, doc_id, elapsed, res.get("error", "unknown"),
+                    idx, total, doc_id, elapsed, res.get("error", str(status)),
                 )
             documents.append(res)
 
@@ -1659,10 +1699,56 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
 
 def extract_single_document(doc_id: str) -> Dict[str, Any]:
     doc_coll = extract_document_info()
-    if not doc_coll or doc_id not in doc_coll:
+    if doc_coll and doc_id in doc_coll:
+        doc_info = doc_coll[doc_id]
+        return _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
+
+    # Fallback: profile-uploaded document (content in Azure Blob)
+    from src.api.document_status import get_document_record
+    record = get_document_record(doc_id)
+    if not record:
         return {"status": "not_found", "message": f"Document {doc_id} not found"}
-    doc_info = doc_coll[doc_id]
-    return _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
+
+    # Resolve blob location: try blob_url (new pipeline) or location (UI connector)
+    blob_url = record.get("blob_url") or record.get("location", "")
+    source_file = record.get("source_file") or record.get("name", "document")
+    subscription_id = record.get("subscription_id") or record.get("subscription")
+    profile_id = record.get("profile_id") or record.get("profile")
+
+    if blob_url:
+        try:
+            if blob_url.startswith("az://"):
+                # UI connector format: az://container/path
+                from src.storage.azure_blob_client import get_blob_service_client
+                svc = get_blob_service_client()
+                parts = blob_url.replace("az://", "", 1).split("/", 1)
+                container_name, blob_name = parts[0], parts[1] if len(parts) > 1 else ""
+                container = svc.get_container_client(container_name)
+                blob_client = container.get_blob_client(blob_name)
+            else:
+                from src.api.blob_content_store import get_blob_client
+                container = get_blob_client()
+                blob_name = f"raw/{doc_id}/{source_file}"
+                blob_client = container.get_blob_client(blob_name)
+
+            file_bytes = blob_client.download_blob().readall()
+            logger.info("Loaded %d bytes from blob for doc=%s", len(file_bytes), doc_id)
+        except Exception as exc:
+            logger.error("Failed to download from blob for doc=%s: %s", doc_id, exc)
+            return {"status": "error", "message": f"Blob download failed: {exc}"}
+    else:
+        return {"status": "error", "message": f"Document {doc_id} has no connector or blob_url"}
+
+    return extract_uploaded_document(
+        document_id=doc_id,
+        file_bytes=file_bytes,
+        filename=source_file,
+        subscription_id=subscription_id,
+        profile_id=profile_id,
+        doc_type=record.get("doc_type") or record.get("file_type") or record.get("type"),
+        content_type=record.get("content_type"),
+        content_size=len(file_bytes),
+    )
 
 def extract_uploaded_document(
     *,

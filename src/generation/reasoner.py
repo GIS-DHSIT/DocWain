@@ -35,14 +35,14 @@ class ReasonerResult:
 # ---------------------------------------------------------------------------
 
 _BASE_TOKENS: Dict[str, int] = {
-    "lookup": 512,
-    "extract": 1024,
-    "list": 1024,
-    "summarize": 2048,
-    "overview": 3072,
-    "compare": 2048,
-    "investigate": 2048,
-    "aggregate": 1024,
+    "lookup": 2048,
+    "extract": 4096,
+    "list": 2048,
+    "summarize": 4096,
+    "overview": 4096,
+    "compare": 4096,
+    "investigate": 4096,
+    "aggregate": 2048,
 }
 
 # ---------------------------------------------------------------------------
@@ -229,4 +229,4 @@ class Reasoner:
         if thinking:
             base = int(base * 1.5)
 
-        return min(base, 4096)
+        return min(base, 8192)

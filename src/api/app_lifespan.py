@@ -100,11 +100,17 @@ def initialize_app_state(app: FastAPI) -> AppState:
         ollama_client = llm_gateway
         # Warm up Ollama so the model is loaded before the first query
         if hasattr(llm_gateway, "warm_up"):
-            try:
-                llm_gateway.warm_up()
-                logger.info("LLM model warm-up completed")
-            except Exception:  # noqa: BLE001
-                logger.debug("LLM warm-up skipped (model will load on first query)")
+            def _do_warmup():
+                try:
+                    llm_gateway.warm_up()
+                    logger.info("LLM model warm-up completed")
+                except Exception:  # noqa: BLE001
+                    logger.debug("LLM warm-up skipped (model will load on first query)")
+            _warmup_thread = threading.Thread(target=_do_warmup, daemon=True)
+            _warmup_thread.start()
+            _warmup_thread.join(timeout=30)
+            if _warmup_thread.is_alive():
+                logger.warning("LLM warm-up timed out after 30s — model will load on first query")
     except Exception as exc:  # noqa: BLE001
         logger.error("LLM gateway init failed, trying direct Ollama: %s", exc)
         try:
@@ -164,24 +170,10 @@ def initialize_app_state(app: FastAPI) -> AppState:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Zombie extraction recovery skipped: %s", exc)
 
-    # Auto-retry extraction for UNDER_REVIEW documents (background thread, non-blocking)
-    def _startup_extraction():
-        try:
-            from src.api.extraction_service import extract_documents
-            result = extract_documents()
-            status = result.get("status", "unknown")
-            if status == "completed":
-                results = result.get("results", {})
-                successful = len(results.get("successful", []))
-                failed = len(results.get("failed", []))
-                if successful or failed:
-                    logger.info("Startup extraction: %d succeeded, %d failed", successful, failed)
-            elif status != "no_documents":
-                logger.warning("Startup extraction: %s", result.get("message", status))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Startup extraction failed: %s", exc)
-
-    threading.Thread(target=_startup_extraction, daemon=True, name="startup-extraction").start()
+    # Auto-extraction at startup DISABLED — pipeline is HITL-driven.
+    # Documents are only extracted when the UI triggers it (upload auto-extracts,
+    # or user clicks extract). Server restart should not re-process documents.
+    # Zombie recovery above already resets stuck documents so users can retry.
 
     # Legacy task-aware routing disabled — single vLLM model handles all tasks.
     # ModelRegistry, TaskRouter, TaskAwareGateway are no longer used.

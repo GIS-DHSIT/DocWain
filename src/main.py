@@ -135,6 +135,8 @@ import src.screening.tool_bridge  # noqa: F401 — registers bridge tools
 import src.content_generation.tool_bridge  # noqa: F401 — registers content generation tools
 from src.gateway.api import gateway_router
 from src.screening.api import screening_router
+from src.api.pipeline_api import pipeline_router
+from src.api.model_management_api import model_router
 from src.tools.router import tools_router
 from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
@@ -175,6 +177,8 @@ api_router.include_router(profiles_router)
 api_router.include_router(profile_docs_router)
 api_router.include_router(gateway_router, tags=["Gateway"])
 api_router.include_router(screening_router)
+api_router.include_router(pipeline_router)
+api_router.include_router(model_router)
 api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
 api_router.include_router(tools_router, tags=["Agents"])
@@ -997,14 +1001,6 @@ def ask_question_api(
         current_session_id=persisted_session_id,
         debug=result.debug or {},
     )
-
-@api_router.post("/askStream", tags=["Default"], deprecated=True)
-def ask_question_stream_api(request: QuestionRequest, agent_mode: Optional[bool] = Query(None)):
-    """
-    Backward-compatible alias for streaming; prefer /ask with `stream=true`.
-    """
-    object.__setattr__(request, "stream", True)
-    return ask_question_api(request, agent_mode=agent_mode, stream=True)
 
 @api_router.post("/extract/{doc_id}", tags=["Default"])
 def trigger_single_extraction(doc_id: str, subscription_id: str = "default"):
@@ -1911,7 +1907,6 @@ def reprocess_documents_with_new_pii_setting(subscription_id: str):
 app.include_router(api_router)
 app.include_router(knowledge_graph_router)
 app.add_api_route("/ask", ask_question_api, methods=["POST"], include_in_schema=False)
-app.add_api_route("/askStream", ask_question_stream_api, methods=["POST"], include_in_schema=False)
 app.add_api_route("/teams/messages", handle_teams_messages, methods=["POST"], include_in_schema=False)
 
 if __name__ == "__main__":
