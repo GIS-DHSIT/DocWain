@@ -312,10 +312,20 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
 
     if blob_path:
         try:
-            from src.api.blob_content_store import get_blob_client
             import json as _json
-            container = get_blob_client()
-            blob_client = container.get_blob_client(blob_path)
+            # Determine correct container: az:// URLs encode container in path
+            if "/" in blob_path and blob_url and blob_url.startswith("az://"):
+                # blob_path is "container/rest/of/path" — split container from path
+                from src.storage.azure_blob_client import get_blob_service_client
+                parts = blob_path.split("/", 1)
+                container_name, actual_path = parts[0], parts[1] if len(parts) > 1 else ""
+                svc = get_blob_service_client()
+                container = svc.get_container_client(container_name)
+                blob_client = container.get_blob_client(actual_path)
+            else:
+                from src.api.blob_content_store import get_blob_client
+                container = get_blob_client()
+                blob_client = container.get_blob_client(blob_path)
             blob_data = blob_client.download_blob().readall()
             # Try JSON (extraction result)
             try:
@@ -325,14 +335,34 @@ def get_document_text(doc_id: str, extracted: Any = None, allow_fallback: bool =
                     texts = [clean_text]
                     logger.info("Loaded extraction text from blob for doc_id=%s (%d chars)", doc_id, len(clean_text))
             except (_json.JSONDecodeError, UnicodeDecodeError):
-                # Raw file content (text)
+                # Binary file (PDF, DOCX, etc.) — extract text using fileProcessor
+                doc_name = record.get("name") or record.get("source_file") or "document"
                 try:
-                    raw_text = blob_data.decode("utf-8", errors="ignore")
-                    if raw_text.strip():
-                        texts = [raw_text.strip()]
-                        logger.info("Loaded raw text from blob for doc_id=%s (%d chars)", doc_id, len(raw_text))
-                except Exception:
-                    pass
+                    from src.api.dataHandler import fileProcessor
+                    extracted_content = fileProcessor(blob_data, doc_name)
+                    if extracted_content:
+                        if hasattr(extracted_content, 'full_text'):
+                            raw_text = extracted_content.full_text
+                        elif isinstance(extracted_content, dict):
+                            raw_text = extracted_content.get("full_text") or extracted_content.get("text", "")
+                        elif isinstance(extracted_content, str):
+                            raw_text = extracted_content
+                        else:
+                            raw_text = str(extracted_content)
+                        if raw_text and raw_text.strip():
+                            texts = [raw_text.strip()]
+                            logger.info("Extracted text from blob file for doc_id=%s (%d chars)", doc_id, len(raw_text))
+                except Exception as fp_exc:
+                    logger.debug("fileProcessor failed for doc_id=%s: %s", doc_id, fp_exc)
+                # Fallback: try raw decode for text files
+                if not texts:
+                    try:
+                        raw_text = blob_data.decode("utf-8", errors="ignore")
+                        if raw_text.strip() and len(raw_text.strip()) > 20:
+                            texts = [raw_text.strip()]
+                            logger.info("Loaded raw text from blob for doc_id=%s (%d chars)", doc_id, len(raw_text))
+                    except Exception:
+                        pass
         except Exception as exc:
             logger.debug("Blob text load failed for doc_id=%s: %s", doc_id, exc)
 
