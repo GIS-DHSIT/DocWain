@@ -1641,15 +1641,21 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
             res["elapsed_seconds"] = elapsed
             res["doc_name"] = doc_name
             res["index"] = f"{idx}/{total}"
-            if res.get("status") == STATUS_EXTRACTION_COMPLETED:
+            status = res.get("status", "")
+            if status == STATUS_EXTRACTION_COMPLETED:
                 logger.info(
                     "[EXTRACTION %d/%d] Completed: doc=%s in %.1fs",
                     idx, total, doc_id, elapsed,
                 )
+            elif status == "CONFLICT":
+                logger.info(
+                    "[EXTRACTION %d/%d] Skipped: doc=%s reason=%s",
+                    idx, total, doc_id, res.get("reason", "conflict"),
+                )
             else:
                 logger.warning(
                     "[EXTRACTION %d/%d] Failed: doc=%s in %.1fs error=%s",
-                    idx, total, doc_id, elapsed, res.get("error", "unknown"),
+                    idx, total, doc_id, elapsed, res.get("error", str(status)),
                 )
             documents.append(res)
 

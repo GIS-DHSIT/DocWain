@@ -404,6 +404,13 @@ class LLMGateway:
         if extra_options:
             opts.update(extra_options)
 
+        # Suppress thinking for structured output (JSON) prompts on qwen3 models
+        if not think and not system.startswith("/no_think"):
+            json_markers = ("json only", "strict json", "valid json", "return json")
+            combined = (system + " " + prompt).lower()
+            if any(m in combined for m in json_markers):
+                system = "/no_think\n" + system
+
         try:
             raw, usage_meta = self._call_client(
                 client, prompt, system=system, think=think,
