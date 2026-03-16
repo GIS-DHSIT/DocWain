@@ -1614,7 +1614,9 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
             eligible_docs = {
                 doc_id: doc_info
                 for doc_id, doc_info in eligible_docs.items()
-                if doc_info.get("dataDict", {}).get("subscription_id") == subscription_id
+                if (doc_info.get("dataDict", {}).get("subscription_id")
+                    or doc_info.get("dataDict", {}).get("subscription")
+                    or doc_info.get("dataDict", {}).get("subscriptionId")) == subscription_id
             }
 
         if not eligible_docs:

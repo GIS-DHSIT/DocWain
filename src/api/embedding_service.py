@@ -2909,39 +2909,51 @@ def _process_local_document(
                     "Loaded pickle for %s: keys=%s, has_screening=%s",
                     document_id, pickle_keys, has_screening,
                 )
-        except Exception as exc:  # noqa: BLE001
-            error_message = _truncate_error_message(str(exc) or repr(exc))
-            logger.error(
-                "embed_request_id=%s doc=%s load pickle failed: %s",
-                embed_request_id,
-                document_id,
-                exc,
-                exc_info=True,
+        except Exception as pickle_exc:  # noqa: BLE001
+            logger.warning(
+                "embed_request_id=%s doc=%s pickle not found, attempting extraction from blob: %s",
+                embed_request_id, document_id, pickle_exc,
             )
-            error_payload = _build_error_payload(
-                stage="embedding",
-                message=error_message,
-                exc=exc,
-                run_id=embed_request_id,
-                code="blob_read_failed",
-            )
-            _safe_update_stage(
-                document_id,
-                "embedding",
-                {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
-                cause=exc,
-            )
-            _safe_set_document_status(
-                document_id,
-                STATUS_TRAINING_FAILED,
-                error_message,
-                error_summary="blob_read_failed",
-                cause=exc,
-            )
-            result["error"] = "blob_read_failed"
-            result["error_message"] = error_message
-            result["failed_reason"] = "blob_read_failed"
-            return result
+            # Fallback: run extraction from Azure Blob, then retry pickle load
+            try:
+                from src.api.extraction_service import extract_single_document
+                extract_result = extract_single_document(document_id)
+                extract_status = extract_result.get("status", "")
+                if "COMPLETED" in str(extract_status).upper() or "EXTRACTION_COMPLETED" in str(extract_status).upper():
+                    logger.info("embed_request_id=%s doc=%s on-demand extraction succeeded, retrying pickle load", embed_request_id, document_id)
+                    extracted = load_extracted_pickle(document_id)
+                else:
+                    raise ValueError(f"On-demand extraction failed: {extract_result.get('error', extract_status)}")
+            except Exception as fallback_exc:
+                error_message = _truncate_error_message(str(fallback_exc) or repr(fallback_exc))
+                logger.error(
+                    "embed_request_id=%s doc=%s extraction fallback also failed: %s",
+                    embed_request_id, document_id, fallback_exc, exc_info=True,
+                )
+                error_payload = _build_error_payload(
+                    stage="embedding",
+                    message=error_message,
+                    exc=fallback_exc,
+                    run_id=embed_request_id,
+                    code="blob_read_failed",
+                )
+                _safe_update_stage(
+                    document_id,
+                    "embedding",
+                    {"status": "FAILED", "completed_at": time.time(), "error": error_payload},
+                    cause=fallback_exc,
+                )
+                _safe_set_document_status(
+                    document_id,
+                    STATUS_TRAINING_FAILED,
+                    error_message,
+                    error_summary="blob_read_failed",
+                    cause=fallback_exc,
+                )
+                result["error"] = "blob_read_failed"
+                result["error_message"] = error_message
+                result["failed_reason"] = "blob_read_failed"
+                return result
 
         extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
             document_id=document_id,
