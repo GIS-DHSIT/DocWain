@@ -1622,7 +1622,22 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
             }
 
         if not eligible_docs:
-            return {"status": "no_documents", "message": "No documents eligible for extraction", "documents": []}
+            # Report why no documents are eligible
+            total_with_connectors = len(doc_coll)
+            all_statuses = {}
+            for _did, _di in doc_coll.items():
+                s = _di.get("dataDict", {}).get("status", "unknown")
+                all_statuses[s] = all_statuses.get(s, 0) + 1
+            return {
+                "status": "no_documents",
+                "message": (
+                    f"No documents eligible for extraction. "
+                    f"Found {total_with_connectors} documents with valid connectors. "
+                    f"Status breakdown: {all_statuses}. "
+                    f"Only UNDER_REVIEW or EXTRACTION_FAILED documents can be extracted."
+                ),
+                "documents": [],
+            }
 
         total = len(eligible_docs)
         logger.info("Starting batch extraction: %d documents queued", total)

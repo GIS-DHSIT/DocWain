@@ -245,6 +245,22 @@ class ScreeningExecutor:
             doc_entry: Dict[str, Any] = {"doc_id": doc_id, "status": "success", "categories": {}}
             doc_failed = False
 
+            # HITL gate: check extraction completed before screening
+            from src.api.document_status import get_document_record
+            from src.api.screening_service import SCREENING_ELIGIBLE_STATUSES
+            _rec = get_document_record(doc_id)
+            _status = (_rec or {}).get("status", "")
+            if _status not in SCREENING_ELIGIBLE_STATUSES:
+                doc_entry["status"] = "skipped"
+                doc_entry["error"] = {
+                    "code": "extraction_required",
+                    "message": f"Document must be extracted before screening. Current status: {_status}. "
+                               f"Wait for extraction to complete, then retry screening.",
+                }
+                documents.append(doc_entry)
+                overall_status = "partial"
+                continue
+
             for category in categories:
                 try:
                     if category == "all":
