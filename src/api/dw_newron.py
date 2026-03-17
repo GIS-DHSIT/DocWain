@@ -112,8 +112,8 @@ def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
     normalized = str(model_name).strip().lower()
     # Strip Ollama tag suffix (e.g. "gpt-oss:latest" → "gpt-oss")
     base_name = normalized.split(":")[0]
-    if base_name in ("docwain-agent", "gpt-oss"):
-        return "qwen3:14b"
+    if base_name in ("docwain-agent", "gpt-oss", "dhs/docwain"):
+        return "DHS/DocWain"
     return model_name
 
 def _is_generation_empty(text: Optional[str], stop_tokens: Optional[Set[str]] = None) -> bool:
@@ -1558,7 +1558,7 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "qwen3:14b")
+        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "DHS/DocWain")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
@@ -5317,7 +5317,7 @@ def answer_question(
         user_id: str,
         profile_id: str,
         subscription_id: str = "default",
-        model_name: str = "DocWain-Agent",
+        model_name: str = "DHS/DocWain",
         persona: str = "professional document analysis assistant",
         session_id: Optional[str] = None,
         new_session: bool = False,

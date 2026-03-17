@@ -240,9 +240,36 @@ class KnowledgeExtractor:
                         page, section,
                     )
         if not parsed:
+            # Single retry with explicit JSON reinforcement
+            try:
+                retry_prompt = (
+                    "You MUST respond with ONLY a valid JSON object. No text before or after.\n\n"
+                    + prompt
+                )
+                raw_text_retry, _meta_retry = llm.generate_with_metadata(
+                    retry_prompt,
+                    system=_EXTRACTION_SYSTEM + "\n\nCRITICAL: Output ONLY the JSON object. No markdown fences, no explanation.",
+                    temperature=0.05,
+                    max_tokens=self._max_tokens,
+                )
+                parsed = self._parse_json(raw_text_retry)
+                if not parsed:
+                    thinking_retry = (_meta_retry or {}).get("thinking", "")
+                    if thinking_retry:
+                        parsed = self._parse_json(thinking_retry)
+                if parsed:
+                    logger.info(
+                        "[KnowledgeExtractor] Recovered via retry for page=%s section=%s",
+                        page, section,
+                    )
+            except Exception as retry_err:
+                logger.debug("[KnowledgeExtractor] Retry failed for page=%s section=%s: %s", page, section, retry_err)
+        if not parsed:
+            # Log first 200 chars of raw response for debugging
+            snippet = (raw_text or "")[:200].replace("\n", " ")
             logger.warning(
-                "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s",
-                page, section,
+                "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s raw_preview='%s'",
+                page, section, snippet,
             )
             return KnowledgeExtractionResult(
                 extraction_time_ms=(time.monotonic() - start) * 1000
@@ -363,15 +390,31 @@ class KnowledgeExtractor:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to find JSON object in the text
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    pass
-            return None
+            pass
+
+        # Try to find JSON object in the text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+
+        # Try fixing common LLM JSON issues: trailing commas, single quotes
+        import re
+        cleaned = text[start:end] if (start >= 0 and end > start) else text
+        # Remove trailing commas before } or ]
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        # Replace single quotes with double quotes (crude but effective for simple cases)
+        if "'" in cleaned and '"' not in cleaned:
+            cleaned = cleaned.replace("'", '"')
+        try:
+            return json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return None
 
     def _build_result(
         self,

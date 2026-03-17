@@ -1057,6 +1057,21 @@ def trigger_extraction(subscription_id: str = "default"):
         logging.error(f"Extraction API error: {e}")
         raise HTTPException(status_code=500, detail=f"Extraction process failed: {e}")
 
+@api_router.get("/extract/progress", tags=["Default"])
+def get_extraction_progress(subscription_id: str = "default"):
+    """Get the current batch extraction progress for a subscription.
+
+    Returns progress info including completed/total counts and current
+    document being processed. Useful for frontend progress bars.
+    """
+    from src.api.extraction_service import get_batch_extraction_progress
+    progress = get_batch_extraction_progress(
+        subscription_id if subscription_id != "default" else "global"
+    )
+    if not progress:
+        return {"status": "idle", "message": "No extraction currently running or recently completed"}
+    return {"status": "ok", "progress": progress}
+
 @api_router.get("/train", tags=["Default"], deprecated=True)
 def trigger_training(subscription_id: str = "default"):
     """Deprecated alias for /extract. Performs extraction only."""
@@ -1097,6 +1112,44 @@ def train_documents_batch(request: TrainDocumentsRequest = Body(...)):
     except Exception as exc:
         logging.error("Train (embed) API error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Training failed: {exc}")
+
+
+@api_router.get("/train/progress", tags=["Default"])
+def get_training_progress_endpoint(
+    subscription_id: str = None,
+    document_id: str = None,
+):
+    """Get training/embedding progress.
+
+    - With subscription_id: returns batch-level progress (all docs in batch).
+    - With document_id: returns per-document progress (detailed stages).
+    - With both: returns both.
+    """
+    result = {}
+
+    if subscription_id:
+        from src.api.embedding_service import get_batch_embedding_progress
+        batch = get_batch_embedding_progress(subscription_id)
+        if batch:
+            result["batch"] = batch
+            result["status"] = "running" if batch.get("stage") != "completed" else "completed"
+        else:
+            result["batch"] = None
+
+    if document_id:
+        from src.api.document_status import get_training_progress
+        doc_progress = get_training_progress(document_id)
+        if doc_progress:
+            result["document"] = doc_progress
+        else:
+            result["document"] = None
+
+    if not result:
+        return {"status": "idle", "message": "No training currently running. Provide subscription_id or document_id."}
+
+    if "status" not in result:
+        result["status"] = "ok"
+    return result
 
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])

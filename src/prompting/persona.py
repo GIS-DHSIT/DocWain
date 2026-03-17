@@ -171,13 +171,35 @@ def sanitize_response(text: str) -> str:
         sanitized = pat.sub("", sanitized)
     for pattern in _INTERNAL_PATTERNS:
         sanitized = pattern.sub("[redacted]", sanitized)
+
+    # Fix stray characters before bold markers (e.g., "in 2 **2016**" → "in **2016**")
+    sanitized = re.sub(r"(\s)\d\s+(\*\*\d)", r"\1\2", sanitized)
+
+    # Fix broken bold markers split across lines
+    sanitized = re.sub(r"\*\*\s*\n\s*", "** ", sanitized)
+
     lines = sanitized.splitlines()
     cleaned_lines: List[str] = []
     for line in lines:
         cleaned_lines.append(re.sub(r"[ \t]+", " ", line).strip())
+
+    # Detect and remove repetitive lines (3+ consecutive duplicates)
+    deduped: List[str] = []
+    repeat_count = 0
+    prev_line = None
+    for line in cleaned_lines:
+        if line == prev_line and line.strip():
+            repeat_count += 1
+            if repeat_count >= 3:
+                continue  # Skip after 3rd repeat
+        else:
+            repeat_count = 0
+        deduped.append(line)
+        prev_line = line
+
     normalized: List[str] = []
     blank = False
-    for line in cleaned_lines:
+    for line in deduped:
         if line == "":
             if normalized and not blank:
                 normalized.append("")

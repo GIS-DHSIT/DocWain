@@ -197,7 +197,7 @@ class Config:
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
         DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
-        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "DocWain-Agent")
+        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "DHS/DocWain")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
         BLOB_CONNECTION_STRING = os.getenv("TEAMS_BLOB_CONNECTION_STRING", "")

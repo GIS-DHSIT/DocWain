@@ -76,21 +76,31 @@ def build_system_prompt(profile_domain: str = "", kg_context: str = "") -> str:
 TASK_FORMATS: Dict[str, str] = {
     "extract": (
         "TASK: Extract the requested information precisely.\n"
-        "- Present exact values from the documents.\n"
-        "- Use a markdown table for line items or multi-field data.\n"
+        "- Start with a ## header for each major category (e.g., ## Vendor Details, ## Line Items).\n"
+        "- Use bullets (- **Label:** value) for single-value fields.\n"
+        "- MANDATORY: Use a markdown table for line items, multi-row data, or anything with 3+ entries.\n"
+        "  Example table:\n"
+        "  | Item | Description | Amount |\n"
+        "  |------|-------------|--------|\n"
+        "  | Service | Details | **$X.XX** |\n"
         "- Bold ALL extracted values inline: **$720.00**, **Super Widget Industries**, **5 mockups**.\n"
         "- Keep each bullet on ONE line — never break **bold** markers across lines.\n"
         "- If a requested field is not found, state: 'Not found in provided documents.'\n"
         "- For procedural extractions (steps, protocols), use numbered lists.\n"
+        "- NEVER fabricate values not present in the evidence.\n"
     ),
     "compare": (
         "TASK: Compare the subjects systematically.\n"
         "- Start with a one-line summary of the key difference.\n"
-        "- Present a markdown table with subjects as rows and criteria as columns.\n"
+        "- MANDATORY: Present a markdown comparison table. Example:\n"
+        "  | Criteria | Subject A | Subject B |\n"
+        "  |----------|-----------|----------|\n"
+        "  | Experience | **8 years** | 3 years |\n"
         "- Keep the table focused: max 4-5 meaningful columns. Do NOT include internal scores, "
         "metadata, relevance values, or image descriptions as columns.\n"
-        "- **Bold** the better or more notable value in each column.\n"
+        "- **Bold** the better or more notable value in each cell.\n"
         "- End with 2-3 bullet points synthesising the key takeaways.\n"
+        "- The table MUST be complete — do not truncate mid-row.\n"
     ),
     "summarize": (
         "TASK: Provide a structured summary.\n"

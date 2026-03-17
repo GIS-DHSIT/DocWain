@@ -3502,6 +3502,21 @@ def _embed_from_local_pickles(
 
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(ordered_ids))
+    total_local = len(ordered_ids)
+    completed_local = 0
+
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING (local): %d documents queued (sub=%s)  ║",
+        total_local, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, 0, total_local, stage="starting")
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
         for index, doc_id in enumerate(ordered_ids):
@@ -3520,8 +3535,14 @@ def _embed_from_local_pickles(
             doc_id = info["document_id"]
             try:
                 results_by_index[index] = future.result()
+                completed_local += 1
+                logger.info("[EMBEDDING %d/%d] ✓ Completed: doc=%s", completed_local, total_local, doc_id)
             except Exception as exc:  # noqa: BLE001
                 error_message = _truncate_error_message(str(exc) or repr(exc))
+                logger.error(
+                    "[EMBEDDING %d/%d] ✗ Failed: doc=%s error=%s",
+                    completed_local + 1, total_local, doc_id, error_message,
+                )
                 logger.error(
                     "embed_request_id=%s doc=%s embedding failed: %s",
                     embed_request_id,
@@ -3542,10 +3563,65 @@ def _embed_from_local_pickles(
                     blob_name=f"{doc_id}.pkl",
                     error_message=error_message,
                 )
+            _emit_embedding_batch_progress(
+                subscription_id, completed_local, total_local,
+                current_doc=doc_id or "", stage=f"processed {completed_local}/{total_local}",
+            )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     summary = _build_embed_summary(results)
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING (local) DONE: %d/%d succeeded (sub=%s)  ║",
+        completed_local, total_local, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, completed_local, total_local, stage="completed")
     return summary
+
+def _emit_embedding_batch_progress(subscription_id: str, completed: int, total: int,
+                                    current_doc: str = "", stage: str = "") -> None:
+    """Publish batch embedding progress to Redis for frontend polling."""
+    try:
+        import json as _json
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return
+        progress = round(completed / total, 3) if total > 0 else 0.0
+        event = {
+            "subscription_id": subscription_id or "global",
+            "completed": completed,
+            "total": total,
+            "progress": progress,
+            "current_document": current_doc,
+            "stage": stage,
+            "timestamp": time.time(),
+        }
+        payload = _json.dumps(event)
+        client.setex(f"dw:embedding:batch_progress:{subscription_id or 'global'}", 3600, payload)
+        client.publish("dw:embedding:progress", payload)
+    except Exception:
+        pass
+
+
+def get_batch_embedding_progress(subscription_id: str) -> Optional[Dict[str, Any]]:
+    """Get the latest batch embedding progress for a subscription (for polling)."""
+    try:
+        import json as _json
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return None
+        raw = client.get(f"dw:embedding:batch_progress:{subscription_id or 'global'}")
+        return _json.loads(raw) if raw else None
+    except Exception:
+        return None
+
 
 def embed_documents(
     *,
@@ -3610,6 +3686,21 @@ def embed_documents(
 
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(blob_candidates))
+    total_blobs = len(blob_candidates)
+    completed_blobs = 0
+
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING START: %d documents queued (sub=%s)  ║",
+        total_blobs, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, 0, total_blobs, stage="starting")
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
         for index, blob in enumerate(blob_candidates):
@@ -3631,8 +3722,17 @@ def embed_documents(
             blob = info["blob"]
             try:
                 results_by_index[index] = future.result()
+                completed_blobs += 1
+                logger.info(
+                    "[EMBEDDING %d/%d] ✓ Completed: doc=%s",
+                    completed_blobs, total_blobs, doc_id,
+                )
             except Exception as exc:  # noqa: BLE001
                 error_message = _truncate_error_message(str(exc) or repr(exc))
+                logger.error(
+                    "[EMBEDDING %d/%d] ✗ Failed: doc=%s error=%s",
+                    completed_blobs + 1, total_blobs, doc_id, error_message,
+                )
                 logger.error(
                     "embed_request_id=%s doc=%s embedding failed: %s",
                     embed_request_id,
@@ -3653,6 +3753,11 @@ def embed_documents(
                     blob_name=getattr(blob, "name", None),
                     error_message=error_message,
                 )
+            _emit_embedding_batch_progress(
+                subscription_id, completed_blobs, total_blobs,
+                current_doc=doc_id or "",
+                stage=f"processed {completed_blobs}/{total_blobs}",
+            )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     for _entry in results:
@@ -3660,6 +3765,17 @@ def embed_documents(
             telemetry.increment("embed_pickles_processed_total")
 
     summary = _build_embed_summary(results)
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING DONE: %d documents, %d succeeded (sub=%s)  ║",
+        total_blobs, completed_blobs, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, completed_blobs, total_blobs, stage="completed")
     return summary
 
 def embedding_integrity_report(
