@@ -990,6 +990,14 @@ def ask_question_api(
         return response
 
     normalized = normalize_answer(result.answer)
+
+    # Post-generation visualization enhancement
+    try:
+        from src.visualization.enhancer import enhance_with_visualization
+        normalized = enhance_with_visualization(normalized, request.query, channel="web")
+    except Exception:
+        pass  # Visualization failure never affects the response
+
     persisted_session_id = _persist_chat_turn(
         user_id=request.user_id,
         query=request.query,

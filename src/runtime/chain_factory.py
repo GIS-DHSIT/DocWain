@@ -71,6 +71,15 @@ class RequestChain:
         )
 
         normalized = normalize_answer(raw_answer)
+
+        # Post-generation visualization enhancement (non-blocking)
+        try:
+            from src.visualization.enhancer import enhance_with_visualization
+            channel = "teams" if getattr(self.ctx, "channel", "") == "teams" else "web"
+            normalized = enhance_with_visualization(normalized, self.ctx.query, channel=channel)
+        except Exception:
+            pass  # Visualization failure never affects the response
+
         metadata = normalized.get("metadata") or {}
         metadata.update(
             {
