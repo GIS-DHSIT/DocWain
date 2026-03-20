@@ -188,6 +188,95 @@ def generate_anti_repetition_pairs() -> List[Dict]:
     ]
 
 
+def generate_viz_preference_pairs() -> List[Dict]:
+    """Chosen: markdown table + DOCWAIN_VIZ directive. Rejected: plain prose without directive."""
+
+    def _viz(chart_type: str, title: str, labels: list, values: list, **kwargs) -> str:
+        payload = {"chart_type": chart_type, "title": title, "labels": labels, "values": values}
+        payload.update(kwargs)
+        return f"<!--DOCWAIN_VIZ\n{json.dumps(payload)}\n-->"
+
+    return [
+        # 1 - bar
+        _pair(
+            "What are the quarterly expenses?\n\n[EVIDENCE]\nQ1: $120K, Q2: $145K, Q3: $98K, Q4: $167K.",
+            "## Quarterly Expenses\n\n| Quarter | Amount |\n|---------|--------|\n| Q1 | **$120K** |\n| Q2 | **$145K** |\n| Q3 | **$98K** |\n| Q4 | **$167K** |\n\n"
+            + _viz("bar", "Quarterly Expenses", ["Q1", "Q2", "Q3", "Q4"], [120, 145, 98, 167], unit="$K"),
+            "The quarterly expenses are as follows. In Q1 the company spent $120K. In Q2 spending rose to $145K. Q3 saw a decrease to $98K. Finally Q4 had the highest spending at $167K. Overall, Q4 was the most expensive quarter while Q3 was the least expensive."
+        ),
+        # 2 - donut
+        _pair(
+            "Show the budget allocation by department.\n\n[EVIDENCE]\nEngineering: 40%, Marketing: 25%, Sales: 20%, HR: 15%.",
+            "## Budget Allocation\n\n| Department | Share |\n|------------|-------|\n| Engineering | **40%** |\n| Marketing | **25%** |\n| Sales | **20%** |\n| HR | **15%** |\n\n"
+            + _viz("donut", "Budget Allocation by Department", ["Engineering", "Marketing", "Sales", "HR"], [40, 25, 20, 15], unit="%"),
+            "The budget is allocated across four departments. Engineering receives 40% of the total budget, making it the largest allocation. Marketing gets 25%, Sales receives 20%, and HR has 15%. Engineering clearly has the biggest share of the budget."
+        ),
+        # 3 - line
+        _pair(
+            "How did monthly revenue trend this year?\n\n[EVIDENCE]\nJan: $50K, Feb: $55K, Mar: $62K, Apr: $58K, May: $71K, Jun: $80K.",
+            "## Monthly Revenue Trend\n\n| Month | Revenue |\n|-------|--------|\n| Jan | $50K |\n| Feb | $55K |\n| Mar | $62K |\n| Apr | $58K |\n| May | $71K |\n| Jun | $80K |\n\nRevenue grew **60%** from January to June with a minor dip in April.\n\n"
+            + _viz("line", "Monthly Revenue Trend", ["Jan", "Feb", "Mar", "Apr", "May", "Jun"], [50, 55, 62, 58, 71, 80], unit="$K"),
+            "Monthly revenue this year started at $50K in January and went to $55K in February. March saw $62K, then April dipped slightly to $58K. May recovered to $71K and June reached $80K. The overall trend is upward with a small dip in April."
+        ),
+        # 4 - grouped_bar
+        _pair(
+            "Compare actual vs target sales per region.\n\n[EVIDENCE]\nNorth: actual $300K, target $350K. South: actual $420K, target $400K. West: actual $280K, target $310K.",
+            "## Actual vs Target Sales\n\n| Region | Actual | Target | Gap |\n|--------|--------|--------|-----|\n| North | $300K | $350K | -$50K |\n| South | **$420K** | $400K | +$20K |\n| West | $280K | $310K | -$30K |\n\nOnly **South** exceeded its target.\n\n"
+            + _viz("grouped_bar", "Actual vs Target Sales by Region", ["North", "South", "West"], [300, 420, 280], unit="$K", secondary_values=[350, 400, 310], secondary_name="Target"),
+            "In the North region, actual sales were $300K against a target of $350K, falling short by $50K. The South region outperformed with $420K actual versus $400K target. The West region achieved $280K against a $310K target. South was the only region to exceed its target."
+        ),
+        # 5 - radar
+        _pair(
+            "Rate the vendor on key criteria.\n\n[EVIDENCE]\nVendor evaluation: Quality 9/10, Cost 6/10, Delivery 8/10, Support 7/10, Innovation 5/10.",
+            "## Vendor Scorecard\n\n| Criteria | Score |\n|----------|-------|\n| Quality | **9/10** |\n| Delivery | 8/10 |\n| Support | 7/10 |\n| Cost | 6/10 |\n| Innovation | 5/10 |\n\nStrong on **quality** and **delivery**; weaker on **innovation**.\n\n"
+            + _viz("radar", "Vendor Evaluation Scorecard", ["Quality", "Cost", "Delivery", "Support", "Innovation"], [9, 6, 8, 7, 5]),
+            "The vendor scored 9 out of 10 on quality, 6 out of 10 on cost, 8 out of 10 on delivery, 7 out of 10 on support, and 5 out of 10 on innovation. Quality is the strongest area while innovation is the weakest."
+        ),
+        # 6 - horizontal_bar
+        _pair(
+            "Rank the projects by completion percentage.\n\n[EVIDENCE]\nProject Alpha: 95%, Project Beta: 72%, Project Gamma: 88%, Project Delta: 60%.",
+            "## Project Completion\n\n| Project | Completion |\n|---------|------------|\n| Alpha | **95%** |\n| Gamma | 88% |\n| Beta | 72% |\n| Delta | 60% |\n\n"
+            + _viz("horizontal_bar", "Project Completion Status", ["Alpha", "Gamma", "Beta", "Delta"], [95, 88, 72, 60], unit="%"),
+            "Project Alpha is the most complete at 95%. Project Gamma is at 88% completion. Project Beta is 72% complete. Project Delta is the least complete at 60%."
+        ),
+        # 7 - waterfall
+        _pair(
+            "Show the profit waterfall from revenue to net income.\n\n[EVIDENCE]\nRevenue: $500K, COGS: -$200K, OpEx: -$150K, Tax: -$45K, Net Income: $105K.",
+            "## Profit Waterfall\n\n| Item | Amount |\n|------|--------|\n| Revenue | **$500K** |\n| COGS | -$200K |\n| OpEx | -$150K |\n| Tax | -$45K |\n| **Net Income** | **$105K** |\n\n"
+            + _viz("waterfall", "Revenue to Net Income Waterfall", ["Revenue", "COGS", "OpEx", "Tax", "Net Income"], [500, -200, -150, -45, 105], unit="$K"),
+            "Starting from revenue of $500K, the company deducted $200K for cost of goods sold, $150K for operating expenses, and $45K for taxes, resulting in a net income of $105K."
+        ),
+        # 8 - scatter
+        _pair(
+            "Is there a relationship between experience and salary?\n\n[EVIDENCE]\n5yr: $85K, 8yr: $105K, 3yr: $65K, 12yr: $130K, 7yr: $95K, 10yr: $115K.",
+            "## Experience vs Salary\n\n| Years | Salary |\n|-------|--------|\n| 3 | $65K |\n| 5 | $85K |\n| 7 | $95K |\n| 8 | $105K |\n| 10 | $115K |\n| 12 | $130K |\n\nStrong positive correlation — each additional year adds roughly **$7K**.\n\n"
+            + _viz("scatter", "Experience vs Salary", [3, 5, 7, 8, 10, 12], [65, 85, 95, 105, 115, 130], unit="$K"),
+            "Looking at the data, employees with 3 years experience earn $65K, 5 years earn $85K, 7 years earn $95K, 8 years earn $105K, 10 years earn $115K, and 12 years earn $130K. There appears to be a positive relationship between experience and salary."
+        ),
+        # 9 - area
+        _pair(
+            "Show the cumulative support tickets over the week.\n\n[EVIDENCE]\nMon: 12, Tue: 28, Wed: 45, Thu: 63, Fri: 80.",
+            "## Cumulative Support Tickets\n\n| Day | Cumulative Total |\n|-----|------------------|\n| Mon | 12 |\n| Tue | 28 |\n| Wed | 45 |\n| Thu | 63 |\n| Fri | **80** |\n\nTicket volume grew steadily throughout the week.\n\n"
+            + _viz("area", "Cumulative Support Tickets", ["Mon", "Tue", "Wed", "Thu", "Fri"], [12, 28, 45, 63, 80]),
+            "On Monday there were 12 cumulative tickets. By Tuesday it reached 28. Wednesday had 45 total tickets. Thursday reached 63. By Friday the total was 80 support tickets for the week."
+        ),
+        # 10 - gauge
+        _pair(
+            "What is the current SLA compliance rate?\n\n[EVIDENCE]\nSLA compliance: 94.7% against a 99.5% target.",
+            "## SLA Compliance\n\n| Metric | Value |\n|--------|-------|\n| Current | **94.7%** |\n| Target | 99.5% |\n| Gap | **-4.8pp** |\n\nCompliance is **below target** by 4.8 percentage points.\n\n"
+            + _viz("gauge", "SLA Compliance Rate", ["SLA Compliance"], [94.7], unit="%"),
+            "The current SLA compliance rate is 94.7% which is below the target of 99.5%. There is a gap of 4.8 percentage points that needs to be addressed to meet the service level agreement requirements."
+        ),
+        # 11 - stacked_bar
+        _pair(
+            "Break down headcount by level per department.\n\n[EVIDENCE]\nEngineering: 15 junior, 25 mid, 10 senior. Product: 8 junior, 12 mid, 5 senior. Design: 6 junior, 9 mid, 3 senior.",
+            "## Headcount by Level\n\n| Department | Junior | Mid | Senior | Total |\n|------------|--------|-----|--------|-------|\n| Engineering | 15 | 25 | 10 | **50** |\n| Product | 8 | 12 | 5 | **25** |\n| Design | 6 | 9 | 3 | **18** |\n\n"
+            + _viz("stacked_bar", "Headcount by Level per Department", ["Engineering", "Product", "Design"], [15, 8, 6], secondary_values=[25, 12, 9], secondary_name="Mid"),
+            "Engineering has 15 junior, 25 mid, and 10 senior employees for a total of 50. Product has 8 junior, 12 mid, and 5 senior for 25 total. Design has 6 junior, 9 mid, and 3 senior for 18 total. Engineering is the largest department."
+        ),
+    ]
+
+
 def build_dpo_dataset(output_dir: Path = None) -> Dict[str, int]:
     """Generate the full DPO preference dataset."""
     output_dir = output_dir or Path("finetune_data")
@@ -201,6 +290,7 @@ def build_dpo_dataset(output_dir: Path = None) -> Dict[str, int]:
         ("isolation", generate_isolation_pairs),
         ("identity", generate_identity_pairs),
         ("anti_repetition", generate_anti_repetition_pairs),
+        ("visualization", generate_viz_preference_pairs),
     ]
 
     for name, gen_fn in generators:
