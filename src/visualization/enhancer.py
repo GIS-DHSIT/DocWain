@@ -30,8 +30,9 @@ def enhance_with_visualization(
 ) -> Dict[str, Any]:
     """Enhance a DocWain response with auto-generated charts if appropriate.
 
-    This function NEVER modifies the text response. It only appends to
-    the media[] field. Any failure returns the original answer unchanged.
+    When the user explicitly requests a chart and one cannot be generated,
+    a validation note explaining why is appended to the response.
+    For auto-detected opportunities, charts are silently skipped when not viable.
 
     Args:
         answer: Normalized answer dict with at minimum {"response": str}
@@ -42,6 +43,8 @@ def enhance_with_visualization(
         The same answer dict, possibly with chart data appended to media[].
     """
     start = time.time()
+    from src.visualization.chart_decision import is_user_triggered
+    force_chart = is_user_triggered(query) if query else False
 
     try:
         response_text = ""
@@ -60,10 +63,84 @@ def enhance_with_visualization(
         if not response_text:
             return answer
 
-        # Step 1: Check if user explicitly requested a chart
-        from src.visualization.chart_decision import is_user_triggered, should_generate_chart
+        # Step 0: Render relationship graphs — triggered by either:
+        #   (a) user query asks for a graph/diagram/relationship, OR
+        #   (b) LLM response contains Mermaid code or a relationship table
+        try:
+            from src.visualization.graph_renderer import (
+                try_graph_rendering, is_graph_query,
+                parse_mermaid, extract_relationship_table, extract_relationships,
+                render_graph,
+            )
 
-        force_chart = is_user_triggered(query)
+            # Determine if we should attempt graph rendering
+            user_wants_graph = query and is_graph_query(query)
+            response_has_mermaid = "```mermaid" in response_text or "graph TD" in response_text or "graph LR" in response_text
+            response_has_rel_table = _has_relationship_table(response_text)
+
+            if user_wants_graph or response_has_mermaid or response_has_rel_table:
+                # Try parsing graph data from the response
+                graph_data = parse_mermaid(response_text)
+                if graph_data is None and response_has_rel_table:
+                    graph_data = extract_relationship_table(response_text)
+                if graph_data is None:
+                    graph_data = extract_relationships(response_text)
+
+                if graph_data and graph_data.edges:
+                    title = graph_data.title or (query.strip().rstrip("?.").title() if query else "Relationship Diagram")
+                    rendered = render_graph(graph_data, title=title, channel=channel)
+                    if rendered and rendered.matplotlib_png_base64:
+                        media_entry = {
+                            "type": "chart",
+                            "chart_type": "graph",
+                            "title": rendered.title,
+                            "png_base64": rendered.matplotlib_png_base64,
+                            "data_summary": rendered.data_summary,
+                        }
+                        _append_media(answer, media_entry)
+                        _strip_mermaid_from_response(answer)
+                        elapsed = time.time() - start
+                        logger.info("Relationship graph rendered (%.1fs)", elapsed)
+                        return answer
+        except Exception as exc:
+            logger.debug("Graph rendering skipped: %s", exc)
+
+        # Step 0.5: Parse model-driven VIZ directive (high confidence)
+        viz_spec = parse_viz_directive(response_text)
+        if viz_spec:
+            logger.info("Model-driven VIZ directive found: %s", viz_spec.get("chart_type"))
+            from src.visualization.chart_renderer import render_chart
+
+            rendered = render_chart(
+                chart_type=viz_spec["chart_type"],
+                labels=viz_spec["labels"],
+                values=viz_spec["values"],
+                title=viz_spec.get("title", "Data Analysis"),
+                secondary_values=viz_spec.get("secondary_values"),
+                secondary_name=viz_spec.get("secondary_name", ""),
+                series_name=viz_spec.get("series_name", "Value"),
+                unit=viz_spec.get("unit", ""),
+                channel=channel,
+            )
+
+            if rendered.matplotlib_png_base64 or rendered.plotly_html:
+                media_entry = {
+                    "type": "chart",
+                    "chart_type": rendered.chart_type,
+                    "title": rendered.title,
+                    "png_base64": rendered.matplotlib_png_base64,
+                    "data_summary": rendered.data_summary,
+                }
+                _append_media(answer, media_entry)
+                _strip_viz_directive(answer)
+                elapsed = time.time() - start
+                logger.info("Model-driven chart rendered: %s (%.1fs)", rendered.title, elapsed)
+                return answer
+            else:
+                logger.warning("Model-driven VIZ directive failed to render; falling back to auto-detect")
+
+        # Step 1: Check if user explicitly requested a chart
+        from src.visualization.chart_decision import should_generate_chart
 
         # Step 2: Run decision engine (skip if user-triggered)
         if not force_chart:
@@ -77,6 +154,8 @@ def enhance_with_visualization(
         # Timeout check
         if time.time() - start > VIZ_TIMEOUT_SECONDS:
             logger.warning("Visualization timeout before extraction")
+            if force_chart:
+                _append_chart_validation(answer, "Chart generation timed out. The response content is available in text form above.")
             return answer
 
         # Step 3: Extract chartable data from response
@@ -85,15 +164,23 @@ def enhance_with_visualization(
         chart_data = extract_chart_data(response_text)
 
         if not chart_data or len(chart_data.labels) < 2:
-            # Try word cloud for text-heavy responses
             if force_chart:
-                return _try_wordcloud(answer, response_text, channel)
+                # Try word cloud first; if that also fails, explain why
+                wc_result = _try_wordcloud(answer, response_text, channel)
+                if not _has_media(wc_result):
+                    _append_chart_validation(
+                        answer,
+                        _build_chart_validation_reason(response_text),
+                    )
+                return wc_result
             logger.debug("Chart skipped: insufficient data points")
             return answer
 
         # Timeout check
         if time.time() - start > VIZ_TIMEOUT_SECONDS:
             logger.warning("Visualization timeout before rendering")
+            if force_chart:
+                _append_chart_validation(answer, "Chart generation timed out during rendering. The data is available in the text response.")
             return answer
 
         # Step 4: Select chart type
@@ -126,9 +213,11 @@ def enhance_with_visualization(
 
         if not rendered.matplotlib_png_base64 and not rendered.plotly_html:
             logger.warning("Chart rendering produced no output")
+            if force_chart:
+                _append_chart_validation(answer, "Chart rendering failed. The data could not be visualized in the requested format, but is available in the text response above.")
             return answer
 
-        # Step 7: Append to media[]
+        # Step 7: Append to media[] — only the rendered image, no raw JSON/code
         media_entry = {
             "type": "chart",
             "chart_type": rendered.chart_type,
@@ -136,10 +225,6 @@ def enhance_with_visualization(
             "png_base64": rendered.matplotlib_png_base64,
             "data_summary": rendered.data_summary,
         }
-
-        if channel == "web" and rendered.plotly_html:
-            media_entry["plotly_html"] = rendered.plotly_html
-            media_entry["plotly_json"] = rendered.plotly_json
 
         _append_media(answer, media_entry)
 
@@ -150,6 +235,8 @@ def enhance_with_visualization(
 
     except Exception as exc:
         logger.warning("Visualization enhancement failed (returning original): %s", exc)
+        if force_chart:
+            _append_chart_validation(answer, f"Chart generation encountered an error: {exc}. The response data is available in text form above.")
         return answer
 
 
@@ -177,8 +264,6 @@ def _try_wordcloud(
             "png_base64": rendered.matplotlib_png_base64,
             "data_summary": rendered.data_summary,
         }
-        if channel == "web" and rendered.plotly_html:
-            media_entry["plotly_html"] = rendered.plotly_html
 
         _append_media(answer, media_entry)
         logger.info("Word cloud generated: %d terms", len(frequencies))
@@ -247,3 +332,163 @@ def _generate_title(chart_data, chart_type: str, query: str) -> str:
 
     # Fallback
     return f"Data Analysis ({n} Items)"
+
+
+# ---------------------------------------------------------------------------
+# Relationship table detection
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_VIZ_DIRECTIVE_RE = _re.compile(
+    r"<!--DOCWAIN_VIZ\s*(\{.*?\})\s*-->",
+    _re.DOTALL,
+)
+
+_REL_TABLE_HEADER = _re.compile(
+    r"\|\s*(?:source|from|entity|party|node)\s*\|"
+    r"\s*(?:relationship|relation|type|action|link|role|connects?)\s*\|"
+    r"\s*(?:target|to|destination|object|party)\s*\|",
+    _re.IGNORECASE,
+)
+
+
+def _has_relationship_table(text: str) -> bool:
+    """Detect if the response contains a Source|Relationship|Target table."""
+    return bool(_REL_TABLE_HEADER.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Chart validation helpers
+# ---------------------------------------------------------------------------
+
+_ANY_NUMBER_RE = _re.compile(r"\d")
+
+
+def _has_media(answer: Dict[str, Any]) -> bool:
+    """Check if the answer already has media entries."""
+    inner = answer.get("answer", answer) if isinstance(answer, dict) else answer
+    if isinstance(inner, dict) and inner.get("media"):
+        return True
+    return bool(answer.get("media")) if isinstance(answer, dict) else False
+
+
+def _build_chart_validation_reason(response_text: str) -> str:
+    """Build a specific explanation for why a chart cannot be generated."""
+    has_numbers = bool(_ANY_NUMBER_RE.search(response_text))
+    has_table = "|" in response_text and response_text.count("|") >= 4
+    text_len = len(response_text.strip())
+
+    if text_len < 100:
+        return (
+            "A chart could not be generated because the response is too brief. "
+            "Charts require structured data such as tables, lists with numeric values, "
+            "or multiple comparable data points."
+        )
+    if not has_numbers:
+        return (
+            "A chart could not be generated because the response contains no numeric data. "
+            "Charts require quantitative values (numbers, percentages, currency amounts) "
+            "to create a meaningful visualization."
+        )
+    if has_table:
+        return (
+            "A chart could not be generated from the table data. The table may contain "
+            "non-numeric or mixed content that cannot be plotted. Charts require at least "
+            "2 rows with comparable numeric values."
+        )
+    return (
+        "A chart could not be generated because the response data is not in a chartable format. "
+        "For best results, ask a question that produces structured comparisons, ranked lists, "
+        "breakdowns with percentages, or time-based trends — e.g., 'Compare the costs across "
+        "all line items' or 'Show a breakdown of expenses by category'."
+    )
+
+
+def _append_chart_validation(answer: Dict[str, Any], reason: str) -> None:
+    """Append a chart validation note to the answer's media list."""
+    validation_entry = {
+        "type": "chart_validation",
+        "status": "not_generated",
+        "reason": reason,
+    }
+    _append_media(answer, validation_entry)
+
+    # Also append a visible note to the response text so the user sees it
+    _set_response_text(answer, reason)
+
+
+def _strip_mermaid_from_response(answer: Dict[str, Any]) -> None:
+    """Remove Mermaid code blocks from the response text since we rendered an image."""
+    import re as _mermaid_re
+    _MERMAID_BLOCK = _mermaid_re.compile(
+        r"```(?:mermaid)?\s*\n\s*(?:graph|flowchart)\s+(?:TD|LR|TB|RL|BT).*?```",
+        _mermaid_re.DOTALL,
+    )
+    inner = answer.get("answer", answer) if isinstance(answer, dict) else answer
+    if isinstance(inner, dict) and "response" in inner:
+        current = inner.get("response", "")
+        if isinstance(current, str) and _MERMAID_BLOCK.search(current):
+            cleaned = _MERMAID_BLOCK.sub("", current).strip()
+            if cleaned:
+                inner["response"] = cleaned
+    elif isinstance(answer, dict) and "response" in answer:
+        current = answer.get("response", "")
+        if isinstance(current, str) and _MERMAID_BLOCK.search(current):
+            cleaned = _MERMAID_BLOCK.sub("", current).strip()
+            if cleaned:
+                answer["response"] = cleaned
+
+
+def parse_viz_directive(response_text: str) -> Optional[Dict[str, Any]]:
+    """Parse a <!--DOCWAIN_VIZ {...} --> directive from the response.
+    Returns the parsed JSON dict if valid, None otherwise.
+    """
+    import json as _json
+    match = _VIZ_DIRECTIVE_RE.search(response_text)
+    if not match:
+        return None
+    try:
+        spec = _json.loads(match.group(1))
+    except _json.JSONDecodeError:
+        logger.debug("VIZ directive has invalid JSON")
+        return None
+    if not all(k in spec for k in ("chart_type", "labels", "values")):
+        logger.debug("VIZ directive missing required fields")
+        return None
+    if not isinstance(spec["labels"], list) or not isinstance(spec["values"], list):
+        return None
+    if len(spec["labels"]) < 1 or len(spec["values"]) < 1:
+        return None
+    return spec
+
+
+def _strip_viz_directive(answer: Dict[str, Any]) -> None:
+    """Remove <!--DOCWAIN_VIZ ... --> blocks from response text."""
+    inner = answer.get("answer", answer) if isinstance(answer, dict) else answer
+    if isinstance(inner, dict) and "response" in inner:
+        current = inner.get("response", "")
+        if isinstance(current, str) and _VIZ_DIRECTIVE_RE.search(current):
+            cleaned = _VIZ_DIRECTIVE_RE.sub("", current).strip()
+            if cleaned:
+                inner["response"] = cleaned
+    elif isinstance(answer, dict) and "response" in answer:
+        current = answer.get("response", "")
+        if isinstance(current, str) and _VIZ_DIRECTIVE_RE.search(current):
+            cleaned = _VIZ_DIRECTIVE_RE.sub("", current).strip()
+            if cleaned:
+                answer["response"] = cleaned
+
+
+def _set_response_text(answer: Dict[str, Any], note: str) -> None:
+    """Append a visualization note to the response text."""
+    separator = "\n\n---\n**Visualization Note:** "
+    inner = answer.get("answer", answer) if isinstance(answer, dict) else answer
+    if isinstance(inner, dict) and "response" in inner:
+        current = inner["response"] or ""
+        if isinstance(current, str) and note not in current:
+            inner["response"] = current + separator + note
+    elif isinstance(answer, dict) and "response" in answer:
+        current = answer["response"] or ""
+        if isinstance(current, str) and note not in current:
+            answer["response"] = current + separator + note
