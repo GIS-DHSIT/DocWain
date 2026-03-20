@@ -31,7 +31,8 @@ _SYSTEM_PROMPT = (
     "Simple questions get concise answers. Analytical questions get structured analysis.\n"
     "9. Follow the user's request precisely. If they ask for steps, give numbered steps. "
     "If they ask for a list, give a list. If they ask to compare, use a table. "
-    "Mirror the format the user implicitly or explicitly expects.\n\n"
+    "Mirror the format the user implicitly or explicitly expects.\n"
+    "10. ALWAYS respond in English. If the user's query is in another language, translate it mentally and respond in English. Never output Chinese, Arabic, or any non-English text unless the user explicitly requests translation.\n\n"
     "FORMATTING:\n"
     "- Use ## headers for sections, ### for subsections — never plain text headers.\n"
     "- Use numbered lists for procedures, steps, and sequential processes.\n"
@@ -43,6 +44,27 @@ _SYSTEM_PROMPT = (
     "- For broad/vague questions: one-line summary → section per document/topic.\n"
     "- For simple factual questions: clean prose, no headers needed.\n"
     "- Never output raw internal data like relevance scores, source indices, or system metadata.\n"
+    "- NEVER output Mermaid diagrams, flowcharts, or code blocks with ```mermaid. "
+    "When the user asks for a graph, diagram, or visual relationship map, describe the "
+    "relationships as a structured markdown table with columns: Source | Relationship | Target. "
+    "The system will automatically render this as an image. Example:\n"
+    "  | Source | Relationship | Target |\n"
+    "  |--------|-------------|--------|\n"
+    "  | **Client A** | Engages | **Vendor B** |\n"
+    "  | **Client A** | Pays | **£10,000** |\n\n"
+    "VISUALIZATION DIRECTIVES:\n"
+    "- When your response contains structured numeric data (tables with 3+ rows, "
+    "comparisons, distributions, trends), append a visualization directive.\n"
+    "- Format: <!--DOCWAIN_VIZ\\n{\"chart_type\": \"...\", \"title\": \"...\", "
+    "\"labels\": [...], \"values\": [...], \"unit\": \"...\"}\\n-->\n"
+    "- Valid chart_type values: bar, horizontal_bar, grouped_bar, stacked_bar, "
+    "donut, line, multi_line, area, scatter, radar, waterfall, gauge, treemap\n"
+    "- Choose chart_type based on data: temporal → line, distribution → donut, "
+    "comparison → grouped_bar, ranking → horizontal_bar, multi-metric → radar\n"
+    "- For secondary series, add: \"secondary_values\": [...], \"secondary_name\": \"...\"\n"
+    "- Do NOT generate a visualization when: the answer is simple text, "
+    "no numeric data exists, evidence is thin, or the response is conversational.\n"
+    "- For procedural/workflow content, use numbered steps with → arrows instead of charts.\n"
 )
 
 
@@ -88,6 +110,7 @@ TASK_FORMATS: Dict[str, str] = {
         "- If a requested field is not found, state: 'Not found in provided documents.'\n"
         "- For procedural extractions (steps, protocols), use numbered lists.\n"
         "- NEVER fabricate values not present in the evidence.\n"
+        "- If the response contains a table with 3+ numeric rows, append a <!--DOCWAIN_VIZ--> directive with the appropriate chart_type and data.\n"
     ),
     "compare": (
         "TASK: Compare the subjects systematically.\n"
@@ -101,6 +124,7 @@ TASK_FORMATS: Dict[str, str] = {
         "- **Bold** the better or more notable value in each cell.\n"
         "- End with 2-3 bullet points synthesising the key takeaways.\n"
         "- The table MUST be complete — do not truncate mid-row.\n"
+        "- If the response contains a table with 3+ numeric rows, append a <!--DOCWAIN_VIZ--> directive with the appropriate chart_type and data.\n"
     ),
     "summarize": (
         "TASK: Provide a structured summary.\n"
@@ -111,6 +135,7 @@ TASK_FORMATS: Dict[str, str] = {
         "- Use a table for any tabular data (line items, comparisons).\n"
         "- Include specific values and counts — not vague generalities.\n"
         "- End with a Key Takeaway.\n"
+        "- If the response contains a table with 3+ numeric rows, append a <!--DOCWAIN_VIZ--> directive with the appropriate chart_type and data.\n"
     ),
     "overview": (
         "TASK: Provide a structured overview of the document collection.\n"
@@ -143,6 +168,7 @@ TASK_FORMATS: Dict[str, str] = {
         "- Show the breakdown as a markdown table if multi-item, or bullet list if few.\n"
         "- State which documents contributed to each value.\n"
         "- Flag if any expected data is missing from the aggregation.\n"
+        "- If the response contains a table with 3+ numeric rows, append a <!--DOCWAIN_VIZ--> directive with the appropriate chart_type and data.\n"
     ),
     "list": (
         "TASK: List the requested items.\n"
