@@ -68,6 +68,7 @@ class TestVizDirectives:
             if match:
                 payload = json.loads(match.group(1))
                 assert "chart_type" in payload
+                assert "title" in payload
                 assert "labels" in payload
                 assert "values" in payload
                 assert isinstance(payload["labels"], list)
@@ -75,8 +76,13 @@ class TestVizDirectives:
                 assert len(payload["labels"]) > 0
                 assert len(payload["values"]) > 0
 
-    def test_at_least_six_chart_types(self):
-        """At least 6 different chart_types are covered."""
+    def test_all_thirteen_chart_types_covered(self):
+        """All 13 required chart types must be present."""
+        required = {
+            "bar", "horizontal_bar", "grouped_bar", "stacked_bar",
+            "donut", "line", "multi_line", "area", "scatter",
+            "radar", "waterfall", "gauge", "treemap",
+        }
         examples = generate_viz_sft_examples()
         pattern = re.compile(r"<!--DOCWAIN_VIZ\n(.+?)\n-->", re.DOTALL)
         chart_types = set()
@@ -85,7 +91,8 @@ class TestVizDirectives:
             if match:
                 payload = json.loads(match.group(1))
                 chart_types.add(payload["chart_type"])
-        assert len(chart_types) >= 6, f"Only found {chart_types}"
+        missing = required - chart_types
+        assert not missing, f"Missing chart types: {missing}"
 
     def test_viz_examples_have_tables(self):
         """Chart examples should include markdown tables."""

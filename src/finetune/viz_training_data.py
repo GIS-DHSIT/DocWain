@@ -270,17 +270,17 @@ def _gauge_examples() -> List[Dict]:
     return [
         _msg(
             "What is the SLA compliance rate?\n\n[EVIDENCE]\nCurrent SLA compliance: 97.3%. Target: 99.5%.",
-            "## SLA Compliance\n\nCurrent SLA compliance is **97.3%** against a target of **99.5%**. The gap of **2.2pp** needs attention.\n\n"
+            "## SLA Compliance\n\n| Metric | Value |\n|--------|------|\n| SLA Compliance | **97.3%** |\n| Target | **99.5%** |\n\nCurrent SLA compliance is **97.3%** against a target of **99.5%**. The gap of **2.2pp** needs attention.\n\n"
             + _viz("gauge", "SLA Compliance", ["SLA Compliance"], [97.3], unit="%"),
         ),
         _msg(
             "Show the project completion percentage.\n\n[EVIDENCE]\nProject Omega: 73% complete. 22 of 30 milestones achieved.",
-            "## Project Omega Progress\n\n**73%** complete with **22 of 30** milestones achieved. **8 milestones** remain.\n\n"
+            "## Project Omega Progress\n\n| Metric | Value |\n|--------|------|\n| Completion | **73%** |\n| Milestones Achieved | **22 of 30** |\n\n**73%** complete with **22 of 30** milestones achieved. **8 milestones** remain.\n\n"
             + _viz("gauge", "Project Omega Completion", ["Completion"], [73], unit="%"),
         ),
         _msg(
             "What is our current customer retention rate?\n\n[EVIDENCE]\nCustomer retention rate for Q4: 91.5%. Industry average: 85%.",
-            "## Customer Retention\n\nCurrent retention is **91.5%**, which is **6.5pp above** the industry average of 85%.\n\n"
+            "## Customer Retention\n\n| Metric | Value |\n|--------|------|\n| Retention Rate | **91.5%** |\n| Industry Average | **85%** |\n\nCurrent retention is **91.5%**, which is **6.5pp above** the industry average of 85%.\n\n"
             + _viz("gauge", "Customer Retention Rate", ["Retention"], [91.5], unit="%"),
         ),
     ]
