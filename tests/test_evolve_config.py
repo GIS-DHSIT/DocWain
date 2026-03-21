@@ -1,5 +1,4 @@
 # tests/test_evolve_config.py
-import json
 import pytest
 from pathlib import Path
 

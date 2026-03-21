@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -19,7 +19,7 @@ class ModelEntry:
     scores: Dict[str, float]
     artifact_path: str
     status: str  # "production" | "available" | "rollback_ready"
-    promoted_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    promoted_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class ModelRegistry:
@@ -66,7 +66,7 @@ class ModelRegistry:
             self._models["DocWain:previous"] = old
         new_latest.tag = "DocWain:latest"
         new_latest.status = "production"
-        new_latest.promoted_at = datetime.utcnow().isoformat()
+        new_latest.promoted_at = datetime.now(timezone.utc).isoformat()
         self._models["DocWain:latest"] = new_latest
         self._save()
 
