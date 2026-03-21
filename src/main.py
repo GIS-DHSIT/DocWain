@@ -976,6 +976,16 @@ def ask_question_api(
 
     if want_stream:
         normalized_stream_answer = normalize_answer(result.answer)
+
+        # Run visualization on the completed answer before streaming
+        try:
+            from src.visualization.enhancer import enhance_with_visualization
+            normalized_stream_answer = enhance_with_visualization(
+                normalized_stream_answer, request.query, channel="web",
+            )
+        except Exception as _viz_exc:
+            logger.warning("Stream visualization failed: %s", _viz_exc)
+
         persisted_session_id = _persist_chat_turn(
             user_id=request.user_id,
             query=request.query,
@@ -983,8 +993,33 @@ def ask_question_api(
             session_id=session_id,
             new_session=bool(request.new_session),
         )
-        stream_iter = result.stream or []
-        response = StreamingResponse(stream_iter, media_type="text/plain")
+
+        # Build trailing metadata block with media, sources, session_id
+        import json as _stream_json
+        _stream_media = normalized_stream_answer.get("media")
+        _stream_sources = normalized_stream_answer.get("sources", [])
+        _stream_meta = {
+            "sources": _stream_sources,
+            "grounded": normalized_stream_answer.get("grounded", False),
+            "context_found": normalized_stream_answer.get("context_found", False),
+            "session_id": persisted_session_id,
+        }
+        if _stream_media:
+            _stream_meta["media"] = _stream_media
+            logger.info("Stream visualization attached: %d media items", len(_stream_media))
+
+        # Re-chunk the response text (viz may have stripped VIZ directives)
+        from src.execution.common import chunk_text_stream_with_metadata
+        _response_text = normalized_stream_answer.get("response", "")
+        _text_chunks = list(chunk_text_stream_with_metadata(_response_text))
+
+        def _stream_with_trailing_meta():
+            for chunk in _text_chunks:
+                yield chunk
+            # Append metadata as a parseable trailing block
+            yield "\n\n<!--DOCWAIN_MEDIA_JSON:" + _stream_json.dumps(_stream_meta, default=str) + "-->"
+
+        response = StreamingResponse(_stream_with_trailing_meta(), media_type="text/plain")
         if persisted_session_id:
             response.headers["X-Session-ID"] = persisted_session_id
         return response
@@ -995,8 +1030,13 @@ def ask_question_api(
     try:
         from src.visualization.enhancer import enhance_with_visualization
         normalized = enhance_with_visualization(normalized, request.query, channel="web")
-    except Exception:
-        pass  # Visualization failure never affects the response
+        _media = normalized.get("media")
+        if _media:
+            logger.info("Visualization attached: %d media items", len(_media))
+        else:
+            logger.info("Visualization: no media generated for query")
+    except Exception as _viz_exc:
+        logger.warning("Visualization enhancement failed: %s", _viz_exc, exc_info=True)
 
     persisted_session_id = _persist_chat_turn(
         user_id=request.user_id,
@@ -1066,19 +1106,19 @@ def trigger_extraction(subscription_id: str = "default"):
         raise HTTPException(status_code=500, detail=f"Extraction process failed: {e}")
 
 @api_router.get("/extract/progress", tags=["Default"])
-def get_extraction_progress(subscription_id: str = "default"):
-    """Get the current batch extraction progress for a subscription.
+def get_extraction_progress(profile_id: str = Query(..., description="Profile ID")):
+    """Get extraction progress for a profile.
 
-    Returns progress info including completed/total counts and current
-    document being processed. Useful for frontend progress bars.
+    Returns per-document extraction progress and aggregated common data
+    including live logs, overall progress, and elapsed time.
     """
-    from src.api.extraction_service import get_batch_extraction_progress
-    progress = get_batch_extraction_progress(
-        subscription_id if subscription_id != "default" else "global"
-    )
-    if not progress:
-        return {"status": "idle", "message": "No extraction currently running or recently completed"}
-    return {"status": "ok", "progress": progress}
+    from src.api.document_status import get_profile_extraction_status
+    result = get_profile_extraction_status(profile_id)
+    if not result.get("documents"):
+        return {"status": "idle", "profile_id": profile_id,
+                "message": "No documents found for this profile",
+                "data": result}
+    return {"status": "ok", "data": result}
 
 @api_router.get("/train", tags=["Default"], deprecated=True)
 def trigger_training(subscription_id: str = "default"):
@@ -1123,41 +1163,19 @@ def train_documents_batch(request: TrainDocumentsRequest = Body(...)):
 
 
 @api_router.get("/train/progress", tags=["Default"])
-def get_training_progress_endpoint(
-    subscription_id: str = None,
-    document_id: str = None,
-):
-    """Get training/embedding progress.
+def get_training_progress_endpoint(profile_id: str = Query(..., description="Profile ID")):
+    """Get training/embedding progress for a profile.
 
-    - With subscription_id: returns batch-level progress (all docs in batch).
-    - With document_id: returns per-document progress (detailed stages).
-    - With both: returns both.
+    Returns per-document training progress and aggregated common data
+    including live logs, overall progress, and elapsed time.
     """
-    result = {}
-
-    if subscription_id:
-        from src.api.embedding_service import get_batch_embedding_progress
-        batch = get_batch_embedding_progress(subscription_id)
-        if batch:
-            result["batch"] = batch
-            result["status"] = "running" if batch.get("stage") != "completed" else "completed"
-        else:
-            result["batch"] = None
-
-    if document_id:
-        from src.api.document_status import get_training_progress
-        doc_progress = get_training_progress(document_id)
-        if doc_progress:
-            result["document"] = doc_progress
-        else:
-            result["document"] = None
-
-    if not result:
-        return {"status": "idle", "message": "No training currently running. Provide subscription_id or document_id."}
-
-    if "status" not in result:
-        result["status"] = "ok"
-    return result
+    from src.api.document_status import get_profile_training_status
+    result = get_profile_training_status(profile_id)
+    if not result.get("documents"):
+        return {"status": "idle", "profile_id": profile_id,
+                "message": "No training documents found for this profile",
+                "data": result}
+    return {"status": "ok", "data": result}
 
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])
