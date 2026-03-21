@@ -453,6 +453,12 @@ def parse_viz_directive(response_text: str) -> Optional[Dict[str, Any]]:
     except _json.JSONDecodeError:
         logger.debug("VIZ directive has invalid JSON")
         return None
+    # Normalize field aliases — model may emit "type" or "chart" instead of "chart_type"
+    if "chart_type" not in spec:
+        for alias in ("type", "chart"):
+            if alias in spec:
+                spec["chart_type"] = spec.pop(alias)
+                break
     if not all(k in spec for k in ("chart_type", "labels", "values")):
         logger.debug("VIZ directive missing required fields")
         return None

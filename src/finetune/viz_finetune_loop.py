@@ -252,7 +252,7 @@ def _run_sft_training(config: VizFinetuneConfig, dataset_path: str) -> Dict[str,
     train_result = trainer.train()
     final_loss = train_result.metrics.get("train_loss", 0.0)
 
-    # Save merged model
+    # Save merged model + GGUF for Ollama
     merged_dir = ARTIFACT_DIR / "sft_merged"
     merged_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -261,12 +261,25 @@ def _run_sft_training(config: VizFinetuneConfig, dataset_path: str) -> Dict[str,
         model.save_pretrained(str(merged_dir))
         tokenizer.save_pretrained(str(merged_dir))
 
+    # Export to GGUF for Ollama consumption
+    gguf_dir = ARTIFACT_DIR / "gguf"
+    gguf_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        model.save_pretrained_gguf(
+            str(gguf_dir),
+            tokenizer,
+            quantization_method="q4_k_m",
+        )
+        log.info("GGUF exported to %s", gguf_dir)
+    except Exception as exc:
+        log.warning("GGUF export failed (will use Modelfile fallback): %s", exc)
+
     log.info("SFT training complete (loss=%.4f)", final_loss)
     return {"train_loss": final_loss, "epochs": config.sft_epochs, "examples": len(dataset)}
 
 
 def _run_dpo_training(config: VizFinetuneConfig, dpo_path: str) -> Dict[str, Any]:
-    """Run DPO training using the existing dpo_trainer module.
+    """Run DPO training on top of the SFT-trained model.
 
     Args:
         config: Fine-tuning configuration.
@@ -277,9 +290,13 @@ def _run_dpo_training(config: VizFinetuneConfig, dpo_path: str) -> Dict[str, Any
     """
     from src.finetune.dpo_trainer import run_dpo_training
 
-    log.info("Starting DPO training (epochs=%d, beta=%.2f)...", config.dpo_epochs, config.dpo_beta)
+    # Use SFT merged model if available, otherwise fall back to base
+    sft_merged = ARTIFACT_DIR / "sft_merged"
+    base = str(sft_merged) if sft_merged.exists() else config.base_model
+
+    log.info("Starting DPO training on %s (epochs=%d, beta=%.2f)...", base, config.dpo_epochs, config.dpo_beta)
     result = run_dpo_training(
-        base_model=config.base_model,
+        base_model=base,
         epochs=config.dpo_epochs,
         learning_rate=config.dpo_learning_rate,
         lora_r=config.lora_r,
@@ -290,7 +307,10 @@ def _run_dpo_training(config: VizFinetuneConfig, dpo_path: str) -> Dict[str, Any
 
 
 def _update_ollama_model(config: VizFinetuneConfig) -> bool:
-    """Update the Ollama model using `ollama create`.
+    """Update the Ollama model from trained GGUF weights or Modelfile fallback.
+
+    Looks for GGUF files from training. If found, creates a temporary Modelfile
+    pointing to the GGUF. Otherwise falls back to the project Modelfile.
 
     Args:
         config: Fine-tuning configuration.
@@ -298,15 +318,62 @@ def _update_ollama_model(config: VizFinetuneConfig) -> bool:
     Returns:
         True if the model was updated successfully.
     """
-    modelfile = Path("Modelfile")
-    if not modelfile.exists():
-        log.warning("Modelfile not found at %s, skipping Ollama update", modelfile)
-        return False
+    import glob
+
+    # Look for GGUF from training
+    gguf_dir = ARTIFACT_DIR / "gguf"
+    gguf_files = sorted(glob.glob(str(gguf_dir / "*.gguf"))) if gguf_dir.exists() else []
+
+    if gguf_files:
+        gguf_path = gguf_files[-1]  # latest GGUF
+        log.info("Found trained GGUF: %s", gguf_path)
+
+        # Read existing Modelfile for system prompt and params
+        base_modelfile = Path("Modelfile")
+        system_block = ""
+        param_lines = []
+        if base_modelfile.exists():
+            content = base_modelfile.read_text()
+            # Extract everything after FROM line
+            lines = content.split("\n")
+            for line in lines:
+                if line.startswith("SYSTEM") or line.startswith("PARAMETER") or line.startswith("LICENSE"):
+                    break
+            # Get SYSTEM, PARAMETER, LICENSE blocks
+            in_system = False
+            for line in lines:
+                if line.startswith("SYSTEM"):
+                    in_system = True
+                    system_block += line + "\n"
+                elif in_system:
+                    system_block += line + "\n"
+                    if '"""' in line and not line.startswith("SYSTEM"):
+                        in_system = False
+                elif line.startswith("PARAMETER") or line.startswith("LICENSE"):
+                    param_lines.append(line)
+
+        # Create temporary Modelfile pointing to trained GGUF
+        tmp_modelfile = ARTIFACT_DIR / "Modelfile.trained"
+        with open(tmp_modelfile, "w") as f:
+            f.write(f"FROM {gguf_path}\n\n")
+            if system_block:
+                f.write(system_block + "\n")
+            for pline in param_lines:
+                f.write(pline + "\n")
+
+        modelfile_path = str(tmp_modelfile)
+        log.info("Using trained GGUF Modelfile: %s", modelfile_path)
+    else:
+        modelfile_path = "Modelfile"
+        if not Path(modelfile_path).exists():
+            log.warning("Modelfile not found, skipping Ollama update")
+            return False
+        log.info("No GGUF found, falling back to base Modelfile")
 
     try:
         log.info("Updating Ollama model: %s", config.model_name)
         result = subprocess.run(
-            ["ollama", "create", config.model_name, "-f", str(modelfile)],
+            ["ollama", "create", config.model_name, "-f", modelfile_path],
             capture_output=True,
             text=True,
             timeout=600,

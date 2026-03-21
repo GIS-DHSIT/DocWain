@@ -99,6 +99,12 @@ def score_viz_response(
     if viz_match:
         try:
             parsed_spec = json.loads(viz_match.group(1))
+            # Normalize field aliases — model may emit "type" instead of "chart_type"
+            if parsed_spec and "chart_type" not in parsed_spec:
+                for alias in ("type", "chart"):
+                    if alias in parsed_spec:
+                        parsed_spec["chart_type"] = parsed_spec.pop(alias)
+                        break
         except json.JSONDecodeError:
             parsed_spec = None
 
