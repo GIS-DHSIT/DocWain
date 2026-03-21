@@ -436,6 +436,13 @@ class Config:
         OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         OLLAMA_API = os.getenv("OLLAMA_API", "")
 
+    class Evolve:
+        ENABLED = os.getenv("EVOLVE_ENABLED", "false").lower() == "true"
+        SIGNALS_DIR = os.getenv("EVOLVE_SIGNALS_DIR", "signals")
+        ARTIFACT_DIR = os.getenv("EVOLVE_ARTIFACT_DIR", "finetune_artifacts")
+        REGISTRY_PATH = os.getenv("EVOLVE_REGISTRY_PATH", "registry.yaml")
+        CONFIG_PATH = os.getenv("EVOLVE_CONFIG_PATH", "src/finetune/evolve_config.yaml")
+
     class FollowUp:
         ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         MAX_SUGGESTIONS = int(os.getenv("FOLLOWUP_MAX_SUGGESTIONS", "3"))
