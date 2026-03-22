@@ -443,6 +443,11 @@ class Config:
         REGISTRY_PATH = os.getenv("EVOLVE_REGISTRY_PATH", "registry.yaml")
         CONFIG_PATH = os.getenv("EVOLVE_CONFIG_PATH", "src/finetune/evolve_config.yaml")
 
+    class V2:
+        BASE_MODEL = os.getenv("V2_BASE_MODEL", "unsloth/Qwen3-14B-bnb-4bit")
+        VISION_ENCODER = os.getenv("V2_VISION_ENCODER", "google/siglip-so400m-patch14-384")
+        ARTIFACT_DIR = os.getenv("V2_ARTIFACT_DIR", "finetune_artifacts/v2")
+
     class FollowUp:
         ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
         MAX_SUGGESTIONS = int(os.getenv("FOLLOWUP_MAX_SUGGESTIONS", "3"))

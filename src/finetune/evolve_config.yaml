@@ -53,3 +53,11 @@ azure_fallback:
   api_key: "${AZURE_AI_API_KEY}"
   model: "gpt-4.1"
   deployment_date: "2025-04-14"
+
+v2:
+  base_model: "unsloth/Qwen3-14B-bnb-4bit"
+  vision_encoder: "google/siglip-so400m-patch14-384"
+  vision_dim: 1152
+  text_dim: 5120
+  lora_r: 16
+  artifact_dir: "finetune_artifacts/v2"

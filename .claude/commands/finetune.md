@@ -50,7 +50,7 @@ Execute the 5-stage evolution cycle with review checkpoints:
 - Azure GPT-4.1 available as fallback (endpoint in env vars)
 - Weights: accuracy=0.30, groundedness=0.25, reasoning=0.20, formatting=0.15, tone=0.10
 
-## Quick Start
+## Quick Start — Evolving Pipeline
 ```python
 from src.finetune.evolve import EvolvePipeline, EvolveConfig
 from pathlib import Path
@@ -63,4 +63,38 @@ pipeline = EvolvePipeline(
     registry_path=Path("registry.yaml"),
 )
 print(pipeline.status())
+```
+
+---
+
+## V2 Pipeline — Vision + Tool-Calling
+
+Build DocWain V2: graft SigLIP vision encoder onto Qwen3-14B V1, train document intelligence + native function-calling.
+
+### Phase 1: Projection Pre-Training
+- Train projection MLP on image-caption alignment (LLaVA-Pretrain)
+- Only projection trainable, SigLIP + Qwen3 frozen
+- Gate: BLEU >= 30, CIDEr >= 80
+
+### Phase 2: Document Intelligence
+- SFT + DPO on DocVQA, ChartQA, PubTabNet, DocLayNet + glm-ocr distillation
+- Projection + LoRA trainable
+- Gate: DocVQA >= 75%, Table F1 >= 80%, Layout mAP >= 70%
+
+### Phase 3: Tool-Calling
+- SFT + DPO on synthetic tool-call data + ToolBench + Gorilla
+- 9 core tools: ocr_extract, layout_extract, extract_table, extract_entities, context_understand, cross_reference, search_documents, summarize_section, visualize_data
+- Gate: Tool accuracy >= 85%, Arg correctness >= 90%
+
+### Phase 4: Merge & Promote
+- Merge projection + LoRA into Qwen3-14B, export GGUF
+- V1 regression test (persona, RAG, formatting must not regress)
+- Promote: DHS/DocWain:v1 (backup) → DHS/DocWain:v2 → DHS/DocWain:latest
+
+### Quick Start — V2 Pipeline
+```python
+from src.finetune.v2 import V2Pipeline
+pipe = V2Pipeline()
+print(pipe.status())
+# Run phases interactively: phase1 → phase2 → phase3 → phase4
 ```
