@@ -1,0 +1,11 @@
+{
+  "phase": 1,
+  "training_steps": 200,
+  "final_loss": 0.1713,
+  "initial_loss": 2.0546,
+  "elapsed_seconds": 366,
+  "projection_params": 25699328,
+  "gpu_peak_mb": 2585,
+  "dataset_size": 2000,
+  "batch_size": 8
+}
