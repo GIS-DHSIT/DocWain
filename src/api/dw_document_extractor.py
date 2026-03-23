@@ -333,6 +333,96 @@ class DocumentExtractor:
                 )
             )
 
+    @staticmethod
+    def _reorder_text_blocks(blocks: list, page_width: float) -> list:
+        """Reorder raw PyMuPDF block tuples for correct multi-column reading order.
+
+        PyMuPDF blocks are tuples: (x0, y0, x1, y1, text, block_no, block_type).
+        Multi-column PDFs (resumes, academic papers) return blocks interleaved
+        across columns. This method detects columns and reads each top-to-bottom
+        before moving to the next.
+
+        Strategy:
+        1. Separate text blocks (type 0) from image blocks (type 1)
+        2. Detect columns by clustering block x-midpoints
+        3. Full-width blocks (>55% page width) read first in y-order
+        4. Left column blocks read top-to-bottom
+        5. Right column blocks read top-to-bottom
+        6. Supports 2-column and 3-column layouts
+        """
+        if not blocks or page_width <= 0:
+            return blocks
+
+        # Filter to text blocks only (type 0)
+        text_blocks = [b for b in blocks if len(b) >= 7 and b[6] == 0]
+        other_blocks = [b for b in blocks if len(b) < 7 or b[6] != 0]
+
+        if len(text_blocks) < 3:
+            return blocks  # Too few to rearrange
+
+        mid = page_width / 2.0
+        gap_tolerance = page_width * 0.05  # 5% of page width
+
+        # Classify blocks by position
+        full_width = []
+        left_col = []
+        right_col = []
+
+        for b in text_blocks:
+            x0, y0, x1, y1 = b[0], b[1], b[2], b[3]
+            block_width = x1 - x0
+            block_mid = (x0 + x1) / 2.0
+
+            if block_width > page_width * 0.55:
+                full_width.append(b)
+            elif block_mid < mid + gap_tolerance:
+                left_col.append(b)
+            else:
+                right_col.append(b)
+
+        # Check if this is actually multi-column
+        is_multi = len(left_col) >= 2 and len(right_col) >= 2
+
+        if not is_multi:
+            # Single column — just sort by vertical position
+            return sorted(text_blocks, key=lambda b: (b[1], b[0])) + other_blocks
+
+        # Multi-column: full-width headers first, then left column, then right column
+        full_width.sort(key=lambda b: b[1])
+        left_col.sort(key=lambda b: b[1])
+        right_col.sort(key=lambda b: b[1])
+
+        # Interleave full-width blocks at their correct vertical position
+        result = []
+        fw_idx = 0
+        l_idx = 0
+        r_idx = 0
+
+        # First pass: full-width blocks that appear above both columns
+        while fw_idx < len(full_width):
+            fw_y = full_width[fw_idx][1]
+            first_left_y = left_col[0][1] if left_col else float('inf')
+            first_right_y = right_col[0][1] if right_col else float('inf')
+            if fw_y < min(first_left_y, first_right_y):
+                result.append(full_width[fw_idx])
+                fw_idx += 1
+            else:
+                break
+
+        # Left column
+        result.extend(left_col)
+
+        # Right column
+        result.extend(right_col)
+
+        # Remaining full-width blocks (footers)
+        result.extend(full_width[fw_idx:])
+
+        # Add back non-text blocks
+        result.extend(other_blocks)
+
+        return result
+
     def _reorder_blocks_by_layout(self, blocks: List[dict], page_width: float = 612.0) -> List[dict]:
         """Reorder text blocks using layout analysis for multi-column detection."""
         try:
@@ -532,8 +622,14 @@ class DocumentExtractor:
                             page_dims[page_index] = {"width": float(page.rect.width), "height": float(page.rect.height)}
                         except Exception:
                             page_dims[page_index] = {}
-                        blocks = page.get_text("blocks") or []
+                        blocks = page.get_text("blocks", sort=True) or []
                         page_text_parts: List[str] = []
+
+                        # ── Multi-column layout detection & reordering ──
+                        # Sort blocks spatially for proper reading order in multi-column PDFs
+                        page_width = float(page.rect.width)
+                        if len(blocks) >= 4 and page_width > 0:
+                            blocks = self._reorder_text_blocks(blocks, page_width)
 
                         for block in blocks:
                             if len(block) < 5:
@@ -878,7 +974,10 @@ class DocumentExtractor:
         # force OCR on ALL pages (the PDF is likely fully image-based)
         _text_stripped = full_text.strip()
         _alnum_ratio = sum(c.isalnum() for c in _text_stripped) / max(len(_text_stripped), 1)
-        _text_is_garbage = len(_text_stripped) < 50 or (len(_text_stripped) < 500 and _alnum_ratio < 0.3)
+        _text_is_garbage = (
+            len(_text_stripped) < 100
+            or (len(_text_stripped) < 800 and _alnum_ratio < 0.5)
+        )
         if _text_is_garbage and not chunk_candidates:
             logger.info(
                 "PDF extraction produced low-quality text (%d chars, %.0f%% alnum); triggering full-document OCR",

@@ -14,6 +14,9 @@ logger = get_logger("chart_decision")
 _CHART_KEYWORDS: list[str] = [
     "chart", "graph", "visualize", "visualise", "plot",
     "diagram", "bar chart", "pie chart", "line graph",
+    "show me a", "create a chart", "draw a", "generate a chart",
+    "visual", "breakdown chart", "trend graph", "comparison chart",
+    "donut", "histogram", "scatter plot", "heatmap",
 ]
 
 
@@ -115,14 +118,14 @@ def _check_triggers(response_text: str) -> Tuple[bool, str]:
     if len(data_rows) >= 3:
         return True, f"markdown table with {len(data_rows)} numeric rows"
 
-    # 2. 3+ percentages
+    # 2. 2+ percentages
     pct_matches = _PERCENTAGE.findall(response_text)
-    if len(pct_matches) >= 3:
+    if len(pct_matches) >= 2:
         return True, f"{len(pct_matches)} percentage values detected"
 
-    # 3. 3+ currency values in list/bullet context
+    # 3. 2+ currency values in list/bullet context
     currency_matches = _CURRENCY.findall(response_text)
-    if len(currency_matches) >= 3 and _BULLET_OR_LIST.search(response_text):
+    if len(currency_matches) >= 2 and _BULLET_OR_LIST.search(response_text):
         return True, f"{len(currency_matches)} currency values in list context"
 
     # 4. Temporal data with numeric values

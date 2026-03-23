@@ -365,6 +365,23 @@ class QdrantVectorStore:
     def delete_document(self, subscription_id: str, profile_id: str, document_id: str) -> dict:
         """Delete all embeddings for a document scoped to subscription collection and profile filter."""
         collection_name = build_collection_name(subscription_id)
+
+        # Guard: check if collection exists before attempting delete to avoid 404 errors
+        try:
+            collections = self.client.get_collections().collections
+            if collection_name not in {col.name for col in collections}:
+                logger.debug(
+                    "[DELETE] Collection %s does not exist — nothing to delete",
+                    collection_name,
+                )
+                return {
+                    "status": "ok",
+                    "message": "collection does not exist",
+                    "document_id": str(document_id),
+                }
+        except Exception:
+            pass  # If we can't check, proceed with delete and let it fail naturally
+
         delete_filter = build_qdrant_filter(
             subscription_id=str(subscription_id),
             profile_id=str(profile_id),

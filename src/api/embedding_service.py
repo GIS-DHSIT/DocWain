@@ -2011,6 +2011,9 @@ def _process_blob(
                 emit_progress(doc_id, "failed", 0.0, "Auto-recovered: training timeout exceeded")
         _set_document_status(doc_id, STATUS_TRAINING_STARTED)
         emit_progress(doc_id, "extraction", 0.10, "Starting document processing")
+        from src.api.document_status import emit_status_log
+        emit_status_log(doc_id, "embedding", "pipeline_start", "Embedding pipeline started",
+                        extra={"blob_name": blob.name, "subscription_id": subscription_id, "profile_id": profile_id})
 
         try:
             subscription_id = resolve_subscription_id(
@@ -2058,6 +2061,7 @@ def _process_blob(
             {"status": "IN_PROGRESS", "started_at": time.time(), "error": None, "reason": None},
         )
         emit_progress(doc_id, "chunking", 0.20, "Preparing document chunks")
+        emit_status_log(doc_id, "embedding", "lock_acquired", "Embedding lock acquired, preparing chunks")
 
         extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
             document_id=doc_id,
@@ -2141,6 +2145,8 @@ def _process_blob(
                 error_summary=reason,
             )
             emit_progress(doc_id, "failed", 0.25, message)
+            emit_status_log(doc_id, "embedding", "preparation_failed", f"Embedding preparation failed: {message}",
+                            extra={"reason": reason})
             result["error"] = reason
             result["error_message"] = message
             result["failed_reason"] = reason
@@ -2149,6 +2155,9 @@ def _process_blob(
         emit_progress(doc_id, "chunking", 0.25,
                       f"Prepared {expected_chunks} chunks for embedding",
                       extra={"chunks_total": expected_chunks})
+        emit_status_log(doc_id, "embedding", "chunks_prepared",
+                        f"Prepared {expected_chunks} chunks for embedding",
+                        extra={"chunks_total": expected_chunks})
 
         result["chunks_count"] = expected_chunks
         logger.info("Embedding pre-check for %s: expected_chunks=%s", doc_id, expected_chunks)
@@ -2160,6 +2169,10 @@ def _process_blob(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Qdrant count failed for %s: %s", doc_id, exc)
         logger.info("Existing Qdrant points for %s: %s", doc_id, qdrant_count)
+
+        emit_status_log(doc_id, "embedding", "dedup_check",
+                        f"Qdrant dedup check: {qdrant_count} existing points, {expected_chunks} expected",
+                        extra={"existing_points": qdrant_count, "expected_chunks": expected_chunks})
 
         if qdrant_count and expected_chunks and qdrant_count >= expected_chunks:
             if telemetry:
@@ -2216,6 +2229,18 @@ def _process_blob(
             return result
 
         if qdrant_count and expected_chunks and qdrant_count < expected_chunks:
+            # Clean up partial embeddings before re-upserting to prevent duplicates
+            try:
+                from src.api.dataHandler import get_vector_store
+                from src.api.vector_store import build_collection_name
+                _cleanup_store = get_vector_store()
+                _cleanup_store.delete_document(subscription_id, profile_id, doc_id)
+                logger.info(
+                    "Cleaned %d partial embeddings for %s before re-embedding",
+                    qdrant_count, doc_id,
+                )
+            except Exception as _cleanup_exc:
+                logger.warning("Partial embedding cleanup failed for %s: %s", doc_id, _cleanup_exc)
             logger.warning(
                 "Partial embeddings detected for %s: %s/%s; upserting all chunks",
                 doc_id,
@@ -2299,6 +2324,12 @@ def _process_blob(
                 emit_progress(doc_id, "encoding", _file_progress,
                               f"Encoded file {_file_idx}/{_file_total} ({total_upserted} chunks stored)",
                               extra={"files_done": _file_idx, "files_total": _file_total, "chunks_stored": total_upserted})
+                emit_status_log(doc_id, "embedding", "file_encoded",
+                                f"Encoded file {_file_idx}/{_file_total}: {int(embed_result.get('points_saved', 0))} chunks stored, {int(embed_result.get('dropped_chunks', 0))} dropped",
+                                extra={"file_index": _file_idx, "files_total": _file_total,
+                                       "chunks_stored": int(embed_result.get("points_saved", 0)),
+                                       "chunks_dropped": int(embed_result.get("dropped_chunks", 0)),
+                                       "coverage_ratio": embed_result.get("coverage_ratio")})
         except ChunkingDiagnosticError as exc:
             error_message = _truncate_error_message(str(exc) or repr(exc))
             diagnostics = exc.diagnostics or {}
@@ -2448,6 +2479,11 @@ def _process_blob(
         emit_progress(doc_id, "upserting", 0.85,
                       f"Stored {total_upserted} embeddings in Qdrant",
                       extra={"chunks_stored": total_upserted, "chunks_total": total_chunks})
+        emit_status_log(doc_id, "embedding", "embeddings_stored",
+                        f"Stored {total_upserted} embeddings in Qdrant (collection: {collection_name})",
+                        extra={"chunks_stored": total_upserted, "chunks_total": total_chunks,
+                               "chunks_dropped": total_dropped, "collection": collection_name,
+                               "coverage_ratio": coverage_ratio})
 
         # ── Multi-resolution: create doc-level + section-level vectors ──
         try:
@@ -2592,6 +2628,7 @@ def _process_blob(
         cleanup_error: Optional[Dict[str, Any]] = None
         if subscription_id and profile_id and total_upserted > 0:
             emit_progress(doc_id, "verifying", 0.90, "Verifying storage integrity")
+            emit_status_log(doc_id, "embedding", "verification_start", "Post-upsert storage integrity verification started")
             try:
                 post_count, cleanup_allowed = _verify_post_upsert_count(
                     subscription_id=subscription_id,
@@ -2652,6 +2689,10 @@ def _process_blob(
         emit_progress(doc_id, "completed", 1.0,
                       f"Training completed — {total_upserted} chunks stored",
                       extra={"chunks_stored": total_upserted, "collection": collection_name})
+        emit_status_log(doc_id, "embedding", "training_completed",
+                        f"Training completed — {total_upserted} chunks stored in {collection_name}",
+                        extra={"chunks_stored": total_upserted, "collection": collection_name,
+                               "post_upsert_count": post_count})
 
         # KG chunk-level ingestion (async, non-blocking)
         _ingest_chunks_to_knowledge_graph(
@@ -3632,6 +3673,10 @@ def embed_documents(
     doc_type: Optional[str] = None,
     max_blobs: Optional[int] = None,
 ) -> Dict[str, Any]:
+    from src.utils.logging_utils import set_pipeline_profile, clear_pipeline_profile, clear_live_logs
+    if profile_id:
+        set_pipeline_profile(profile_id)
+        clear_live_logs(profile_id)
     embed_request_id = str(uuid.uuid4())
     logger.info("embed_request_id=%s embedding request received", embed_request_id)
     if not blob_storage_configured():
@@ -3776,6 +3821,7 @@ def embed_documents(
         "╚══════════════════════════════════════════════════════════════╝"
     )
     _emit_embedding_batch_progress(subscription_id, completed_blobs, total_blobs, stage="completed")
+    clear_pipeline_profile()
     return summary
 
 def embedding_integrity_report(

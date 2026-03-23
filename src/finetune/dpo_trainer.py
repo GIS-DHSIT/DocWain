@@ -22,7 +22,8 @@ from src.utils.logging_utils import get_logger
 
 log = get_logger(__name__)
 
-BASE_MODEL_ID = "unsloth/Qwen3-14B-bnb-4bit"
+# Must match the SFT base model (8B fits T4 16GB, 14B needs A100)
+BASE_MODEL_ID = "unsloth/Qwen3-8B-bnb-4bit"
 ARTIFACT_DIR = Path(os.getenv("DOCWAIN_HOME", ".")) / "finetune_artifacts" / "dpo"
 DATASET_DIR = Path("finetune_data")
 MAX_SEQ_LENGTH = 4096

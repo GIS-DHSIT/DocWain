@@ -590,15 +590,23 @@ def _extract_entity_metadata(raw_docs: Any, filename: str = "") -> Dict[str, Any
             logger.debug("_name_from_filename not available from rag_v3.extract", exc_info=True)
     if not name and text:
         # Use first non-empty line that looks like a name (2-4 words, no special chars)
-        for line in text.split("\n")[:5]:
+        _TITLE_KEYWORDS = {
+            "resume", "curriculum", "invoice", "page", "date", "engineer", "analyst",
+            "developer", "manager", "director", "specialist", "consultant", "architect",
+            "designer", "scientist", "intern", "associate", "officer", "coordinator",
+            "administrator", "assistant", "lead", "senior", "junior", "trainee",
+            "executive", "supervisor", "data", "software", "project", "product",
+            "business", "marketing", "sales", "finance", "human", "resource",
+            "full-stack", "full stack", "front-end", "back-end", "devops", "qa",
+        }
+        for line in text.split("\n")[:10]:
             line = line.strip()
-            if not line or len(line) > 60:
+            if not line or len(line) > 60 or "/" in line:
                 continue
             words = line.split()
             if 2 <= len(words) <= 4 and all(w[0].isupper() for w in words if w):
-                # Reject lines that look like headers/metadata
                 lower = line.lower()
-                if not any(kw in lower for kw in ("resume", "curriculum", "invoice", "page", "date")):
+                if not any(kw in lower for kw in _TITLE_KEYWORDS):
                     name = line
                     break
     if name:
@@ -1114,7 +1122,10 @@ def _run_extraction_subagents(doc_id: str, masked_docs: Dict[str, Any]) -> Dict[
 
 
 def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Dict[str, Any]) -> Dict[str, Any]:
+    from src.utils.logging_utils import set_pipeline_profile, clear_pipeline_profile
     profile_id = str(doc_data.get("profile")) if doc_data.get("profile") else None
+    if profile_id:
+        set_pipeline_profile(profile_id)
     subscription_candidate = (
         doc_data.get("subscriptionId")
         or doc_data.get("subscription_id")
@@ -1616,6 +1627,7 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
             "doc_name": doc_data.get("name", "Unknown"),
         }
     finally:
+        clear_pipeline_profile()
         if lock.acquired:
             release_lock(lock)
 
@@ -1822,6 +1834,16 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
             _emit_batch_progress(effective_sub, completed_count, total,
                                   current_doc=doc_name,
                                   stage=f"extracting {idx}/{total}")
+            # Emit per-document status log and progress for batch extraction
+            try:
+                from src.api.document_status import emit_status_log as _esl, clear_status_logs as _csl
+                _csl(doc_id)
+                _esl(doc_id, "extraction", "batch_extraction_start",
+                     f"Batch extraction started ({idx}/{total})",
+                     extra={"batch_index": idx, "batch_total": total, "doc_name": doc_name})
+                emit_progress(doc_id, "extraction", 0.05, f"Extraction starting ({idx}/{total})")
+            except Exception:
+                pass
             try:
                 res = _extract_from_connector(doc_id, doc_info.get("dataDict", {}), doc_info.get("connDict", {}))
             except CredentialError as exc:
@@ -1838,17 +1860,36 @@ def extract_documents(subscription_id: Optional[str] = None) -> Dict[str, Any]:
                     "[EXTRACTION %d/%d] ✓ Completed: doc=%s name=%s in %.1fs",
                     idx, total, doc_id, doc_name, elapsed,
                 )
+                try:
+                    _esl(doc_id, "extraction", "extraction_completed",
+                         f"Extraction completed in {elapsed}s",
+                         extra={"elapsed_seconds": elapsed})
+                    emit_progress(doc_id, "extraction", 0.20, f"Extraction completed in {elapsed}s")
+                except Exception:
+                    pass
             elif status == "CONFLICT":
                 skipped_count += 1
                 logger.info(
                     "[EXTRACTION %d/%d] ⊘ Skipped: doc=%s reason=%s",
                     idx, total, doc_id, res.get("reason", "conflict"),
                 )
+                try:
+                    _esl(doc_id, "extraction", "extraction_skipped",
+                         f"Skipped: {res.get('reason', 'conflict')}")
+                except Exception:
+                    pass
             else:
                 logger.warning(
                     "[EXTRACTION %d/%d] ✗ Failed: doc=%s name=%s in %.1fs error=%s",
                     idx, total, doc_id, doc_name, elapsed, res.get("error", str(status)),
                 )
+                try:
+                    _esl(doc_id, "extraction", "extraction_failed",
+                         f"Extraction failed after {elapsed}s: {res.get('error', str(status))}",
+                         extra={"elapsed_seconds": elapsed, "error": res.get("error")})
+                    emit_progress(doc_id, "failed", 0.0, f"Extraction failed: {res.get('error', str(status))}")
+                except Exception:
+                    pass
             documents.append(res)
             _emit_batch_progress(effective_sub, completed_count, total,
                                   current_doc=doc_name,
@@ -1949,6 +1990,9 @@ def extract_uploaded_document(
     content_type: Optional[str] = None,
     content_size: Optional[int] = None,
 ) -> Dict[str, Any]:
+    from src.utils.logging_utils import set_pipeline_profile, clear_pipeline_profile
+    if profile_id:
+        set_pipeline_profile(profile_id)
     lock = acquire_lock(stage="extraction", document_id=document_id, subscription_id=subscription_id)
     if not lock.acquired:
         logger.info("Extraction already in progress for %s; skipping duplicate upload.", document_id)
@@ -1967,6 +2011,13 @@ def extract_uploaded_document(
 
     update_stage(document_id, "extraction", {"status": "IN_PROGRESS", "started_at": time.time(), "error": None})
     emit_progress(document_id, "extraction", 0.05, "Starting document extraction")
+    from src.api.document_status import emit_status_log, clear_status_logs
+    from src.utils.logging_utils import clear_live_logs
+    clear_status_logs(document_id)
+    if profile_id:
+        clear_live_logs(profile_id)
+    emit_status_log(document_id, "extraction", "pipeline_start", "Extraction pipeline started",
+                    extra={"filename": filename, "content_type": content_type, "content_size": content_size})
 
     try:
         extracted = fileProcessor(file_bytes, filename, content_type=content_type or "")
@@ -1975,12 +2026,17 @@ def extract_uploaded_document(
     except Exception as exc:  # noqa: BLE001
         set_error(document_id, "extraction", exc)
         _set_document_status(document_id, STATUS_EXTRACTION_FAILED, str(exc))
+        emit_status_log(document_id, "extraction", "text_extraction_failed", f"Text extraction failed: {exc}")
+        clear_pipeline_profile()
         raise
 
     emit_progress(document_id, "extraction", 0.08, "Text extracted from document")
+    emit_status_log(document_id, "extraction", "text_extracted", "Raw text extracted from document",
+                    extra={"filename": filename})
 
     extracted = _normalize_extracted_metadata(extracted, document_id=document_id)
     extracted = _sanitize_raw_text_fields(extracted)
+    emit_status_log(document_id, "extraction", "content_normalized", "Extraction content normalized and sanitized")
 
     _persist_layout_graph(
         document_id=document_id,
@@ -1988,6 +2044,8 @@ def extract_uploaded_document(
         profile_id=profile_id,
         extracted_docs=extracted,
     )
+
+    emit_status_log(document_id, "extraction", "layout_graph_persisted", "Layout graph built and persisted")
 
     # Structured extraction for uploaded document
     try:
@@ -2023,6 +2081,10 @@ def extract_uploaded_document(
         logger.warning("Failed to build structured documents for upload", exc_info=True)
         structured_docs = {}
 
+    emit_status_log(document_id, "extraction", "structured_extraction_done",
+                    f"Structured extraction completed ({len(structured_docs)} files processed)",
+                    extra={"files_processed": len(structured_docs)})
+
     # Intelligence layer processing: entity extraction, Q&A generation
     intelligence_result = _process_document_intelligence(
         document_id=document_id,
@@ -2031,6 +2093,9 @@ def extract_uploaded_document(
         subscription_id=subscription_id,
         profile_id=profile_id,
     )
+
+    emit_status_log(document_id, "extraction", "intelligence_processing_done",
+                    "Intelligence layer processing completed (entity extraction, Q&A generation)")
 
     # Document understanding (summary, entities, facts) — runs inline for pickle enrichment
     understanding_result = None
@@ -2058,6 +2123,16 @@ def extract_uploaded_document(
             break
     except Exception as exc:
         logger.warning("Document understanding skipped for %s: %s", document_id, exc)
+
+    if understanding_result:
+        emit_status_log(document_id, "extraction", "understanding_done",
+                        f"Document understanding completed: type={understanding_result.get('document_type', 'unknown')}",
+                        extra={"document_type": understanding_result.get("document_type"),
+                               "doc_type_confidence": understanding_result.get("doc_type_confidence"),
+                               "entities_count": len(understanding_result.get("key_entities") or []),
+                               "facts_count": len(understanding_result.get("key_facts") or [])})
+    else:
+        emit_status_log(document_id, "extraction", "understanding_skipped", "Document understanding skipped")
 
     # Deep document analysis (upload path)
     deep_result = None
@@ -2097,6 +2172,16 @@ def extract_uploaded_document(
     except Exception as exc:
         logger.warning("Deep analysis skipped for upload %s: %s", document_id, exc)
 
+    if deep_result:
+        emit_status_log(document_id, "extraction", "deep_analysis_done",
+                        f"Deep analysis completed: quality={deep_result.quality_grade}, complexity={deep_result.complexity_score:.2f}",
+                        extra={"quality_grade": deep_result.quality_grade,
+                               "quality_score": deep_result.quality_score,
+                               "complexity_score": deep_result.complexity_score,
+                               "entities_found": len(deep_result.entities) if deep_result.entities else 0})
+    else:
+        emit_status_log(document_id, "extraction", "deep_analysis_skipped", "Deep analysis skipped")
+
     try:
         # Persist uploaded file extraction (raw, structured, intelligence, classification) in the pickle
         doc_classification = _extract_classification_from_structured(structured_docs)
@@ -2131,6 +2216,8 @@ def extract_uploaded_document(
         update_extraction_metadata(document_id, subscription_id, save_info.get("path"), save_info.get("sha256"))
     except Exception as exc:  # noqa: BLE001
         _set_document_status(document_id, STATUS_EXTRACTION_FAILED, f"Failed to persist extracted content: {exc}")
+        emit_status_log(document_id, "extraction", "persistence_failed", f"Failed to persist extracted content: {exc}")
+        clear_pipeline_profile()
         return {"document_id": document_id, "status": STATUS_EXTRACTION_FAILED, "error": str(exc)}
 
     extra_fields = {
@@ -2139,10 +2226,14 @@ def extract_uploaded_document(
         "extracted_pickle_path": save_info.get("path"),
         "extracted_hash": save_info.get("sha256"),
     }
+    emit_status_log(document_id, "extraction", "data_persisted", "Extraction data persisted to storage",
+                    extra={"pickle_path": save_info.get("path")})
+
     _set_document_status(document_id, STATUS_EXTRACTION_COMPLETED, extra_fields=extra_fields)
     update_stage(document_id, "extraction", {"status": "COMPLETED", "completed_at": time.time(), "error": None})
 
     # KG ingestion (async, non-blocking — run in daemon thread to avoid stalling extraction)
+    emit_status_log(document_id, "extraction", "kg_ingestion_started", "Knowledge graph ingestion triggered (async)")
     _kg_async = getattr(getattr(Config, "DocumentProcessing", None), "KG_INGEST_ASYNC", True)
     if _kg_async:
         threading.Thread(
@@ -2170,6 +2261,10 @@ def extract_uploaded_document(
     # HITL: No auto-embedding. Document stays at EXTRACTION_COMPLETED.
     # User must manually trigger screening then embedding.
     _mark_intelligence_ready(document_id)
+    emit_status_log(document_id, "extraction", "extraction_completed",
+                    "Extraction pipeline completed. Awaiting screening and embedding.",
+                    extra={"document_domain": document_domain,
+                           "status": STATUS_EXTRACTION_COMPLETED})
     logger.info("Extraction completed for %s; awaiting manual screening/embedding", document_id)
 
     # Refresh profile-level domain tag
@@ -2181,6 +2276,7 @@ def extract_uploaded_document(
         logger.debug("Failed to refresh profile domain tag after upload extraction", exc_info=True)
 
     summary = _build_extraction_summary(extracted)
+    clear_pipeline_profile()
     return {
         "document_id": document_id,
         "status": STATUS_EXTRACTION_COMPLETED,

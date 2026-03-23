@@ -65,8 +65,330 @@ def get_training_progress(document_id: str) -> Optional[dict]:
     except Exception:
         return None
 
+_STATUS_LOG_TTL = 86400  # 24 hours
+
+
+def emit_status_log(
+    document_id: str,
+    stage: str,
+    step: str,
+    detail: str,
+    extra: dict = None,
+) -> None:
+    """Append a timestamped log entry to the document's status log in Redis.
+
+    Each entry captures a discrete pipeline step with wall-clock time so the
+    frontend can render a detailed timeline.
+    """
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return
+        entry = {
+            "stage": stage,
+            "step": step,
+            "detail": detail,
+            "timestamp": time.time(),
+            "ts_iso": datetime.utcnow().isoformat() + "Z",
+        }
+        if extra:
+            entry["extra"] = extra
+        key = f"dw:status_log:{document_id}"
+        client.rpush(key, json.dumps(entry))
+        client.expire(key, _STATUS_LOG_TTL)
+    except Exception:
+        pass  # Best-effort, never block the pipeline
+
+
+def get_status_logs(document_id: str) -> List[dict]:
+    """Return the full ordered status log for a document.
+
+    ``elapsed_since_stage_start`` is computed per-stage so extraction and
+    embedding each start from 0, which is more useful for the UI than a
+    single global counter.
+    """
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return []
+        raw_entries = client.lrange(f"dw:status_log:{document_id}", 0, -1)
+        logs = []
+        for raw in raw_entries:
+            try:
+                logs.append(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # Compute elapsed per-stage (extraction and embedding each start from 0)
+        stage_start: Dict[str, float] = {}
+        for entry in logs:
+            stage = entry.get("stage", "")
+            ts = entry.get("timestamp", 0)
+            if stage not in stage_start:
+                stage_start[stage] = ts
+            entry["elapsed_since_stage_start"] = round(ts - stage_start[stage], 2)
+        return logs
+    except Exception:
+        return []
+
+
+def clear_status_logs(document_id: str) -> None:
+    """Clear status logs for a document (called at start of a new pipeline run)."""
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if client:
+            client.delete(f"dw:status_log:{document_id}")
+    except Exception:
+        pass
+
+
+def _progress_to_percent(progress: Optional[dict]) -> Optional[dict]:
+    """Convert progress 0.0-1.0 to 0-100 scale for UI consumption."""
+    if not progress:
+        return progress
+    result = dict(progress)
+    if "progress" in result and isinstance(result["progress"], (int, float)):
+        result["progress"] = round(result["progress"] * 100, 1)
+    return result
+
+
+# Maps document status to a deterministic pipeline progress % (0-100).
+# Used when Redis real-time progress has expired.
+_STATUS_TO_PROGRESS = {
+    "UNDER_REVIEW": 0,
+    "EXTRACTION_IN_PROGRESS": 10,
+    "EXTRACTION_COMPLETED": 25,
+    "EXTRACTION_FAILED": 0,
+    "SCREENING_IN_PROGRESS": 30,
+    "SCREENING_COMPLETED": 40,
+    "TRAINING_STARTED": 45,
+    "EMBEDDING_IN_PROGRESS": 50,
+    "TRAINING_COMPLETED": 100,
+    "TRAINING_FAILED": 0,
+    "TRAINING_PARTIALLY_COMPLETED": 80,
+    "TRAINING_BLOCKED_SECURITY": 0,
+    "TRAINING_BLOCKED_CONFIDENTIAL": 0,
+    "EXTRACTION_OR_CHUNKING_FAILED": 0,
+    "EMBEDDING_FAILED": 0,
+}
+
+
+def _compute_document_progress(status: str, redis_progress: Optional[dict]) -> dict:
+    """Build a unified progress object for a document.
+
+    If Redis has a live value (from ``emit_progress``), use it and convert to
+    0-100.  Otherwise derive a deterministic value from the document status so
+    the UI always has something to show.
+    """
+    if redis_progress:
+        result = dict(redis_progress)
+        raw = result.get("progress", 0)
+        if isinstance(raw, (int, float)):
+            result["progress"] = round(raw * 100, 1)
+        result["source"] = "live"
+        return result
+
+    pct = _STATUS_TO_PROGRESS.get(status, 0)
+    return {
+        "progress": pct,
+        "stage": status.lower(),
+        "detail": status.replace("_", " ").title(),
+        "source": "derived",
+    }
+
+
+def _format_elapsed(seconds: Optional[float]) -> str:
+    """Format elapsed seconds into a human-readable string."""
+    if seconds is None or seconds <= 0:
+        return "0s"
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    hours = int(minutes // 60)
+    mins = minutes % 60
+    return f"{hours}h {mins}m" if mins else f"{hours}h"
+
+
+def get_profile_extraction_status(profile_id: str) -> Dict[str, Any]:
+    """Get comprehensive extraction status for all documents in a profile."""
+    from src.utils.logging_utils import get_live_logs
+
+    collection = get_documents_collection()
+    if collection is None:
+        return {"documents": [], "common_data": {
+            "Overall_live_logs": [], "overall_progress": 0,
+            "toatal_documents": 0, "uploaded": 0, "elapsed_time": "0s",
+        }}
+
+    docs = list(collection.find(
+        {"profile_id": profile_id},
+        {
+            "document_id": 1, "status": 1, "source_file": 1,
+            "extraction": 1, "screening": 1, "embedding": 1,
+            "training_started_at": 1, "trained_at": 1,
+            "created_at": 1, "updated_at": 1,
+        },
+    ).sort("updated_at", -1))
+
+    now = time.time()
+    result_docs = []
+    progress_sum = 0.0
+    earliest_start: Optional[float] = None
+    latest_end: Optional[float] = None
+    uploaded_count = 0
+
+    for doc in docs:
+        doc_id = str(doc.get("document_id") or doc.get("_id"))
+        status = doc.get("status", "UNKNOWN")
+
+        progress = _compute_document_progress(status, get_training_progress(doc_id))
+        progress_sum += progress.get("progress", 0)
+
+        # Track earliest start and latest end for elapsed time
+        extraction = doc.get("extraction") or {}
+        embedding = doc.get("embedding") or {}
+        start_at = extraction.get("started_at")
+        if start_at and isinstance(start_at, (int, float)):
+            if earliest_start is None or start_at < earliest_start:
+                earliest_start = start_at
+
+        end_at = (
+            doc.get("trained_at")
+            or embedding.get("completed_at")
+            or extraction.get("completed_at")
+        )
+        if end_at and isinstance(end_at, (int, float)):
+            if latest_end is None or end_at > latest_end:
+                latest_end = end_at
+
+        # Count uploaded (any document that exists is uploaded)
+        uploaded_count += 1
+
+        result_docs.append({
+            "document_id": doc_id,
+            "document_name": doc.get("source_file", ""),
+            "progress": progress,
+        })
+
+    # Live logs: actual terminal output captured by RedisLogHandler
+    live_logs = get_live_logs(profile_id)
+
+    total_docs = len(result_docs)
+    overall_progress = round(progress_sum / total_docs, 1) if total_docs else 0
+
+    # Elapsed time: from earliest start to latest end (or now if still running)
+    elapsed_seconds: Optional[float] = None
+    if earliest_start:
+        end_ref = latest_end or now
+        elapsed_seconds = round(end_ref - earliest_start, 1)
+
+    return {
+        "documents": result_docs,
+        "common_data": {
+            "Overall_live_logs": live_logs,
+            "overall_progress": overall_progress,
+            "toatal_documents": total_docs,
+            "uploaded": uploaded_count,
+            "elapsed_time": _format_elapsed(elapsed_seconds),
+        },
+    }
+
+
+def get_profile_training_status(profile_id: str) -> Dict[str, Any]:
+    """Get comprehensive training (embedding) status for all documents in a profile."""
+    from src.utils.logging_utils import get_live_logs
+
+    collection = get_documents_collection()
+    if collection is None:
+        return {"documents": [], "common_data": {
+            "Overall_live_logs": [], "overall_progress": 0,
+            "toatal_documents": 0, "uploaded": 0, "elapsed_time": "0s",
+        }}
+
+    # Focus on documents that have reached or passed screening
+    docs = list(collection.find(
+        {
+            "profile_id": profile_id,
+            "status": {"$in": [
+                "SCREENING_COMPLETED", "TRAINING_STARTED", "TRAINING_COMPLETED",
+                "TRAINING_FAILED", "TRAINING_PARTIALLY_COMPLETED",
+                "TRAINING_BLOCKED_SECURITY", "TRAINING_BLOCKED_CONFIDENTIAL",
+                "EXTRACTION_OR_CHUNKING_FAILED", "EMBEDDING_FAILED",
+            ]},
+        },
+        {
+            "document_id": 1, "status": 1, "source_file": 1,
+            "embedding": 1,
+            "training_started_at": 1, "trained_at": 1,
+            "created_at": 1, "updated_at": 1,
+        },
+    ).sort("updated_at", -1))
+
+    now = time.time()
+    result_docs = []
+    progress_sum = 0.0
+    earliest_start: Optional[float] = None
+    latest_end: Optional[float] = None
+    uploaded_count = 0
+
+    for doc in docs:
+        doc_id = str(doc.get("document_id") or doc.get("_id"))
+        status = doc.get("status", "UNKNOWN")
+
+        progress = _compute_document_progress(status, get_training_progress(doc_id))
+        progress_sum += progress.get("progress", 0)
+
+        # Track earliest start and latest end for elapsed time
+        embedding = doc.get("embedding") or {}
+        start_at = embedding.get("started_at") or doc.get("training_started_at")
+        if start_at and isinstance(start_at, (int, float)):
+            if earliest_start is None or start_at < earliest_start:
+                earliest_start = start_at
+
+        end_at = doc.get("trained_at") or embedding.get("completed_at")
+        if end_at and isinstance(end_at, (int, float)):
+            if latest_end is None or end_at > latest_end:
+                latest_end = end_at
+
+        uploaded_count += 1
+
+        result_docs.append({
+            "document_id": doc_id,
+            "document_name": doc.get("source_file", ""),
+            "progress": progress,
+        })
+
+    # Live logs: actual terminal output captured by RedisLogHandler
+    live_logs = get_live_logs(profile_id)
+
+    total_docs = len(result_docs)
+    overall_progress = round(progress_sum / total_docs, 1) if total_docs else 0
+
+    # Elapsed time: from earliest start to latest end (or now if still running)
+    elapsed_seconds: Optional[float] = None
+    if earliest_start:
+        end_ref = latest_end or now
+        elapsed_seconds = round(end_ref - earliest_start, 1)
+
+    return {
+        "documents": result_docs,
+        "common_data": {
+            "Overall_live_logs": live_logs,
+            "overall_progress": overall_progress,
+            "toatal_documents": total_docs,
+            "uploaded": uploaded_count,
+            "elapsed_time": _format_elapsed(elapsed_seconds),
+        },
+    }
+
+
 _ZOMBIE_TIMEOUT_SECONDS = 1800  # 30 minutes
-_EXTRACTION_ZOMBIE_TIMEOUT_SECONDS = 600  # 10 minutes
+_EXTRACTION_ZOMBIE_TIMEOUT_SECONDS = 1200  # 20 minutes
 
 def recover_zombie_documents(timeout_seconds: int = _ZOMBIE_TIMEOUT_SECONDS) -> int:
     """Auto-fail documents stuck in TRAINING_STARTED beyond timeout."""

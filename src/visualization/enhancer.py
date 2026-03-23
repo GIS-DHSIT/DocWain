@@ -20,7 +20,8 @@ from src.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 # Timeout for the entire visualization pipeline
-VIZ_TIMEOUT_SECONDS = 5.0
+# First render is slower due to matplotlib font cache initialization (~6s)
+VIZ_TIMEOUT_SECONDS = 15.0
 
 
 def enhance_with_visualization(

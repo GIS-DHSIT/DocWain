@@ -77,7 +77,11 @@ def render_plotly(
     height: int = 450,
 ) -> Dict[str, Any]:
     """Render a chart using Plotly. Returns {html, json}."""
-    import plotly.graph_objects as go
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        logger.warning("plotly not installed — skipping interactive chart render")
+        return {"html": "", "json": {}}
 
     palette = DOCWAIN_THEME["palette"]
     layout = _plotly_layout(title, width, height)
@@ -276,10 +280,14 @@ def render_matplotlib(
     height: int = 450,
 ) -> str:
     """Render a chart using matplotlib. Returns base64 PNG string."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        logger.warning("matplotlib not installed — skipping static PNG render")
+        return ""
 
     palette = DOCWAIN_THEME["palette"]
     fig_w, fig_h = width / 100, height / 100
@@ -318,9 +326,13 @@ def render_matplotlib(
             ax.legend()
 
         elif chart_type in ("donut", "pie"):
+            # Guard against all-zero values which cause NaN in pie chart
+            plot_values = [v if v > 0 else 0.001 for v in values]
+            if sum(plot_values) == 0:
+                plot_values = [1] * len(labels)  # Equal slices fallback
             colors = palette[:len(labels)]
             wedges, texts, autotexts = ax.pie(
-                values, labels=labels, autopct="%1.1f%%",
+                plot_values, labels=labels, autopct="%1.1f%%",
                 colors=colors, startangle=90,
             )
             if chart_type == "donut":
@@ -438,14 +450,23 @@ def render_chart(
         "height": height,
     }
 
-    # Always render matplotlib PNG (works for both channels)
-    result.matplotlib_png_base64 = render_matplotlib(**kwargs)
+    # Always attempt matplotlib PNG (works for both channels)
+    try:
+        result.matplotlib_png_base64 = render_matplotlib(**kwargs)
+    except Exception as exc:
+        logger.warning("matplotlib render failed: %s", exc)
+        result.matplotlib_png_base64 = ""
 
     # Render Plotly for web channel
     if channel == "web":
-        plotly_result = render_plotly(**kwargs)
-        result.plotly_html = plotly_result.get("html", "")
-        result.plotly_json = plotly_result.get("json", {})
+        try:
+            plotly_result = render_plotly(**kwargs)
+            result.plotly_html = plotly_result.get("html", "")
+            result.plotly_json = plotly_result.get("json", {})
+        except Exception as exc:
+            logger.warning("Plotly render failed: %s", exc)
+            result.plotly_html = ""
+            result.plotly_json = {}
 
     # Generate data summary
     if values:

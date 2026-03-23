@@ -145,20 +145,26 @@ _CHART_CONFIGS: Dict[str, Dict] = {
 # Query hint keywords → chart type
 # ---------------------------------------------------------------------------
 
-_QUERY_HINTS: list[tuple[list[str], str | None]] = [
-    # Each entry: ([keywords], chart_type_or_None)
-    # None means "resolve dynamically" — handled in code below.
-    (["pie", "donut"], "donut"),
-    (["line", "trend"], "line"),
-    (["bar"], None),  # depends on has_secondary
-    (["scatter"], "scatter"),
-    (["radar", "spider"], "radar"),
-    (["heatmap"], "heatmap"),
-    (["waterfall"], "waterfall"),
-    (["treemap"], "treemap"),
-    (["gauge"], "gauge"),
-    (["sankey"], "sankey"),
-    (["area"], "area"),
+import re as _re
+
+# Each entry: (compiled regex, chart_type_or_None)
+# None means "resolve dynamically" — handled in code below.
+# Patterns require chart-type words to appear in a chart/visualization context
+# (e.g., "line chart", "as a line", "show line graph") to avoid false positives
+# on common English phrases like "line items" or "bar association".
+_QUERY_HINTS: list[tuple[_re.Pattern, str | None]] = [
+    (_re.compile(r"\b(?:pie|donut)\s*(?:chart|graph|diagram|plot)?\b", _re.IGNORECASE), "donut"),
+    (_re.compile(r"\bline\s+(?:chart|graph|diagram|plot)\b", _re.IGNORECASE), "line"),
+    (_re.compile(r"\b(?:as\s+a\s+)?(?:trend|time\s*series)\b", _re.IGNORECASE), "line"),
+    (_re.compile(r"\bbar\s+(?:chart|graph|diagram|plot)\b", _re.IGNORECASE), None),
+    (_re.compile(r"\bscatter\s+(?:chart|graph|diagram|plot)\b", _re.IGNORECASE), "scatter"),
+    (_re.compile(r"\b(?:radar|spider)\s*(?:chart|graph|diagram|plot)?\b", _re.IGNORECASE), "radar"),
+    (_re.compile(r"\bheatmap\b", _re.IGNORECASE), "heatmap"),
+    (_re.compile(r"\bwaterfall\b", _re.IGNORECASE), "waterfall"),
+    (_re.compile(r"\btreemap\b", _re.IGNORECASE), "treemap"),
+    (_re.compile(r"\bgauge\b", _re.IGNORECASE), "gauge"),
+    (_re.compile(r"\bsankey\b", _re.IGNORECASE), "sankey"),
+    (_re.compile(r"\barea\s+(?:chart|graph|diagram|plot)\b", _re.IGNORECASE), "area"),
 ]
 
 
@@ -170,8 +176,8 @@ def _match_query_hint(query: str, has_secondary: bool) -> str | None:
     if "word" in query_lower and "cloud" in query_lower:
         return "wordcloud"
 
-    for keywords, chart_type in _QUERY_HINTS:
-        if any(kw in query_lower for kw in keywords):
+    for pattern, chart_type in _QUERY_HINTS:
+        if pattern.search(query):
             if chart_type is not None:
                 return chart_type
             # Dynamic resolution for "bar"

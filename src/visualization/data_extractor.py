@@ -174,10 +174,19 @@ def _try_markdown_table(text: str) -> Optional[ChartData]:
         non_numeric = [i for i in range(len(headers)) if i not in numeric_cols]
         label_col = non_numeric[0] if non_numeric else 0
 
-    labels = [r[label_col].replace("**", "").strip() for r in rows]
+    # Filter out summary/total rows that would distort the chart
+    _SUMMARY_LABELS = {"total", "subtotal", "sub-total", "grand total", "sum", "net", "overall"}
+    filtered_rows = [
+        r for r in rows
+        if r[label_col].replace("**", "").strip().lower() not in _SUMMARY_LABELS
+    ]
+    if not filtered_rows:
+        filtered_rows = rows  # fall back if ALL rows are "total"-like
+
+    labels = [r[label_col].replace("**", "").strip() for r in filtered_rows]
 
     val_col = numeric_cols[0]
-    raw_vals = [r[val_col] for r in rows]
+    raw_vals = [r[val_col] for r in filtered_rows]
     values = [_parse_number(v) or 0.0 for v in raw_vals]
 
     series_name = headers[val_col].replace("**", "").strip()
@@ -187,7 +196,7 @@ def _try_markdown_table(text: str) -> Optional[ChartData]:
     secondary_name = ""
     if len(numeric_cols) >= 2:
         sec_col = numeric_cols[1]
-        secondary_values = [_parse_number(r[sec_col]) or 0.0 for r in rows]
+        secondary_values = [_parse_number(r[sec_col]) or 0.0 for r in filtered_rows]
         secondary_name = headers[sec_col].replace("**", "").strip()
 
     data_type = "temporal" if _is_temporal(labels) else "nominal"

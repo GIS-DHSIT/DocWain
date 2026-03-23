@@ -239,8 +239,9 @@ class KnowledgeExtractor:
                         "[KnowledgeExtractor] Recovered JSON from thinking block for page=%s section=%s",
                         page, section,
                     )
-        if not parsed:
-            # Single retry with explicit JSON reinforcement
+        if not parsed and raw_text and len(raw_text.strip()) >= 10:
+            # Only retry if LLM produced content that failed to parse as JSON.
+            # Empty responses won't improve with a retry.
             try:
                 retry_prompt = (
                     "You MUST respond with ONLY a valid JSON object. No text before or after.\n\n"
@@ -265,12 +266,17 @@ class KnowledgeExtractor:
             except Exception as retry_err:
                 logger.debug("[KnowledgeExtractor] Retry failed for page=%s section=%s: %s", page, section, retry_err)
         if not parsed:
-            # Log first 200 chars of raw response for debugging
-            snippet = (raw_text or "")[:200].replace("\n", " ")
-            logger.warning(
-                "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s raw_preview='%s'",
-                page, section, snippet,
-            )
+            if not raw_text or len(raw_text.strip()) < 10:
+                logger.debug(
+                    "[KnowledgeExtractor] Empty LLM response for page=%s section=%s (skipping)",
+                    page, section,
+                )
+            else:
+                snippet = (raw_text or "")[:200].replace("\n", " ")
+                logger.warning(
+                    "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s raw_preview='%s'",
+                    page, section, snippet,
+                )
             return KnowledgeExtractionResult(
                 extraction_time_ms=(time.monotonic() - start) * 1000
             )
@@ -305,19 +311,47 @@ class KnowledgeExtractor:
         Returns:
             List of KnowledgeExtractionResult, one per section.
         """
-        results = []
-        for sec in sections:
+        import concurrent.futures
+
+        if len(sections) <= 1:
+            # No benefit from parallelization
+            results = []
+            for sec in sections:
+                text = sec.get("text", "")
+                page = sec.get("page", sec.get("start_page", 1))
+                section_title = sec.get("section_title", sec.get("title", "unknown"))
+                result = self.extract_section(
+                    text=text,
+                    page=page,
+                    section=section_title,
+                    confidence_threshold=confidence_threshold,
+                )
+                results.append(result)
+            return results
+
+        max_workers = min(3, len(sections))
+
+        def _extract_one(sec):
             text = sec.get("text", "")
             page = sec.get("page", sec.get("start_page", 1))
             section_title = sec.get("section_title", sec.get("title", "unknown"))
-
-            result = self.extract_section(
+            return self.extract_section(
                 text=text,
                 page=page,
                 section=section_title,
                 confidence_threshold=confidence_threshold,
             )
-            results.append(result)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_extract_one, sec): i for i, sec in enumerate(sections)}
+            results = [None] * len(sections)
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result(timeout=120.0)
+                except Exception as exc:
+                    logger.warning("[KnowledgeExtractor] Section %d failed: %s", idx, exc)
+                    results[idx] = KnowledgeExtractionResult()
 
         return results
 

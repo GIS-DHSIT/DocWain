@@ -203,7 +203,7 @@ class SectionChunker:
         minimum = int(min_chunk_chars or getattr(Config.Retrieval, "MIN_CHUNK_SIZE", 200))
         maximum = int(max_chunk_chars or max(target + target // 2, minimum + 200))
         self.target_chunk_chars = max(200, target)
-        self.min_chunk_chars = max(50, minimum)
+        self.min_chunk_chars = max(30, minimum)
         self.max_chunk_chars = max(self.target_chunk_chars, maximum)
         self.overlap_sentences = max(0, int(overlap_sentences))
 
@@ -523,6 +523,19 @@ class SectionChunker:
                 current_len = 0
                 return
             if not force and current_len < self.min_chunk_chars and chunks:
+                # Merge small chunk into previous chunk instead of dropping it
+                if chunks and chunk_text.strip():
+                    chunks[-1] = Chunk(
+                        text=chunks[-1].text + "\n" + chunk_text,
+                        section_title=chunks[-1].section_title,
+                        section_path=chunks[-1].section_path,
+                        page_start=chunks[-1].page_start,
+                        page_end=page_end,
+                        chunk_type=chunks[-1].chunk_type,
+                        metadata=chunks[-1].metadata,
+                    )
+                    current_blocks = []
+                    current_len = 0
                 return
             sentence_complete = self._is_sentence_complete(chunk_text, current_blocks[-1].block_type)
             chunks.append(
