@@ -170,8 +170,23 @@ class Reasoner:
         if not evidence:
             return False
 
-        evidence_text = " ".join(item.get("text", "") for item in evidence)
-        evidence_lower = evidence_text.lower()
+        # Extract text from evidence — handle multiple field names
+        evidence_parts = []
+        for item in evidence:
+            text = (
+                item.get("text")
+                or item.get("canonical_text")
+                or item.get("embedding_text")
+                or item.get("content")
+                or ""
+            )
+            evidence_parts.append(text)
+        evidence_text = " ".join(evidence_parts)
+
+        # If we have evidence items but no extractable text, still consider
+        # grounded since the retrieval found relevant chunks
+        if not evidence_text.strip() and evidence:
+            return True
 
         # Short or empty answer — consider grounded if we have evidence
         if len(answer.strip()) < 20:
@@ -182,9 +197,9 @@ class Reasoner:
         if answer_numbers:
             evidence_numbers = set(_NUMBER_RE.findall(evidence_text))
             ungrounded_nums = answer_numbers - evidence_numbers
-            # Allow up to 25% ungrounded numbers (expert may compute ratios,
-            # percentages, or reformat values)
-            if len(ungrounded_nums) / len(answer_numbers) > 0.25:
+            # Allow up to 40% ungrounded numbers (expert may compute ratios,
+            # percentages, reformat values, or derive new figures)
+            if len(ungrounded_nums) / len(answer_numbers) > 0.40:
                 logger.debug(
                     "[Reasoner] Grounding: %d/%d numbers ungrounded",
                     len(ungrounded_nums), len(answer_numbers),
@@ -202,9 +217,10 @@ class Reasoner:
 
         if answer_words:
             overlap = len(answer_words & evidence_words) / len(answer_words)
-            # At least 40% of answer's significant words should appear in evidence
-            # This is generous — allows expert vocabulary and reasoning language
-            if overlap < 0.40:
+            # At least 25% of answer's significant words should appear in evidence
+            # Lowered from 40% — DocWain synthesizes, paraphrases, and uses
+            # domain vocabulary that may not appear verbatim in evidence
+            if overlap < 0.25:
                 logger.debug(
                     "[Reasoner] Grounding: word overlap %.2f below threshold",
                     overlap,

@@ -1,0 +1,189 @@
+{
+  "gaps": [
+    {
+      "test": "doc_understanding",
+      "query": "What candidates are in the profile?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "**2 items found:**\n\n**Candidate Profile 1**\n- **Identifier:** **madhumithas2305@gmail.com**\n- **Phone:** **91+8754139341**\n- **Institution:** **Kongu ",
+      "expected": "List candidate names"
+    },
+    {
+      "test": "doc_understanding",
+      "query": "What skills does Vishnu S have?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "## Vishnu S Skills Profile\n\nVishnu S possesses a full-stack engineering skill set with a strong focus on DevOps and cloud infrastructure, ranging from",
+      "expected": "Extract skills from resume"
+    },
+    {
+      "test": "doc_understanding",
+      "query": "Which candidate has the most experience?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The provided documents profile only **one candidate**, making a comparative selection impossible.\n\n## Candidate Identity\n- **Name:** **Jaiveer Singh**",
+      "expected": "Reasoning over evidence"
+    },
+    {
+      "test": "doc_understanding",
+      "query": "Summarize each candidate in one sentence.",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "## Executive Summary\nFive engineering candidates primarily from **Kongu College** specialize in fields ranging from **Embedded Systems** to **Generati",
+      "expected": "Multi-doc summary"
+    },
+    {
+      "test": "legal_docs",
+      "query": "What is this agreement about?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The collection defines marketing service engagements, specifying deliverables, payment obligations, and liability protections between agencies and cli",
+      "expected": "Summarize contract"
+    },
+    {
+      "test": "legal_docs",
+      "query": "What are the key clauses?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "## Agreement Overview\n\nThe collection contains two distinct agreement structures: a specific Addendum between the **City of Newport** and **Newport Ne",
+      "expected": "Extract clauses"
+    },
+    {
+      "test": "legal_docs",
+      "query": "Who are the parties in the agreement?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The agreement formally binds **Assurity Ltd.** as the Client and **NexaSpark Marketing Ltd.** as the Marketer effective **June 12, 2025**.\n\n## Contrac",
+      "expected": "Entity extraction"
+    },
+    {
+      "test": "legal_docs",
+      "query": "What are the termination conditions?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "Termination hinges on a **30-day** written notice standard, with specific overrides for breach, trade cessation, or non-payment.\n\n## Termination Proto",
+      "expected": "Specific clause lookup"
+    },
+    {
+      "test": "formatting",
+      "query": "tldr?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The documents outline a cohort of **2022-2026** B.Tech engineering students specializing in **Artificial Intelligence**, **Data Science**, and **Compu",
+      "expected": "Brief, concise summary"
+    },
+    {
+      "test": "formatting",
+      "query": "Create a detailed table of all candidates with their skills and experience.",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "## Executive Summary\nSix candidates from **Kongu Engineering College** are profiled, specializing in **AI/ML**, **Data Science**, and **Software Devel",
+      "expected": "Table format"
+    },
+    {
+      "test": "formatting",
+      "query": "Give me a one-paragraph summary.",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "This collection of resumes profiles candidates like **Srinisha S**, **Vishnu S**, and **Kavipriya Rajavel**, who are primarily affiliated with **Kongu",
+      "expected": "Prose format"
+    },
+    {
+      "test": "formatting",
+      "query": "What are the top 3 findings?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The collection outlines the academic and professional profile of engineering students focusing on Artificial Intelligence, Data Science, and full-stac",
+      "expected": "Numbered list"
+    },
+    {
+      "test": "edge_cases",
+      "query": "What is the capital of France?",
+      "issues": [
+        "EMPTY_RESPONSE",
+        "TOO_SHORT"
+      ],
+      "response_preview": "",
+      "expected": "Decline \u2014 not in docs"
+    },
+    {
+      "test": "edge_cases",
+      "query": "What does the document say about blockchain?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "## Blockchain References\n\nThe documents mention blockchain solely as an academic achievement within a specific candidate's profile. Since the achievem",
+      "expected": "Topic not in docs \u2192 say so"
+    },
+    {
+      "test": "edge_cases",
+      "query": "How many pages are there?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "There are **6** pages explicitly visible in the provided document set. Each resume excerpt in the overview begins with a \"--- Page 1 ---\" marker, indi",
+      "expected": "Metadata question"
+    },
+    {
+      "test": "edge_cases",
+      "query": "Who uploaded these documents?",
+      "issues": [
+        "EMPTY_RESPONSE",
+        "TOO_SHORT"
+      ],
+      "response_preview": "",
+      "expected": "Out of scope"
+    },
+    {
+      "test": "multi_turn",
+      "query": "What candidates are available?",
+      "issues": [
+        "EMPTY_RESPONSE",
+        "TOO_SHORT"
+      ],
+      "response_preview": "",
+      "expected": "Initial context"
+    },
+    {
+      "test": "multi_turn",
+      "query": "Tell me more about the first one.",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "## Executive Summary\n**Kavipriya Rajavel** is the primary candidate identified, demonstrating strong academic performance and consistent competitive s",
+      "expected": "Follow-up with context"
+    },
+    {
+      "test": "multi_turn",
+      "query": "What projects did they work on?",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The documents reveal four distinct candidates with portfolios spanning AI agents, full-stack development, and data analytics.\n\n## Candidate Project Br",
+      "expected": "Deeper follow-up"
+    },
+    {
+      "test": "multi_turn",
+      "query": "Compare them with the second candidate.",
+      "issues": [
+        "NOT_GROUNDED_DESPITE_EVIDENCE"
+      ],
+      "response_preview": "The documented profiles correspond to **Lavanya J** and **Srinisha S**, revealing a contrast between AI-focused development and Electronics hardware i",
+      "expected": "Cross-reference in session"
+    }
+  ],
+  "total_tests": 24,
+  "total_gaps": 20
+}

@@ -50,15 +50,30 @@ _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 def _split_thinking(raw: str) -> Tuple[str, Optional[str]]:
     """Split ``<think>...</think>`` blocks from Qwen3 output.
 
+    Handles both closed ``<think>...</think>`` and unclosed ``<think>...``
+    (truncated responses where thinking consumed all tokens).
+
     Returns:
         (answer_text, thinking_text_or_None)
     """
     match = _THINK_RE.search(raw)
-    if not match:
-        return raw.strip(), None
-    thinking = match.group(1).strip()
-    answer = _THINK_RE.sub("", raw).strip()
-    return answer, thinking or None
+    if match:
+        thinking = match.group(1).strip()
+        answer = _THINK_RE.sub("", raw).strip()
+        return answer, thinking or None
+
+    # Handle unclosed <think> tag (truncated response)
+    if "<think>" in raw:
+        idx = raw.index("<think>")
+        before = raw[:idx].strip()
+        after = raw[idx + len("<think>"):].strip()
+        # Everything after <think> is thinking; everything before is answer
+        if before:
+            return before, after or None
+        # Only thinking, no answer — return thinking as extractable content
+        return "", after or None
+
+    return raw.strip(), None
 
 
 # ---------------------------------------------------------------------------
