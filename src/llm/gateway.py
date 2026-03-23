@@ -313,9 +313,10 @@ class LLMGateway:
         if not answer.strip() and thinking and len(thinking) > 50:
             logger.warning("LLM response empty (thinking consumed all tokens) — extracting from thinking block")
             # Try to find the last substantive paragraph in thinking
-            lines = [l.strip() for l in thinking.split('\n') if l.strip() and not l.strip().startswith('*')]
-            # Look for draft/final sections in thinking
-            for marker in ['Draft:', 'Final', 'Response:', 'Answer:']:
+            lines = [l.strip() for l in thinking.split('\n') if l.strip()]
+            # Look for draft/final/response sections in thinking
+            for marker in ['Draft:', 'Final', 'Response:', 'Answer:', 'Summary:', 'Result:',
+                           '## ', '**', 'Here is', 'The document', 'Based on']:
                 for i, line in enumerate(lines):
                     if marker.lower() in line.lower():
                         answer = '\n'.join(lines[i:])
