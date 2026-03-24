@@ -2232,7 +2232,6 @@ def _process_blob(
             # Clean up partial embeddings before re-upserting to prevent duplicates
             try:
                 from src.api.dataHandler import get_vector_store
-                from src.api.vector_store import build_collection_name
                 _cleanup_store = get_vector_store()
                 _cleanup_store.delete_document(subscription_id, profile_id, doc_id)
                 logger.info(
