@@ -2672,6 +2672,100 @@ def _process_blob(
                     exc,
                 )
 
+        # --- Document Intelligence Points ---
+        try:
+            from src.extraction.document_intelligence import (
+                extract_document_intelligence,
+                build_doc_index_text,
+                build_doc_intelligence_text,
+            )
+
+            # Reconstruct full document text from extracted_docs
+            _di_full_text = ""
+            for _di_fname, _di_content in (extracted_docs or {}).items():
+                if isinstance(_di_content, ExtractedDocument) and _di_content.full_text:
+                    _di_full_text += _di_content.full_text + "\n"
+                elif isinstance(_di_content, dict) and isinstance(_di_content.get("full_text"), str):
+                    _di_full_text += _di_content["full_text"] + "\n"
+                elif isinstance(_di_content, str):
+                    _di_full_text += _di_content + "\n"
+
+            _di_source_filename = file_name or doc_id
+
+            if _di_full_text.strip():
+                _intelligence = extract_document_intelligence(_di_full_text, _di_source_filename)
+                _doc_index_text = build_doc_index_text(_di_source_filename, _intelligence)
+                _doc_intel_text = build_doc_intelligence_text(_di_source_filename, _intelligence)
+
+                from src.embedding.pipeline.schema_normalizer import build_qdrant_payload as _di_build_payload
+                import uuid as _di_uuid
+
+                _di_base_payload = {
+                    "subscription_id": subscription_id,
+                    "profile_id": profile_id,
+                    "document_id": doc_id,
+                    "source_name": _di_source_filename,
+                    "canonical_text": _doc_index_text,
+                    "embedding_text": _doc_index_text,
+                    "resolution": "doc_index",
+                    "chunk_kind": "doc_index",
+                    "chunk_id": f"doc_index_{doc_id}",
+                    "chunk_index": 0,
+                    "section_title": "Document Index",
+                }
+
+                _index_payload = _di_build_payload(_di_base_payload)
+                _index_payload["doc_intelligence"] = _intelligence
+
+                # Encode embedding vectors
+                from src.embedding.model_loader import get_embedding_model as _di_get_model
+                _di_model_result = _di_get_model()
+                _di_model = _di_model_result[0] if isinstance(_di_model_result, tuple) else _di_model_result
+
+                _index_vector = _di_model.encode([_doc_index_text], show_progress_bar=False)[0].tolist()
+
+                from qdrant_client.models import PointStruct as _di_PointStruct
+
+                _index_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_index_{doc_id}")),
+                    vector=_index_vector,
+                    payload=_index_payload,
+                )
+
+                # Build doc_intelligence point
+                _intel_payload = _di_build_payload({
+                    **_di_base_payload,
+                    "canonical_text": _doc_intel_text,
+                    "embedding_text": _doc_intel_text,
+                    "resolution": "doc_intelligence",
+                    "chunk_kind": "doc_intelligence",
+                    "chunk_id": f"doc_intelligence_{doc_id}",
+                    "section_title": "Document Intelligence",
+                })
+                _intel_payload["doc_intelligence"] = _intelligence
+
+                _intel_vector = _di_model.encode([_doc_intel_text], show_progress_bar=False)[0].tolist()
+
+                _intel_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_intelligence_{doc_id}")),
+                    vector=_intel_vector,
+                    payload=_intel_payload,
+                )
+
+                from src.api.dataHandler import get_vector_store as _di_get_vs
+                _di_vs = _di_get_vs()
+                _di_vs.client.upsert(
+                    collection_name=collection_name,
+                    points=[_index_point, _intel_point],
+                )
+
+                logger.info(
+                    "[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)",
+                    doc_id, _di_source_filename,
+                )
+        except Exception as _di_exc:
+            logger.warning("[DOC_INTELLIGENCE] Failed for %s: %s", doc_id, _di_exc)
+
         _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
         # Profile intelligence: auto-generate insights (background, non-blocking)
         try:
@@ -3346,6 +3440,100 @@ def _process_local_document(
                     document_id,
                     exc,
                 )
+
+        # --- Document Intelligence Points ---
+        try:
+            from src.extraction.document_intelligence import (
+                extract_document_intelligence,
+                build_doc_index_text,
+                build_doc_intelligence_text,
+            )
+
+            # Reconstruct full document text from extracted_docs
+            _di_full_text = ""
+            for _di_fname, _di_content in (extracted_docs or {}).items():
+                if isinstance(_di_content, ExtractedDocument) and _di_content.full_text:
+                    _di_full_text += _di_content.full_text + "\n"
+                elif isinstance(_di_content, dict) and isinstance(_di_content.get("full_text"), str):
+                    _di_full_text += _di_content["full_text"] + "\n"
+                elif isinstance(_di_content, str):
+                    _di_full_text += _di_content + "\n"
+
+            _di_source_filename = file_name or document_id
+
+            if _di_full_text.strip():
+                _intelligence = extract_document_intelligence(_di_full_text, _di_source_filename)
+                _doc_index_text = build_doc_index_text(_di_source_filename, _intelligence)
+                _doc_intel_text = build_doc_intelligence_text(_di_source_filename, _intelligence)
+
+                from src.embedding.pipeline.schema_normalizer import build_qdrant_payload as _di_build_payload
+                import uuid as _di_uuid
+
+                _di_base_payload = {
+                    "subscription_id": subscription_id,
+                    "profile_id": profile_id,
+                    "document_id": document_id,
+                    "source_name": _di_source_filename,
+                    "canonical_text": _doc_index_text,
+                    "embedding_text": _doc_index_text,
+                    "resolution": "doc_index",
+                    "chunk_kind": "doc_index",
+                    "chunk_id": f"doc_index_{document_id}",
+                    "chunk_index": 0,
+                    "section_title": "Document Index",
+                }
+
+                _index_payload = _di_build_payload(_di_base_payload)
+                _index_payload["doc_intelligence"] = _intelligence
+
+                # Encode embedding vectors
+                from src.embedding.model_loader import get_embedding_model as _di_get_model
+                _di_model_result = _di_get_model()
+                _di_model = _di_model_result[0] if isinstance(_di_model_result, tuple) else _di_model_result
+
+                _index_vector = _di_model.encode([_doc_index_text], show_progress_bar=False)[0].tolist()
+
+                from qdrant_client.models import PointStruct as _di_PointStruct
+
+                _index_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_index_{document_id}")),
+                    vector=_index_vector,
+                    payload=_index_payload,
+                )
+
+                # Build doc_intelligence point
+                _intel_payload = _di_build_payload({
+                    **_di_base_payload,
+                    "canonical_text": _doc_intel_text,
+                    "embedding_text": _doc_intel_text,
+                    "resolution": "doc_intelligence",
+                    "chunk_kind": "doc_intelligence",
+                    "chunk_id": f"doc_intelligence_{document_id}",
+                    "section_title": "Document Intelligence",
+                })
+                _intel_payload["doc_intelligence"] = _intelligence
+
+                _intel_vector = _di_model.encode([_doc_intel_text], show_progress_bar=False)[0].tolist()
+
+                _intel_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_intelligence_{document_id}")),
+                    vector=_intel_vector,
+                    payload=_intel_payload,
+                )
+
+                from src.api.dataHandler import get_vector_store as _di_get_vs
+                _di_vs = _di_get_vs()
+                _di_vs.client.upsert(
+                    collection_name=collection_name,
+                    points=[_index_point, _intel_point],
+                )
+
+                logger.info(
+                    "[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)",
+                    document_id, _di_source_filename,
+                )
+        except Exception as _di_exc:
+            logger.warning("[DOC_INTELLIGENCE] Failed for %s: %s", document_id, _di_exc)
 
         _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
         # Profile intelligence: auto-generate insights (background, non-blocking)
