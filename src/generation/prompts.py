@@ -428,9 +428,15 @@ def build_reason_prompt(
 
     if doc_intel_summaries:
         parts.append("--- DOCUMENT INTELLIGENCE (structured summaries) ---")
+        _intel_chars = 0
+        _MAX_INTEL_CHARS = 8000  # Cap to avoid exceeding context window
         for entry in doc_intel_summaries:
+            if _intel_chars + len(entry) > _MAX_INTEL_CHARS:
+                parts.append(f"... ({len(doc_intel_summaries) - doc_intel_summaries.index(entry)} more documents)")
+                break
             parts.append(entry)
             parts.append("")
+            _intel_chars += len(entry)
         parts.append("--- END DOCUMENT INTELLIGENCE ---")
         parts.append("")
 
