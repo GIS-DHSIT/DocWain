@@ -150,8 +150,8 @@ class OllamaClient:
         prompt: str,
         *,
         options: Optional[Dict[str, Any]] = None,
-        max_retries: int = 1,
-        backoff: float = 0.5,
+        max_retries: int = 3,
+        backoff: float = 1.0,
         thinking: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         import ollama
@@ -294,8 +294,8 @@ class OllamaClient:
         messages: List[Dict[str, str]],
         *,
         options: Optional[Dict[str, Any]] = None,
-        max_retries: int = 1,
-        backoff: float = 0.5,
+        max_retries: int = 3,
+        backoff: float = 1.0,
         thinking: bool = False,
     ) -> Tuple[str, Dict[str, Any]]:
         """Chat-based generation with proper system/user/assistant role separation.

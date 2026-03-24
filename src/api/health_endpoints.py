@@ -194,10 +194,12 @@ def health_check(request: Request) -> Dict[str, Any]:
     """
     Production health check endpoint.
 
-    Checks all backend services and returns per-component status.
+    Checks all backend services concurrently and returns per-component status.
     Each check is independent — one failing service will not prevent
     the others from being reported.
     """
+    import concurrent.futures
+
     def _safe_check(fn):
         try:
             result = fn()
@@ -211,21 +213,23 @@ def health_check(request: Request) -> Dict[str, Any]:
         except Exception as e:
             return {"status": "error", "error": str(e)[:80]}
 
-    redis_status = _safe_check(_check_redis_connection)
-    mongodb_status = _safe_check(_check_mongodb_connection)
-    qdrant_status = _safe_check(_check_qdrant_connection)
-    neo4j_status = _safe_check(_check_neo4j_connection)
-    ollama_status = _safe_check(_check_ollama_connection)
-    celery_stats = _safe_check_full(_get_celery_queue_stats)
+    # Run all checks concurrently to reduce total latency from ~6s to ~1s
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        redis_future = executor.submit(_safe_check, _check_redis_connection)
+        mongodb_future = executor.submit(_safe_check, _check_mongodb_connection)
+        qdrant_future = executor.submit(_safe_check, _check_qdrant_connection)
+        neo4j_future = executor.submit(_safe_check, _check_neo4j_connection)
+        ollama_future = executor.submit(_safe_check, _check_ollama_connection)
+        celery_future = executor.submit(_safe_check_full, _get_celery_queue_stats)
 
     return {
         "api": "ok",
-        "redis": redis_status,
-        "mongodb": mongodb_status,
-        "qdrant": qdrant_status,
-        "neo4j": neo4j_status,
-        "ollama_local": ollama_status,
-        "celery": celery_stats,
+        "redis": redis_future.result(timeout=6),
+        "mongodb": mongodb_future.result(timeout=6),
+        "qdrant": qdrant_future.result(timeout=6),
+        "neo4j": neo4j_future.result(timeout=6),
+        "ollama_local": ollama_future.result(timeout=6),
+        "celery": celery_future.result(timeout=6),
     }
 
 @health_router.get("/health/detailed")

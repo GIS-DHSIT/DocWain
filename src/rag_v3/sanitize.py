@@ -33,8 +33,12 @@ _NER_TAG_LEAK_RE = re.compile(
 )
 
 # Embedded metadata ID slugs: "id: workflowsandreducingmanual..." (run-on slugs)
-# Only match "id:" followed by a slug that is >20 chars with no spaces (payload leak)
-_ID_SLUG_RE = re.compile(r"\bid:\s*\S{20,}")
+# Match "id:" followed by a camelCase/concatenated slug (>10 chars, no spaces).
+# Also match bullet points starting with "id:" to catch list-style leaks.
+_ID_SLUG_RE = re.compile(r"\bid:\s*\S{10,}")
+# Catch "id: CamelCaseSlug number" patterns (e.g. "id: reducingmissingdataby 40")
+_ID_CAMEL_SLUG_RE = re.compile(r"\bid:\s*[a-z]{2}[a-zA-Z]{6,}(?:\s+\d+)?")
+
 
 # Re-join hyphens broken by normalize_content: "self - employed" → "self-employed"
 # Only for lowercase words (not date ranges like "2019 - 2023" or "Name - Title")
@@ -179,6 +183,7 @@ def sanitize_text(text: str) -> str:
         cleaned = _METADATA_LEAK_RE.sub("", cleaned)
         cleaned = _NER_TAG_LEAK_RE.sub("", cleaned)
         cleaned = _ID_SLUG_RE.sub("", cleaned)
+        cleaned = _ID_CAMEL_SLUG_RE.sub("", cleaned)
     else:
         def _meta_sub(m: re.Match) -> str:
             if _in_fence(m.start()):
@@ -187,6 +192,7 @@ def sanitize_text(text: str) -> str:
         cleaned = _METADATA_LEAK_RE.sub(_meta_sub, cleaned)
         cleaned = _NER_TAG_LEAK_RE.sub(_meta_sub, cleaned)
         cleaned = _ID_SLUG_RE.sub(_meta_sub, cleaned)
+        cleaned = _ID_CAMEL_SLUG_RE.sub(_meta_sub, cleaned)
     # Strip LLM meta-commentary preambles — only the first occurrence
     # (MULTILINE makes ^ match interior line starts; count=1 prevents
     # stripping legitimate mid-response sentences that match the pattern)

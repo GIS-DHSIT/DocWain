@@ -50,6 +50,7 @@ class UnifiedRetriever:
     def __init__(self, qdrant_client, embedder):
         self.qdrant_client = qdrant_client
         self.embedder = embedder
+        self._collection_exists_cache: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -70,6 +71,31 @@ class UnifiedRetriever:
             raise ValueError("subscription_id is required for retrieval")
 
         collection_name = build_collection_name(subscription_id)
+
+        # Guard: verify collection exists before querying Qdrant.
+        # Cache the result to avoid repeated round-trips.
+        if collection_name not in self._collection_exists_cache:
+            try:
+                self._collection_exists_cache[collection_name] = (
+                    self.qdrant_client.collection_exists(collection_name)
+                )
+            except Exception:
+                logger.warning(
+                    "Could not verify collection existence: %s", collection_name,
+                )
+                self._collection_exists_cache[collection_name] = False
+
+        if not self._collection_exists_cache.get(collection_name):
+            logger.warning(
+                "Collection %s does not exist — returning empty results for subscription=%s",
+                collection_name, subscription_id,
+            )
+            return RetrievalResult(
+                chunks=[],
+                profiles_searched=list(profile_ids),
+                total_found=0,
+            )
+
         query_vector = self.embedder.encode([query])[0]
 
         all_chunks: List[EvidenceChunk] = []

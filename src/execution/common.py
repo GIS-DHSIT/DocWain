@@ -73,6 +73,9 @@ def normalize_answer(answer: Any) -> Dict[str, Any]:
         response_text = answer.get("response") or answer.get("answer") or ""
         if isinstance(response_text, str):
             response_text = _sanitize_response_text(response_text)
+        # Guard: never return an empty response to the user.
+        if isinstance(response_text, str) and not response_text.strip():
+            response_text = "I couldn't find relevant information in the uploaded documents to answer that. Try rephrasing your question or check that the right documents are uploaded."
         # Extract media from answer or from metadata.media
         media = answer.get("media")
         if media is None and isinstance(meta.get("media"), list):

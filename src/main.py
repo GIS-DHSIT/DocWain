@@ -960,7 +960,7 @@ def ask_question_api(
         if getattr(decision, "direct_response", False):
             response_text = decision.response_text or ""
             response_text = sanitize_response(response_text)
-            answer_payload = AnswerPayload(response=response_text, sources=[], grounded=True, context_found=False)
+            answer_payload = AnswerPayload(response=response_text, sources=[], grounded=False, context_found=False)
             persisted_session_id = _persist_chat_turn(
                 user_id=request.user_id,
                 query=request.query,

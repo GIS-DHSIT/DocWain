@@ -4011,9 +4011,9 @@ class EnterpriseRAGSystem:
                             "collection": collection_name,
                             "request_id": request_id,
                             "index_version": index_version,
-                            "context_found": True,
+                            "context_found": False,
                             "query_type": _conv_resp.intent.lower(),
-                            "grounded": True,
+                            "grounded": False,
                         }
                 except Exception as exc:
                     logger.debug("Conversation-driven response failed", exc_info=True)
