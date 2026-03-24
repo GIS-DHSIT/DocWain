@@ -414,12 +414,12 @@ def _upsert_doc_intelligence(
     points = [
         PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_index_{doc_id}")),
-            vector=idx_vector,
+            vector={"content_vector": idx_vector},
             payload=idx_payload,
         ),
         PointStruct(
             id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_intelligence_{doc_id}")),
-            vector=intel_vector,
+            vector={"content_vector": intel_vector},
             payload=intel_payload,
         ),
     ]
