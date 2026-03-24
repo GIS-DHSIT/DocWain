@@ -18,6 +18,7 @@ pdfplumber
 pymupdf
 Pillow
 pycryptodome
+pytesseract
 pydantic
 pymongo
 python-dotenv
