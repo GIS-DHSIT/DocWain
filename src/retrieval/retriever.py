@@ -244,7 +244,8 @@ class UnifiedRetriever:
 
         text = payload.get("canonical_text") or payload.get("embedding_text") or ""
         source_name = (
-            provenance.get("source_file")
+            payload.get("source_name")
+            or provenance.get("source_file")
             or payload.get("source_file")
             or ""
         )
