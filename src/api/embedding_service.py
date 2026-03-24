@@ -305,6 +305,128 @@ def _normalize_requested_ids(document_id: Optional[str], document_ids: Optional[
         requested.extend([str(doc_id).strip() for doc_id in document_ids if str(doc_id).strip()])
     return list(dict.fromkeys(requested))
 
+def _extract_full_text_from_pickle(extracted: Any) -> str:
+    """Extract full document text from a deserialized pickle."""
+    if extracted is None:
+        return ""
+    # Handle dict with 'raw' key containing ExtractedDocument objects
+    if isinstance(extracted, dict):
+        for key in ("raw", "structured", "document"):
+            content = extracted.get(key)
+            if isinstance(content, dict):
+                for _fname, _doc in content.items():
+                    if hasattr(_doc, "full_text") and _doc.full_text:
+                        return _doc.full_text
+                    if isinstance(_doc, dict) and _doc.get("full_text"):
+                        return _doc["full_text"]
+            elif hasattr(content, "full_text") and content.full_text:
+                return content.full_text
+        # Try direct full_text
+        if extracted.get("full_text"):
+            return extracted["full_text"]
+    elif hasattr(extracted, "full_text") and extracted.full_text:
+        return extracted.full_text
+    return ""
+
+
+def _check_doc_intelligence_exists(doc_id: str, subscription_id: str, profile_id: str) -> bool:
+    """Check if doc_index point already exists in Qdrant for this document."""
+    try:
+        from src.api.vector_store import build_collection_name
+        from src.api.dataHandler import get_vector_store
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        _vs = get_vector_store()
+        _count = _vs.qdrant_client.count(
+            collection_name=build_collection_name(subscription_id),
+            count_filter=Filter(must=[
+                FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="resolution", match=MatchValue(value="doc_index")),
+            ]),
+        ).count
+        return _count > 0
+    except Exception:
+        return False
+
+
+def _upsert_doc_intelligence(
+    doc_id: str,
+    subscription_id: str,
+    profile_id: str,
+    source_filename: str,
+    full_text: str,
+    collection_name: str,
+) -> None:
+    """Extract document intelligence and upsert doc_index + doc_intelligence points."""
+    import uuid
+
+    from src.extraction.document_intelligence import (
+        extract_document_intelligence,
+        build_doc_index_text,
+        build_doc_intelligence_text,
+    )
+    from src.embedding.pipeline.schema_normalizer import build_qdrant_payload
+    from src.api.dataHandler import get_vector_store, get_embedding_model
+
+    intelligence = extract_document_intelligence(full_text, source_filename)
+    doc_index_text = build_doc_index_text(source_filename, intelligence)
+    doc_intel_text = build_doc_intelligence_text(source_filename, intelligence)
+
+    if not doc_index_text.strip():
+        logger.warning("[DOC_INTELLIGENCE] Empty doc_index text for %s", doc_id)
+        return
+
+    model = get_embedding_model()
+    _vs = get_vector_store()
+
+    # Build and upsert doc_index point
+    _base = {
+        "subscription_id": subscription_id,
+        "profile_id": profile_id,
+        "document_id": doc_id,
+        "source_name": source_filename,
+        "resolution": "doc_index",
+        "chunk_kind": "doc_index",
+        "chunk_id": f"doc_index_{doc_id}",
+        "chunk_index": 0,
+        "section_title": "Document Index",
+        "canonical_text": doc_index_text,
+        "embedding_text": doc_index_text,
+    }
+    idx_payload = build_qdrant_payload(_base)
+    idx_payload["doc_intelligence"] = intelligence
+
+    _base_intel = {**_base,
+        "canonical_text": doc_intel_text,
+        "embedding_text": doc_intel_text,
+        "resolution": "doc_intelligence",
+        "chunk_kind": "doc_intelligence",
+        "chunk_id": f"doc_intelligence_{doc_id}",
+        "section_title": "Document Intelligence",
+    }
+    intel_payload = build_qdrant_payload(_base_intel)
+    intel_payload["doc_intelligence"] = intelligence
+
+    # Encode vectors
+    idx_vector = model.encode([doc_index_text])[0].tolist()
+    intel_vector = model.encode([doc_intel_text])[0].tolist()
+
+    from qdrant_client.models import PointStruct
+    points = [
+        PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_index_{doc_id}")),
+            vector=idx_vector,
+            payload=idx_payload,
+        ),
+        PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_intelligence_{doc_id}")),
+            vector=intel_vector,
+            payload=intel_payload,
+        ),
+    ]
+    _vs.qdrant_client.upsert(collection_name=collection_name, points=points)
+    logger.info("[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)", doc_id, source_filename)
+
+
 def _extract_doc_id(record: Dict[str, Any]) -> Optional[str]:
     for key in ("_id", "document_id", "documentId", "doc_id", "id"):
         value = record.get(key)
@@ -1978,6 +2100,20 @@ def _process_blob(
         record = get_document_record(doc_id) or {}
         current_status = record.get("status")
         if current_status in COMPLETED_STATUSES:
+            # Still generate doc_index/doc_intelligence if missing
+            try:
+                _has_di = _check_doc_intelligence_exists(doc_id, subscription_id, profile_id)
+                if not _has_di:
+                    _di_full_text = _extract_full_text_from_pickle(extracted)
+                    if _di_full_text:
+                        _source_fn = record.get("name", blob.name or "")
+                        _upsert_doc_intelligence(
+                            doc_id, subscription_id, profile_id,
+                            _source_fn, _di_full_text,
+                            collection_name=build_collection_name(subscription_id or ""),
+                        )
+            except Exception as _di_exc:
+                logger.debug("[DOC_INTELLIGENCE] Skipped-path extraction failed: %s", _di_exc)
             result["status"] = "SKIPPED"
             result["failed_reason"] = None
             return result
@@ -2175,6 +2311,21 @@ def _process_blob(
                         extra={"existing_points": qdrant_count, "expected_chunks": expected_chunks})
 
         if qdrant_count and expected_chunks and qdrant_count >= expected_chunks:
+            # Generate doc_intelligence if missing even for already-embedded docs
+            try:
+                _has_di = _check_doc_intelligence_exists(doc_id, subscription_id, profile_id)
+                if not _has_di:
+                    _di_text = _extract_full_text_from_pickle(extracted)
+                    if _di_text:
+                        _upsert_doc_intelligence(
+                            doc_id, subscription_id, profile_id,
+                            source_filename or blob.name or "",
+                            _di_text,
+                            collection_name=build_collection_name(subscription_id or ""),
+                        )
+            except Exception as _di_exc:
+                logger.debug("[DOC_INTELLIGENCE] Already-embedded path extraction failed: %s", _di_exc)
+
             if telemetry:
                 telemetry.increment("embed_skipped_already_embedded_total")
             update_stage(
