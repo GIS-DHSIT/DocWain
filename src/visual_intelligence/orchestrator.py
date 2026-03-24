@@ -16,6 +16,9 @@ from src.visual_intelligence.datatypes import (
     Tier,
     VisualEnrichmentResult,
     VisualRegion,
+    StructuredTableResult,
+    OCRPatch,
+    KVPair,
 )
 from src.visual_intelligence.page_renderer import PageImage
 
@@ -54,6 +57,9 @@ class VisualIntelligenceOrchestrator:
         self.renderer = PageRenderer()
         self.merger = EnrichmentMerger()
         self._dit_detector: Optional[Any] = None
+        self._table_detector: Optional[Any] = None
+        self._trocr_enhancer: Optional[Any] = None
+        self._kg_enricher: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Lazy DiT detector with setter for testing
@@ -71,6 +77,39 @@ class VisualIntelligenceOrchestrator:
     def dit_detector(self, value: Any) -> None:
         self._dit_detector = value
 
+    @property
+    def table_detector(self) -> Any:
+        if self._table_detector is None:
+            from src.visual_intelligence.models.table_transformer import TableTransformerDetector
+            self._table_detector = TableTransformerDetector()
+        return self._table_detector
+
+    @table_detector.setter
+    def table_detector(self, value: Any) -> None:
+        self._table_detector = value
+
+    @property
+    def trocr_enhancer(self) -> Any:
+        if self._trocr_enhancer is None:
+            from src.visual_intelligence.models.trocr_enhancer import TrOCREnhancer
+            self._trocr_enhancer = TrOCREnhancer()
+        return self._trocr_enhancer
+
+    @trocr_enhancer.setter
+    def trocr_enhancer(self, value: Any) -> None:
+        self._trocr_enhancer = value
+
+    @property
+    def kg_enricher(self) -> Any:
+        if self._kg_enricher is None:
+            from src.visual_intelligence.kg_enricher import VisualKGEnricher
+            self._kg_enricher = VisualKGEnricher()
+        return self._kg_enricher
+
+    @kg_enricher.setter
+    def kg_enricher(self, value: Any) -> None:
+        self._kg_enricher = value
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -80,6 +119,8 @@ class VisualIntelligenceOrchestrator:
         doc_id: str,
         extracted_doc: Any,
         file_bytes: bytes,
+        subscription_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
     ) -> Any:
         """Run the full visual intelligence pipeline on *extracted_doc*.
 
@@ -113,30 +154,61 @@ class VisualIntelligenceOrchestrator:
 
             # 4. Process each page (blocking → executor)
             all_regions: List[VisualRegion] = []
+            all_tables: List[StructuredTableResult] = []
+            all_ocr_patches: dict = {}
+            all_kv_pairs: List[KVPair] = []
+            models_used: List[str] = []
+
             for page_img in page_images:
                 tier = tier_map.get(page_img.page_number, Tier.LIGHT)
-                regions = await loop.run_in_executor(
+                page_result = await loop.run_in_executor(
                     _executor,
                     lambda pi=page_img, t=tier: self._process_page(pi, t),
                 )
-                all_regions.extend(regions)
+                all_regions.extend(page_result.get("regions", []))
+                all_tables.extend(page_result.get("tables", []))
+                if page_result.get("ocr_patches"):
+                    page_num = page_img.page_number
+                    all_ocr_patches.setdefault(page_num, []).extend(page_result["ocr_patches"])
+                all_kv_pairs.extend(page_result.get("kv_pairs", []))
+
+            if all_regions:
+                models_used.append("dit")
+            if all_tables:
+                models_used.append("table_transformer")
+            if all_ocr_patches:
+                models_used.append("trocr")
+            if all_kv_pairs:
+                models_used.append("layoutlmv3")
 
             # 5. Build enrichment result
             elapsed_ms = (time.perf_counter() - t0) * 1000
             result = VisualEnrichmentResult(
                 doc_id=doc_id,
                 regions=all_regions,
+                tables=all_tables,
+                ocr_patches=all_ocr_patches,
+                kv_pairs=all_kv_pairs,
                 page_complexities=complexities,
                 processing_time_ms=elapsed_ms,
-                models_used=["dit"] if all_regions else [],
+                models_used=models_used,
             )
 
             # 6. Merge into extracted doc
             enriched = self.merger.merge(extracted_doc, result)
 
+            # 7. Fire KG enrichment (async, non-blocking)
+            if subscription_id and profile_id:
+                try:
+                    self.kg_enricher.enqueue_enrichment(
+                        doc_id, subscription_id, profile_id, result,
+                    )
+                except Exception:
+                    logger.debug("KG enrichment failed for doc=%s", doc_id, exc_info=True)
+
             logger.info(
-                "doc=%s — visual intelligence completed in %.0fms, %d regions detected across %d pages",
-                doc_id, elapsed_ms, len(all_regions), len(needed),
+                "doc=%s — visual intelligence completed in %.0fms, %d regions, %d tables across %d pages",
+                doc_id, elapsed_ms, len(all_regions), len(all_tables), len(needed),
             )
             return enriched
 
@@ -152,18 +224,57 @@ class VisualIntelligenceOrchestrator:
     # Per-page processing
     # ------------------------------------------------------------------
 
-    def _process_page(self, page_img: PageImage, tier: Tier) -> List[VisualRegion]:
+    def _process_page(self, page_img: PageImage, tier: Tier) -> dict:
         """Process a single page image according to its tier.
 
-        LIGHT and above: run DiT layout detection.
+        LIGHT+: DiT layout detection + Table Transformer
+        FULL:   + TrOCR on low-confidence regions
         """
         regions: List[VisualRegion] = []
+        tables: List[StructuredTableResult] = []
+        ocr_patches: List[OCRPatch] = []
+        kv_pairs: List[KVPair] = []
 
         if tier >= Tier.LIGHT:
+            # DiT layout detection
             dit_regions = self.dit_detector.detect(page_img.image, page_img.page_number)
             regions.extend(dit_regions)
 
-        return regions
+            # Table Transformer on table regions
+            table_regions = [
+                {"bbox": r.bbox, "confidence": r.confidence}
+                for r in dit_regions if r.label == "table"
+            ]
+            if table_regions:
+                extracted_tables = self.table_detector.extract(
+                    page_img.image, page_img.page_number,
+                    table_regions=table_regions,
+                )
+                tables.extend(extracted_tables)
+
+        if tier >= Tier.FULL:
+            # TrOCR on low-confidence text regions
+            for region in regions:
+                if region.label in ("text", "title"):
+                    patch = self.trocr_enhancer.enhance_region(
+                        image=page_img.image.crop(
+                            (int(region.bbox[0]), int(region.bbox[1]),
+                             int(region.bbox[2]), int(region.bbox[3]))
+                        ),
+                        page=page_img.page_number,
+                        bbox=region.bbox,
+                        original_text="",  # placeholder — actual text from extraction
+                        original_confidence=0.5,  # default for visual-only regions
+                    )
+                    if patch:
+                        ocr_patches.append(patch)
+
+        return {
+            "regions": regions,
+            "tables": tables,
+            "ocr_patches": ocr_patches,
+            "kv_pairs": kv_pairs,
+        }
 
 
 # ---------------------------------------------------------------------------
