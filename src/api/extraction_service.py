@@ -22,6 +22,12 @@ except ImportError:
     DocumentIntelligenceProcessor = None
     process_document_intelligence = None
 try:
+    from src.visual_intelligence.orchestrator import get_visual_orchestrator
+    VISUAL_INTELLIGENCE_AVAILABLE = True
+except ImportError:
+    VISUAL_INTELLIGENCE_AVAILABLE = False
+    get_visual_orchestrator = None
+try:
     from src.api.dataHandler import (
         extract_document_info,
         decrypt_data,
@@ -1157,6 +1163,7 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
 
     try:
         all_extracted_docs: Dict[str, Any] = {}
+        _raw_file_bytes: Optional[bytes] = None  # captured for visual intelligence
         try:
             if doc_data.get("type") == "S3":
                 bk_name = conn_data["s3_details"]["bucketName"]
@@ -1173,6 +1180,7 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                     raise ValueError("File not found in S3")
 
                 doc_content = read_s3_file(s3, bk_name, file_keys[0])
+                _raw_file_bytes = doc_content if isinstance(doc_content, bytes) else None
                 if doc_content is None:
                     raise ValueError("Failed to read S3 file")
 
@@ -1204,6 +1212,7 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
                 doc_content = get_azure_docs(file_key, document_id=doc_id)
                 if doc_content is None:
                     raise ValueError(f"Failed to read file {file_key}")
+                _raw_file_bytes = doc_content if isinstance(doc_content, bytes) else None
 
                 extracted_doc = fileProcessor(doc_content, file_path)
                 if not extracted_doc:
@@ -1457,6 +1466,25 @@ def _extract_from_connector(doc_id: str, doc_data: Dict[str, Any], conn_data: Di
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to run structured extraction engine for %s: %s", doc_id, exc)
             structured_docs = {}
+
+        # --- Visual Intelligence Enrichment (second pass) ---
+        if VISUAL_INTELLIGENCE_AVAILABLE and _raw_file_bytes:
+            try:
+                import asyncio
+                _vi_orch = get_visual_orchestrator()
+                for _vi_fname, _vi_content in (masked_docs or {}).items():
+                    try:
+                        _vi_enriched = asyncio.run(
+                            _vi_orch.enrich(doc_id, _vi_content, _raw_file_bytes)
+                        )
+                        if _vi_enriched is not _vi_content:
+                            masked_docs[_vi_fname] = _vi_enriched
+                            logger.info("Visual intelligence enriched document %s (%s)", doc_id, _vi_fname)
+                    except Exception as _vi_page_exc:
+                        logger.warning("Visual intelligence enrichment failed for %s/%s: %s", doc_id, _vi_fname, _vi_page_exc)
+                    break  # Process first document only
+            except Exception as _vi_exc:
+                logger.warning("Visual intelligence enrichment skipped: %s", _vi_exc)
 
         # Intelligence layer processing: entity extraction, Q&A generation
         intelligence_result = _process_document_intelligence(
@@ -2084,6 +2112,29 @@ def extract_uploaded_document(
     emit_status_log(document_id, "extraction", "structured_extraction_done",
                     f"Structured extraction completed ({len(structured_docs)} files processed)",
                     extra={"files_processed": len(structured_docs)})
+
+    # --- Visual Intelligence Enrichment (second pass) ---
+    if VISUAL_INTELLIGENCE_AVAILABLE:
+        try:
+            import asyncio
+            _vi_orch = get_visual_orchestrator()
+            _vi_docs = extracted if isinstance(extracted, dict) else {filename: extracted}
+            for _vi_fname, _vi_content in _vi_docs.items():
+                try:
+                    _vi_enriched = asyncio.run(
+                        _vi_orch.enrich(document_id, _vi_content, file_bytes)
+                    )
+                    if _vi_enriched is not _vi_content:
+                        if isinstance(extracted, dict):
+                            extracted[_vi_fname] = _vi_enriched
+                        else:
+                            extracted = _vi_enriched
+                        logger.info("Visual intelligence enriched document %s (%s)", document_id, _vi_fname)
+                except Exception as _vi_page_exc:
+                    logger.warning("Visual intelligence enrichment failed for %s/%s: %s", document_id, _vi_fname, _vi_page_exc)
+                break  # Process first document only
+        except Exception as _vi_exc:
+            logger.warning("Visual intelligence enrichment skipped: %s", _vi_exc)
 
     # Intelligence layer processing: entity extraction, Q&A generation
     intelligence_result = _process_document_intelligence(
