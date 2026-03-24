@@ -1,0 +1,1 @@
+"""Visual intelligence model wrappers."""
