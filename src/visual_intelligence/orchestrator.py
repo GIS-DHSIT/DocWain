@@ -59,6 +59,7 @@ class VisualIntelligenceOrchestrator:
         self._dit_detector: Optional[Any] = None
         self._table_detector: Optional[Any] = None
         self._trocr_enhancer: Optional[Any] = None
+        self._layoutlmv3_extractor: Optional[Any] = None
         self._kg_enricher: Optional[Any] = None
 
     # ------------------------------------------------------------------
@@ -98,6 +99,17 @@ class VisualIntelligenceOrchestrator:
     @trocr_enhancer.setter
     def trocr_enhancer(self, value: Any) -> None:
         self._trocr_enhancer = value
+
+    @property
+    def layoutlmv3_extractor(self) -> Any:
+        if self._layoutlmv3_extractor is None:
+            from src.visual_intelligence.models.layoutlmv3 import LayoutLMv3Extractor
+            self._layoutlmv3_extractor = LayoutLMv3Extractor()
+        return self._layoutlmv3_extractor
+
+    @layoutlmv3_extractor.setter
+    def layoutlmv3_extractor(self, value: Any) -> None:
+        self._layoutlmv3_extractor = value
 
     @property
     def kg_enricher(self) -> Any:
@@ -268,6 +280,16 @@ class VisualIntelligenceOrchestrator:
                     )
                     if patch:
                         ocr_patches.append(patch)
+
+            # LayoutLMv3 for semantic KIE (key information extraction)
+            try:
+                extracted_kv = self.layoutlmv3_extractor.extract(
+                    page_img.image, words=[], boxes=[],
+                    page_number=page_img.page_number,
+                )
+                kv_pairs.extend(extracted_kv)
+            except Exception:
+                logger.debug("LayoutLMv3 failed on page %d", page_img.page_number, exc_info=True)
 
         return {
             "regions": regions,

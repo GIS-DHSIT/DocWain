@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 try:
     import torch
@@ -134,6 +134,13 @@ class ModelPool:
         with self._lock:
             self._models.clear()
             self._processors.clear()
+
+    def warmup(self, model_keys: List[str]) -> None:
+        """Pre-load models to avoid cold-start latency."""
+        for key in model_keys:
+            if self.is_available(key):
+                self.load_model(key)
+                logger.info("Warmed up model '%s'", key)
 
     # ------------------------------------------------------------------
     # Internal helpers
