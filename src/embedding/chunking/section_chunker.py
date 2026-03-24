@@ -18,6 +18,14 @@ from src.embedding.chunking.sentence_splitter import join_sentences, split_into_
 
 logger = get_logger(__name__)
 
+# When True, each section becomes a single chunk (100-4000 char guardrails).
+# When False, sections are fragmented at the smaller target_chunk_chars threshold (legacy).
+FULL_SECTION_MODE = True
+
+# Full-section mode guardrails
+_FULL_SECTION_MIN_CHARS = 100
+_FULL_SECTION_MAX_CHARS = 4000
+
 _HEADING_RE = re.compile(
     r"^(?:chapter\b|section\b|appendix\b|\d+(?:\.\d+)+|\d+\.|[ivxlcdm]+\.)\s+.+",
     re.IGNORECASE,
@@ -219,22 +227,98 @@ class SectionChunker:
         chunks: List[Chunk] = []
         chunk_index = 0
 
-        for section_path, section, section_blocks in sections:
-            if not section_blocks:
-                continue
-            section_title = (section.title or "Untitled Section").strip() or "Untitled Section"
-            section_path = section_path or section_title
+        if FULL_SECTION_MODE:
+            # ── Full-section mode: collect section texts, merge small ones ──
+            section_entries: List[Tuple[str, str, str, Optional[int], Optional[int]]] = []
+            # Each entry: (section_title, section_path, section_text, page_start, page_end)
 
-            section_chunks = self._chunk_section(
-                section_blocks,
-                section_title=section_title,
-                section_path=section_path,
-                doc_internal_id=doc_internal_id,
-                source_filename=source_filename,
-                start_index=chunk_index,
-            )
-            chunks.extend(section_chunks)
-            chunk_index += len(section_chunks)
+            for section_path_val, section, section_blocks in sections:
+                if not section_blocks:
+                    continue
+                section_title = (section.title or "Untitled Section").strip() or "Untitled Section"
+                section_path_val = section_path_val or section_title
+                text, page_start, page_end = self._render_chunk_text(section_blocks)
+                if not text.strip():
+                    continue
+                section_entries.append((section_title, section_path_val, text, page_start, page_end))
+
+            # Merge sections smaller than _FULL_SECTION_MIN_CHARS with adjacent below
+            merged_entries: List[Tuple[str, str, str, Optional[int], Optional[int]]] = []
+            for entry in section_entries:
+                title, path, text, ps, pe = entry
+                if len(text) < _FULL_SECTION_MIN_CHARS and merged_entries:
+                    # Merge into previous entry
+                    prev = merged_entries[-1]
+                    merged_entries[-1] = (
+                        prev[0],
+                        prev[1],
+                        prev[2] + "\n\n" + text,
+                        prev[3],
+                        pe if pe is not None else prev[4],
+                    )
+                elif len(text) < _FULL_SECTION_MIN_CHARS and not merged_entries:
+                    # First section is too small — keep it, will merge forward
+                    merged_entries.append(entry)
+                else:
+                    # Check if previous entry was too small and should merge into this one
+                    if merged_entries and len(merged_entries[-1][2]) < _FULL_SECTION_MIN_CHARS:
+                        prev = merged_entries[-1]
+                        merged_entries[-1] = (
+                            title,
+                            path,
+                            prev[2] + "\n\n" + text,
+                            prev[3],
+                            pe if pe is not None else prev[4],
+                        )
+                    else:
+                        merged_entries.append(entry)
+
+            # Now chunk each merged entry
+            for title, path, text, ps, pe in merged_entries:
+                if len(text) <= _FULL_SECTION_MAX_CHARS:
+                    # Single chunk for the full section
+                    sentence_complete = text.strip()[-1] in {".", "?", "!"} if text.strip() else False
+                    chunks.append(Chunk(
+                        text=text,
+                        section_title=title,
+                        section_path=path,
+                        page_start=ps,
+                        page_end=pe,
+                        chunk_index=chunk_index,
+                        doc_internal_id=str(doc_internal_id),
+                        source_filename=source_filename,
+                        sentence_complete=sentence_complete,
+                    ))
+                    chunk_index += 1
+                else:
+                    # Split at paragraph boundaries with 2-sentence overlap
+                    sub_chunks = self._split_large_section(
+                        text, title=title, path=path,
+                        page_start=ps, page_end=pe,
+                        doc_internal_id=doc_internal_id,
+                        source_filename=source_filename,
+                        start_index=chunk_index,
+                    )
+                    chunks.extend(sub_chunks)
+                    chunk_index += len(sub_chunks)
+        else:
+            # ── Legacy fragmented mode ──
+            for section_path_val, section, section_blocks in sections:
+                if not section_blocks:
+                    continue
+                section_title = (section.title or "Untitled Section").strip() or "Untitled Section"
+                section_path_val = section_path_val or section_title
+
+                section_chunks = self._chunk_section(
+                    section_blocks,
+                    section_title=section_title,
+                    section_path=section_path_val,
+                    doc_internal_id=doc_internal_id,
+                    source_filename=source_filename,
+                    start_index=chunk_index,
+                )
+                chunks.extend(section_chunks)
+                chunk_index += len(section_chunks)
 
         if not chunks:
             raise ValueError(f"No chunks produced for {source_filename}")
@@ -487,6 +571,148 @@ class SectionChunker:
             cleaned.append(Block(text, block_type, block.page_start, block.page_end))
         return cleaned
 
+    # -------- full-section splitting --------
+    def _split_large_section(
+        self,
+        text: str,
+        *,
+        title: str,
+        path: str,
+        page_start: Optional[int],
+        page_end: Optional[int],
+        doc_internal_id: str,
+        source_filename: str,
+        start_index: int,
+    ) -> List[Chunk]:
+        """Split a section > _FULL_SECTION_MAX_CHARS at paragraph boundaries with 2-sentence overlap.
+
+        Falls back to sentence-based splitting when paragraph boundaries are insufficient.
+        """
+        paragraphs = [p.strip() for p in re.split(r"\n\n+", text) if p.strip()]
+        if not paragraphs:
+            return []
+
+        # If there's only one paragraph or any paragraph exceeds the max,
+        # fall back to sentence-level splitting.
+        needs_sentence_split = len(paragraphs) == 1 or any(
+            len(p) > _FULL_SECTION_MAX_CHARS for p in paragraphs
+        )
+        if needs_sentence_split:
+            return self._split_section_by_sentences(
+                text, title=title, path=path,
+                page_start=page_start, page_end=page_end,
+                doc_internal_id=doc_internal_id,
+                source_filename=source_filename,
+                start_index=start_index,
+            )
+
+        chunks: List[Chunk] = []
+        chunk_index = start_index
+        buffer: List[str] = []
+        buf_len = 0
+        last_chunk_sentences: List[str] = []
+
+        def _flush() -> None:
+            nonlocal buffer, buf_len, last_chunk_sentences, chunk_index
+            if not buffer:
+                return
+            chunk_text = "\n\n".join(buffer).strip()
+            if not chunk_text:
+                buffer = []
+                buf_len = 0
+                return
+            sentence_complete = chunk_text[-1] in {".", "?", "!"} if chunk_text else False
+            chunks.append(Chunk(
+                text=chunk_text,
+                section_title=title,
+                section_path=path,
+                page_start=page_start,
+                page_end=page_end,
+                chunk_index=chunk_index,
+                doc_internal_id=str(doc_internal_id),
+                source_filename=source_filename,
+                sentence_complete=sentence_complete,
+            ))
+            last_chunk_sentences = split_into_sentences(chunk_text)
+            chunk_index += 1
+            buffer = []
+            buf_len = 0
+            # Add 2-sentence overlap from previous chunk
+            if last_chunk_sentences and self.overlap_sentences > 0:
+                overlap = " ".join(last_chunk_sentences[-self.overlap_sentences:]).strip()
+                if overlap:
+                    buffer = [overlap]
+                    buf_len = len(overlap)
+
+        for para in paragraphs:
+            para_len = len(para)
+            if buffer and buf_len + para_len + 2 > _FULL_SECTION_MAX_CHARS:
+                _flush()
+            buffer.append(para)
+            buf_len += para_len + 2
+
+        _flush()
+        return chunks
+
+    def _split_section_by_sentences(
+        self,
+        text: str,
+        *,
+        title: str,
+        path: str,
+        page_start: Optional[int],
+        page_end: Optional[int],
+        doc_internal_id: str,
+        source_filename: str,
+        start_index: int,
+    ) -> List[Chunk]:
+        """Split text by sentences when paragraph boundaries are not available."""
+        sentences = split_into_sentences(text)
+        if not sentences:
+            return []
+
+        chunks: List[Chunk] = []
+        chunk_index = start_index
+        buffer: List[str] = []
+        buf_len = 0
+
+        def _flush_sentences() -> None:
+            nonlocal buffer, buf_len, chunk_index
+            if not buffer:
+                return
+            chunk_text = " ".join(buffer).strip()
+            if not chunk_text:
+                buffer = []
+                buf_len = 0
+                return
+            sentence_complete = chunk_text[-1] in {".", "?", "!"} if chunk_text else False
+            chunks.append(Chunk(
+                text=chunk_text,
+                section_title=title,
+                section_path=path,
+                page_start=page_start,
+                page_end=page_end,
+                chunk_index=chunk_index,
+                doc_internal_id=str(doc_internal_id),
+                source_filename=source_filename,
+                sentence_complete=sentence_complete,
+            ))
+            chunk_index += 1
+            # 2-sentence overlap
+            overlap = buffer[-self.overlap_sentences:] if self.overlap_sentences > 0 else []
+            buffer = list(overlap)
+            buf_len = sum(len(s) + 1 for s in buffer)
+
+        for sentence in sentences:
+            slen = len(sentence)
+            if buffer and buf_len + slen + 1 > _FULL_SECTION_MAX_CHARS:
+                _flush_sentences()
+            buffer.append(sentence)
+            buf_len += slen + 1
+
+        _flush_sentences()
+        return chunks
+
     # -------- chunking --------
     def _chunk_section(
         self,
@@ -675,3 +901,18 @@ class SectionChunker:
         if block_type in {"bullet", "table"}:
             return True
         return stripped[-1] in {".", "?", "!"}
+
+
+def chunk_document(
+    extracted_document: Any,
+    *,
+    doc_internal_id: str,
+    source_filename: str,
+) -> List[Chunk]:
+    """Module-level convenience wrapper around SectionChunker.chunk_document."""
+    chunker = SectionChunker()
+    return chunker.chunk_document(
+        extracted_document,
+        doc_internal_id=doc_internal_id,
+        source_filename=source_filename,
+    )
