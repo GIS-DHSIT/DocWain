@@ -1,0 +1,44 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "name": {
+      "value": "DocWainKB"
+    },
+    "location": {
+      "value": "westeurope"
+    },
+    "sku": {
+      "value": "Free"
+    },
+    "skucode": {
+      "value": "Free"
+    },
+    "repositoryUrl": {
+      "value": "https://github.com/GIS-DHSIT/DocWain"
+    },
+    "branch": {
+      "value": "main"
+    },
+    "repositoryToken": {
+      "reference": {
+        "keyVault": {
+          "id": "/subscriptions/15e0c724-4de0-492e-9861-9e637b3f9076/resourceGroups/DocWain/providers/Microsoft.KeyVault/vaults/docwain-vault"
+        },
+        "secretName": "github-pat"
+      }
+    },
+    "appLocation": {
+      "value": "docs/course"
+    },
+    "apiLocation": {
+      "value": ""
+    },
+    "appArtifactLocation": {
+      "value": ""
+    },
+    "enterpriseGradeCdnStatus": {
+      "value": "Disabled"
+    }
+  }
+}

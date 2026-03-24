@@ -1,0 +1,13 @@
+{
+  "navigationFallback": {
+    "rewrite": "/index.html"
+  },
+  "globalHeaders": {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "SAMEORIGIN",
+    "Cache-Control": "public, max-age=3600"
+  },
+  "mimeTypes": {
+    ".html": "text/html"
+  }
+}
