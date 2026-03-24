@@ -245,6 +245,12 @@ class CoreAgent:
 
         timing["understand_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
+        logger.info(
+            "[RAG_QUERY] query=%r profile=%s subscription=%s user=%s task_type=%s",
+            query[:100], profile_id, subscription_id, user_id,
+            getattr(understanding, "task_type", "?"),
+        )
+
         if understanding.is_conversational:
             return self._handle_conversational(query)
 
@@ -343,6 +349,30 @@ class CoreAgent:
 
         # Dynamic evidence count by task type
         evidence_top_k = _EVIDENCE_TOP_K.get(understanding.task_type, 6)
+
+        # --- Profile isolation audit on retrieved chunks ---
+        _raw_chunks = retrieval_result.chunks or []
+        _chunk_profiles = set()
+        _chunk_sources = set()
+        _foreign_count = 0
+        for _rc in _raw_chunks:
+            _rc_pid = getattr(_rc, "profile_id", None) or (getattr(_rc, "metadata", {}) or {}).get("profile_id", "")
+            _rc_src = (getattr(_rc, "metadata", {}) or {}).get("source_name", getattr(_rc, "document_id", "?"))
+            _chunk_profiles.add(str(_rc_pid))
+            _chunk_sources.add(str(_rc_src))
+            if str(_rc_pid) and str(_rc_pid) != str(profile_id):
+                _foreign_count += 1
+        if _foreign_count:
+            logger.error(
+                "[PROFILE_ISOLATION_VIOLATION] %d/%d retrieved chunks belong to foreign profiles %s "
+                "(expected=%s query=%r)",
+                _foreign_count, len(_raw_chunks), _chunk_profiles - {str(profile_id)},
+                profile_id, query[:80],
+            )
+        logger.info(
+            "[RAG_RETRIEVAL] profile=%s chunks=%d sources=%s profiles_seen=%s",
+            profile_id, len(_raw_chunks), list(_chunk_sources)[:10], list(_chunk_profiles),
+        )
 
         reranked = rerank_chunks(
             understanding.resolved_query,  # rerank against original query, not expanded
@@ -477,6 +507,15 @@ class CoreAgent:
             grounded=reason_result.grounded,
             task_type=understanding.task_type,
             metadata=metadata,
+        )
+
+        _evidence_sources = list({e.get("source_name", e.get("document_id", "?")) for e in evidence})
+        logger.info(
+            "[RAG_RESPONSE] profile=%s grounded=%s evidence_count=%d "
+            "sources=%s task_type=%s response_len=%d timing=%s query=%r",
+            profile_id, reason_result.grounded, len(evidence),
+            _evidence_sources[:5], understanding.task_type,
+            len(reason_result.text), timing, query[:80],
         )
 
         # --- FEEDBACK SIGNAL (non-blocking) ---
