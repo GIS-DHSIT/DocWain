@@ -336,7 +336,7 @@ def _check_doc_intelligence_exists(doc_id: str, subscription_id: str, profile_id
         from src.api.dataHandler import get_vector_store
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         _vs = get_vector_store()
-        _count = _vs.qdrant_client.count(
+        _count = _vs.client.count(
             collection_name=build_collection_name(subscription_id),
             count_filter=Filter(must=[
                 FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
@@ -365,7 +365,7 @@ def _upsert_doc_intelligence(
         build_doc_intelligence_text,
     )
     from src.embedding.pipeline.schema_normalizer import build_qdrant_payload
-    from src.api.dataHandler import get_vector_store, get_embedding_model
+    from src.api.dataHandler import get_vector_store, get_model
 
     intelligence = extract_document_intelligence(full_text, source_filename)
     doc_index_text = build_doc_index_text(source_filename, intelligence)
@@ -375,7 +375,7 @@ def _upsert_doc_intelligence(
         logger.warning("[DOC_INTELLIGENCE] Empty doc_index text for %s", doc_id)
         return
 
-    model = get_embedding_model()
+    model = get_model()
     _vs = get_vector_store()
 
     # Build and upsert doc_index point
@@ -423,7 +423,7 @@ def _upsert_doc_intelligence(
             payload=intel_payload,
         ),
     ]
-    _vs.qdrant_client.upsert(collection_name=collection_name, points=points)
+    _vs.client.upsert(collection_name=collection_name, points=points)
     logger.info("[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)", doc_id, source_filename)
 
 
@@ -2113,7 +2113,7 @@ def _process_blob(
                             collection_name=build_collection_name(subscription_id or ""),
                         )
             except Exception as _di_exc:
-                logger.debug("[DOC_INTELLIGENCE] Skipped-path extraction failed: %s", _di_exc)
+                logger.warning("[DOC_INTELLIGENCE] Skipped-path extraction failed: %s", _di_exc, exc_info=True)
             result["status"] = "SKIPPED"
             result["failed_reason"] = None
             return result
@@ -2324,7 +2324,7 @@ def _process_blob(
                             collection_name=build_collection_name(subscription_id or ""),
                         )
             except Exception as _di_exc:
-                logger.debug("[DOC_INTELLIGENCE] Already-embedded path extraction failed: %s", _di_exc)
+                logger.warning("[DOC_INTELLIGENCE] Already-embedded path extraction failed: %s", _di_exc, exc_info=True)
 
             if telemetry:
                 telemetry.increment("embed_skipped_already_embedded_total")

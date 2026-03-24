@@ -21,6 +21,7 @@ REQUIRED_PAYLOAD_INDEX_FIELDS: List[str] = [
     "chunk_id",
     "page",
     "embed_pipeline_version",
+    "resolution",
 ]
 
 _INDEX_CACHE: Dict[str, Tuple[float, List[str]]] = {}
