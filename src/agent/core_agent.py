@@ -54,14 +54,14 @@ _STOPWORDS: Set[str] = {
 # ---------------------------------------------------------------------------
 
 _EVIDENCE_TOP_K: Dict[str, int] = {
-    "lookup": 4,
-    "extract": 6,
-    "list": 8,
-    "summarize": 8,
-    "overview": 10,
-    "compare": 8,
-    "investigate": 8,
-    "aggregate": 6,
+    "lookup": 8,
+    "extract": 12,
+    "list": 20,
+    "summarize": 20,
+    "overview": 25,
+    "compare": 12,
+    "investigate": 12,
+    "aggregate": 10,
 }
 
 _TASK_SYNONYMS: Dict[str, List[str]] = {
@@ -125,6 +125,7 @@ class CoreAgent:
         cross_encoder: Any = None,
     ) -> None:
         self._llm = llm_gateway
+        self._qdrant = qdrant_client
         self._mongodb = mongodb
         self._intent_analyzer = IntentAnalyzer(llm_gateway=llm_gateway)
         self._retriever = UnifiedRetriever(qdrant_client=qdrant_client, embedder=embedder)
@@ -250,6 +251,57 @@ class CoreAgent:
             query[:100], profile_id, subscription_id, user_id,
             getattr(understanding, "task_type", "?"),
         )
+
+        # --- Fetch document index for profile awareness ---
+        BROAD_TASK_TYPES = {"summarize", "overview", "list", "aggregate", "compare"}
+        doc_index_entries: List[str] = []
+        doc_intelligence_entries: List[str] = []
+        try:
+            from qdrant_client.models import Filter as _QFilter, FieldCondition as _QFC, MatchValue as _QMV
+            from src.api.vector_store import build_collection_name
+            _collection = build_collection_name(subscription_id)
+
+            # Always fetch doc_index (compact, ~50 tokens per doc)
+            _idx_points, _ = self._qdrant.scroll(
+                collection_name=_collection,
+                scroll_filter=_QFilter(must=[
+                    _QFC(key="profile_id", match=_QMV(value=str(profile_id))),
+                    _QFC(key="resolution", match=_QMV(value="doc_index")),
+                ]),
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            doc_index_entries = [
+                (p.payload or {}).get("canonical_text", "")
+                for p in _idx_points
+                if (p.payload or {}).get("canonical_text")
+            ]
+
+            # For broad queries, also fetch doc_intelligence
+            if understanding.task_type in BROAD_TASK_TYPES:
+                _intel_points, _ = self._qdrant.scroll(
+                    collection_name=_collection,
+                    scroll_filter=_QFilter(must=[
+                        _QFC(key="profile_id", match=_QMV(value=str(profile_id))),
+                        _QFC(key="resolution", match=_QMV(value="doc_intelligence")),
+                    ]),
+                    limit=200,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                doc_intelligence_entries = [
+                    (p.payload or {}).get("canonical_text", "")
+                    for p in _intel_points
+                    if (p.payload or {}).get("canonical_text")
+                ]
+
+            logger.info(
+                "[DOC_INDEX] Fetched %d doc_index + %d doc_intelligence entries for profile %s",
+                len(doc_index_entries), len(doc_intelligence_entries), profile_id,
+            )
+        except Exception as _di_exc:
+            logger.debug("[DOC_INDEX] Fetch failed (non-fatal): %s", _di_exc)
 
         if understanding.is_conversational:
             return self._handle_conversational(query)
@@ -473,6 +525,12 @@ class CoreAgent:
             logger.debug("Hot cache module not available — skipping KG enrichment")
         except Exception as exc:
             logger.debug("KG context enrichment failed (non-fatal): %s", exc)
+
+        # --- Enrich doc_context with doc_index / doc_intelligence ---
+        if doc_index_entries:
+            doc_context["doc_index"] = doc_index_entries
+        if doc_intelligence_entries:
+            doc_context["doc_intelligence_summaries"] = doc_intelligence_entries
 
         # --- REASON ---
         t0 = time.monotonic()

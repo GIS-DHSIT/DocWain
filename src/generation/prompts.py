@@ -412,6 +412,28 @@ def build_reason_prompt(
         parts.append("--- END DOCUMENT INTELLIGENCE ---")
         parts.append("")
 
+    # Document Index — always present when available
+    doc_index = None
+    doc_intel_summaries = None
+    if doc_context:
+        doc_index = doc_context.get("doc_index")
+        doc_intel_summaries = doc_context.get("doc_intelligence_summaries")
+
+    if doc_index:
+        parts.append("--- DOCUMENT INDEX (%d documents in this profile) ---" % len(doc_index))
+        for i, entry in enumerate(doc_index, 1):
+            parts.append(f"{i}. {entry}")
+        parts.append("--- END DOCUMENT INDEX ---")
+        parts.append("")
+
+    if doc_intel_summaries:
+        parts.append("--- DOCUMENT INTELLIGENCE (structured summaries) ---")
+        for entry in doc_intel_summaries:
+            parts.append(entry)
+            parts.append("")
+        parts.append("--- END DOCUMENT INTELLIGENCE ---")
+        parts.append("")
+
     # Evidence block
     parts.append("--- EVIDENCE ---")
     if evidence:

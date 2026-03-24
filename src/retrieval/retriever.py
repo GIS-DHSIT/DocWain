@@ -63,7 +63,7 @@ class UnifiedRetriever:
         profile_ids: List[str],
         *,
         document_ids: Optional[List[str]] = None,
-        top_k: int = 30,
+        top_k: int = 50,
         correlation_id: Optional[str] = None,
     ) -> RetrievalResult:
         """Search across one or more profiles and return merged results."""
@@ -174,6 +174,11 @@ class UnifiedRetriever:
             )
             points = []
 
+        # Filter out doc_index/doc_intelligence points — those are fetched separately
+        points = [
+            pt for pt in points
+            if (pt.payload or {}).get("resolution", "chunk") not in ("doc_index", "doc_intelligence")
+        ]
         chunks = [self._point_to_chunk(pt, profile_id) for pt in points]
 
         # Keyword fallback when dense returns too few high-quality hits
