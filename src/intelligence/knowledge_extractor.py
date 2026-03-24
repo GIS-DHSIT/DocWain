@@ -239,11 +239,44 @@ class KnowledgeExtractor:
                         "[KnowledgeExtractor] Recovered JSON from thinking block for page=%s section=%s",
                         page, section,
                     )
+        if not parsed and raw_text and len(raw_text.strip()) >= 10:
+            # Only retry if LLM produced content that failed to parse as JSON.
+            # Empty responses won't improve with a retry.
+            try:
+                retry_prompt = (
+                    "You MUST respond with ONLY a valid JSON object. No text before or after.\n\n"
+                    + prompt
+                )
+                raw_text_retry, _meta_retry = llm.generate_with_metadata(
+                    retry_prompt,
+                    system=_EXTRACTION_SYSTEM + "\n\nCRITICAL: Output ONLY the JSON object. No markdown fences, no explanation.",
+                    temperature=0.05,
+                    max_tokens=self._max_tokens,
+                )
+                parsed = self._parse_json(raw_text_retry)
+                if not parsed:
+                    thinking_retry = (_meta_retry or {}).get("thinking", "")
+                    if thinking_retry:
+                        parsed = self._parse_json(thinking_retry)
+                if parsed:
+                    logger.info(
+                        "[KnowledgeExtractor] Recovered via retry for page=%s section=%s",
+                        page, section,
+                    )
+            except Exception as retry_err:
+                logger.debug("[KnowledgeExtractor] Retry failed for page=%s section=%s: %s", page, section, retry_err)
         if not parsed:
-            logger.warning(
-                "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s",
-                page, section,
-            )
+            if not raw_text or len(raw_text.strip()) < 10:
+                logger.debug(
+                    "[KnowledgeExtractor] Empty LLM response for page=%s section=%s (skipping)",
+                    page, section,
+                )
+            else:
+                snippet = (raw_text or "")[:200].replace("\n", " ")
+                logger.warning(
+                    "[KnowledgeExtractor] Failed to parse JSON for page=%s section=%s raw_preview='%s'",
+                    page, section, snippet,
+                )
             return KnowledgeExtractionResult(
                 extraction_time_ms=(time.monotonic() - start) * 1000
             )
@@ -278,19 +311,47 @@ class KnowledgeExtractor:
         Returns:
             List of KnowledgeExtractionResult, one per section.
         """
-        results = []
-        for sec in sections:
+        import concurrent.futures
+
+        if len(sections) <= 1:
+            # No benefit from parallelization
+            results = []
+            for sec in sections:
+                text = sec.get("text", "")
+                page = sec.get("page", sec.get("start_page", 1))
+                section_title = sec.get("section_title", sec.get("title", "unknown"))
+                result = self.extract_section(
+                    text=text,
+                    page=page,
+                    section=section_title,
+                    confidence_threshold=confidence_threshold,
+                )
+                results.append(result)
+            return results
+
+        max_workers = min(3, len(sections))
+
+        def _extract_one(sec):
             text = sec.get("text", "")
             page = sec.get("page", sec.get("start_page", 1))
             section_title = sec.get("section_title", sec.get("title", "unknown"))
-
-            result = self.extract_section(
+            return self.extract_section(
                 text=text,
                 page=page,
                 section=section_title,
                 confidence_threshold=confidence_threshold,
             )
-            results.append(result)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_extract_one, sec): i for i, sec in enumerate(sections)}
+            results = [None] * len(sections)
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
+                try:
+                    results[idx] = future.result(timeout=120.0)
+                except Exception as exc:
+                    logger.warning("[KnowledgeExtractor] Section %d failed: %s", idx, exc)
+                    results[idx] = KnowledgeExtractionResult()
 
         return results
 
@@ -363,15 +424,31 @@ class KnowledgeExtractor:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to find JSON object in the text
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                try:
-                    return json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    pass
-            return None
+            pass
+
+        # Try to find JSON object in the text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+
+        # Try fixing common LLM JSON issues: trailing commas, single quotes
+        import re
+        cleaned = text[start:end] if (start >= 0 and end > start) else text
+        # Remove trailing commas before } or ]
+        cleaned = re.sub(r',\s*([}\]])', r'\1', cleaned)
+        # Replace single quotes with double quotes (crude but effective for simple cases)
+        if "'" in cleaned and '"' not in cleaned:
+            cleaned = cleaned.replace("'", '"')
+        try:
+            return json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        return None
 
     def _build_result(
         self,

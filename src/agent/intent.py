@@ -7,6 +7,7 @@ without an LLM call; everything else gets analyzed via build_understand_prompt.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -82,8 +83,9 @@ class QueryUnderstanding:
 class IntentAnalyzer:
     """LLM-native intent analysis with conversational fast-path."""
 
-    def __init__(self, llm_gateway: Any) -> None:
+    def __init__(self, llm_gateway: Any, redis_client: Any = None) -> None:
         self._llm = llm_gateway
+        self._redis = redis_client
 
     # -- public API ---------------------------------------------------------
 
@@ -123,14 +125,45 @@ class IntentAnalyzer:
             self._enrich_relevant_documents(heuristic, query, doc_intelligence, kg_hints)
             return heuristic
 
+        # Build cache key: intent:{profile_id}:{sha1(query)}
+        _query_hash = hashlib.sha1(query.encode("utf-8")).hexdigest()
+        _cache_key = f"intent:{profile_id}:{_query_hash}"
+        _INTENT_TTL = 300  # 5 minutes
+
+        # Check Redis cache before calling LLM
+        if self._redis is not None:
+            try:
+                cached_raw = self._redis.get(_cache_key)
+                if cached_raw:
+                    if isinstance(cached_raw, (bytes, bytearray)):
+                        cached_raw = cached_raw.decode("utf-8")
+                    cached_data = json.loads(cached_raw)
+                    result = QueryUnderstanding(
+                        task_type=cached_data["task_type"],
+                        complexity=cached_data["complexity"],
+                        resolved_query=cached_data["resolved_query"],
+                        output_format=cached_data["output_format"],
+                        relevant_documents=cached_data.get("relevant_documents", []),
+                        cross_profile=cached_data.get("cross_profile", False),
+                        sub_tasks=cached_data.get("sub_tasks"),
+                        entities=cached_data.get("entities", []),
+                        needs_clarification=cached_data.get("needs_clarification", False),
+                        clarification_question=cached_data.get("clarification_question"),
+                    )
+                    logger.debug("[IntentAnalyzer] Cache hit for key %s", _cache_key)
+                    self._enrich_relevant_documents(result, query, doc_intelligence, kg_hints)
+                    return result
+            except Exception:
+                logger.debug("[IntentAnalyzer] Redis cache read failed — proceeding without cache")
+
         # Build prompt and call LLM
         prompt = build_understand_prompt(query, doc_intelligence, conversation_history)
         try:
             raw = self._llm.generate(
                 prompt,
-                system="You are a document intelligence query analyzer. Respond with valid JSON only.",
+                system="You are a document intelligence query analyzer. Respond with valid JSON only. Do NOT use <think> tags. Output JSON immediately.",
                 temperature=0.1,
-                max_tokens=1024,
+                max_tokens=2048,
             )
         except Exception:
             logger.exception("LLM call failed for intent analysis")
@@ -139,6 +172,27 @@ class IntentAnalyzer:
             return result
 
         result = self._parse_response(raw, query)
+
+        # Cache successful LLM parse result (not fallback defaults)
+        if self._redis is not None and result.task_type != "summarize":
+            try:
+                cache_payload = json.dumps({
+                    "task_type": result.task_type,
+                    "complexity": result.complexity,
+                    "resolved_query": result.resolved_query,
+                    "output_format": result.output_format,
+                    "relevant_documents": result.relevant_documents,
+                    "cross_profile": result.cross_profile,
+                    "sub_tasks": result.sub_tasks,
+                    "entities": result.entities,
+                    "needs_clarification": result.needs_clarification,
+                    "clarification_question": result.clarification_question,
+                })
+                self._redis.setex(_cache_key, _INTENT_TTL, cache_payload)
+                logger.debug("[IntentAnalyzer] Cached intent result for key %s (TTL=%ds)", _cache_key, _INTENT_TTL)
+            except Exception:
+                logger.debug("[IntentAnalyzer] Redis cache write failed — continuing without cache")
+
         self._enrich_relevant_documents(result, query, doc_intelligence, kg_hints)
         return result
 
@@ -286,15 +340,20 @@ class IntentAnalyzer:
         # Strip markdown code fences if present
         text = raw.strip()
         if text.startswith("```"):
-            # Remove opening fence (```json or ```)
             text = re.sub(r"^```(?:json)?\s*\n?", "", text)
-            # Remove closing fence
             text = re.sub(r"\n?```\s*$", "", text)
+
+        # If response is empty but thinking block exists, try to extract JSON from thinking
+        if not text and raw:
+            think_match = re.search(r"\{[^{}]*\"task_type\"[^{}]*\}", raw, re.DOTALL)
+            if think_match:
+                text = think_match.group()
+                logger.debug("Extracted intent JSON from thinking block")
 
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, TypeError):
-            logger.warning("Failed to parse intent JSON: %.200s", raw)
+            logger.warning("Failed to parse intent JSON (len=%d): %.200s", len(raw or ""), raw or "(empty)")
             return IntentAnalyzer._safe_defaults(original_query)
 
         # Validate and coerce enum fields

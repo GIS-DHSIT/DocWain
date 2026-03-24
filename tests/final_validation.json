@@ -1,0 +1,132 @@
+{
+  "total": 24,
+  "gaps": 14,
+  "details": [
+    {
+      "name": "doc",
+      "q": "What candidates are in this profile?",
+      "issues": [
+        "EMPTY"
+      ],
+      "resp": "",
+      "expect": "List names"
+    },
+    {
+      "name": "doc",
+      "q": "Compare technical skills of all candidates.",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Technical Skills Comparison Across Candidates\n\nThe candidate pool splits primarily between **Full-Stack Engineering** and **AI/ML Specialization**, with Python dominating the language stack across ",
+      "expect": "Cross-ref"
+    },
+    {
+      "name": "doc",
+      "q": "Which candidate has the most experience?",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Executive Summary\nOnly one candidate profile is available in the provided documents, making a comparative ranking impossible; however, **Anish Rameshwaran** demonstrates **~15 months** of cumulativ",
+      "expect": "Reasoning"
+    },
+    {
+      "name": "doc",
+      "q": "Summarize each candidate in one sentence.",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Executive Summary\nFive engineering candidates are profiled across the documents, each seeking fresher roles with distinct technical specializations ranging from **Electronics** to **Artificial Inte",
+      "expect": "Multi-doc summary"
+    },
+    {
+      "name": "legal",
+      "q": "What is this agreement about?",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "This collection governs marketing services, primarily defined by a specific **2025** agreement between **Assurity Ltd.** and **NexaSpark Marketing Ltd.**.\n\n## Parties and Engagement Details\n\n### Prima",
+      "expect": "Contract summary"
+    },
+    {
+      "name": "legal",
+      "q": "What are the key clauses?",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Agreement Identity and Parties\n\n- **Primary Client:** **City of Newport**\n- **Service Provider:** **Newport News-Times**\n- **Doing Business As:** **News Media Digital**\n- **Document Type:** **Adden",
+      "expect": "Clause extraction"
+    },
+    {
+      "name": "legal",
+      "q": "Who are the parties in the agreement?",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Agreement Parties\n\nThe agreement is formally entered into by two specific entities acting as the Client and the Marketer, collectively defined as the Parties. Since the document explicitly identifi",
+      "expect": "Entity extraction"
+    },
+    {
+      "name": "format",
+      "q": "Create a table of candidates with skills.",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Executive Summary\nSix candidates identified across AI/ML, Data Analysis, and Electronics domains with distinct technical stacks ranging from **LLM agents** to **embedded systems**.\n\n## Candidate Sk",
+      "expect": "Table"
+    },
+    {
+      "name": "format",
+      "q": "List key points as bullets.",
+      "issues": [
+        "EMPTY"
+      ],
+      "resp": "",
+      "expect": "Bullets"
+    },
+    {
+      "name": "format",
+      "q": "Give a one-paragraph summary.",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Executive Summary\nA cohort of engineering students from **Kongu Engineering College** specializing in **AI**, **Data Science**, and **ECE** are seeking fresher roles with strong programming fundame",
+      "expect": "Prose"
+    },
+    {
+      "name": "format",
+      "q": "Top 3 findings?",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "The collection highlights early-career engineers specializing in **AI** with verified project delivery and competition success.\n\n## Top 3 Findings\n\n### Finding 1: Unified Academic Specialization\n- **O",
+      "expect": "Numbered"
+    },
+    {
+      "name": "edge",
+      "q": "What is the capital of France?",
+      "issues": [
+        "EMPTY"
+      ],
+      "resp": "",
+      "expect": "Decline OOS"
+    },
+    {
+      "name": "edge",
+      "q": "Explain the technical architecture.",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "The evidence outlines three converging architectural domains: AI agent workflows, full-stack web applications, and data analytics pipelines.\n\n## AI & Automation Architecture\nThe resumes demonstrate a ",
+      "expect": "Deep reference"
+    },
+    {
+      "name": "multi",
+      "q": "Tell me more about the first one.",
+      "issues": [
+        "UNGROUNDED"
+      ],
+      "resp": "## Executive Summary\n**Kavipriya Rajavel** is the primary entity detailed in the intelligence, positioning as an **AI & Data Science** student with dual internship experience and a **8.19** CGPA.\n\n## ",
+      "expect": "Follow-up"
+    }
+  ]
+}

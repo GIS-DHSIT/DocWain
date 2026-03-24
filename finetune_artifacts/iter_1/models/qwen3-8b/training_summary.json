@@ -1,0 +1,10 @@
+{
+  "model": "unsloth/Qwen3-8B-bnb-4bit",
+  "training_loss": 3.1943261358473034,
+  "global_step": 18,
+  "examples": 22,
+  "epochs": 3,
+  "elapsed_seconds": 59.74030256271362,
+  "lora_r": 8,
+  "max_seq_length": 512
+}

@@ -22,8 +22,8 @@ model_router = APIRouter(prefix="/model", tags=["Model Management"])
 # ---------------------------------------------------------------------------
 
 class ModelUpdateRequest(BaseModel):
-    model_name: str = Field(default="MuthuSubramanian/DocWain", description="Ollama model name to update")
-    base_model: str = Field(default="qwen3:8b", description="Base model to build from")
+    model_name: str = Field(default="DHS/DocWain", description="Ollama model name to update")
+    base_model: str = Field(default="qwen3:14b", description="Base model to build from")
 
 
 class FinetuneCheckResponse(BaseModel):
@@ -182,7 +182,7 @@ async def trigger_auto_finetune(request: AutoFinetuneRequest, background_tasks: 
     1. Checks which profiles need fine-tuning (or use force=True to skip check)
     2. Builds training dataset from Qdrant + feedback
     3. Runs Unsloth LoRA fine-tune
-    4. On success: rebuilds and pushes MuthuSubramanian/DocWain
+    4. On success: rebuilds and pushes DHS/DocWain
 
     This is the endpoint the daily scheduler calls.
     """
@@ -276,16 +276,16 @@ async def trigger_auto_finetune(request: AutoFinetuneRequest, background_tasks: 
 
             # Step 3: If succeeded, rebuild and push model
             if ft_status in ("succeeded", "completed"):
-                logger.info("Fine-tune succeeded — rebuilding MuthuSubramanian/DocWain")
+                logger.info("Fine-tune succeeded — rebuilding DHS/DocWain")
                 project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
                 modelfile_path = os.path.join(project_dir, "Modelfile")
 
                 subprocess.run(
-                    ["ollama", "create", "MuthuSubramanian/DocWain", "-f", modelfile_path],
+                    ["ollama", "create", "DHS/DocWain", "-f", modelfile_path],
                     capture_output=True, text=True, timeout=300
                 )
                 subprocess.run(
-                    ["ollama", "push", "MuthuSubramanian/DocWain"],
+                    ["ollama", "push", "DHS/DocWain"],
                     capture_output=True, text=True, timeout=1200
                 )
                 _finetune_jobs[job_id].update({
@@ -349,7 +349,7 @@ async def get_model_status():
 
         return ModelStatusResponse(
             models=models,
-            active_model="MuthuSubramanian/DocWain:latest",
+            active_model="DHS/DocWain:latest",
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list models: {e}")

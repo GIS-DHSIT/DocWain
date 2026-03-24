@@ -1,0 +1,63 @@
+pipeline:
+  scheduled_interval_hours: 24
+  signal_threshold: 50
+  distillation_every_n: 3
+  eval_prompt_count: 200
+
+models:
+  primary: "unsloth/Qwen3-8B-bnb-4bit"
+  students:
+    - name: "qwen3-8b"
+      repo: "unsloth/Qwen3-8B-bnb-4bit"
+      enabled: true
+    - name: "llama-3.1-8b"
+      repo: "unsloth/Meta-Llama-3.1-8B-Instruct-bnb-4bit"
+      enabled: true
+
+training:
+  sft:
+    epochs: 3
+    learning_rate: 0.0002
+    lora_r: 16
+    lora_alpha: 16
+    batch_size: 4
+  dpo:
+    epochs: 1
+    beta: 0.1
+    learning_rate: 0.00005
+
+gate:
+  composite_minimum: 80.0
+  criterion_floor: 60.0
+  must_beat_previous: true
+  weights:
+    accuracy: 0.30
+    groundedness: 0.25
+    reasoning: 0.20
+    formatting: 0.15
+    tone: 0.10
+
+deployment:
+  target: ollama
+  ollama_host: "http://localhost:11434"
+  keep_previous: true
+  max_stored_iterations: 10
+
+docwain:
+  endpoint: "http://localhost:11434"
+  model_name: "DHS/DocWain"
+
+azure_fallback:
+  enabled: false
+  endpoint: "${AZURE_AI_ENDPOINT}"
+  api_key: "${AZURE_AI_API_KEY}"
+  model: "gpt-4.1"
+  deployment_date: "2025-04-14"
+
+v2:
+  base_model: "unsloth/Qwen3-14B-bnb-4bit"
+  vision_encoder: "google/siglip-so400m-patch14-384"
+  vision_dim: 1152
+  text_dim: 5120
+  lora_r: 16
+  artifact_dir: "finetune_artifacts/v2"

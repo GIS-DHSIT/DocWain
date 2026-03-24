@@ -49,13 +49,12 @@ def _detect_task_type(query: str) -> str:
 
         tokens = query.strip().split()
 
-        # For short queries (1-3 tokens), skip expensive conversational check
-        # — single words/phrases are never greetings or conversational
-        if len(tokens) > 3:
-            from src.nlp.nlu_engine import classify_conversational
-            conv = classify_conversational(query)
-            if conv and conv[0] == "GREETING":
-                return "greet"
+        # Short queries (1-3 tokens) are often greetings ("hi", "hello", "hey there").
+        # Always run the conversational check — it's cheap for short text.
+        from src.nlp.nlu_engine import classify_conversational
+        conv = classify_conversational(query)
+        if conv and conv[0] == "GREETING":
+            return "greet"
 
         intent = classify_intent(query)
         # Map NLU intent names to deterministic router task types

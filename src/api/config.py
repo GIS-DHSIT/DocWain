@@ -197,7 +197,7 @@ class Config:
         SIGNATURE_ENABLED = os.getenv("TEAMS_SIGNATURE_ENABLED", "false").lower() == "true"
         DEFAULT_PROFILE = os.getenv("TEAMS_DEFAULT_PROFILE", "default")
         DEFAULT_SUBSCRIPTION = os.getenv("TEAMS_DEFAULT_SUBSCRIPTION") or "15e0c724-4de0-492e-9861-9e637b3f9076"
-        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "DocWain-Agent")
+        DEFAULT_MODEL = os.getenv("TEAMS_DEFAULT_MODEL", "DHS/DocWain")
         DEFAULT_PERSONA = os.getenv("TEAMS_DEFAULT_PERSONA", "Document Assistant")
         UPLOAD_DIR = os.getenv("TEAMS_UPLOAD_DIR", "/tmp")
         BLOB_CONNECTION_STRING = os.getenv("TEAMS_BLOB_CONNECTION_STRING", "")
@@ -435,6 +435,18 @@ class Config:
         AGENT_FALLBACK_TO_LEGACY = os.getenv("FINETUNE_AGENT_FALLBACK_TO_LEGACY", "true").lower() == "true"
         OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
         OLLAMA_API = os.getenv("OLLAMA_API", "")
+
+    class Evolve:
+        ENABLED = os.getenv("EVOLVE_ENABLED", "false").lower() == "true"
+        SIGNALS_DIR = os.getenv("EVOLVE_SIGNALS_DIR", "signals")
+        ARTIFACT_DIR = os.getenv("EVOLVE_ARTIFACT_DIR", "finetune_artifacts")
+        REGISTRY_PATH = os.getenv("EVOLVE_REGISTRY_PATH", "registry.yaml")
+        CONFIG_PATH = os.getenv("EVOLVE_CONFIG_PATH", "src/finetune/evolve_config.yaml")
+
+    class V2:
+        BASE_MODEL = os.getenv("V2_BASE_MODEL", "unsloth/Qwen3-14B-bnb-4bit")
+        VISION_ENCODER = os.getenv("V2_VISION_ENCODER", "google/siglip-so400m-patch14-384")
+        ARTIFACT_DIR = os.getenv("V2_ARTIFACT_DIR", "finetune_artifacts/v2")
 
     class FollowUp:
         ENABLED = os.getenv("FOLLOWUP_ENABLED", "true").lower() in {"1", "true", "yes", "on"}

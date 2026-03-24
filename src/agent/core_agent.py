@@ -6,6 +6,7 @@ queries it spawns dynamic sub-agents in parallel via ThreadPoolExecutor.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import re
 import time
@@ -199,10 +200,49 @@ class CoreAgent:
             trimmed["document_type"] = intel.get("document_type", "")
             trimmed_intel.append(trimmed)
 
-        understanding = self._intent_analyzer.analyze(
-            query, subscription_id, profile_id, trimmed_intel, conversation_history,
-            kg_hints=kg_hints,
-        )
+        # --- PARALLEL: UNDERSTAND + PRE-FETCH RETRIEVE ---
+        # Launch intent analysis (LLM, ~20s) and a broad retrieval (vector search, ~2s)
+        # concurrently so the retrieval result is ready by the time intent finishes.
+        prefetch_result = None
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as _par_executor:
+                # Thread 1: Intent analysis (LLM call)
+                _intent_future = _par_executor.submit(
+                    self._intent_analyzer.analyze,
+                    query, subscription_id, profile_id, trimmed_intel, conversation_history,
+                    kg_hints,
+                )
+
+                # Thread 2: Broad pre-fetch retrieval — no intent filtering yet, use KG doc
+                # hints if available as a light scope hint.
+                _prefetch_doc_ids = kg_hints.get("target_doc_ids") or None
+                _prefetch_kwargs = {
+                    "query": query,
+                    "subscription_id": subscription_id,
+                    "profile_ids": [profile_id],
+                }
+                if _prefetch_doc_ids:
+                    _prefetch_kwargs["document_ids"] = _prefetch_doc_ids
+                _prefetch_future = _par_executor.submit(
+                    lambda kw=_prefetch_kwargs: self._retriever.retrieve(**kw),
+                )
+
+                understanding = _intent_future.result(timeout=45.0)
+                prefetch_result = _prefetch_future.result(timeout=45.0)
+
+            logger.debug("Parallel UNDERSTAND+RETRIEVE complete")
+        except Exception as _par_exc:
+            logger.warning(
+                "Parallel UNDERSTAND+RETRIEVE failed (%s) — falling back to sequential",
+                _par_exc,
+            )
+            # Sequential fallback
+            understanding = self._intent_analyzer.analyze(
+                query, subscription_id, profile_id, trimmed_intel, conversation_history,
+                kg_hints=kg_hints,
+            )
+            prefetch_result = None
+
         timing["understand_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
         if understanding.is_conversational:
@@ -223,7 +263,7 @@ class CoreAgent:
                 domain_result.setdefault("metadata", {})["timing"] = timing
                 return domain_result
 
-        # --- RETRIEVE ---
+        # --- RETRIEVE (filter pre-fetched result with intent, or run focused retrieval) ---
         t0 = time.monotonic()
         profile_ids = self._resolve_profile_scope(understanding, profile_id)
 
@@ -249,7 +289,7 @@ class CoreAgent:
                     if did not in existing:
                         document_ids.append(did)
 
-        # Enhance query for better retrieval coverage
+        # Enhance query for better retrieval coverage (always computed — used by reranker)
         enhanced_query = self._enhance_query(
             understanding.resolved_query,
             understanding.task_type,
@@ -257,12 +297,49 @@ class CoreAgent:
             understanding.entities,
         )
 
-        retrieval_result = self._retriever.retrieve(
-            enhanced_query,
-            subscription_id,
-            profile_ids,
-            document_ids=document_ids,
-        )
+        # Use the pre-fetched result when available; apply intent-driven doc filtering.
+        if prefetch_result is not None:
+            # Filter pre-fetched chunks to intent-resolved document scope
+            if understanding.relevant_documents:
+                target_doc_ids = {
+                    d.get("document_id") for d in understanding.relevant_documents
+                    if d.get("document_id")
+                }
+                if target_doc_ids:
+                    prefetch_result.chunks = [
+                        c for c in prefetch_result.chunks
+                        if getattr(c, "document_id", None) in target_doc_ids
+                    ]
+
+            if document_id:
+                prefetch_result.chunks = [
+                    c for c in prefetch_result.chunks
+                    if getattr(c, "document_id", None) == document_id
+                ]
+
+            # If filtering left too few chunks, do a focused re-retrieval with the
+            # enhanced (intent-resolved) query and the narrowed document scope.
+            if len(prefetch_result.chunks) < 3 and (document_id or understanding.relevant_documents):
+                logger.debug(
+                    "Pre-fetch yielded %d chunks after filtering — running focused re-retrieval",
+                    len(prefetch_result.chunks),
+                )
+                retrieval_result = self._retriever.retrieve(
+                    enhanced_query,
+                    subscription_id,
+                    profile_ids,
+                    document_ids=document_ids,
+                )
+            else:
+                retrieval_result = prefetch_result
+        else:
+            # Fallback: sequential retrieval (parallel block failed)
+            retrieval_result = self._retriever.retrieve(
+                enhanced_query,
+                subscription_id,
+                profile_ids,
+                document_ids=document_ids,
+            )
 
         # Dynamic evidence count by task type
         evidence_top_k = _EVIDENCE_TOP_K.get(understanding.task_type, 6)

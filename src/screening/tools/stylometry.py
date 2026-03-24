@@ -11,6 +11,7 @@ from collections import Counter
 from statistics import mean, pstdev
 from typing import Dict, List, Tuple
 
+from ..models import ScreeningContext
 from .base import (
     ToolResult,
     ScreeningTool,
@@ -147,8 +148,13 @@ class StylometryTool(ScreeningTool):
     """Stylometric fingerprinting."""
 
     name = "stylometry"
+    category = "Authenticity & Originality"
+    default_weight = 0.1
+    tool_version = "1.0"
 
-    def run(self, text: str) -> ToolResult:
+    def run(self, ctx: ScreeningContext) -> ToolResult:
+        text = ctx.text
+
         sentences = split_sentences(text)
         words = tokenize_words(text)
 
@@ -173,12 +179,23 @@ class StylometryTool(ScreeningTool):
 
         combined_score = clamp(0.3 * cv_score + 0.25 * readability_score + 0.2 * punct_score + 0.25 * pos_score)
 
-        reason = (
-            f"Sentence length CV={cv:.2f}, readability std={readability_std:.2f}, "
-            f"punctuation diversity={punct_diversity:.2f}."
-        )
+        reasons = [
+            f"Sentence length CV={cv:.2f} (low variation may indicate uniform AI-style output).",
+            f"Readability std={readability_std:.2f} (low oscillation suggests consistent, synthetic prose).",
+            f"Punctuation diversity={punct_diversity:.2f} (fewer punctuation types may indicate constrained generation).",
+        ]
 
-        raw_features: Dict[str, float | Dict[str, float]] = {
+        # Actionable intelligence based on combined score
+        actions: List[str] = []
+        if combined_score > 0.6:
+            actions.append("Review for AI-generated content")
+            actions.append("Flag for human expert review")
+        elif combined_score > 0.4:
+            actions.append("Monitor for stylometric drift")
+        else:
+            actions.append("Writing style appears natural")
+
+        raw_features: Dict = {
             "sentence_length_mean": mean_len,
             "sentence_length_std": std_len,
             "sentence_length_cv": cv,
@@ -192,9 +209,38 @@ class StylometryTool(ScreeningTool):
             "readability_score": readability_score,
         }
 
-        return ToolResult(
-            name=self.name,
-            score=combined_score,
-            reason=reason,
+        # Evidence spans: highlight the most suspicious stylometric signals
+        evidence_spans = []
+        if cv_score > 0.5:
+            evidence_spans.append({
+                "label": "uniform_sentence_length",
+                "text": f"CV={cv:.2f}",
+                "detail": "Low coefficient of variation in sentence lengths — typical of AI generation.",
+            })
+        if readability_score > 0.5:
+            evidence_spans.append({
+                "label": "low_readability_oscillation",
+                "text": f"readability_std={readability_std:.2f}",
+                "detail": "Consistently flat readability across passage windows.",
+            })
+        if punct_score > 0.5:
+            evidence_spans.append({
+                "label": "punctuation_uniformity",
+                "text": f"punct_diversity={punct_diversity:.2f}",
+                "detail": "Limited punctuation variety compared to natural writing.",
+            })
+        if pos_score > 0.5:
+            evidence_spans.append({
+                "label": "low_pos_entropy",
+                "text": f"pos_entropy={pos_entropy:.2f}",
+                "detail": "POS tag distribution shows low entropy — may indicate synthetic text.",
+            })
+
+        return self.result(
+            ctx,
+            combined_score,
+            reasons,
             raw_features=raw_features,
+            actions=actions,
+            evidence_spans=evidence_spans,
         )

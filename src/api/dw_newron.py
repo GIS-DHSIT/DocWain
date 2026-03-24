@@ -91,6 +91,7 @@ from src.retrieval.profile_document_index import build_profile_document_index
 from src.retrieval.retrieval_planner import RetrievalPlanner
 from src.intent.llm_intent import parse_intent
 from src.intelligence.conversation_state import ConversationState, ProgressiveSummarizer
+from src.generation.prompts import build_system_prompt
 
 try:
     import torch
@@ -112,8 +113,8 @@ def _resolve_model_alias(model_name: Optional[str]) -> Optional[str]:
     normalized = str(model_name).strip().lower()
     # Strip Ollama tag suffix (e.g. "gpt-oss:latest" → "gpt-oss")
     base_name = normalized.split(":")[0]
-    if base_name in ("docwain-agent", "gpt-oss"):
-        return "qwen3:14b"
+    if base_name in ("docwain-agent", "gpt-oss", "dhs/docwain"):
+        return "DHS/DocWain"
     return model_name
 
 def _is_generation_empty(text: Optional[str], stop_tokens: Optional[Set[str]] = None) -> bool:
@@ -1558,7 +1559,7 @@ class OllamaClient:
     """Handles local Ollama model calls with controlled generation to reduce hallucinations."""
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "qwen3:14b")
+        self.model_name = _resolve_model_alias(model_name) or os.getenv("OLLAMA_MODEL", "DHS/DocWain")
         if not self.model_name:
             raise ValueError("OLLAMA_MODEL environment variable is not set")
         logger.info(f"Initialized OllamaClient with model: {self.model_name}")
@@ -2053,6 +2054,7 @@ REFORMULATED QUERY:"""
         try:
             reformulated = self.llm_client.generate(
                 prompt,
+                system=build_system_prompt(),
                 max_retries=2,
                 backoff=0.5
             )
@@ -2925,7 +2927,7 @@ Respond with ONLY one of these formats:
 Your response:"""
 
         try:
-            response = self.llm_client.generate(prompt, max_retries=2)
+            response = self.llm_client.generate(prompt, system=build_system_prompt(), max_retries=2)
             response = response.strip()
 
             if response.startswith("ANSWERABLE"):
@@ -3181,7 +3183,7 @@ CONVERSATION:
 
 SUMMARY:"""
         try:
-            summary = self.llm_client.generate(prompt, max_retries=2, backoff=0.5)
+            summary = self.llm_client.generate(prompt, system=build_system_prompt(), max_retries=2, backoff=0.5)
             return summary.strip()
         except Exception as e:
             logger.warning(f"Conversation summarization failed: {e}")
@@ -3226,7 +3228,7 @@ class EnterpriseRAGSystem:
             self.reranker = HybridReranker(alpha=0.7, cross_encoder=cross_encoder)
             self.context_builder = ContextBuilder()
             self.intelligent_context_builder = IntelligentContextBuilder(
-                max_context_chunks=getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)
+                max_context_chunks=getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 16)
             )
             self.prompt_builder = PromptBuilder()
             self.greeting_handler = GreetingHandler()
@@ -4009,9 +4011,9 @@ class EnterpriseRAGSystem:
                             "collection": collection_name,
                             "request_id": request_id,
                             "index_version": index_version,
-                            "context_found": True,
+                            "context_found": False,
                             "query_type": _conv_resp.intent.lower(),
-                            "grounded": True,
+                            "grounded": False,
                         }
                 except Exception as exc:
                     logger.debug("Conversation-driven response failed", exc_info=True)
@@ -4513,8 +4515,8 @@ class EnterpriseRAGSystem:
                 )
                 reranked_chunks = sorted(reranked_chunks, key=lambda c: to_py_scalar(c.score), reverse=True)
 
-            config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 7)  # ✅ default 7
-            context_chunk_limit = max(final_k or 7, config_context_limit)  # ✅ default 7
+            config_context_limit = getattr(Config.Retrieval, "MAX_CONTEXT_CHUNKS", 16)
+            context_chunk_limit = max(final_k or 12, config_context_limit)
             context_chunk_limit = min(context_chunk_limit, len(reranked_chunks))
             extraction_mode = bool(_extract_requested_fields(processed_query))
             if extraction_mode and len(reranked_chunks) > context_chunk_limit:
@@ -4810,9 +4812,10 @@ class EnterpriseRAGSystem:
                     if gemini_used:
                         raise RuntimeError("Gemini call budget exhausted for request")
                     gemini_used = True
+                _sys = build_system_prompt()
                 if hasattr(self.llm_client, "generate_with_metadata"):
-                    return self.llm_client.generate_with_metadata(prompt_text, options=options)
-                text = self.llm_client.generate(prompt_text)
+                    return self.llm_client.generate_with_metadata(prompt_text, system=_sys, options=options)
+                text = self.llm_client.generate(prompt_text, system=_sys)
                 return text, {"response": text}
 
             temperature = float(getattr(Config.LLM, "TEMPERATURE", 0.2))
@@ -4833,6 +4836,30 @@ class EnterpriseRAGSystem:
                     answer = _format_evidence_fallback(query, ledger)
                 else:
                     answer = "I don’t have enough context to answer that from this profile."
+            # ── Grounding verification: check answer is supported by context ──
+            if answer and context and not _is_generation_empty(answer):
+                try:
+                    _answer_sentences = [s.strip() for s in answer.replace('\n', ' ').split('.') if len(s.strip()) > 20]
+                    _context_lower = context.lower()
+                    _ungrounded = []
+                    for _sent in _answer_sentences[:10]:  # Check first 10 sentences
+                        _sent_words = set(_sent.lower().split())
+                        _key_words = {w for w in _sent_words if len(w) > 4}  # Meaningful words only
+                        if not _key_words:
+                            continue
+                        _overlap = sum(1 for w in _key_words if w in _context_lower)
+                        _ratio = _overlap / len(_key_words) if _key_words else 1.0
+                        if _ratio < 0.3:  # Less than 30% of key words found in context
+                            _ungrounded.append(_sent)
+                    if _ungrounded and len(_ungrounded) > len(_answer_sentences) * 0.5:
+                        logger.warning(
+                            "Grounding check: %d/%d sentences appear ungrounded",
+                            len(_ungrounded), len(_answer_sentences),
+                        )
+                        answer += "\n\n---\n*Note: Some details in this response may not be fully supported by the available documents. Please verify critical information against the source documents.*"
+                except Exception:
+                    pass  # Never block response for verification failure
+
             done_reason = raw_response.get("done_reason")
             eval_count = raw_response.get("eval_count")
             recovery_path_taken = "none"
@@ -5317,7 +5344,7 @@ def answer_question(
         user_id: str,
         profile_id: str,
         subscription_id: str = "default",
-        model_name: str = "DocWain-Agent",
+        model_name: str = "DHS/DocWain",
         persona: str = "professional document analysis assistant",
         session_id: Optional[str] = None,
         new_session: bool = False,

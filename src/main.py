@@ -137,6 +137,7 @@ from src.gateway.api import gateway_router
 from src.screening.api import screening_router
 from src.api.pipeline_api import pipeline_router
 from src.api.model_management_api import model_router
+from src.api.profile_intelligence_api import profile_intelligence_router
 from src.tools.router import tools_router
 from src.agentic.api_router import agents_router
 from src.training.qdrant_profile_discovery import discover_profile_ids_from_collection
@@ -181,6 +182,7 @@ api_router.include_router(pipeline_router)
 api_router.include_router(model_router)
 api_router.include_router(debug_router, tags=["Debug"])
 api_router.include_router(health_router)
+api_router.include_router(profile_intelligence_router)
 api_router.include_router(tools_router, tags=["Agents"])
 
 @api_router.get("/agents/capabilities", tags=["Agents"])
@@ -958,7 +960,7 @@ def ask_question_api(
         if getattr(decision, "direct_response", False):
             response_text = decision.response_text or ""
             response_text = sanitize_response(response_text)
-            answer_payload = AnswerPayload(response=response_text, sources=[], grounded=True, context_found=False)
+            answer_payload = AnswerPayload(response=response_text, sources=[], grounded=False, context_found=False)
             persisted_session_id = _persist_chat_turn(
                 user_id=request.user_id,
                 query=request.query,
@@ -974,6 +976,16 @@ def ask_question_api(
 
     if want_stream:
         normalized_stream_answer = normalize_answer(result.answer)
+
+        # Run visualization on the completed answer before streaming
+        try:
+            from src.visualization.enhancer import enhance_with_visualization
+            normalized_stream_answer = enhance_with_visualization(
+                normalized_stream_answer, request.query, channel="web",
+            )
+        except Exception as _viz_exc:
+            logger.warning("Stream visualization failed: %s", _viz_exc)
+
         persisted_session_id = _persist_chat_turn(
             user_id=request.user_id,
             query=request.query,
@@ -981,13 +993,51 @@ def ask_question_api(
             session_id=session_id,
             new_session=bool(request.new_session),
         )
-        stream_iter = result.stream or []
-        response = StreamingResponse(stream_iter, media_type="text/plain")
+
+        # Build trailing metadata block with media, sources, session_id
+        import json as _stream_json
+        _stream_media = normalized_stream_answer.get("media")
+        _stream_sources = normalized_stream_answer.get("sources", [])
+        _stream_meta = {
+            "sources": _stream_sources,
+            "grounded": normalized_stream_answer.get("grounded", False),
+            "context_found": normalized_stream_answer.get("context_found", False),
+            "session_id": persisted_session_id,
+        }
+        if _stream_media:
+            _stream_meta["media"] = _stream_media
+            logger.info("Stream visualization attached: %d media items", len(_stream_media))
+
+        # Re-chunk the response text (viz may have stripped VIZ directives)
+        from src.execution.common import chunk_text_stream_with_metadata
+        _response_text = normalized_stream_answer.get("response", "")
+        _text_chunks = list(chunk_text_stream_with_metadata(_response_text))
+
+        def _stream_with_trailing_meta():
+            for chunk in _text_chunks:
+                yield chunk
+            # Append metadata as a parseable trailing block
+            yield "\n\n<!--DOCWAIN_MEDIA_JSON:" + _stream_json.dumps(_stream_meta, default=str) + "-->"
+
+        response = StreamingResponse(_stream_with_trailing_meta(), media_type="text/plain")
         if persisted_session_id:
             response.headers["X-Session-ID"] = persisted_session_id
         return response
 
     normalized = normalize_answer(result.answer)
+
+    # Post-generation visualization enhancement
+    try:
+        from src.visualization.enhancer import enhance_with_visualization
+        normalized = enhance_with_visualization(normalized, request.query, channel="web")
+        _media = normalized.get("media")
+        if _media:
+            logger.info("Visualization attached: %d media items", len(_media))
+        else:
+            logger.info("Visualization: no media generated for query")
+    except Exception as _viz_exc:
+        logger.warning("Visualization enhancement failed: %s", _viz_exc, exc_info=True)
+
     persisted_session_id = _persist_chat_turn(
         user_id=request.user_id,
         query=request.query,
@@ -1055,6 +1105,21 @@ def trigger_extraction(subscription_id: str = "default"):
         logging.error(f"Extraction API error: {e}")
         raise HTTPException(status_code=500, detail=f"Extraction process failed: {e}")
 
+@api_router.get("/extract/progress", tags=["Default"])
+def get_extraction_progress(profile_id: str = Query(..., description="Profile ID")):
+    """Get extraction progress for a profile.
+
+    Returns per-document extraction progress and aggregated common data
+    including live logs, overall progress, and elapsed time.
+    """
+    from src.api.document_status import get_profile_extraction_status
+    result = get_profile_extraction_status(profile_id)
+    if not result.get("documents"):
+        return {"status": "idle", "profile_id": profile_id,
+                "message": "No documents found for this profile",
+                "data": result}
+    return {"status": "ok", "data": result}
+
 @api_router.get("/train", tags=["Default"], deprecated=True)
 def trigger_training(subscription_id: str = "default"):
     """Deprecated alias for /extract. Performs extraction only."""
@@ -1095,6 +1160,22 @@ def train_documents_batch(request: TrainDocumentsRequest = Body(...)):
     except Exception as exc:
         logging.error("Train (embed) API error: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Training failed: {exc}")
+
+
+@api_router.get("/train/progress", tags=["Default"])
+def get_training_progress_endpoint(profile_id: str = Query(..., description="Profile ID")):
+    """Get training/embedding progress for a profile.
+
+    Returns per-document training progress and aggregated common data
+    including live logs, overall progress, and elapsed time.
+    """
+    from src.api.document_status import get_profile_training_status
+    result = get_profile_training_status(profile_id)
+    if not result.get("documents"):
+        return {"status": "idle", "profile_id": profile_id,
+                "message": "No training documents found for this profile",
+                "data": result}
+    return {"status": "ok", "data": result}
 
 
 @api_router.post("/finetune/by-profile", tags=["Finetuning"])

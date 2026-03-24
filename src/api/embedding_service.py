@@ -2011,6 +2011,9 @@ def _process_blob(
                 emit_progress(doc_id, "failed", 0.0, "Auto-recovered: training timeout exceeded")
         _set_document_status(doc_id, STATUS_TRAINING_STARTED)
         emit_progress(doc_id, "extraction", 0.10, "Starting document processing")
+        from src.api.document_status import emit_status_log
+        emit_status_log(doc_id, "embedding", "pipeline_start", "Embedding pipeline started",
+                        extra={"blob_name": blob.name, "subscription_id": subscription_id, "profile_id": profile_id})
 
         try:
             subscription_id = resolve_subscription_id(
@@ -2058,6 +2061,7 @@ def _process_blob(
             {"status": "IN_PROGRESS", "started_at": time.time(), "error": None, "reason": None},
         )
         emit_progress(doc_id, "chunking", 0.20, "Preparing document chunks")
+        emit_status_log(doc_id, "embedding", "lock_acquired", "Embedding lock acquired, preparing chunks")
 
         extracted_docs, expected_chunks, coverage_values, prep_error = _prepare_extracted_docs(
             document_id=doc_id,
@@ -2141,6 +2145,8 @@ def _process_blob(
                 error_summary=reason,
             )
             emit_progress(doc_id, "failed", 0.25, message)
+            emit_status_log(doc_id, "embedding", "preparation_failed", f"Embedding preparation failed: {message}",
+                            extra={"reason": reason})
             result["error"] = reason
             result["error_message"] = message
             result["failed_reason"] = reason
@@ -2149,6 +2155,9 @@ def _process_blob(
         emit_progress(doc_id, "chunking", 0.25,
                       f"Prepared {expected_chunks} chunks for embedding",
                       extra={"chunks_total": expected_chunks})
+        emit_status_log(doc_id, "embedding", "chunks_prepared",
+                        f"Prepared {expected_chunks} chunks for embedding",
+                        extra={"chunks_total": expected_chunks})
 
         result["chunks_count"] = expected_chunks
         logger.info("Embedding pre-check for %s: expected_chunks=%s", doc_id, expected_chunks)
@@ -2160,6 +2169,10 @@ def _process_blob(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Qdrant count failed for %s: %s", doc_id, exc)
         logger.info("Existing Qdrant points for %s: %s", doc_id, qdrant_count)
+
+        emit_status_log(doc_id, "embedding", "dedup_check",
+                        f"Qdrant dedup check: {qdrant_count} existing points, {expected_chunks} expected",
+                        extra={"existing_points": qdrant_count, "expected_chunks": expected_chunks})
 
         if qdrant_count and expected_chunks and qdrant_count >= expected_chunks:
             if telemetry:
@@ -2176,6 +2189,18 @@ def _process_blob(
                 },
             )
             _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+            # Profile intelligence: auto-generate insights (background, non-blocking)
+            try:
+                from src.intelligence.profile_intelligence import generate_profile_intelligence
+                import threading as _threading
+                _threading.Thread(
+                    target=generate_profile_intelligence,
+                    args=(doc_id, profile_id, subscription_id),
+                    daemon=True,
+                    name=f"profile-intel-{doc_id[:12]}",
+                ).start()
+            except Exception:
+                logger.debug("Profile intelligence trigger skipped", exc_info=True)
             deleted = False
             logger.info("Preserving pickle for %s after embedding (cleanup disabled)", doc_id)
             if telemetry:
@@ -2204,6 +2229,18 @@ def _process_blob(
             return result
 
         if qdrant_count and expected_chunks and qdrant_count < expected_chunks:
+            # Clean up partial embeddings before re-upserting to prevent duplicates
+            try:
+                from src.api.dataHandler import get_vector_store
+                from src.api.vector_store import build_collection_name
+                _cleanup_store = get_vector_store()
+                _cleanup_store.delete_document(subscription_id, profile_id, doc_id)
+                logger.info(
+                    "Cleaned %d partial embeddings for %s before re-embedding",
+                    qdrant_count, doc_id,
+                )
+            except Exception as _cleanup_exc:
+                logger.warning("Partial embedding cleanup failed for %s: %s", doc_id, _cleanup_exc)
             logger.warning(
                 "Partial embeddings detected for %s: %s/%s; upserting all chunks",
                 doc_id,
@@ -2287,6 +2324,12 @@ def _process_blob(
                 emit_progress(doc_id, "encoding", _file_progress,
                               f"Encoded file {_file_idx}/{_file_total} ({total_upserted} chunks stored)",
                               extra={"files_done": _file_idx, "files_total": _file_total, "chunks_stored": total_upserted})
+                emit_status_log(doc_id, "embedding", "file_encoded",
+                                f"Encoded file {_file_idx}/{_file_total}: {int(embed_result.get('points_saved', 0))} chunks stored, {int(embed_result.get('dropped_chunks', 0))} dropped",
+                                extra={"file_index": _file_idx, "files_total": _file_total,
+                                       "chunks_stored": int(embed_result.get("points_saved", 0)),
+                                       "chunks_dropped": int(embed_result.get("dropped_chunks", 0)),
+                                       "coverage_ratio": embed_result.get("coverage_ratio")})
         except ChunkingDiagnosticError as exc:
             error_message = _truncate_error_message(str(exc) or repr(exc))
             diagnostics = exc.diagnostics or {}
@@ -2436,6 +2479,11 @@ def _process_blob(
         emit_progress(doc_id, "upserting", 0.85,
                       f"Stored {total_upserted} embeddings in Qdrant",
                       extra={"chunks_stored": total_upserted, "chunks_total": total_chunks})
+        emit_status_log(doc_id, "embedding", "embeddings_stored",
+                        f"Stored {total_upserted} embeddings in Qdrant (collection: {collection_name})",
+                        extra={"chunks_stored": total_upserted, "chunks_total": total_chunks,
+                               "chunks_dropped": total_dropped, "collection": collection_name,
+                               "coverage_ratio": coverage_ratio})
 
         # ── Multi-resolution: create doc-level + section-level vectors ──
         try:
@@ -2580,6 +2628,7 @@ def _process_blob(
         cleanup_error: Optional[Dict[str, Any]] = None
         if subscription_id and profile_id and total_upserted > 0:
             emit_progress(doc_id, "verifying", 0.90, "Verifying storage integrity")
+            emit_status_log(doc_id, "embedding", "verification_start", "Post-upsert storage integrity verification started")
             try:
                 post_count, cleanup_allowed = _verify_post_upsert_count(
                     subscription_id=subscription_id,
@@ -2625,9 +2674,25 @@ def _process_blob(
                 )
 
         _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        # Profile intelligence: auto-generate insights (background, non-blocking)
+        try:
+            from src.intelligence.profile_intelligence import generate_profile_intelligence
+            import threading as _threading
+            _threading.Thread(
+                target=generate_profile_intelligence,
+                args=(doc_id, profile_id, subscription_id),
+                daemon=True,
+                name=f"profile-intel-{doc_id[:12]}",
+            ).start()
+        except Exception:
+            logger.debug("Profile intelligence trigger skipped", exc_info=True)
         emit_progress(doc_id, "completed", 1.0,
                       f"Training completed — {total_upserted} chunks stored",
                       extra={"chunks_stored": total_upserted, "collection": collection_name})
+        emit_status_log(doc_id, "embedding", "training_completed",
+                        f"Training completed — {total_upserted} chunks stored in {collection_name}",
+                        extra={"chunks_stored": total_upserted, "collection": collection_name,
+                               "post_upsert_count": post_count})
 
         # KG chunk-level ingestion (async, non-blocking)
         _ingest_chunks_to_knowledge_graph(
@@ -3284,6 +3349,18 @@ def _process_local_document(
                 )
 
         _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
+        # Profile intelligence: auto-generate insights (background, non-blocking)
+        try:
+            from src.intelligence.profile_intelligence import generate_profile_intelligence
+            import threading as _threading
+            _threading.Thread(
+                target=generate_profile_intelligence,
+                args=(document_id, profile_id, subscription_id),
+                daemon=True,
+                name=f"profile-intel-{document_id[:12]}",
+            ).start()
+        except Exception:
+            logger.debug("Profile intelligence trigger skipped", exc_info=True)
         emit_progress(document_id, "completed", 1.0,
                       f"Training completed — {total_upserted} chunks stored",
                       extra={"chunks_stored": total_upserted, "collection": collection_name})
@@ -3466,6 +3543,21 @@ def _embed_from_local_pickles(
 
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(ordered_ids))
+    total_local = len(ordered_ids)
+    completed_local = 0
+
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING (local): %d documents queued (sub=%s)  ║",
+        total_local, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, 0, total_local, stage="starting")
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
         for index, doc_id in enumerate(ordered_ids):
@@ -3484,8 +3576,14 @@ def _embed_from_local_pickles(
             doc_id = info["document_id"]
             try:
                 results_by_index[index] = future.result()
+                completed_local += 1
+                logger.info("[EMBEDDING %d/%d] ✓ Completed: doc=%s", completed_local, total_local, doc_id)
             except Exception as exc:  # noqa: BLE001
                 error_message = _truncate_error_message(str(exc) or repr(exc))
+                logger.error(
+                    "[EMBEDDING %d/%d] ✗ Failed: doc=%s error=%s",
+                    completed_local + 1, total_local, doc_id, error_message,
+                )
                 logger.error(
                     "embed_request_id=%s doc=%s embedding failed: %s",
                     embed_request_id,
@@ -3506,10 +3604,65 @@ def _embed_from_local_pickles(
                     blob_name=f"{doc_id}.pkl",
                     error_message=error_message,
                 )
+            _emit_embedding_batch_progress(
+                subscription_id, completed_local, total_local,
+                current_doc=doc_id or "", stage=f"processed {completed_local}/{total_local}",
+            )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     summary = _build_embed_summary(results)
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING (local) DONE: %d/%d succeeded (sub=%s)  ║",
+        completed_local, total_local, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, completed_local, total_local, stage="completed")
     return summary
+
+def _emit_embedding_batch_progress(subscription_id: str, completed: int, total: int,
+                                    current_doc: str = "", stage: str = "") -> None:
+    """Publish batch embedding progress to Redis for frontend polling."""
+    try:
+        import json as _json
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return
+        progress = round(completed / total, 3) if total > 0 else 0.0
+        event = {
+            "subscription_id": subscription_id or "global",
+            "completed": completed,
+            "total": total,
+            "progress": progress,
+            "current_document": current_doc,
+            "stage": stage,
+            "timestamp": time.time(),
+        }
+        payload = _json.dumps(event)
+        client.setex(f"dw:embedding:batch_progress:{subscription_id or 'global'}", 3600, payload)
+        client.publish("dw:embedding:progress", payload)
+    except Exception:
+        pass
+
+
+def get_batch_embedding_progress(subscription_id: str) -> Optional[Dict[str, Any]]:
+    """Get the latest batch embedding progress for a subscription (for polling)."""
+    try:
+        import json as _json
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return None
+        raw = client.get(f"dw:embedding:batch_progress:{subscription_id or 'global'}")
+        return _json.loads(raw) if raw else None
+    except Exception:
+        return None
+
 
 def embed_documents(
     *,
@@ -3520,6 +3673,10 @@ def embed_documents(
     doc_type: Optional[str] = None,
     max_blobs: Optional[int] = None,
 ) -> Dict[str, Any]:
+    from src.utils.logging_utils import set_pipeline_profile, clear_pipeline_profile, clear_live_logs
+    if profile_id:
+        set_pipeline_profile(profile_id)
+        clear_live_logs(profile_id)
     embed_request_id = str(uuid.uuid4())
     logger.info("embed_request_id=%s embedding request received", embed_request_id)
     if not blob_storage_configured():
@@ -3574,6 +3731,21 @@ def embed_documents(
 
     results_by_index: Dict[int, Dict[str, Any]] = {}
     max_workers = _get_max_workers(len(blob_candidates))
+    total_blobs = len(blob_candidates)
+    completed_blobs = 0
+
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING START: %d documents queued (sub=%s)  ║",
+        total_blobs, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, 0, total_blobs, stage="starting")
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
         for index, blob in enumerate(blob_candidates):
@@ -3595,8 +3767,17 @@ def embed_documents(
             blob = info["blob"]
             try:
                 results_by_index[index] = future.result()
+                completed_blobs += 1
+                logger.info(
+                    "[EMBEDDING %d/%d] ✓ Completed: doc=%s",
+                    completed_blobs, total_blobs, doc_id,
+                )
             except Exception as exc:  # noqa: BLE001
                 error_message = _truncate_error_message(str(exc) or repr(exc))
+                logger.error(
+                    "[EMBEDDING %d/%d] ✗ Failed: doc=%s error=%s",
+                    completed_blobs + 1, total_blobs, doc_id, error_message,
+                )
                 logger.error(
                     "embed_request_id=%s doc=%s embedding failed: %s",
                     embed_request_id,
@@ -3617,6 +3798,11 @@ def embed_documents(
                     blob_name=getattr(blob, "name", None),
                     error_message=error_message,
                 )
+            _emit_embedding_batch_progress(
+                subscription_id, completed_blobs, total_blobs,
+                current_doc=doc_id or "",
+                stage=f"processed {completed_blobs}/{total_blobs}",
+            )
 
     results = [results_by_index[index] for index in sorted(results_by_index)]
     for _entry in results:
@@ -3624,6 +3810,18 @@ def embed_documents(
             telemetry.increment("embed_pickles_processed_total")
 
     summary = _build_embed_summary(results)
+    logger.info(
+        "╔══════════════════════════════════════════════════════════════╗"
+    )
+    logger.info(
+        "║  BATCH EMBEDDING DONE: %d documents, %d succeeded (sub=%s)  ║",
+        total_blobs, completed_blobs, subscription_id or "global",
+    )
+    logger.info(
+        "╚══════════════════════════════════════════════════════════════╝"
+    )
+    _emit_embedding_batch_progress(subscription_id, completed_blobs, total_blobs, stage="completed")
+    clear_pipeline_profile()
     return summary
 
 def embedding_integrity_report(

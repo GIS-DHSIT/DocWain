@@ -1239,10 +1239,14 @@ def delete_embeddings(subscription_id: str, profile_id: str, document_id: str):
         return result
 
     except Exception as e:
-        logger.error("[DELETE_EMBEDDINGS] Failed", exc_info=True)
+        error_msg = str(e)
+        if "doesn't exist" in error_msg or "not found" in error_msg.lower() or "Not Found" in error_msg:
+            logger.debug("[DELETE_EMBEDDINGS] Collection not found (no embeddings to delete) for doc=%s", document_id)
+            return {"status": "ok", "message": "no embeddings to delete", "document_id": document_id}
+        logger.error("[DELETE_EMBEDDINGS] Failed for doc=%s: %s", document_id, error_msg)
         return {
             "status": "error",
-            "message": str(e),
+            "message": error_msg,
             "document_id": document_id,
         }
 

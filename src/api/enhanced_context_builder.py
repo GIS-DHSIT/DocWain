@@ -836,7 +836,7 @@ def generate_accurate_answer(
         Dict with answer, sources, and verification info
     """
     # Build context
-    context_builder = IntelligentContextBuilder(max_context_chunks=7)
+    context_builder = IntelligentContextBuilder(max_context_chunks=16)
     context, sources = context_builder.build_context(
         chunks=retrieved_chunks,
         query=query,

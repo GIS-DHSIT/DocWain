@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import sys
+import threading
+import time as _time
 import uuid
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -252,6 +254,114 @@ class ConsoleFormatter(logging.Formatter):
         return f"{prefix} - {message}"
 
 
+# ---------------------------------------------------------------------------
+# Pipeline log context: tracks which profile_id is active on this thread
+# so RedisLogHandler can route logs to the correct Redis list.
+# ---------------------------------------------------------------------------
+_pipeline_ctx = threading.local()
+
+_LIVE_LOG_TTL = 86400  # 24 hours
+_LIVE_LOG_MAX_ENTRIES = 5000
+
+
+def set_pipeline_profile(profile_id: Optional[str]) -> None:
+    """Set the active pipeline profile for the current thread."""
+    _pipeline_ctx.profile_id = profile_id
+
+
+def get_pipeline_profile() -> Optional[str]:
+    """Get the active pipeline profile for the current thread."""
+    return getattr(_pipeline_ctx, "profile_id", None)
+
+
+def clear_pipeline_profile() -> None:
+    """Clear the pipeline profile for the current thread."""
+    _pipeline_ctx.profile_id = None
+
+
+class RedisLogHandler(logging.Handler):
+    """Logging handler that pushes log records to a Redis list per profile.
+
+    Only emits when a pipeline profile is active on the current thread
+    (set via ``set_pipeline_profile``).  Each entry is a JSON dict matching
+    the structure expected by ``Overall_live_logs``.
+    """
+
+    def __init__(self, level: int = logging.DEBUG):
+        super().__init__(level)
+        self._redis_client = None
+        self._init_attempted = False
+
+    def _get_redis(self):
+        if self._init_attempted:
+            return self._redis_client
+        self._init_attempted = True
+        try:
+            from src.api.dw_newron import get_redis_client
+            self._redis_client = get_redis_client()
+        except Exception:
+            self._redis_client = None
+        return self._redis_client
+
+    def emit(self, record: logging.LogRecord) -> None:
+        profile_id = get_pipeline_profile()
+        if not profile_id:
+            return
+        try:
+            client = self._get_redis()
+            if not client:
+                return
+            key = f"dw:live_logs:{profile_id}"
+            entry = {
+                "timestamp": record.created,
+                "ts_iso": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+                "function": record.funcName,
+                "line": record.lineno,
+            }
+            correlation_id = getattr(record, "correlation_id", None)
+            if correlation_id:
+                entry["correlation_id"] = correlation_id
+            client.rpush(key, json.dumps(entry, default=str))
+            client.expire(key, _LIVE_LOG_TTL)
+            # Trim to prevent unbounded growth
+            client.ltrim(key, -_LIVE_LOG_MAX_ENTRIES, -1)
+        except Exception:
+            pass  # Best-effort, never block the pipeline
+
+
+def get_live_logs(profile_id: str) -> list:
+    """Retrieve all live log entries from Redis for a profile."""
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if not client:
+            return []
+        raw_entries = client.lrange(f"dw:live_logs:{profile_id}", 0, -1)
+        logs = []
+        for raw in raw_entries:
+            try:
+                logs.append(json.loads(raw))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return logs
+    except Exception:
+        return []
+
+
+def clear_live_logs(profile_id: str) -> None:
+    """Clear live logs for a profile (called at start of a new pipeline run)."""
+    try:
+        from src.api.dw_newron import get_redis_client
+        client = get_redis_client()
+        if client:
+            client.delete(f"dw:live_logs:{profile_id}")
+    except Exception:
+        pass
+
+
 def configure_logging(
     log_level: str = "INFO",
     json_format: bool = False,
@@ -324,6 +434,12 @@ def configure_logging(
         # Don't fail startup if log dir is unwritable (e.g. read-only container)
         root_logger.warning("Could not create file log handler at %s: %s", log_dir, exc)
 
+    # --- Redis log handler (captures terminal output for live progress) ---
+    redis_handler = RedisLogHandler(level=level)
+    if correlation_filter:
+        redis_handler.addFilter(correlation_filter)
+    root_logger.addHandler(redis_handler)
+
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -368,4 +484,10 @@ __all__ = [
     "CorrelationLoggerAdapter",
     "JSONFormatter",
     "ConsoleFormatter",
+    "RedisLogHandler",
+    "set_pipeline_profile",
+    "get_pipeline_profile",
+    "clear_pipeline_profile",
+    "get_live_logs",
+    "clear_live_logs",
 ]

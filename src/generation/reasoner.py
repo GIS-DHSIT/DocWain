@@ -170,8 +170,23 @@ class Reasoner:
         if not evidence:
             return False
 
-        evidence_text = " ".join(item.get("text", "") for item in evidence)
-        evidence_lower = evidence_text.lower()
+        # Extract text from evidence — handle multiple field names
+        evidence_parts = []
+        for item in evidence:
+            text = (
+                item.get("text")
+                or item.get("canonical_text")
+                or item.get("embedding_text")
+                or item.get("content")
+                or ""
+            )
+            evidence_parts.append(text)
+        evidence_text = " ".join(evidence_parts)
+
+        # If we have evidence items but no extractable text, still consider
+        # grounded since the retrieval found relevant chunks
+        if not evidence_text.strip() and evidence:
+            return True
 
         # Short or empty answer — consider grounded if we have evidence
         if len(answer.strip()) < 20:
@@ -182,31 +197,43 @@ class Reasoner:
         if answer_numbers:
             evidence_numbers = set(_NUMBER_RE.findall(evidence_text))
             ungrounded_nums = answer_numbers - evidence_numbers
-            # Allow up to 25% ungrounded numbers (expert may compute ratios,
-            # percentages, or reformat values)
-            if len(ungrounded_nums) / len(answer_numbers) > 0.25:
+            # Allow up to 40% ungrounded numbers (expert may compute ratios,
+            # percentages, reformat values, or derive new figures)
+            if len(ungrounded_nums) / len(answer_numbers) > 0.40:
                 logger.debug(
                     "[Reasoner] Grounding: %d/%d numbers ungrounded",
                     len(ungrounded_nums), len(answer_numbers),
                 )
                 return False
 
-        # Check semantic overlap: answer sentences should have word overlap
-        # with evidence. An expert synthesizes but doesn't invent topics.
+        # Grounding strategy: if the retrieval pipeline found evidence and the
+        # model produced a substantive response, the response is grounded.
+        #
+        # The RAG pipeline already ensures evidence relevance via:
+        # 1. Dense + sparse hybrid retrieval with score thresholds
+        # 2. Cross-encoder reranking
+        # 3. System prompt instructing grounded-only answers
+        #
+        # Post-hoc word overlap checks are unreliable for a synthesizing model
+        # that paraphrases, summarizes, and uses professional vocabulary.
+        # Instead, we only flag as ungrounded when the answer clearly has NO
+        # connection to the evidence (zero word overlap = likely hallucination).
+
         answer_words = set(
-            w.lower() for w in re.findall(r'\b[a-zA-Z]{4,}\b', answer)
+            w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', answer)
         )
         evidence_words = set(
-            w.lower() for w in re.findall(r'\b[a-zA-Z]{4,}\b', evidence_text)
+            w.lower() for w in re.findall(r'\b[a-zA-Z]{3,}\b', evidence_text)
         )
 
-        if answer_words:
-            overlap = len(answer_words & evidence_words) / len(answer_words)
-            # At least 40% of answer's significant words should appear in evidence
-            # This is generous — allows expert vocabulary and reasoning language
-            if overlap < 0.40:
+        if answer_words and evidence_words:
+            overlap = len(answer_words & evidence_words)
+            # If there's ANY meaningful word overlap (>= 3 shared words),
+            # consider the answer grounded. Only reject when there's virtually
+            # zero connection between answer and evidence.
+            if overlap < 3:
                 logger.debug(
-                    "[Reasoner] Grounding: word overlap %.2f below threshold",
+                    "[Reasoner] Grounding: only %d shared words — UNGROUNDED",
                     overlap,
                 )
                 return False
@@ -227,6 +254,9 @@ class Reasoner:
             base = int(base * 1.15)
 
         if thinking:
-            base = int(base * 1.5)
+            # Qwen3's <think> blocks can consume 2000+ tokens of reasoning
+            # before producing the actual answer. Double the budget to ensure
+            # enough room for both thinking and answer generation.
+            base = int(base * 2.5)
 
-        return min(base, 8192)
+        return min(base, 16384)

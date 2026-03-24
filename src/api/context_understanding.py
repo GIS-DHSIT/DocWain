@@ -21,7 +21,14 @@ def list_local_models() -> List[str]:
         return []
     try:
         result = ollama.list()
-        return [m["name"] for m in result.get("models", []) if m.get("name")]
+        # ollama SDK returns a Pydantic ListResponse with .models attribute
+        models = getattr(result, "models", None) or result.get("models", []) if isinstance(result, dict) else getattr(result, "models", [])
+        names = []
+        for m in models:
+            name = getattr(m, "model", None) or (m.get("name") if isinstance(m, dict) else None)
+            if name:
+                names.append(name)
+        return names
     except Exception as exc:  # noqa: BLE001
         logger.debug("Failed to list ollama models: %s", exc)
         return []
@@ -40,8 +47,8 @@ class ContextUnderstanding:
     def _select_model(self) -> Optional[str]:
         if not self.available_models:
             return None
-        # Prefer newer llama/mistral style models for summarization
-        for candidate in ("llama3.2", "llama3.1", "llama3", "mistral"):
+        # Prefer DocWain fine-tuned model, then general-purpose models
+        for candidate in ("DHS/DocWain", "DocWain", "qwen3", "llama3.2", "llama3.1", "llama3", "mistral"):
             for model in self.available_models:
                 if candidate in model:
                     return model

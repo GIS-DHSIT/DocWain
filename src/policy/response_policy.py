@@ -22,13 +22,12 @@ INFO_KEYWORDS = (
     "what can you do",
     "how do you work",
     "how does docwain work",
-    "privacy",
-    "docs",
+    # NOTE: removed bare "privacy", "help", "docs", "support", "features",
+    # "capabilities" — these caused document queries containing these words
+    # (e.g. "What is the privacy policy?", "What features does X have?") to
+    # be misclassified as INFO_MODE.  The _INFO_QUERY_PATTERNS regexes
+    # already handle the real meta-question variants precisely.
     "documentation",
-    "help",
-    "support",
-    "capabilities",
-    "features",
 )
 
 _INFO_QUERY_PATTERNS = (
@@ -160,9 +159,6 @@ class ResponseModeClassifier:
                 return INFO_MODE
             return None
         if any(keyword in text for keyword in INFO_KEYWORDS):
-            # Avoid classifying generic "help" as INFO unless it's about the system.
-            if "help" in text and "doc" not in text and "documentation" not in text:
-                return None
             return INFO_MODE
         return None
 
@@ -174,19 +170,15 @@ class ResponseModeClassifier:
     def _explicit_info_request(text: str) -> bool:
         if ResponseModeClassifier._matches_info_patterns(text):
             return True
+        # Only match full meta-question phrases, not bare keywords that can
+        # appear in legitimate document content queries.
         info_cues = (
-            "what is",
+            "what is docwain",
             "who are you",
             "what are you",
             "how do you work",
             "what can you do",
-            "privacy",
-            "docs",
             "documentation",
-            "help",
-            "support",
-            "capabilities",
-            "features",
         )
         return any(cue in text for cue in info_cues)
 

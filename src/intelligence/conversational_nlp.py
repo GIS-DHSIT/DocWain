@@ -68,6 +68,16 @@ def classify_conversational_intent(
     try:
         from src.nlp.nlu_engine import classify_query_routing
 
+        # Pre-check: if the query contains possessive patterns with proper nouns
+        # (e.g. "Philip's skills", "Gokul's email"), it's always a document query.
+        # This guard prevents embedding-based misrouting for entity-specific questions.
+        import re as _re_conv
+        _possessive_entity_re = _re_conv.compile(
+            r"[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)*'s?\s+\w+",
+        )
+        if _possessive_entity_re.search(text):
+            return None
+
         routing, intent, score = classify_query_routing(text)
 
         # If the holistic classifier sees GREETING but the message is longer,
