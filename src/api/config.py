@@ -553,6 +553,24 @@ class Config:
         PHOTO_ANALYSIS = os.getenv("VISION_ANALYSIS_PHOTO", "true").lower() in {"1", "true", "yes", "on"}
         MAX_IMAGE_TOKENS = int(os.getenv("VISION_ANALYSIS_MAX_IMAGE_TOKENS", "4096"))
 
+    class VisualIntelligence:
+        """ML-based visual document understanding (second-pass enrichment)."""
+        ENABLED = os.getenv("VISUAL_INTELLIGENCE_ENABLED", "true")
+        GPU_DEVICE = os.getenv("VISUAL_INTELLIGENCE_GPU_DEVICE", "cuda:0")
+        CPU_FALLBACK = os.getenv("VISUAL_INTELLIGENCE_CPU_FALLBACK", "true")
+        MAX_CONCURRENT_PAGES = int(os.getenv("VISUAL_INTELLIGENCE_MAX_CONCURRENT_PAGES", "4"))
+        TIER1_MODELS = os.getenv("VISUAL_INTELLIGENCE_TIER1_MODELS", "dit").split(",")
+        TIER2_MODELS = os.getenv("VISUAL_INTELLIGENCE_TIER2_MODELS", "dit,table_transformer,trocr,layoutlmv3").split(",")
+        DIT_MODEL = os.getenv("VISUAL_INTELLIGENCE_DIT_MODEL", "microsoft/dit-large-finetuned-publaynet")
+        TABLE_DET_MODEL = os.getenv("VISUAL_INTELLIGENCE_TABLE_DET_MODEL", "microsoft/table-transformer-detection")
+        TABLE_STR_MODEL = os.getenv("VISUAL_INTELLIGENCE_TABLE_STR_MODEL", "microsoft/table-transformer-structure-recognition")
+        TROCR_PRINTED_MODEL = os.getenv("VISUAL_INTELLIGENCE_TROCR_PRINTED_MODEL", "microsoft/trocr-base-printed")
+        TROCR_HANDWRITTEN_MODEL = os.getenv("VISUAL_INTELLIGENCE_TROCR_HANDWRITTEN_MODEL", "microsoft/trocr-base-handwritten")
+        LAYOUTLMV3_MODEL = os.getenv("VISUAL_INTELLIGENCE_LAYOUTLMV3_MODEL", "microsoft/layoutlmv3-base")
+        RENDER_DPI = int(os.getenv("VISUAL_INTELLIGENCE_RENDER_DPI", "300"))
+        COMPLEXITY_OCR_HIGH = float(os.getenv("VISUAL_INTELLIGENCE_OCR_HIGH", "0.85"))
+        COMPLEXITY_OCR_LOW = float(os.getenv("VISUAL_INTELLIGENCE_OCR_LOW", "0.70"))
+
     class Agents:
         """Per-agent feature flags for enhanced agent capabilities."""
         RESUMES_INTERNET_ENABLED = os.getenv("DOCWAIN_RESUMES_INTERNET_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
