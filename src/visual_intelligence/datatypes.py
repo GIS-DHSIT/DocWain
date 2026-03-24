@@ -73,7 +73,7 @@ class PageComplexity:
     image_ratio: float
     has_tables: bool
     has_forms: bool
-    signals: Dict
+    signals: Dict = field(default_factory=dict)
 
 
 @dataclass
