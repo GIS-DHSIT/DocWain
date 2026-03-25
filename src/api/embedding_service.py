@@ -329,6 +329,47 @@ def _extract_full_text_from_pickle(extracted: Any) -> str:
     return ""
 
 
+def _extract_full_text_from_qdrant(
+    doc_id: str, subscription_id: str, profile_id: str
+) -> str:
+    """Reconstruct document text from existing Qdrant chunks when pickle is unavailable."""
+    try:
+        from src.api.dataHandler import get_vector_store
+        from src.api.vector_store import build_collection_name
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        _vs = get_vector_store()
+        collection = build_collection_name(subscription_id)
+        points, _ = _vs.client.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="profile_id", match=MatchValue(value=profile_id)),
+            ]),
+            limit=100,
+            with_payload=["canonical_text", "resolution", "chunk_index"],
+            with_vectors=False,
+        )
+        chunks = []
+        for p in points:
+            payload = p.payload or {}
+            if payload.get("resolution") in ("doc_index", "doc_intelligence"):
+                continue
+            chunks.append({
+                "text": payload.get("canonical_text", ""),
+                "index": payload.get("chunk_index", 0),
+            })
+        chunks.sort(key=lambda c: c["index"])
+        full_text = "\n".join(c["text"] for c in chunks if c["text"])
+        if full_text:
+            logger.info("[DOC_INTELLIGENCE] Reconstructed %d chars from %d Qdrant chunks for %s",
+                       len(full_text), len(chunks), doc_id)
+        return full_text
+    except Exception as exc:
+        logger.debug("[DOC_INTELLIGENCE] Qdrant text reconstruction failed: %s", exc)
+        return ""
+
+
 def _check_doc_intelligence_exists(doc_id: str, subscription_id: str, profile_id: str) -> bool:
     """Check if doc_index point already exists in Qdrant for this document."""
     try:
@@ -2105,6 +2146,11 @@ def _process_blob(
                 _has_di = _check_doc_intelligence_exists(doc_id, subscription_id, profile_id)
                 if not _has_di:
                     _di_full_text = _extract_full_text_from_pickle(extracted)
+                    # Fallback: reconstruct text from Qdrant chunks if pickle is purged
+                    if not _di_full_text:
+                        _di_full_text = _extract_full_text_from_qdrant(
+                            doc_id, subscription_id or "", profile_id or ""
+                        )
                     if _di_full_text:
                         _source_fn = record.get("name", blob.name or "")
                         _upsert_doc_intelligence(
@@ -2112,6 +2158,8 @@ def _process_blob(
                             _source_fn, _di_full_text,
                             collection_name=build_collection_name(subscription_id or ""),
                         )
+                    else:
+                        logger.warning("[DOC_INTELLIGENCE] No text source for %s (pickle purged, no Qdrant chunks)", doc_id)
             except Exception as _di_exc:
                 logger.warning("[DOC_INTELLIGENCE] Skipped-path extraction failed: %s", _di_exc, exc_info=True)
             result["status"] = "SKIPPED"
@@ -2316,6 +2364,10 @@ def _process_blob(
                 _has_di = _check_doc_intelligence_exists(doc_id, subscription_id, profile_id)
                 if not _has_di:
                     _di_text = _extract_full_text_from_pickle(extracted)
+                    if not _di_text:
+                        _di_text = _extract_full_text_from_qdrant(
+                            doc_id, subscription_id or "", profile_id or ""
+                        )
                     if _di_text:
                         _upsert_doc_intelligence(
                             doc_id, subscription_id, profile_id,
