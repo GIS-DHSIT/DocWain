@@ -2879,7 +2879,7 @@ def _process_blob(
 
                 _index_point = _di_PointStruct(
                     id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_index_{doc_id}")),
-                    vector=_index_vector,
+                    vector={"content_vector": _index_vector},
                     payload=_index_payload,
                 )
 
@@ -2899,7 +2899,7 @@ def _process_blob(
 
                 _intel_point = _di_PointStruct(
                     id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_intelligence_{doc_id}")),
-                    vector=_intel_vector,
+                    vector={"content_vector": _intel_vector},
                     payload=_intel_payload,
                 )
 
@@ -3648,7 +3648,7 @@ def _process_local_document(
 
                 _index_point = _di_PointStruct(
                     id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_index_{document_id}")),
-                    vector=_index_vector,
+                    vector={"content_vector": _index_vector},
                     payload=_index_payload,
                 )
 
@@ -3668,7 +3668,7 @@ def _process_local_document(
 
                 _intel_point = _di_PointStruct(
                     id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_intelligence_{document_id}")),
-                    vector=_intel_vector,
+                    vector={"content_vector": _intel_vector},
                     payload=_intel_payload,
                 )
 
