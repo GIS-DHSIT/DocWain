@@ -252,8 +252,9 @@ class CoreAgent:
             getattr(understanding, "task_type", "?"),
         )
 
-        # --- Fetch document index for profile awareness ---
-        BROAD_TASK_TYPES = {"summarize", "overview", "list", "aggregate", "compare"}
+        # --- Fetch document index + intelligence for profile awareness ---
+        # Always fetch both — doc_intelligence is the richest context source
+        # and is needed even for specific queries (extract, lookup, investigate)
         doc_index_entries: List[str] = []
         doc_intelligence_entries: List[str] = []
         try:
@@ -278,23 +279,22 @@ class CoreAgent:
                 if (p.payload or {}).get("canonical_text")
             ]
 
-            # For broad queries, also fetch doc_intelligence
-            if understanding.task_type in BROAD_TASK_TYPES:
-                _intel_points, _ = self._qdrant.scroll(
-                    collection_name=_collection,
-                    scroll_filter=_QFilter(must=[
-                        _QFC(key="profile_id", match=_QMV(value=str(profile_id))),
-                        _QFC(key="resolution", match=_QMV(value="doc_intelligence")),
-                    ]),
-                    limit=200,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-                doc_intelligence_entries = [
-                    (p.payload or {}).get("canonical_text", "")
-                    for p in _intel_points
-                    if (p.payload or {}).get("canonical_text")
-                ]
+            # Always fetch doc_intelligence — critical context for ALL query types
+            _intel_points, _ = self._qdrant.scroll(
+                collection_name=_collection,
+                scroll_filter=_QFilter(must=[
+                    _QFC(key="profile_id", match=_QMV(value=str(profile_id))),
+                    _QFC(key="resolution", match=_QMV(value="doc_intelligence")),
+                ]),
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            doc_intelligence_entries = [
+                (p.payload or {}).get("canonical_text", "")
+                for p in _intel_points
+                if (p.payload or {}).get("canonical_text")
+            ]
 
             logger.info(
                 "[DOC_INDEX] Fetched %d doc_index + %d doc_intelligence entries for profile %s",
