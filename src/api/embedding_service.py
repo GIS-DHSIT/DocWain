@@ -3177,6 +3177,20 @@ def _process_local_document(
         return _early_return(result)
     current_status = record.get("status")
     if current_status in COMPLETED_STATUSES:
+        # Generate doc_intelligence if missing (local path)
+        try:
+            _has_di = _check_doc_intelligence_exists(document_id, subscription_id or "", profile_id or "")
+            if not _has_di:
+                _di_text = _extract_full_text_from_qdrant(document_id, subscription_id or "", profile_id or "")
+                if _di_text:
+                    _source_fn = record.get("name", "")
+                    _upsert_doc_intelligence(
+                        document_id, subscription_id or "", profile_id or "",
+                        _source_fn, _di_text,
+                        collection_name=build_collection_name(subscription_id or ""),
+                    )
+        except Exception as _di_exc:
+            logger.warning("[DOC_INTELLIGENCE] Local-path extraction failed: %s", _di_exc, exc_info=True)
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
         return _early_return(result)
