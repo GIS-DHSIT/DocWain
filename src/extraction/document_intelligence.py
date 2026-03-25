@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.utils.logging_utils import get_logger
 
@@ -26,7 +26,8 @@ logger = get_logger(__name__)
 
 _SYSTEM_PROMPT = (
     "You are a document analyst. Extract ALL structured information "
-    "from this document. Output valid JSON only."
+    "from this document. Output valid JSON only. "
+    "Do NOT include any explanation, thinking, or commentary — ONLY the JSON object."
 )
 
 _USER_PROMPT_TEMPLATE = """\
@@ -48,44 +49,123 @@ Rules:
 - Extract ONLY what is explicitly stated. Never infer or fabricate.
 - Adapt to the document — a resume has different structure than an invoice.
 - If a field has no data in the document, omit it entirely.
-- Return valid JSON only."""
+- Return valid JSON only. No markdown, no explanation, no commentary."""
+
+_RETRY_PROMPT_TEMPLATE = """\
+The previous attempt to extract document intelligence failed to produce valid JSON.
+Please try again with this document. Return ONLY a valid JSON object, nothing else.
+
+--- DOCUMENT ---
+{text}
+--- END DOCUMENT ---
+
+Return a JSON object with these fields (include only fields with data):
+{{"document_type": "...", "parties": [{{"name": "...", "role": "..."}}], "key_dates": [{{"date": "...", "context": "..."}}], "key_values": [{{"value": "...", "context": "..."}}], "key_sections": [{{"heading": "...", "summary": "..."}}], "key_facts": ["..."], "one_line_summary": "..."}}"""
 
 # ---------------------------------------------------------------------------
 # JSON parsing helpers
 # ---------------------------------------------------------------------------
 
 _CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```")
+_JSON_OBJECT_RE = re.compile(r"\{[\s\S]*\}")
 
 
 def _parse_json_response(raw: str) -> Dict[str, Any]:
-    """Parse JSON from an LLM response, stripping markdown fences if present."""
+    """Parse JSON from an LLM response with multiple fallback strategies."""
+    if not raw or not raw.strip():
+        raise ValueError("Empty LLM response")
+
     text = raw.strip()
 
-    # Try stripping markdown code blocks first
-    m = _CODE_BLOCK_RE.search(text)
-    if m:
-        text = m.group(1).strip()
-
+    # Strategy 1: Direct JSON parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Fallback: find the outermost { ... }
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
+    # Strategy 2: Strip markdown code blocks
+    m = _CODE_BLOCK_RE.search(text)
+    if m:
         try:
-            return json.loads(text[start : end + 1])
+            return json.loads(m.group(1).strip())
         except json.JSONDecodeError:
             pass
 
+    # Strategy 3: Find outermost { ... } braces
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start:end + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            # Strategy 4: Try fixing common JSON issues
+            fixed = _fix_json_issues(candidate)
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+
+    # Strategy 5: Extract key-value pairs with regex as last resort
+    fallback = _regex_extract_fields(text)
+    if fallback:
+        return fallback
+
     raise ValueError(f"Could not parse JSON from LLM response ({len(raw)} chars)")
+
+
+def _fix_json_issues(text: str) -> str:
+    """Fix common JSON formatting issues from LLM output."""
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    # Fix single quotes to double quotes (careful with contractions)
+    # Only do this if there are no double quotes at all
+    if '"' not in text and "'" in text:
+        text = text.replace("'", '"')
+    # Remove control characters
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    return text
+
+
+def _regex_extract_fields(text: str) -> Optional[Dict[str, Any]]:
+    """Last-resort extraction of key fields using regex patterns."""
+    result: Dict[str, Any] = {}
+
+    # Extract document_type
+    m = re.search(r'"?document_type"?\s*[:=]\s*"([^"]+)"', text, re.IGNORECASE)
+    if m:
+        result["document_type"] = m.group(1)
+
+    # Extract one_line_summary
+    m = re.search(r'"?one_line_summary"?\s*[:=]\s*"([^"]+)"', text, re.IGNORECASE)
+    if m:
+        result["one_line_summary"] = m.group(1)
+
+    # Extract party names
+    parties = []
+    for m in re.finditer(r'"name"\s*:\s*"([^"]+)".*?"role"\s*:\s*"([^"]+)"', text):
+        parties.append({"name": m.group(1), "role": m.group(2)})
+    if parties:
+        result["parties"] = parties
+
+    # Extract dates
+    dates = []
+    for m in re.finditer(r'"date"\s*:\s*"([^"]+)"(?:.*?"context"\s*:\s*"([^"]+)")?', text):
+        entry = {"date": m.group(1)}
+        if m.group(2):
+            entry["context"] = m.group(2)
+        dates.append(entry)
+    if dates:
+        result["key_dates"] = dates
+
+    return result if result else None
 
 
 # ---------------------------------------------------------------------------
 # Main extraction
 # ---------------------------------------------------------------------------
+
+_MAX_RETRIES = 3
 
 
 def extract_document_intelligence(
@@ -93,50 +173,145 @@ def extract_document_intelligence(
     filename: str,
     llm_gateway: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Extract structured intelligence from a document via a single LLM call.
+    """Extract structured intelligence from a document via LLM call.
 
-    Args:
-        full_text: The full document text.
-        filename: Original filename (used for logging).
-        llm_gateway: Optional pre-created LLM gateway instance.
+    Uses up to 3 attempts with different strategies:
+    1. Standard prompt with low temperature
+    2. Retry with simplified prompt and explicit JSON example
+    3. Final attempt with no-thinking mode and minimal prompt
 
-    Returns:
-        Dict with keys such as ``document_type``, ``parties``, ``key_dates``,
-        ``key_values``, ``key_sections``, ``key_facts``, ``one_line_summary``.
-        On failure, returns a minimal dict with ``one_line_summary`` only.
+    On complete failure, returns a dict built from the document text directly.
     """
     logger.info(
         "[DOC_INTELLIGENCE] Extracting intelligence for %s (%d chars)",
-        filename,
-        len(full_text),
+        filename, len(full_text),
     )
 
     if llm_gateway is None:
         from src.llm.gateway import get_llm_gateway
         llm_gateway = get_llm_gateway()
 
-    prompt = _USER_PROMPT_TEMPLATE.format(text=full_text[:15000])
+    truncated_text = full_text[:15000]
     t0 = time.perf_counter()
 
-    try:
-        text, _metadata = llm_gateway.generate_with_metadata(
-            prompt,
-            system=_SYSTEM_PROMPT,
-            temperature=0.1,
-            max_tokens=4096,
-        )
-        result = _parse_json_response(text)
-    except Exception as exc:
-        elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        logger.error(
-            "[DOC_INTELLIGENCE] Extraction failed for %s: %s (after %dms)",
-            filename,
-            exc,
-            elapsed_ms,
-        )
-        snippet = full_text[:200].replace("\n", " ").strip()
-        return {"one_line_summary": snippet}
+    # Attempt 1: Standard extraction
+    result = _attempt_extraction(
+        llm_gateway, truncated_text, filename,
+        prompt_template=_USER_PROMPT_TEMPLATE,
+        system=_SYSTEM_PROMPT,
+        temperature=0.1,
+        think=False,
+        attempt=1,
+    )
+    if result is not None:
+        _log_success(filename, result, t0)
+        return result
 
+    # Attempt 2: Retry with simplified prompt and JSON example
+    result = _attempt_extraction(
+        llm_gateway, truncated_text, filename,
+        prompt_template=_RETRY_PROMPT_TEMPLATE,
+        system="You are a JSON extraction tool. Return ONLY valid JSON. No text, no explanation.",
+        temperature=0.0,
+        think=False,
+        attempt=2,
+    )
+    if result is not None:
+        _log_success(filename, result, t0)
+        return result
+
+    # Attempt 3: Minimal prompt, force short response
+    minimal_prompt = (
+        f"Extract from this document and return JSON only:\n\n"
+        f"{truncated_text[:5000]}\n\n"
+        f'Return: {{"document_type":"...","parties":[{{"name":"...","role":"..."}}],'
+        f'"one_line_summary":"...","key_facts":["..."]}}'
+    )
+    result = _attempt_extraction(
+        llm_gateway, truncated_text, filename,
+        prompt_text=minimal_prompt,
+        system="Return valid JSON only.",
+        temperature=0.0,
+        think=False,
+        attempt=3,
+        max_tokens=2048,
+    )
+    if result is not None:
+        _log_success(filename, result, t0)
+        return result
+
+    # All attempts failed — build intelligence from text directly
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    logger.warning(
+        "[DOC_INTELLIGENCE] All %d attempts failed for %s (after %dms). "
+        "Building intelligence from text directly.",
+        _MAX_RETRIES, filename, elapsed_ms,
+    )
+    return _build_fallback_intelligence(full_text, filename)
+
+
+def _attempt_extraction(
+    llm_gateway: Any,
+    text: str,
+    filename: str,
+    *,
+    prompt_template: Optional[str] = None,
+    prompt_text: Optional[str] = None,
+    system: str = "",
+    temperature: float = 0.1,
+    think: bool = False,
+    attempt: int = 1,
+    max_tokens: int = 4096,
+) -> Optional[Dict[str, Any]]:
+    """Single extraction attempt. Returns parsed dict or None on failure."""
+    try:
+        prompt = prompt_text or prompt_template.format(text=text[:15000])
+        raw_response, metadata = llm_gateway.generate_with_metadata(
+            prompt,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            think=think,
+        )
+
+        # Handle thinking mode — response might be in metadata
+        if not raw_response and metadata and metadata.get("thinking"):
+            logger.debug("[DOC_INTELLIGENCE] Attempt %d: response was in thinking block", attempt)
+            raw_response = metadata.get("thinking", "")
+
+        if not raw_response or not raw_response.strip():
+            logger.warning(
+                "[DOC_INTELLIGENCE] Attempt %d for %s: empty response",
+                attempt, filename,
+            )
+            return None
+
+        result = _parse_json_response(raw_response)
+
+        # Validate minimum fields
+        if not isinstance(result, dict):
+            logger.warning("[DOC_INTELLIGENCE] Attempt %d: response is not a dict", attempt)
+            return None
+
+        # Ensure at least one meaningful field exists
+        meaningful = any(result.get(k) for k in (
+            "document_type", "parties", "key_facts", "one_line_summary",
+        ))
+        if not meaningful:
+            logger.warning("[DOC_INTELLIGENCE] Attempt %d: no meaningful fields extracted", attempt)
+            return None
+
+        return result
+
+    except Exception as exc:
+        logger.warning(
+            "[DOC_INTELLIGENCE] Attempt %d for %s failed: %s",
+            attempt, filename, exc,
+        )
+        return None
+
+
+def _log_success(filename: str, result: Dict, t0: float) -> None:
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
     doc_type = result.get("document_type", "unknown")
     parties = result.get("parties", [])
@@ -148,6 +323,104 @@ def extract_document_intelligence(
         len(facts) if isinstance(facts, list) else 0,
         elapsed_ms,
     )
+
+
+def _build_fallback_intelligence(full_text: str, filename: str) -> Dict[str, Any]:
+    """Build basic intelligence from raw text when LLM extraction fails completely.
+
+    Uses regex patterns to extract entities, dates, and amounts directly from text.
+    This ensures EVERY document gets at least basic intelligence — zero failures.
+    """
+    result: Dict[str, Any] = {}
+
+    # Document type from filename
+    fname_lower = filename.lower()
+    if "contract" in fname_lower or "agreement" in fname_lower:
+        result["document_type"] = "contract"
+    elif "invoice" in fname_lower:
+        result["document_type"] = "invoice"
+    elif "resume" in fname_lower or "cv" in fname_lower:
+        result["document_type"] = "resume"
+    elif "report" in fname_lower:
+        result["document_type"] = "report"
+    else:
+        result["document_type"] = "document"
+
+    # Extract entities with common patterns
+    parties: List[Dict[str, str]] = []
+
+    # "between X and Y" pattern
+    m = re.search(
+        r'between\s+(.+?)\s*\("([^"]+)"\)\s*and\s+(.+?)\s*\("([^"]+)"\)',
+        full_text, re.IGNORECASE,
+    )
+    if m:
+        parties.append({"name": m.group(1).strip(), "role": m.group(2)})
+        parties.append({"name": m.group(3).strip(), "role": m.group(4)})
+
+    # "Company Name Inc./LLC/Ltd" patterns
+    if not parties:
+        for m in re.finditer(
+            r'\b([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\s+(?:Inc|LLC|Ltd|Corp|Co|LLP|Pvt)\.?)\b',
+            full_text,
+        ):
+            name = m.group(1).strip()
+            if name not in [p["name"] for p in parties]:
+                parties.append({"name": name, "role": ""})
+            if len(parties) >= 4:
+                break
+
+    if parties:
+        result["parties"] = parties
+
+    # Extract dates
+    dates: List[Dict[str, str]] = []
+    for m in re.finditer(
+        r'\b((?:January|February|March|April|May|June|July|August|September|'
+        r'October|November|December)\s+\d{1,2},?\s+\d{4})\b',
+        full_text,
+    ):
+        if m.group(1) not in [d.get("date") for d in dates]:
+            dates.append({"date": m.group(1), "context": ""})
+        if len(dates) >= 5:
+            break
+
+    if dates:
+        result["key_dates"] = dates
+
+    # Extract monetary values
+    values: List[Dict[str, str]] = []
+    for m in re.finditer(r'\$[\d,]+(?:\.\d{2})?', full_text):
+        if m.group(0) not in [v.get("value") for v in values]:
+            values.append({"value": m.group(0), "context": ""})
+        if len(values) >= 5:
+            break
+
+    # Extract percentages
+    for m in re.finditer(r'\b(\d+(?:\.\d+)?)\s*%', full_text):
+        val = f"{m.group(1)}%"
+        if val not in [v.get("value") for v in values]:
+            values.append({"value": val, "context": ""})
+        if len(values) >= 8:
+            break
+
+    if values:
+        result["key_values"] = values
+
+    # Key facts from first few sentences
+    sentences = re.split(r'[.!?]\s+', full_text[:2000])
+    key_facts = [s.strip() + "." for s in sentences[:5] if len(s.strip()) > 30]
+    if key_facts:
+        result["key_facts"] = key_facts
+
+    # Summary
+    result["one_line_summary"] = full_text[:200].replace("\n", " ").strip()
+
+    logger.info(
+        "[DOC_INTELLIGENCE] Fallback extraction for %s: type=%s parties=%d facts=%d",
+        filename, result.get("document_type"), len(parties), len(key_facts),
+    )
+
     return result
 
 
@@ -157,12 +430,7 @@ def extract_document_intelligence(
 
 
 def build_doc_index_text(filename: str, intelligence: Dict[str, Any]) -> str:
-    """Build a compact one-line summary (~50 tokens) for document indexing.
-
-    Dynamically assembles whichever fields are present.  Example output:
-        ``US_Healthcare_Contract_5.pdf | Healthcare Equipment Agreement |
-        Leica Biosystems (Supplier) <-> Prime Diagnostics (Customer) | Jan 2026 | Net 30 days``
-    """
+    """Build a compact one-line summary (~50 tokens) for document indexing."""
     parts: list[str] = [filename]
 
     doc_type = intelligence.get("document_type")
@@ -171,14 +439,13 @@ def build_doc_index_text(filename: str, intelligence: Dict[str, Any]) -> str:
 
     summary = intelligence.get("one_line_summary")
     if summary and not doc_type:
-        # Use summary only when doc_type is absent to avoid redundancy
         parts.append(str(summary))
 
-    # Parties — compact representation
+    # Parties
     parties = intelligence.get("parties")
     if parties and isinstance(parties, list):
         party_strs = []
-        for p in parties[:4]:  # cap to avoid overly long lines
+        for p in parties[:4]:
             if isinstance(p, dict):
                 name = p.get("name", p.get("entity", ""))
                 role = p.get("role", "")
@@ -212,10 +479,7 @@ def build_doc_index_text(filename: str, intelligence: Dict[str, Any]) -> str:
 def build_doc_intelligence_text(
     filename: str, intelligence: Dict[str, Any]
 ) -> str:
-    """Build a narrative summary (~200-500 tokens) for Qdrant canonical_text.
-
-    Assembles all extracted fields into readable prose/structured text.
-    """
+    """Build a narrative summary (~200-500 tokens) for Qdrant canonical_text."""
     lines: list[str] = []
     lines.append(f"Document: {filename}")
 
@@ -227,7 +491,6 @@ def build_doc_intelligence_text(
     if summary:
         lines.append(f"Summary: {summary}")
 
-    # Parties
     parties = intelligence.get("parties")
     if parties and isinstance(parties, list):
         lines.append("Parties:")
@@ -239,7 +502,6 @@ def build_doc_intelligence_text(
             else:
                 lines.append(f"  - {p}")
 
-    # Key dates
     dates = intelligence.get("key_dates")
     if dates and isinstance(dates, list):
         lines.append("Key Dates:")
@@ -251,7 +513,6 @@ def build_doc_intelligence_text(
             else:
                 lines.append(f"  - {d}")
 
-    # Key values
     values = intelligence.get("key_values")
     if values and isinstance(values, list):
         lines.append("Key Values:")
@@ -263,7 +524,6 @@ def build_doc_intelligence_text(
             else:
                 lines.append(f"  - {v}")
 
-    # Key sections
     sections = intelligence.get("key_sections")
     if sections and isinstance(sections, list):
         lines.append("Sections:")
@@ -275,7 +535,6 @@ def build_doc_intelligence_text(
             else:
                 lines.append(f"  - {s}")
 
-    # Key facts
     facts = intelligence.get("key_facts")
     if facts and isinstance(facts, list):
         lines.append("Key Facts:")

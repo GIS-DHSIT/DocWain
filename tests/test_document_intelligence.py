@@ -110,7 +110,7 @@ class TestExtractDocIntelligenceFailure:
             llm_gateway=mock_gw,
         )
         assert "one_line_summary" in result
-        assert len(result) == 1  # Only one_line_summary
+        assert "document_type" in result  # Fallback always includes type
         assert "This is a test document" in result["one_line_summary"]
 
 
