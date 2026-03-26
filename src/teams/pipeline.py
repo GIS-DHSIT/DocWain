@@ -447,7 +447,7 @@ class TeamsDocumentPipeline:
         correlation_id: str,
         auth_token: str = "",
     ) -> None:
-        """Run the complete Identify -> Screen -> Embed pipeline."""
+        """Run the complete Identify -> Screen -> Embed pipeline with parallel stages."""
         log = get_logger(__name__, correlation_id)
 
         from src.teams.attachments import (
@@ -458,6 +458,7 @@ class TeamsDocumentPipeline:
             _upload_to_blob,
         )
         from src.api.config import Config
+        from src.teams.cards import build_card
 
         filename = _resolve_filename(attachment)
         download_url = _resolve_download_url(attachment)
@@ -489,12 +490,20 @@ class TeamsDocumentPipeline:
             asyncio.to_thread(_upload_to_blob, file_bytes, filename, context.subscription_id, log)
         )
 
-        # Stage 1: Identify
+        # Stage 1: Identify (Step 1/3)
+        progress1 = build_card(
+            "stage_progress_card",
+            step_indicator="1/3",
+            stage_title=f"Analyzing: {filename}",
+            stage_detail="Extracting content and identifying document type...",
+            progress_bar="[===>          ] 33%",
+        )
+        await _send_card(turn_context, progress1, "Step 1/3: Analyzing document...", log)
+
         result = await self.stage_identify(
             file_bytes, filename, content_type, context, correlation_id,
         )
         if result is None:
-            from src.teams.cards import build_card
             card = build_card("error_card", message=f"No extractable content found in {filename}.")
             await _send_card(turn_context, card, "No content found.", log)
             return
@@ -504,7 +513,7 @@ class TeamsDocumentPipeline:
         # Cache extracted content for consent flow
         self.cache_content(result["document_id"], result["extracted_docs"])
 
-        # Stage 2: Screen
+        # Stage 2: Screen (Step 2/3)
         screen_result = await self.stage_screen(
             result["document_id"],
             result["extracted_text"],
@@ -514,11 +523,19 @@ class TeamsDocumentPipeline:
         await _send_card(turn_context, screen_result["card"], "Screening complete.", log)
 
         if screen_result["needs_consent"]:
-            # Stop here — user must click "Proceed" or "Cancel" on the consent card
             log.info("Pipeline paused for consent: doc=%s", result["document_id"])
             return
 
-        # Stage 3: Embed (no consent needed)
+        # Stage 3: Embed (Step 3/3)
+        progress3 = build_card(
+            "stage_progress_card",
+            step_indicator="3/3",
+            stage_title="Embedding Document",
+            stage_detail="Chunking and indexing for intelligent retrieval...",
+            progress_bar="[============> ] 90%",
+        )
+        await _send_card(turn_context, progress3, "Step 3/3: Embedding...", log)
+
         embed_result = await self.stage_embed(
             document_id=result["document_id"],
             extracted_content=result["extracted_docs"],
