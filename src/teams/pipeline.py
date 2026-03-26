@@ -24,14 +24,50 @@ def _build_teams_collection_name(subscription_id: str, profile_id: str) -> str:
     return f"teams_{safe_sub}_{safe_prof}"
 
 
-async def _send_card(turn_context, card: Dict[str, Any], text: Optional[str], log) -> None:
-    """Send an Adaptive Card via the Bot Framework turn context."""
+async def _send_card(turn_context, card: Dict[str, Any], text: Optional[str], log) -> Optional[str]:
+    """Send an Adaptive Card via the Bot Framework turn context.
+
+    Returns the activity ID so the card can be updated in-place later.
+    """
     try:
         from src.teams.tools import _card_activity
         activity = _card_activity(card, text=text)
-        await turn_context.send_activity(activity)
+        resp = await turn_context.send_activity(activity)
+        return getattr(resp, "id", None)
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to send card: %s", exc, exc_info=True)
+        return None
+
+
+async def _update_card(turn_context, activity_id: Optional[str], card: Dict[str, Any], text: Optional[str], log) -> Optional[str]:
+    """Update an existing card in-place, falling back to send if update fails.
+
+    Returns the activity ID (same as input on success, new on fallback).
+    """
+    from src.teams.tools import _card_activity
+    activity = _card_activity(card, text=text)
+
+    if not activity_id:
+        return await _send_card(turn_context, card, text, log)
+
+    # Try in-place update first
+    try:
+        if isinstance(activity, dict):
+            activity["id"] = activity_id
+        elif hasattr(activity, "id"):
+            activity.id = activity_id
+        await turn_context.update_activity(activity)
+        return activity_id
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback: delete old + send new
+    try:
+        await turn_context.delete_activity(activity_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return await _send_card(turn_context, card, text, log)
 
 
 class TeamsDocumentPipeline:
@@ -115,18 +151,47 @@ class TeamsDocumentPipeline:
 
         await asyncio.to_thread(build_content_map, first_extracted)
 
-        understanding = await asyncio.to_thread(
-            understand_document, extracted=first_extracted, doc_type=doc_type, llm_client=cloud_llm,
-        )
-        summary = ""
+        # Understand ALL extracted documents concurrently
+        async def _understand_one(doc_content):
+            return await asyncio.to_thread(
+                understand_document, extracted=doc_content, doc_type=doc_type, llm_client=cloud_llm,
+            )
+
+        understanding_tasks = [_understand_one(doc_content) for doc_content in extracted_docs.values()]
+        all_understandings = await asyncio.gather(*understanding_tasks, return_exceptions=True)
+
+        # Aggregate understanding from all documents
+        summary_parts: List[str] = []
         key_entities: List[str] = []
         key_facts: List[str] = []
         intent_tags: List[str] = []
-        if isinstance(understanding, dict):
-            summary = understanding.get("document_summary", "")
-            key_entities = understanding.get("key_entities", [])
-            key_facts = understanding.get("key_facts", [])
-            intent_tags = understanding.get("intent_tags", [])
+        seen_entities = set()
+        seen_facts = set()
+
+        for understanding in all_understandings:
+            if isinstance(understanding, Exception):
+                log.warning("Understanding failed for one sub-document: %s", understanding)
+                continue
+            if not isinstance(understanding, dict):
+                continue
+            s = understanding.get("document_summary", "")
+            if s:
+                summary_parts.append(s)
+            for ent in understanding.get("key_entities", []):
+                ent_key = str(ent.get("text", "")).lower() if isinstance(ent, dict) else str(ent).lower()
+                if ent_key and ent_key not in seen_entities:
+                    seen_entities.add(ent_key)
+                    key_entities.append(ent if isinstance(ent, str) else ent.get("text", str(ent)))
+            for fact in understanding.get("key_facts", []):
+                fact_key = str(fact.get("fact", "")).lower() if isinstance(fact, dict) else str(fact).lower()
+                if fact_key and fact_key not in seen_facts:
+                    seen_facts.add(fact_key)
+                    key_facts.append(fact if isinstance(fact, str) else fact.get("fact", str(fact)))
+            for tag in understanding.get("intent_tags", []):
+                if tag not in intent_tags:
+                    intent_tags.append(tag)
+
+        summary = " | ".join(summary_parts) if summary_parts else ""
 
         # Store extraction result in MongoDB
         self.storage.store_extraction_result(
@@ -287,6 +352,7 @@ class TeamsDocumentPipeline:
         context,
         correlation_id: str,
         suggested_questions: Optional[List[str]] = None,
+        doc_intelligence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Chunk, embed into Teams-isolated Qdrant collection, return completion card."""
         log = get_logger(__name__, correlation_id)
@@ -312,6 +378,31 @@ class TeamsDocumentPipeline:
             vector_store = QdrantVectorStore(client)
             vector_size = int(getattr(Config.Model, "EMBEDDING_DIM", 1024))
             vector_store.ensure_collection(collection_name, vector_size)
+
+            # Enrich extracted content with DI context for better embedding quality
+            if doc_intelligence:
+                di_context = []
+                if doc_intelligence.get("summary"):
+                    di_context.append(f"Document Summary: {doc_intelligence['summary']}")
+                if doc_intelligence.get("key_entities"):
+                    entities_str = ", ".join(str(e) for e in doc_intelligence["key_entities"][:10])
+                    di_context.append(f"Key Entities: {entities_str}")
+                if doc_intelligence.get("doc_type"):
+                    di_context.append(f"Document Type: {doc_intelligence['doc_type']}")
+
+                if di_context:
+                    di_prefix = "\n".join(di_context) + "\n\n---\n\n"
+                    enriched_content = {}
+                    for doc_name, doc_content in extracted_content.items():
+                        if isinstance(doc_content, str):
+                            enriched_content[doc_name] = di_prefix + doc_content
+                        elif hasattr(doc_content, "full_text") and isinstance(getattr(doc_content, "full_text", None), str):
+                            enriched_content[doc_name] = di_prefix + doc_content.full_text
+                        elif hasattr(doc_content, "text") and isinstance(getattr(doc_content, "text", None), str):
+                            enriched_content[doc_name] = di_prefix + doc_content.text
+                        else:
+                            enriched_content[doc_name] = doc_content
+                    extracted_content = enriched_content
 
             # Embed each extracted doc
             from src.api.dataHandler import train_on_document
@@ -418,7 +509,7 @@ class TeamsDocumentPipeline:
         correlation_id: str,
         auth_token: str = "",
     ) -> None:
-        """Run the complete Identify -> Screen -> Embed pipeline."""
+        """Run the complete Identify -> Screen -> Embed pipeline with parallel stages."""
         log = get_logger(__name__, correlation_id)
 
         from src.teams.attachments import (
@@ -429,6 +520,7 @@ class TeamsDocumentPipeline:
             _upload_to_blob,
         )
         from src.api.config import Config
+        from src.teams.cards import build_card
 
         filename = _resolve_filename(attachment)
         download_url = _resolve_download_url(attachment)
@@ -460,17 +552,35 @@ class TeamsDocumentPipeline:
             asyncio.to_thread(_upload_to_blob, file_bytes, filename, context.subscription_id, log)
         )
 
+        # ── Single progress card updated in-place across all stages ──
+        progress_card = build_card(
+            "stage_progress_card",
+            step_indicator="1/3",
+            stage_title=f"Analyzing: {filename}",
+            stage_detail="Extracting content and identifying document type...",
+            progress_bar="[██░░░░░░░░░░░░] 33%",
+        )
+        progress_id = await _send_card(turn_context, progress_card, "Step 1/3: Analyzing document...", log)
+
         # Stage 1: Identify
         result = await self.stage_identify(
             file_bytes, filename, content_type, context, correlation_id,
         )
         if result is None:
-            from src.teams.cards import build_card
-            card = build_card("error_card", message=f"No extractable content found in {filename}.")
-            await _send_card(turn_context, card, "No content found.", log)
+            # Replace progress card with error
+            error_card = build_card("error_card", message=f"No extractable content found in {filename}.")
+            await _update_card(turn_context, progress_id, error_card, "No content found.", log)
             return
 
-        await _send_card(turn_context, result["card"], "Document identified.", log)
+        # Update progress → Stage 2
+        progress_card = build_card(
+            "stage_progress_card",
+            step_indicator="2/3",
+            stage_title=f"Screening: {filename}",
+            stage_detail=f"Document identified as {result['doc_type'].title()} ({result['confidence']*100:.0f}% confidence). Running security checks...",
+            progress_bar="[██████░░░░░░░░] 50%",
+        )
+        progress_id = await _update_card(turn_context, progress_id, progress_card, "Step 2/3: Screening...", log)
 
         # Cache extracted content for consent flow
         self.cache_content(result["document_id"], result["extracted_docs"])
@@ -482,14 +592,24 @@ class TeamsDocumentPipeline:
             filename,
             correlation_id,
         )
-        await _send_card(turn_context, screen_result["card"], "Screening complete.", log)
 
         if screen_result["needs_consent"]:
-            # Stop here — user must click "Proceed" or "Cancel" on the consent card
+            # Replace progress card with consent card (user must interact)
+            await _update_card(turn_context, progress_id, screen_result["card"], "Consent required.", log)
             log.info("Pipeline paused for consent: doc=%s", result["document_id"])
             return
 
-        # Stage 3: Embed (no consent needed)
+        # Update progress → Stage 3
+        progress_card = build_card(
+            "stage_progress_card",
+            step_indicator="3/3",
+            stage_title=f"Embedding: {filename}",
+            stage_detail=f"Security: {screen_result['risk_level']} risk. Chunking and indexing for intelligent retrieval...",
+            progress_bar="[██████████░░░░] 80%",
+        )
+        progress_id = await _update_card(turn_context, progress_id, progress_card, "Step 3/3: Embedding...", log)
+
+        # Stage 3: Embed
         embed_result = await self.stage_embed(
             document_id=result["document_id"],
             extracted_content=result["extracted_docs"],
@@ -498,8 +618,16 @@ class TeamsDocumentPipeline:
             context=context,
             correlation_id=correlation_id,
             suggested_questions=result.get("suggested_questions"),
+            doc_intelligence={
+                "summary": result.get("summary", ""),
+                "key_entities": result.get("key_entities", []),
+                "doc_type": result.get("doc_type", ""),
+                "key_facts": result.get("key_facts", []),
+            },
         )
-        await _send_card(turn_context, embed_result["card"], "Document ready.", log)
+
+        # Replace progress card with final completion card
+        await _update_card(turn_context, progress_id, embed_result["card"], "Document ready.", log)
 
     # ── Resume after consent ─────────────────────────────────────────
 
@@ -542,6 +670,11 @@ class TeamsDocumentPipeline:
             doc_type=doc_type,
             context=context,
             correlation_id=correlation_id,
+            doc_intelligence={
+                "doc_type": doc_type,
+                "summary": doc.get("extraction", {}).get("summary", ""),
+                "key_entities": doc.get("extraction", {}).get("key_entities", []),
+            },
         )
         await _send_card(turn_context, embed_result["card"], "Document ready.", log)
 

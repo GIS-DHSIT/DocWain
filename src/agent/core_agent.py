@@ -54,14 +54,14 @@ _STOPWORDS: Set[str] = {
 # ---------------------------------------------------------------------------
 
 _EVIDENCE_TOP_K: Dict[str, int] = {
-    "lookup": 4,
-    "extract": 6,
-    "list": 8,
-    "summarize": 8,
-    "overview": 10,
-    "compare": 8,
-    "investigate": 8,
-    "aggregate": 6,
+    "lookup": 8,
+    "extract": 12,
+    "list": 20,
+    "summarize": 20,
+    "overview": 25,
+    "compare": 12,
+    "investigate": 12,
+    "aggregate": 10,
 }
 
 _TASK_SYNONYMS: Dict[str, List[str]] = {
@@ -125,6 +125,7 @@ class CoreAgent:
         cross_encoder: Any = None,
     ) -> None:
         self._llm = llm_gateway
+        self._qdrant = qdrant_client
         self._mongodb = mongodb
         self._intent_analyzer = IntentAnalyzer(llm_gateway=llm_gateway)
         self._retriever = UnifiedRetriever(qdrant_client=qdrant_client, embedder=embedder)
@@ -245,6 +246,63 @@ class CoreAgent:
 
         timing["understand_ms"] = round((time.monotonic() - t0) * 1000, 1)
 
+        logger.info(
+            "[RAG_QUERY] query=%r profile=%s subscription=%s user=%s task_type=%s",
+            query[:100], profile_id, subscription_id, user_id,
+            getattr(understanding, "task_type", "?"),
+        )
+
+        # --- Fetch document index + intelligence for profile awareness ---
+        # Always fetch both — doc_intelligence is the richest context source
+        # and is needed even for specific queries (extract, lookup, investigate)
+        doc_index_entries: List[str] = []
+        doc_intelligence_entries: List[str] = []
+        try:
+            from qdrant_client.models import Filter as _QFilter, FieldCondition as _QFC, MatchValue as _QMV
+            from src.api.vector_store import build_collection_name
+            _collection = build_collection_name(subscription_id)
+
+            # Always fetch doc_index (compact, ~50 tokens per doc)
+            _idx_points, _ = self._qdrant.scroll(
+                collection_name=_collection,
+                scroll_filter=_QFilter(must=[
+                    _QFC(key="profile_id", match=_QMV(value=str(profile_id))),
+                    _QFC(key="resolution", match=_QMV(value="doc_index")),
+                ]),
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            doc_index_entries = [
+                (p.payload or {}).get("canonical_text", "")
+                for p in _idx_points
+                if (p.payload or {}).get("canonical_text")
+            ]
+
+            # Always fetch doc_intelligence — critical context for ALL query types
+            _intel_points, _ = self._qdrant.scroll(
+                collection_name=_collection,
+                scroll_filter=_QFilter(must=[
+                    _QFC(key="profile_id", match=_QMV(value=str(profile_id))),
+                    _QFC(key="resolution", match=_QMV(value="doc_intelligence")),
+                ]),
+                limit=200,
+                with_payload=True,
+                with_vectors=False,
+            )
+            doc_intelligence_entries = [
+                (p.payload or {}).get("canonical_text", "")
+                for p in _intel_points
+                if (p.payload or {}).get("canonical_text")
+            ]
+
+            logger.info(
+                "[DOC_INDEX] Fetched %d doc_index + %d doc_intelligence entries for profile %s",
+                len(doc_index_entries), len(doc_intelligence_entries), profile_id,
+            )
+        except Exception as _di_exc:
+            logger.debug("[DOC_INDEX] Fetch failed (non-fatal): %s", _di_exc)
+
         if understanding.is_conversational:
             return self._handle_conversational(query)
 
@@ -343,6 +401,30 @@ class CoreAgent:
 
         # Dynamic evidence count by task type
         evidence_top_k = _EVIDENCE_TOP_K.get(understanding.task_type, 6)
+
+        # --- Profile isolation audit on retrieved chunks ---
+        _raw_chunks = retrieval_result.chunks or []
+        _chunk_profiles = set()
+        _chunk_sources = set()
+        _foreign_count = 0
+        for _rc in _raw_chunks:
+            _rc_pid = getattr(_rc, "profile_id", None) or (getattr(_rc, "metadata", {}) or {}).get("profile_id", "")
+            _rc_src = (getattr(_rc, "metadata", {}) or {}).get("source_name", getattr(_rc, "document_id", "?"))
+            _chunk_profiles.add(str(_rc_pid))
+            _chunk_sources.add(str(_rc_src))
+            if str(_rc_pid) and str(_rc_pid) != str(profile_id):
+                _foreign_count += 1
+        if _foreign_count:
+            logger.error(
+                "[PROFILE_ISOLATION_VIOLATION] %d/%d retrieved chunks belong to foreign profiles %s "
+                "(expected=%s query=%r)",
+                _foreign_count, len(_raw_chunks), _chunk_profiles - {str(profile_id)},
+                profile_id, query[:80],
+            )
+        logger.info(
+            "[RAG_RETRIEVAL] profile=%s chunks=%d sources=%s profiles_seen=%s",
+            profile_id, len(_raw_chunks), list(_chunk_sources)[:10], list(_chunk_profiles),
+        )
 
         reranked = rerank_chunks(
             understanding.resolved_query,  # rerank against original query, not expanded
@@ -444,6 +526,42 @@ class CoreAgent:
         except Exception as exc:
             logger.debug("KG context enrichment failed (non-fatal): %s", exc)
 
+        # --- Enrich doc_context with doc_index / doc_intelligence ---
+        if doc_index_entries:
+            doc_context["doc_index"] = doc_index_entries
+        if doc_intelligence_entries:
+            # Prioritize intelligence entries that match documents mentioned in the query
+            _query_lower = understanding.resolved_query.lower().replace("_", " ").replace(".pdf", "")
+            _prioritized = []
+            _others = []
+            for entry in doc_intelligence_entries:
+                # Extract document filename from "Document: filename.pdf" line
+                _doc_name = ""
+                for _line in entry.split("\n")[:3]:
+                    if _line.lower().startswith("document:"):
+                        _doc_name = _line.split(":", 1)[1].strip()
+                        break
+                _match = False
+                if _doc_name:
+                    _name_normalized = _doc_name.lower().replace("_", " ").replace(".pdf", "")
+                    _match = _name_normalized in _query_lower or _query_lower in _name_normalized
+                if _match:
+                    _prioritized.append(entry)
+                else:
+                    _others.append(entry)
+
+            if _prioritized:
+                # For specific-doc queries: send matching docs as PRIMARY, limit others
+                # to avoid diluting the LLM's attention across 50+ entries
+                _max_others = 5 if len(_prioritized) <= 3 else 0
+                doc_context["doc_intelligence_summaries"] = _prioritized + _others[:_max_others]
+                logger.info(
+                    "[DOC_INDEX] Prioritized %d matching + %d other doc_intelligence entries",
+                    len(_prioritized), min(len(_others), _max_others),
+                )
+            else:
+                doc_context["doc_intelligence_summaries"] = doc_intelligence_entries
+
         # --- REASON ---
         t0 = time.monotonic()
         # Enable thinking for cloud backends — adds reasoning depth.
@@ -477,6 +595,15 @@ class CoreAgent:
             grounded=reason_result.grounded,
             task_type=understanding.task_type,
             metadata=metadata,
+        )
+
+        _evidence_sources = list({e.get("source_name", e.get("document_id", "?")) for e in evidence})
+        logger.info(
+            "[RAG_RESPONSE] profile=%s grounded=%s evidence_count=%d "
+            "sources=%s task_type=%s response_len=%d timing=%s query=%r",
+            profile_id, reason_result.grounded, len(evidence),
+            _evidence_sources[:5], understanding.task_type,
+            len(reason_result.text), timing, query[:80],
         )
 
         # --- FEEDBACK SIGNAL (non-blocking) ---

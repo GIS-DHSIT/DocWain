@@ -21,8 +21,15 @@ _SYSTEM_PROMPT = (
     "not just what it says.\n"
     "4. When you draw a conclusion from evidence, make the reasoning visible: "
     "'Since the protocol specifies X, and Section 3 establishes Y, this means Z.'\n"
-    "5. Every factual claim must trace to the provided knowledge or evidence. "
-    "You may reason and conclude, but never fabricate data points.\n"
+    "5. CRITICAL — ZERO FABRICATION: Every factual claim, number, name, date, "
+    "invoice ID, entity name, and data point MUST appear verbatim in the "
+    "EVIDENCE section or DOCUMENT INTELLIGENCE section below. If a specific "
+    "value is not found in either section, say 'not specified in the documents'. "
+    "Never invent data.\n"
+    "5a. DOCUMENT INTELLIGENCE sections contain verified extracted facts. "
+    "Check the key_sections, key_facts, and key_values fields thoroughly "
+    "before reporting 'not found'. Cross-reference ALL subsections. "
+    "Never generate plausible-sounding but fake data.\n"
     "6. When evidence is thin, say so naturally: 'The documents address X in "
     "detail but don't cover Y specifically.'\n"
     "7. Do not list sources inline with [SOURCE-N] tags. Sources are provided "
@@ -406,6 +413,37 @@ def build_reason_prompt(
                 else:
                     parts.append(f"- {fact}")
 
+        parts.append("--- END DOCUMENT INTELLIGENCE ---")
+        parts.append("")
+
+    # Document Index — always present when available
+    doc_index = None
+    doc_intel_summaries = None
+    if doc_context:
+        doc_index = doc_context.get("doc_index")
+        doc_intel_summaries = doc_context.get("doc_intelligence_summaries")
+
+    if doc_index:
+        parts.append("--- DOCUMENT INDEX (%d documents in this profile) ---" % len(doc_index))
+        for i, entry in enumerate(doc_index, 1):
+            parts.append(f"{i}. {entry}")
+        parts.append("--- END DOCUMENT INDEX ---")
+        parts.append("")
+
+    if doc_intel_summaries:
+        parts.append("--- DOCUMENT INTELLIGENCE (structured summaries — USE AS PRIMARY EVIDENCE) ---")
+        parts.append("These summaries contain verified extracted facts from each document.")
+        parts.append("Use these as your primary source of truth when answering questions.")
+        parts.append("")
+        _intel_chars = 0
+        _MAX_INTEL_CHARS = 16000  # Increased cap for comprehensive coverage
+        for entry in doc_intel_summaries:
+            if _intel_chars + len(entry) > _MAX_INTEL_CHARS:
+                parts.append(f"... ({len(doc_intel_summaries) - doc_intel_summaries.index(entry)} more documents)")
+                break
+            parts.append(entry)
+            parts.append("")
+            _intel_chars += len(entry)
         parts.append("--- END DOCUMENT INTELLIGENCE ---")
         parts.append("")
 

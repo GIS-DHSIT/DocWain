@@ -4144,7 +4144,10 @@ class EnterpriseRAGSystem:
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Intelligent pipeline failed, falling back: %s", exc)
 
-            logger.info(f"Processing query for collection '{collection_name}': {query[:100]}")
+            logger.info(
+                "[RAG_QUERY] query=%r collection=%s profile=%s subscription=%s user=%s",
+                query[:100], collection_name, profile_id, subscription_id, user_id,
+            )
 
             resolved_query = self.conversation_state.resolve_query(query, namespace, user_id)
             if resolved_query != query:
@@ -4187,18 +4190,39 @@ class EnterpriseRAGSystem:
             retrieved_chunks = retrieval_plan.get("chunks") or []
             graph_hints = retrieval_plan.get("graph_hints")
 
+            # --- Profile isolation audit ---
             if retrieved_chunks:
                 scoped = []
                 dropped = 0
+                _leaked_profiles = set()
                 for chunk in retrieved_chunks:
                     meta = getattr(chunk, "metadata", None) or {}
-                    if str(meta.get("profile_id") or "") == str(profile_id):
+                    chunk_profile = str(meta.get("profile_id") or "")
+                    if chunk_profile == str(profile_id):
                         scoped.append(chunk)
                     else:
                         dropped += 1
+                        _leaked_profiles.add(chunk_profile)
                 if dropped:
-                    logger.warning("Dropped %s chunks outside profile scope", dropped)
+                    logger.error(
+                        "[PROFILE_ISOLATION_VIOLATION] Dropped %s chunks from foreign profiles %s "
+                        "(expected profile=%s, query=%r)",
+                        dropped, _leaked_profiles, profile_id, processed_query[:80],
+                    )
                 retrieved_chunks = scoped
+
+            # Log retrieval summary with source document details
+            _source_docs = set()
+            for _ch in retrieved_chunks:
+                _m = getattr(_ch, "metadata", None) or {}
+                _src = _m.get("source_name") or _m.get("document_id") or "unknown"
+                _source_docs.add(str(_src))
+            logger.info(
+                "[RAG_RETRIEVAL] profile=%s retrieved=%d strategy=%s sources=%s",
+                profile_id, len(retrieved_chunks),
+                retrieval_plan.get("selected_strategy", "?"),
+                list(_source_docs)[:10],
+            )
 
             retrieval_attempts = retrieval_plan.get("attempts", [])
             selected_strategy = retrieval_plan.get("selected_strategy", "direct_qdrant")
@@ -4550,7 +4574,14 @@ class EnterpriseRAGSystem:
                     )
                     context_sources = self.context_builder.extract_sources(final_chunks)
 
-            logger.info(f"Built context with {len(final_chunks)} chunks, {len(context)} chars")
+            _ctx_source_names = set()
+            for _fch in final_chunks:
+                _fm = getattr(_fch, "metadata", None) or {}
+                _ctx_source_names.add(str(_fm.get("source_name") or _fm.get("document_id") or "?"))
+            logger.info(
+                "[RAG_CONTEXT] profile=%s chunks=%d context_chars=%d sources=%s",
+                profile_id, len(final_chunks), len(context), list(_ctx_source_names)[:10],
+            )
 
             if not context.strip():
                 retrieval_response = _build_retrieval_empty_text_response(
@@ -5075,6 +5106,17 @@ class EnterpriseRAGSystem:
                 except Exception as cache_exc:
                     logger.warning(f"Failed to cache answer: {cache_exc}")
 
+            # Log response summary
+            logger.info(
+                "[RAG_RESPONSE] profile=%s grounded=%s context_found=%s "
+                "response_len=%d sources=%s query=%r",
+                profile_id,
+                response_obj.get("grounded"),
+                response_obj.get("context_found"),
+                len(str(response_obj.get("response", ""))),
+                [s.get("name", s.get("document_id", "?")) for s in response_obj.get("sources", [])[:5]],
+                processed_query[:80],
+            )
             # Return the constructed response
             return response_obj
 

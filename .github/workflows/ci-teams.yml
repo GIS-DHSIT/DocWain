@@ -1,0 +1,57 @@
+name: Teams CI
+
+on:
+  pull_request:
+    branches: [main, Development]
+    paths:
+      - 'src/teams/**'
+      - 'src/doc_understanding/**'
+      - 'src/embedding/**'
+      - 'src/api/dw_newron.py'
+      - 'src/api/dataHandler.py'
+      - 'tests/test_teams_*'
+      - 'tests/test_pipeline_*'
+      - 'tests/test_understand_*'
+      - 'tests/test_enriched_*'
+  push:
+    branches: [Development]
+    paths:
+      - 'src/teams/**'
+      - 'src/doc_understanding/**'
+      - 'src/embedding/**'
+
+jobs:
+  test-teams:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-ci.txt pytest pytest-asyncio pytest-timeout httpx
+
+      - name: Run Teams pipeline tests
+        run: |
+          python -m pytest \
+            tests/test_teams_text_responses.py \
+            tests/test_understand_full_text.py \
+            tests/test_pipeline_full_extraction.py \
+            tests/test_pipeline_progress.py \
+            tests/test_enriched_embedding.py \
+            tests/test_teams_integration.py \
+            tests/test_teams_pipeline.py \
+            tests/test_teams_pipeline_e2e.py \
+            -v --tb=short --timeout=120
+        env:
+          MICROSOFT_APP_ID: "test-app-id"
+          MICROSOFT_APP_PASSWORD: "test-password"
+          MICROSOFT_APP_TENANT_ID: "test-tenant-id"
+          MICROSOFT_APP_TYPE: "SingleTenant"

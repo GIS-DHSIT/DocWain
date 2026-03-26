@@ -216,7 +216,7 @@ class TeamsChatService:
         """
         await asyncio.to_thread(self.ensure_collection, context.subscription_id, context.profile_id)
 
-        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 300))
+        _RAG_TIMEOUT_S = float(getattr(getattr(Config, "Teams", None), "RAG_TIMEOUT_S", 120))
 
         try:
             if dw_newron is None:

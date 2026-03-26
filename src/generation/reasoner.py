@@ -35,14 +35,14 @@ class ReasonerResult:
 # ---------------------------------------------------------------------------
 
 _BASE_TOKENS: Dict[str, int] = {
-    "lookup": 2048,
-    "extract": 4096,
-    "list": 2048,
-    "summarize": 4096,
-    "overview": 4096,
-    "compare": 4096,
-    "investigate": 4096,
-    "aggregate": 2048,
+    "lookup": 3072,
+    "extract": 6144,
+    "list": 6144,
+    "summarize": 6144,
+    "overview": 6144,
+    "compare": 6144,
+    "investigate": 6144,
+    "aggregate": 4096,
 }
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,11 @@ class Reasoner:
 
         max_tokens = self._compute_token_budget(
             task_type, len(evidence), use_thinking,
+        )
+
+        logger.info(
+            "[REASONER_PROMPT] task=%s evidence_count=%d prompt_len=%d query=%r",
+            task_type, len(evidence), len(user_msg), query[:80],
         )
 
         try:
@@ -183,10 +188,11 @@ class Reasoner:
             evidence_parts.append(text)
         evidence_text = " ".join(evidence_parts)
 
-        # If we have evidence items but no extractable text, still consider
-        # grounded since the retrieval found relevant chunks
-        if not evidence_text.strip() and evidence:
-            return True
+        # If we have evidence items but no extractable text, mark as ungrounded
+        # — the model cannot be grounded without actual text to reference
+        if not evidence_text.strip():
+            logger.warning("[Reasoner] Grounding: evidence items exist but contain no text — UNGROUNDED")
+            return False
 
         # Short or empty answer — consider grounded if we have evidence
         if len(answer.strip()) < 20:
@@ -197,9 +203,15 @@ class Reasoner:
         if answer_numbers:
             evidence_numbers = set(_NUMBER_RE.findall(evidence_text))
             ungrounded_nums = answer_numbers - evidence_numbers
-            # Allow up to 40% ungrounded numbers (expert may compute ratios,
-            # percentages, reformat values, or derive new figures)
-            if len(ungrounded_nums) / len(answer_numbers) > 0.40:
+            if ungrounded_nums:
+                logger.warning(
+                    "[Reasoner] Grounding: %d/%d numbers not found in evidence: %s",
+                    len(ungrounded_nums), len(answer_numbers),
+                    list(ungrounded_nums)[:10],
+                )
+            # Allow up to 20% ungrounded numbers (expert may compute ratios
+            # or reformat values, but most numbers must trace to evidence)
+            if len(ungrounded_nums) / len(answer_numbers) > 0.20:
                 logger.debug(
                     "[Reasoner] Grounding: %d/%d numbers ungrounded",
                     len(ungrounded_nums), len(answer_numbers),
@@ -228,11 +240,18 @@ class Reasoner:
 
         if answer_words and evidence_words:
             overlap = len(answer_words & evidence_words)
-            # If there's ANY meaningful word overlap (>= 3 shared words),
-            # consider the answer grounded. Only reject when there's virtually
-            # zero connection between answer and evidence.
-            if overlap < 3:
-                logger.debug(
+            overlap_ratio = overlap / len(answer_words) if answer_words else 0
+            # At least 15% of answer words must appear in evidence to be grounded.
+            # This catches responses that share a few generic words but fabricate
+            # most of the content.
+            if overlap_ratio < 0.15:
+                logger.warning(
+                    "[Reasoner] Grounding: only %d/%d words (%.0f%%) overlap with evidence — UNGROUNDED",
+                    overlap, len(answer_words), overlap_ratio * 100,
+                )
+                return False
+            if overlap < 5:
+                logger.warning(
                     "[Reasoner] Grounding: only %d shared words — UNGROUNDED",
                     overlap,
                 )

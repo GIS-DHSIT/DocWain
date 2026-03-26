@@ -305,6 +305,169 @@ def _normalize_requested_ids(document_id: Optional[str], document_ids: Optional[
         requested.extend([str(doc_id).strip() for doc_id in document_ids if str(doc_id).strip()])
     return list(dict.fromkeys(requested))
 
+def _extract_full_text_from_pickle(extracted: Any) -> str:
+    """Extract full document text from a deserialized pickle."""
+    if extracted is None:
+        return ""
+    # Handle dict with 'raw' key containing ExtractedDocument objects
+    if isinstance(extracted, dict):
+        for key in ("raw", "structured", "document"):
+            content = extracted.get(key)
+            if isinstance(content, dict):
+                for _fname, _doc in content.items():
+                    if hasattr(_doc, "full_text") and _doc.full_text:
+                        return _doc.full_text
+                    if isinstance(_doc, dict) and _doc.get("full_text"):
+                        return _doc["full_text"]
+            elif hasattr(content, "full_text") and content.full_text:
+                return content.full_text
+        # Try direct full_text
+        if extracted.get("full_text"):
+            return extracted["full_text"]
+    elif hasattr(extracted, "full_text") and extracted.full_text:
+        return extracted.full_text
+    return ""
+
+
+def _extract_full_text_from_qdrant(
+    doc_id: str, subscription_id: str, profile_id: str
+) -> str:
+    """Reconstruct document text from existing Qdrant chunks when pickle is unavailable."""
+    try:
+        from src.api.dataHandler import get_vector_store
+        from src.api.vector_store import build_collection_name
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+        _vs = get_vector_store()
+        collection = build_collection_name(subscription_id)
+        points, _ = _vs.client.scroll(
+            collection_name=collection,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="profile_id", match=MatchValue(value=profile_id)),
+            ]),
+            limit=100,
+            with_payload=["canonical_text", "resolution", "chunk_index"],
+            with_vectors=False,
+        )
+        chunks = []
+        for p in points:
+            payload = p.payload or {}
+            if payload.get("resolution") in ("doc_index", "doc_intelligence"):
+                continue
+            chunks.append({
+                "text": payload.get("canonical_text", ""),
+                "index": payload.get("chunk_index", 0),
+            })
+        chunks.sort(key=lambda c: c["index"])
+        full_text = "\n".join(c["text"] for c in chunks if c["text"])
+        if full_text:
+            logger.info("[DOC_INTELLIGENCE] Reconstructed %d chars from %d Qdrant chunks for %s",
+                       len(full_text), len(chunks), doc_id)
+        return full_text
+    except Exception as exc:
+        logger.debug("[DOC_INTELLIGENCE] Qdrant text reconstruction failed: %s", exc)
+        return ""
+
+
+def _check_doc_intelligence_exists(doc_id: str, subscription_id: str, profile_id: str) -> bool:
+    """Check if doc_index point already exists in Qdrant for this document."""
+    try:
+        from src.api.vector_store import build_collection_name
+        from src.api.dataHandler import get_vector_store
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        _vs = get_vector_store()
+        _count = _vs.client.count(
+            collection_name=build_collection_name(subscription_id),
+            count_filter=Filter(must=[
+                FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
+                FieldCondition(key="resolution", match=MatchValue(value="doc_index")),
+            ]),
+        ).count
+        return _count > 0
+    except Exception:
+        return False
+
+
+def _upsert_doc_intelligence(
+    doc_id: str,
+    subscription_id: str,
+    profile_id: str,
+    source_filename: str,
+    full_text: str,
+    collection_name: str,
+) -> None:
+    """Extract document intelligence and upsert doc_index + doc_intelligence points."""
+    import uuid
+
+    from src.extraction.document_intelligence import (
+        extract_document_intelligence,
+        build_doc_index_text,
+        build_doc_intelligence_text,
+    )
+    from src.embedding.pipeline.schema_normalizer import build_qdrant_payload
+    from src.api.dataHandler import get_vector_store, get_model
+
+    intelligence = extract_document_intelligence(full_text, source_filename)
+    doc_index_text = build_doc_index_text(source_filename, intelligence)
+    doc_intel_text = build_doc_intelligence_text(source_filename, intelligence)
+
+    if not doc_index_text.strip():
+        logger.warning("[DOC_INTELLIGENCE] Empty doc_index text for %s", doc_id)
+        return
+
+    model = get_model()
+    _vs = get_vector_store()
+
+    # Build and upsert doc_index point
+    _base = {
+        "subscription_id": subscription_id,
+        "profile_id": profile_id,
+        "document_id": doc_id,
+        "source_name": source_filename,
+        "resolution": "doc_index",
+        "chunk_kind": "doc_index",
+        "chunk_id": f"doc_index_{doc_id}",
+        "chunk_index": 0,
+        "section_title": "Document Index",
+        "canonical_text": doc_index_text,
+        "embedding_text": doc_index_text,
+    }
+    idx_payload = build_qdrant_payload(_base)
+    idx_payload["doc_intelligence"] = intelligence
+
+    _base_intel = {**_base,
+        "canonical_text": doc_intel_text,
+        "embedding_text": doc_intel_text,
+        "resolution": "doc_intelligence",
+        "chunk_kind": "doc_intelligence",
+        "chunk_id": f"doc_intelligence_{doc_id}",
+        "section_title": "Document Intelligence",
+    }
+    intel_payload = build_qdrant_payload(_base_intel)
+    intel_payload["doc_intelligence"] = intelligence
+
+    # Encode vectors
+    idx_vector = model.encode([doc_index_text])[0].tolist()
+    intel_vector = model.encode([doc_intel_text])[0].tolist()
+
+    from qdrant_client.models import PointStruct
+    points = [
+        PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_index_{doc_id}")),
+            vector={"content_vector": idx_vector},
+            payload=idx_payload,
+        ),
+        PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_DNS, f"doc_intelligence_{doc_id}")),
+            vector={"content_vector": intel_vector},
+            payload=intel_payload,
+        ),
+    ]
+    _vs.client.upsert(collection_name=collection_name, points=points)
+    logger.info("[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)", doc_id, source_filename)
+
+
 def _extract_doc_id(record: Dict[str, Any]) -> Optional[str]:
     for key in ("_id", "document_id", "documentId", "doc_id", "id"):
         value = record.get(key)
@@ -1566,8 +1729,59 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                             "doc_type": getattr(content, "doc_type", None),
                         }
                         continue
-                # Fallback: if full_text is available, use it as single chunk
+                # Fallback: run full-section chunker on full_text to get proper sections
                 if full_text and full_text.strip():
+                    try:
+                        from src.embedding.chunking.section_chunker import SectionChunker
+                        _chunker = SectionChunker()
+                        # Pass full_text as string — chunker infers sections from text
+                        _chunks = _chunker.chunk_document(full_text, doc_internal_id="", source_filename=name)
+                        if _chunks and len(_chunks) >= 1:
+                            texts = []
+                            chunk_meta = []
+                            sections_data = []
+                            for idx, ch in enumerate(_chunks):
+                                ch_text = ch.text.strip()
+                                if not ch_text or len(ch_text) < 50:
+                                    continue
+                                # Prepend section title
+                                if ch.section_title and ch.section_title.lower() not in ch_text[:80].lower():
+                                    ch_text = f"{ch.section_title}\n{ch_text}"
+                                texts.append(ch_text)
+                                sections_data.append({
+                                    "text": ch_text,
+                                    "start_page": ch.page_start or 1,
+                                    "end_page": ch.page_end or 1,
+                                })
+                                chunk_meta.append({
+                                    "document_id": None,
+                                    "section_title": ch.section_title or "Section",
+                                    "section_path": ch.section_path or ch.section_title or "Section",
+                                    "page_start": ch.page_start or 1,
+                                    "page_end": ch.page_end or 1,
+                                    "page_number": ch.page_start or 1,
+                                    "chunk_index": idx,
+                                    "chunk_type": "section_full",
+                                    "doc_type": getattr(content, "doc_type", None),
+                                    "sentence_complete": ch_text.endswith((".", "?", "!")),
+                                })
+                            if texts:
+                                logger.info(
+                                    "[SECTION_CHUNKER] Produced %d full-section chunks for %s (avg %d chars)",
+                                    len(texts), name, sum(len(t) for t in texts) // max(len(texts), 1),
+                                )
+                                normalized[name] = {
+                                    "full_text": full_text,
+                                    "texts": texts,
+                                    "sections": sections_data,
+                                    "chunk_metadata": chunk_meta,
+                                    "doc_type": getattr(content, "doc_type", None),
+                                }
+                                continue
+                    except Exception as _sc_exc:
+                        logger.debug("[SECTION_CHUNKER] Fallback chunking failed: %s", _sc_exc)
+
+                    # Final fallback: full_text as single chunk
                     normalized[name] = {
                         "full_text": full_text,
                         "texts": [full_text],
@@ -1978,6 +2192,27 @@ def _process_blob(
         record = get_document_record(doc_id) or {}
         current_status = record.get("status")
         if current_status in COMPLETED_STATUSES:
+            # Still generate doc_index/doc_intelligence if missing
+            try:
+                _has_di = _check_doc_intelligence_exists(doc_id, subscription_id, profile_id)
+                if not _has_di:
+                    _di_full_text = _extract_full_text_from_pickle(extracted)
+                    # Fallback: reconstruct text from Qdrant chunks if pickle is purged
+                    if not _di_full_text:
+                        _di_full_text = _extract_full_text_from_qdrant(
+                            doc_id, subscription_id or "", profile_id or ""
+                        )
+                    if _di_full_text:
+                        _source_fn = record.get("name", blob.name or "")
+                        _upsert_doc_intelligence(
+                            doc_id, subscription_id, profile_id,
+                            _source_fn, _di_full_text,
+                            collection_name=build_collection_name(subscription_id or ""),
+                        )
+                    else:
+                        logger.warning("[DOC_INTELLIGENCE] No text source for %s (pickle purged, no Qdrant chunks)", doc_id)
+            except Exception as _di_exc:
+                logger.warning("[DOC_INTELLIGENCE] Skipped-path extraction failed: %s", _di_exc, exc_info=True)
             result["status"] = "SKIPPED"
             result["failed_reason"] = None
             return result
@@ -2175,6 +2410,25 @@ def _process_blob(
                         extra={"existing_points": qdrant_count, "expected_chunks": expected_chunks})
 
         if qdrant_count and expected_chunks and qdrant_count >= expected_chunks:
+            # Generate doc_intelligence if missing even for already-embedded docs
+            try:
+                _has_di = _check_doc_intelligence_exists(doc_id, subscription_id, profile_id)
+                if not _has_di:
+                    _di_text = _extract_full_text_from_pickle(extracted)
+                    if not _di_text:
+                        _di_text = _extract_full_text_from_qdrant(
+                            doc_id, subscription_id or "", profile_id or ""
+                        )
+                    if _di_text:
+                        _upsert_doc_intelligence(
+                            doc_id, subscription_id, profile_id,
+                            source_filename or blob.name or "",
+                            _di_text,
+                            collection_name=build_collection_name(subscription_id or ""),
+                        )
+            except Exception as _di_exc:
+                logger.warning("[DOC_INTELLIGENCE] Already-embedded path extraction failed: %s", _di_exc, exc_info=True)
+
             if telemetry:
                 telemetry.increment("embed_skipped_already_embedded_total")
             update_stage(
@@ -2232,7 +2486,6 @@ def _process_blob(
             # Clean up partial embeddings before re-upserting to prevent duplicates
             try:
                 from src.api.dataHandler import get_vector_store
-                from src.api.vector_store import build_collection_name
                 _cleanup_store = get_vector_store()
                 _cleanup_store.delete_document(subscription_id, profile_id, doc_id)
                 logger.info(
@@ -2673,6 +2926,100 @@ def _process_blob(
                     exc,
                 )
 
+        # --- Document Intelligence Points ---
+        try:
+            from src.extraction.document_intelligence import (
+                extract_document_intelligence,
+                build_doc_index_text,
+                build_doc_intelligence_text,
+            )
+
+            # Reconstruct full document text from extracted_docs
+            _di_full_text = ""
+            for _di_fname, _di_content in (extracted_docs or {}).items():
+                if isinstance(_di_content, ExtractedDocument) and _di_content.full_text:
+                    _di_full_text += _di_content.full_text + "\n"
+                elif isinstance(_di_content, dict) and isinstance(_di_content.get("full_text"), str):
+                    _di_full_text += _di_content["full_text"] + "\n"
+                elif isinstance(_di_content, str):
+                    _di_full_text += _di_content + "\n"
+
+            _di_source_filename = file_name or doc_id
+
+            if _di_full_text.strip():
+                _intelligence = extract_document_intelligence(_di_full_text, _di_source_filename)
+                _doc_index_text = build_doc_index_text(_di_source_filename, _intelligence)
+                _doc_intel_text = build_doc_intelligence_text(_di_source_filename, _intelligence)
+
+                from src.embedding.pipeline.schema_normalizer import build_qdrant_payload as _di_build_payload
+                import uuid as _di_uuid
+
+                _di_base_payload = {
+                    "subscription_id": subscription_id,
+                    "profile_id": profile_id,
+                    "document_id": doc_id,
+                    "source_name": _di_source_filename,
+                    "canonical_text": _doc_index_text,
+                    "embedding_text": _doc_index_text,
+                    "resolution": "doc_index",
+                    "chunk_kind": "doc_index",
+                    "chunk_id": f"doc_index_{doc_id}",
+                    "chunk_index": 0,
+                    "section_title": "Document Index",
+                }
+
+                _index_payload = _di_build_payload(_di_base_payload)
+                _index_payload["doc_intelligence"] = _intelligence
+
+                # Encode embedding vectors
+                from src.embedding.model_loader import get_embedding_model as _di_get_model
+                _di_model_result = _di_get_model()
+                _di_model = _di_model_result[0] if isinstance(_di_model_result, tuple) else _di_model_result
+
+                _index_vector = _di_model.encode([_doc_index_text], show_progress_bar=False)[0].tolist()
+
+                from qdrant_client.models import PointStruct as _di_PointStruct
+
+                _index_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_index_{doc_id}")),
+                    vector={"content_vector": _index_vector},
+                    payload=_index_payload,
+                )
+
+                # Build doc_intelligence point
+                _intel_payload = _di_build_payload({
+                    **_di_base_payload,
+                    "canonical_text": _doc_intel_text,
+                    "embedding_text": _doc_intel_text,
+                    "resolution": "doc_intelligence",
+                    "chunk_kind": "doc_intelligence",
+                    "chunk_id": f"doc_intelligence_{doc_id}",
+                    "section_title": "Document Intelligence",
+                })
+                _intel_payload["doc_intelligence"] = _intelligence
+
+                _intel_vector = _di_model.encode([_doc_intel_text], show_progress_bar=False)[0].tolist()
+
+                _intel_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_intelligence_{doc_id}")),
+                    vector={"content_vector": _intel_vector},
+                    payload=_intel_payload,
+                )
+
+                from src.api.dataHandler import get_vector_store as _di_get_vs
+                _di_vs = _di_get_vs()
+                _di_vs.client.upsert(
+                    collection_name=collection_name,
+                    points=[_index_point, _intel_point],
+                )
+
+                logger.info(
+                    "[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)",
+                    doc_id, _di_source_filename,
+                )
+        except Exception as _di_exc:
+            logger.warning("[DOC_INTELLIGENCE] Failed for %s: %s", doc_id, _di_exc)
+
         _set_document_status(doc_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
         # Profile intelligence: auto-generate insights (background, non-blocking)
         try:
@@ -2881,6 +3228,20 @@ def _process_local_document(
         return _early_return(result)
     current_status = record.get("status")
     if current_status in COMPLETED_STATUSES:
+        # Generate doc_intelligence if missing (local path)
+        try:
+            _has_di = _check_doc_intelligence_exists(document_id, subscription_id or "", profile_id or "")
+            if not _has_di:
+                _di_text = _extract_full_text_from_qdrant(document_id, subscription_id or "", profile_id or "")
+                if _di_text:
+                    _source_fn = record.get("name", "")
+                    _upsert_doc_intelligence(
+                        document_id, subscription_id or "", profile_id or "",
+                        _source_fn, _di_text,
+                        collection_name=build_collection_name(subscription_id or ""),
+                    )
+        except Exception as _di_exc:
+            logger.warning("[DOC_INTELLIGENCE] Local-path extraction failed: %s", _di_exc, exc_info=True)
         result["status"] = "SKIPPED"
         result["failed_reason"] = None
         return _early_return(result)
@@ -3347,6 +3708,100 @@ def _process_local_document(
                     document_id,
                     exc,
                 )
+
+        # --- Document Intelligence Points ---
+        try:
+            from src.extraction.document_intelligence import (
+                extract_document_intelligence,
+                build_doc_index_text,
+                build_doc_intelligence_text,
+            )
+
+            # Reconstruct full document text from extracted_docs
+            _di_full_text = ""
+            for _di_fname, _di_content in (extracted_docs or {}).items():
+                if isinstance(_di_content, ExtractedDocument) and _di_content.full_text:
+                    _di_full_text += _di_content.full_text + "\n"
+                elif isinstance(_di_content, dict) and isinstance(_di_content.get("full_text"), str):
+                    _di_full_text += _di_content["full_text"] + "\n"
+                elif isinstance(_di_content, str):
+                    _di_full_text += _di_content + "\n"
+
+            _di_source_filename = file_name or document_id
+
+            if _di_full_text.strip():
+                _intelligence = extract_document_intelligence(_di_full_text, _di_source_filename)
+                _doc_index_text = build_doc_index_text(_di_source_filename, _intelligence)
+                _doc_intel_text = build_doc_intelligence_text(_di_source_filename, _intelligence)
+
+                from src.embedding.pipeline.schema_normalizer import build_qdrant_payload as _di_build_payload
+                import uuid as _di_uuid
+
+                _di_base_payload = {
+                    "subscription_id": subscription_id,
+                    "profile_id": profile_id,
+                    "document_id": document_id,
+                    "source_name": _di_source_filename,
+                    "canonical_text": _doc_index_text,
+                    "embedding_text": _doc_index_text,
+                    "resolution": "doc_index",
+                    "chunk_kind": "doc_index",
+                    "chunk_id": f"doc_index_{document_id}",
+                    "chunk_index": 0,
+                    "section_title": "Document Index",
+                }
+
+                _index_payload = _di_build_payload(_di_base_payload)
+                _index_payload["doc_intelligence"] = _intelligence
+
+                # Encode embedding vectors
+                from src.embedding.model_loader import get_embedding_model as _di_get_model
+                _di_model_result = _di_get_model()
+                _di_model = _di_model_result[0] if isinstance(_di_model_result, tuple) else _di_model_result
+
+                _index_vector = _di_model.encode([_doc_index_text], show_progress_bar=False)[0].tolist()
+
+                from qdrant_client.models import PointStruct as _di_PointStruct
+
+                _index_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_index_{document_id}")),
+                    vector={"content_vector": _index_vector},
+                    payload=_index_payload,
+                )
+
+                # Build doc_intelligence point
+                _intel_payload = _di_build_payload({
+                    **_di_base_payload,
+                    "canonical_text": _doc_intel_text,
+                    "embedding_text": _doc_intel_text,
+                    "resolution": "doc_intelligence",
+                    "chunk_kind": "doc_intelligence",
+                    "chunk_id": f"doc_intelligence_{document_id}",
+                    "section_title": "Document Intelligence",
+                })
+                _intel_payload["doc_intelligence"] = _intelligence
+
+                _intel_vector = _di_model.encode([_doc_intel_text], show_progress_bar=False)[0].tolist()
+
+                _intel_point = _di_PointStruct(
+                    id=str(_di_uuid.uuid5(_di_uuid.NAMESPACE_DNS, f"doc_intelligence_{document_id}")),
+                    vector={"content_vector": _intel_vector},
+                    payload=_intel_payload,
+                )
+
+                from src.api.dataHandler import get_vector_store as _di_get_vs
+                _di_vs = _di_get_vs()
+                _di_vs.client.upsert(
+                    collection_name=collection_name,
+                    points=[_index_point, _intel_point],
+                )
+
+                logger.info(
+                    "[DOC_INTELLIGENCE] Upserted doc_index + doc_intelligence for %s (%s)",
+                    document_id, _di_source_filename,
+                )
+        except Exception as _di_exc:
+            logger.warning("[DOC_INTELLIGENCE] Failed for %s: %s", document_id, _di_exc)
 
         _set_document_status(document_id, STATUS_TRAINING_COMPLETED, extra_fields=_training_success_fields())
         # Profile intelligence: auto-generate insights (background, non-blocking)

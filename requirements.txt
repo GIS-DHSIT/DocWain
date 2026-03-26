@@ -24,7 +24,7 @@ Pillow
 pycryptodome
 pydantic
 pymongo
-pytesseract==0.3.13
+pytesseract
 python-dotenv
 python_docx
 python_pptx
@@ -35,7 +35,9 @@ Requests
 scikit_learn
 sentence_transformers
 spacy
+timm>=0.9.0
 torch
+torchvision>=0.16.0
 transformers
 unsloth
 uvicorn
