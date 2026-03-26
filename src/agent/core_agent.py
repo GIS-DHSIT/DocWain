@@ -531,15 +531,21 @@ class CoreAgent:
             doc_context["doc_index"] = doc_index_entries
         if doc_intelligence_entries:
             # Prioritize intelligence entries that match documents mentioned in the query
-            _query_lower = understanding.resolved_query.lower()
+            _query_lower = understanding.resolved_query.lower().replace("_", " ").replace(".pdf", "")
             _prioritized = []
             _others = []
             for entry in doc_intelligence_entries:
-                # Check if any document name from the entry appears in the query
-                _entry_lower = entry.lower()
-                _first_line = entry.split("\n")[0] if entry else ""
-                _doc_name = _first_line.split(":")[0].replace("Document", "").strip() if ":" in _first_line else ""
-                if _doc_name and _doc_name.lower().replace(".pdf", "").replace("_", " ") in _query_lower.replace("_", " ").replace(".pdf", ""):
+                # Extract document filename from "Document: filename.pdf" line
+                _doc_name = ""
+                for _line in entry.split("\n")[:3]:
+                    if _line.lower().startswith("document:"):
+                        _doc_name = _line.split(":", 1)[1].strip()
+                        break
+                _match = False
+                if _doc_name:
+                    _name_normalized = _doc_name.lower().replace("_", " ").replace(".pdf", "")
+                    _match = _name_normalized in _query_lower or _query_lower in _name_normalized
+                if _match:
                     _prioritized.append(entry)
                 else:
                     _others.append(entry)
