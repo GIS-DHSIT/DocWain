@@ -493,37 +493,18 @@ class DocWainTeamsBot(TeamsActivityHandler):
             answer = answer_result.answer
             response_text = answer.get("response") or "I could not generate a response."
             sources = answer.get("sources") or []
-            sources_text = legacy_adapter.format_sources(sources)
             grounded = answer.get("grounded", False)
-
-            # Domain badge from answer metadata
             domain = answer.get("domain") or ""
-            domain_badge = f"[{domain.title()}]" if domain and domain != "generic" else ""
 
-            # Confidence indicator
-            source_count = len(sources)
-            if grounded and source_count >= 3:
-                confidence_text = f"High confidence ({source_count} sources)"
-            elif grounded and source_count >= 1:
-                confidence_text = f"Partial confidence ({source_count} source{'s' if source_count > 1 else ''})"
-            elif source_count > 0:
-                confidence_text = f"Low confidence ({source_count} source{'s' if source_count > 1 else ''})"
-            else:
-                confidence_text = ""
-
-            sources_toggle = f"Show sources ({source_count})" if source_count else "Show sources"
-
-            card = build_card(
-                "answer_card",
-                title="Answer",
-                text=response_text,
-                domain_badge=domain_badge,
-                confidence_text=confidence_text,
-                sources_text=sources_text.replace("\n\nSources:\n", "") if sources_text else "No sources available.",
-                sources_toggle_title=sources_toggle,
+            # Build plain text response (cards are for status only)
+            from src.teams.tools import format_text_answer
+            text_activity = format_text_answer(
+                response_text=response_text,
+                sources=sources,
+                domain=domain,
+                grounded=grounded,
             )
-            # Replace processing card in-place (prevents duplicates)
-            final_activity = _as_activity(_card_activity(card, text=response_text))
+            final_activity = _as_activity(text_activity)
             await self._update_or_replace(turn_context, _proc_id, final_activity, log)
 
             # Persist conversation history for context-aware follow-ups (non-blocking)

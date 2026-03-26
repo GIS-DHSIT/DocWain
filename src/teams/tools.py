@@ -43,6 +43,60 @@ def _format_sources(sources: Any) -> str:
             snippets.append(f"- {name}")
     return "\n".join(snippets)
 
+
+def format_text_answer(
+    response_text: str,
+    sources: list,
+    domain: str = "",
+    grounded: bool = False,
+) -> Dict[str, Any]:
+    """Build a plain-text Teams activity for Q&A answers.
+
+    Cards are reserved for status/progress indicators only.
+    """
+    parts: list[str] = []
+
+    # Domain badge
+    if domain and domain not in {"generic", "general", "other", ""}:
+        parts.append(f"[{domain.title()}]")
+
+    # Confidence
+    source_count = len(sources) if sources else 0
+    if grounded and source_count >= 3:
+        parts.append(f"High confidence ({source_count} sources)")
+    elif grounded and source_count >= 1:
+        parts.append(f"Partial confidence ({source_count} source{'s' if source_count > 1 else ''})")
+    elif source_count > 0:
+        parts.append(f"Low confidence ({source_count} source{'s' if source_count > 1 else ''})")
+
+    # Header line
+    header = " | ".join(parts) if parts else ""
+
+    # Build message
+    lines: list[str] = []
+    if header:
+        lines.append(header)
+        lines.append("")
+    lines.append(response_text)
+
+    # Inline sources
+    if sources:
+        lines.append("")
+        lines.append("---")
+        lines.append(f"Sources ({source_count}):")
+        for src in sources[:5]:
+            name = src.get("source_name") or src.get("source_id") or src.get("document_id") or "Source"
+            excerpt = (src.get("excerpt") or "")[:150]
+            if excerpt:
+                lines.append(f"- **{name}**: {excerpt}")
+            else:
+                lines.append(f"- **{name}**")
+
+    return {
+        "type": "message",
+        "text": "\n".join(lines),
+    }
+
 class TeamsToolRouter:
     """Routes Teams Adaptive Card Submit actions to DocWain tools."""
 
@@ -146,11 +200,13 @@ class TeamsToolRouter:
             f"Document tags: {', '.join(doc_tags)}. Filenames: {', '.join(filenames)}."
         )
         answer = await self._ask_docwain(question, context)
-        sources_text = _format_sources(answer.get("sources"))
         body_text = answer.get("response") or "I could not generate a summary."
-        return _card_activity(
-            build_card("answer_card", title="Summary", text=body_text, sources_text=sources_text or "No sources available."),
-            text="Summary ready.",
+        sources = answer.get("sources") or []
+        return format_text_answer(
+            response_text=body_text,
+            sources=sources,
+            domain="summary",
+            grounded=bool(sources),
         )
 
     async def _extract_fields(self, context: TeamsChatContext, preset: Optional[str] = None) -> Dict[str, Any]:
@@ -184,10 +240,12 @@ class TeamsToolRouter:
         )
         answer = await self._ask_docwain(question, context)
         body_text = answer.get("response") or "No fields were extracted."
-        sources_text = _format_sources(answer.get("sources"))
-        return _card_activity(
-            build_card("answer_card", title="Extracted fields", text=body_text, sources_text=sources_text or "No sources available."),
-            text="Field extraction ready.",
+        sources = answer.get("sources") or []
+        return format_text_answer(
+            response_text=body_text,
+            sources=sources,
+            domain=safe_preset or "extraction",
+            grounded=bool(sources),
         )
 
     async def _generate_content(
@@ -397,25 +455,16 @@ class TeamsToolRouter:
         try:
             answer = await self._ask_docwain(query, context)
             response_text = answer.get("response") or "I could not find an answer."
-            sources_text = _format_sources(answer.get("sources"))
+            sources = answer.get("sources") or []
+            domain = answer.get("domain") or "general"
+            grounded = answer.get("grounded", False)
 
-            # Generate follow-up suggestions
-            suggestions = []
-            try:
-                from src.teams.insights import generate_followup_suggestions
-                domain = answer.get("domain") or "general"
-                sources_count = len(answer.get("sources") or [])
-                suggestions = generate_followup_suggestions(query, response_text, domain, sources_count)
-            except Exception:  # noqa: BLE001
-                pass
-
-            card = build_card(
-                "answer_card",
-                title="Answer",
-                text=response_text,
-                sources_text=sources_text or "No sources available.",
+            return format_text_answer(
+                response_text=response_text,
+                sources=sources,
+                domain=domain,
+                grounded=grounded,
             )
-            return _card_activity(card, text=response_text[:200])
         except Exception as exc:  # noqa: BLE001
             logger.error("Domain query failed: %s", exc, exc_info=True)
             return _card_activity(
