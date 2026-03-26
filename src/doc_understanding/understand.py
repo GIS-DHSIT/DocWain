@@ -47,14 +47,14 @@ def _ollama_understand(
         "The document_type is: "
         f"{doc_type}. Only include facts that are explicitly stated in the text. "
         "Evidence pointer should be 'Section: <title>, Page: <page>'.\n\n"
-        f"TEXT:\n{text[:8000]}"
+        f"TEXT:\n{text[:64000]}"
     )
 
     # Build generation options — expand for thinking mode
     _options: Dict[str, Any] = {
         "temperature": 0.1,
-        "num_predict": 1024,
-        "num_ctx": 4096,
+        "num_predict": 2048,
+        "num_ctx": 16384,
     }
     if use_thinking:
         _options["think"] = True
