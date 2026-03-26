@@ -545,9 +545,14 @@ class CoreAgent:
                     _others.append(entry)
 
             if _prioritized:
-                # Put matching documents first, then others
-                doc_context["doc_intelligence_summaries"] = _prioritized + _others
-                logger.info("[DOC_INDEX] Prioritized %d matching doc_intelligence entries for query", len(_prioritized))
+                # For specific-doc queries: send matching docs as PRIMARY, limit others
+                # to avoid diluting the LLM's attention across 50+ entries
+                _max_others = 5 if len(_prioritized) <= 3 else 0
+                doc_context["doc_intelligence_summaries"] = _prioritized + _others[:_max_others]
+                logger.info(
+                    "[DOC_INDEX] Prioritized %d matching + %d other doc_intelligence entries",
+                    len(_prioritized), min(len(_others), _max_others),
+                )
             else:
                 doc_context["doc_intelligence_summaries"] = doc_intelligence_entries
 

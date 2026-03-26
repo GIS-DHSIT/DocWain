@@ -39,11 +39,13 @@ Extract everything that is factually present in this document:
 
 1. document_type: what kind of document this is (e.g., contract, invoice, resume, report, policy, statement, presentation, letter, form, other)
 2. parties: all named people, organizations, or entities with their roles as described in the document
-3. key_dates: all dates mentioned with their context
-4. key_values: all monetary amounts, quantities, percentages, durations, limits, scores, or measurable values with context
-5. key_sections: list each section/heading with a one-line summary of what it contains
-6. key_facts: important statements, terms, conditions, findings, or conclusions — whatever the document asserts
-7. one_line_summary: single sentence describing this document
+3. start_date: the effective date, commencement date, or start date of this document/agreement
+4. end_date: the expiration date, end date, or term end date if specified
+5. key_dates: all other dates mentioned with their context
+6. key_values: all monetary amounts, quantities, percentages, durations, limits, scores, or measurable values with context
+7. key_sections: list each section/heading with a one-line summary of what it contains
+8. key_facts: important statements, terms, conditions, findings, or conclusions — whatever the document asserts
+9. one_line_summary: single sentence describing this document
 
 Rules:
 - Extract ONLY what is explicitly stated. Never infer or fabricate.
@@ -455,6 +457,14 @@ def build_doc_index_text(filename: str, intelligence: Dict[str, Any]) -> str:
         if party_strs:
             parts.append(" \u2194 ".join(party_strs))
 
+    # Start/end dates
+    start_date = intelligence.get("start_date")
+    if start_date:
+        parts.append(f"Start: {start_date}")
+    end_date = intelligence.get("end_date")
+    if end_date:
+        parts.append(f"End: {end_date}")
+
     # First key date
     dates = intelligence.get("key_dates")
     if dates and isinstance(dates, list):
@@ -490,6 +500,13 @@ def build_doc_intelligence_text(
     summary = intelligence.get("one_line_summary")
     if summary:
         lines.append(f"Summary: {summary}")
+
+    start_date = intelligence.get("start_date")
+    if start_date:
+        lines.append(f"Start Date: {start_date}")
+    end_date = intelligence.get("end_date")
+    if end_date:
+        lines.append(f"End Date: {end_date}")
 
     parties = intelligence.get("parties")
     if parties and isinstance(parties, list):
