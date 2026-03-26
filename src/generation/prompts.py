@@ -427,9 +427,12 @@ def build_reason_prompt(
         parts.append("")
 
     if doc_intel_summaries:
-        parts.append("--- DOCUMENT INTELLIGENCE (structured summaries) ---")
+        parts.append("--- DOCUMENT INTELLIGENCE (structured summaries — USE AS PRIMARY EVIDENCE) ---")
+        parts.append("These summaries contain verified extracted facts from each document.")
+        parts.append("Use these as your primary source of truth when answering questions.")
+        parts.append("")
         _intel_chars = 0
-        _MAX_INTEL_CHARS = 8000  # Cap to avoid exceeding context window
+        _MAX_INTEL_CHARS = 16000  # Increased cap for comprehensive coverage
         for entry in doc_intel_summaries:
             if _intel_chars + len(entry) > _MAX_INTEL_CHARS:
                 parts.append(f"... ({len(doc_intel_summaries) - doc_intel_summaries.index(entry)} more documents)")

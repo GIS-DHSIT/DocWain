@@ -530,7 +530,26 @@ class CoreAgent:
         if doc_index_entries:
             doc_context["doc_index"] = doc_index_entries
         if doc_intelligence_entries:
-            doc_context["doc_intelligence_summaries"] = doc_intelligence_entries
+            # Prioritize intelligence entries that match documents mentioned in the query
+            _query_lower = understanding.resolved_query.lower()
+            _prioritized = []
+            _others = []
+            for entry in doc_intelligence_entries:
+                # Check if any document name from the entry appears in the query
+                _entry_lower = entry.lower()
+                _first_line = entry.split("\n")[0] if entry else ""
+                _doc_name = _first_line.split(":")[0].replace("Document", "").strip() if ":" in _first_line else ""
+                if _doc_name and _doc_name.lower().replace(".pdf", "").replace("_", " ") in _query_lower.replace("_", " ").replace(".pdf", ""):
+                    _prioritized.append(entry)
+                else:
+                    _others.append(entry)
+
+            if _prioritized:
+                # Put matching documents first, then others
+                doc_context["doc_intelligence_summaries"] = _prioritized + _others
+                logger.info("[DOC_INDEX] Prioritized %d matching doc_intelligence entries for query", len(_prioritized))
+            else:
+                doc_context["doc_intelligence_summaries"] = doc_intelligence_entries
 
         # --- REASON ---
         t0 = time.monotonic()

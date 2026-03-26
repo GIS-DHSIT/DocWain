@@ -1734,7 +1734,8 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                     try:
                         from src.embedding.chunking.section_chunker import SectionChunker
                         _chunker = SectionChunker()
-                        _chunks = _chunker.chunk_document(content, doc_internal_id="", source_filename=name)
+                        # Pass full_text as string — chunker infers sections from text
+                        _chunks = _chunker.chunk_document(full_text, doc_internal_id="", source_filename=name)
                         if _chunks and len(_chunks) >= 1:
                             texts = []
                             chunk_meta = []
