@@ -1729,8 +1729,58 @@ def _normalize_raw_payload(raw: Any) -> Dict[str, Any]:
                             "doc_type": getattr(content, "doc_type", None),
                         }
                         continue
-                # Fallback: if full_text is available, use it as single chunk
+                # Fallback: run full-section chunker on full_text to get proper sections
                 if full_text and full_text.strip():
+                    try:
+                        from src.embedding.chunking.section_chunker import SectionChunker
+                        _chunker = SectionChunker()
+                        _chunks = _chunker.chunk_document(content, doc_internal_id="", source_filename=name)
+                        if _chunks and len(_chunks) >= 1:
+                            texts = []
+                            chunk_meta = []
+                            sections_data = []
+                            for idx, ch in enumerate(_chunks):
+                                ch_text = ch.text.strip()
+                                if not ch_text or len(ch_text) < 50:
+                                    continue
+                                # Prepend section title
+                                if ch.section_title and ch.section_title.lower() not in ch_text[:80].lower():
+                                    ch_text = f"{ch.section_title}\n{ch_text}"
+                                texts.append(ch_text)
+                                sections_data.append({
+                                    "text": ch_text,
+                                    "start_page": ch.page_start or 1,
+                                    "end_page": ch.page_end or 1,
+                                })
+                                chunk_meta.append({
+                                    "document_id": None,
+                                    "section_title": ch.section_title or "Section",
+                                    "section_path": ch.section_path or ch.section_title or "Section",
+                                    "page_start": ch.page_start or 1,
+                                    "page_end": ch.page_end or 1,
+                                    "page_number": ch.page_start or 1,
+                                    "chunk_index": idx,
+                                    "chunk_type": "section_full",
+                                    "doc_type": getattr(content, "doc_type", None),
+                                    "sentence_complete": ch_text.endswith((".", "?", "!")),
+                                })
+                            if texts:
+                                logger.info(
+                                    "[SECTION_CHUNKER] Produced %d full-section chunks for %s (avg %d chars)",
+                                    len(texts), name, sum(len(t) for t in texts) // max(len(texts), 1),
+                                )
+                                normalized[name] = {
+                                    "full_text": full_text,
+                                    "texts": texts,
+                                    "sections": sections_data,
+                                    "chunk_metadata": chunk_meta,
+                                    "doc_type": getattr(content, "doc_type", None),
+                                }
+                                continue
+                    except Exception as _sc_exc:
+                        logger.debug("[SECTION_CHUNKER] Fallback chunking failed: %s", _sc_exc)
+
+                    # Final fallback: full_text as single chunk
                     normalized[name] = {
                         "full_text": full_text,
                         "texts": [full_text],
