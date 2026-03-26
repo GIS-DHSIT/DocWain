@@ -39,12 +39,12 @@ Extract everything that is factually present in this document:
 
 1. document_type: what kind of document this is (e.g., contract, invoice, resume, report, policy, statement, presentation, letter, form, other)
 2. parties: all named people, organizations, or entities with their roles as described in the document
-3. start_date: the effective date, commencement date, or start date of this document/agreement
-4. end_date: the expiration date, end date, or term end date if specified
+3. start_date: the effective date, commencement date, or "entered into on" date
+4. end_date: the expiration date, or if a term duration is given (e.g. "3 years"), calculate end_date = start_date + term
 5. key_dates: all other dates mentioned with their context
-6. key_values: all monetary amounts, quantities, percentages, durations, limits, scores, or measurable values with context
-7. key_sections: list each section/heading with a one-line summary of what it contains
-8. key_facts: important statements, terms, conditions, findings, or conclusions — whatever the document asserts
+6. key_values: ALL monetary amounts, quantities, percentages, durations, limits, scores, notice periods, uptime percentages, liability caps, and any other measurable values with context. Be exhaustive — capture EVERY number and percentage in the document.
+7. key_sections: list each section/heading with a one-line summary that INCLUDES the specific values mentioned in that section (e.g., "Payment: Net 30 days" not just "Defines payment terms")
+8. key_facts: important statements, terms, conditions, findings, or conclusions — capture EVERY clause, condition, and obligation
 9. one_line_summary: single sentence describing this document
 
 Rules:
@@ -62,7 +62,7 @@ Please try again with this document. Return ONLY a valid JSON object, nothing el
 --- END DOCUMENT ---
 
 Return a JSON object with these fields (include only fields with data):
-{{"document_type": "...", "parties": [{{"name": "...", "role": "..."}}], "key_dates": [{{"date": "...", "context": "..."}}], "key_values": [{{"value": "...", "context": "..."}}], "key_sections": [{{"heading": "...", "summary": "..."}}], "key_facts": ["..."], "one_line_summary": "..."}}"""
+{{"document_type": "...", "parties": [{{"name": "...", "role": "..."}}], "start_date": "...", "end_date": "...", "key_dates": [{{"date": "...", "context": "..."}}], "key_values": [{{"value": "...", "context": "..."}}], "key_sections": [{{"heading": "...", "summary": "include specific values like amounts, percentages, durations"}}], "key_facts": ["..."], "one_line_summary": "..."}}"""
 
 # ---------------------------------------------------------------------------
 # JSON parsing helpers
@@ -507,6 +507,19 @@ def build_doc_intelligence_text(
     end_date = intelligence.get("end_date")
     if end_date:
         lines.append(f"End Date: {end_date}")
+
+    # Calculate Term from start/end dates or from key_values
+    if start_date and end_date:
+        lines.append(f"Term: {start_date} to {end_date}")
+    else:
+        # Look for term duration in key_values
+        for v in (intelligence.get("key_values") or []):
+            if isinstance(v, dict):
+                ctx = str(v.get("context", "")).lower()
+                val = str(v.get("value", ""))
+                if "initial term" in ctx or "contract term" in ctx or "term duration" in ctx:
+                    lines.append(f"Term: {val}")
+                    break
 
     parties = intelligence.get("parties")
     if parties and isinstance(parties, list):
