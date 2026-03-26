@@ -360,6 +360,10 @@ class TeamsDocumentPipeline:
                     for doc_name, doc_content in extracted_content.items():
                         if isinstance(doc_content, str):
                             enriched_content[doc_name] = di_prefix + doc_content
+                        elif hasattr(doc_content, "full_text") and isinstance(getattr(doc_content, "full_text", None), str):
+                            enriched_content[doc_name] = di_prefix + doc_content.full_text
+                        elif hasattr(doc_content, "text") and isinstance(getattr(doc_content, "text", None), str):
+                            enriched_content[doc_name] = di_prefix + doc_content.text
                         else:
                             enriched_content[doc_name] = doc_content
                     extracted_content = enriched_content
@@ -536,6 +540,15 @@ class TeamsDocumentPipeline:
         self.cache_content(result["document_id"], result["extracted_docs"])
 
         # Stage 2: Screen (Step 2/3)
+        progress2 = build_card(
+            "stage_progress_card",
+            step_indicator="2/3",
+            stage_title=f"Screening: {filename}",
+            stage_detail="Running security checks...",
+            progress_bar="[=======>      ] 66%",
+        )
+        await _send_card(turn_context, progress2, "Step 2/3: Screening...", log)
+
         screen_result = await self.stage_screen(
             result["document_id"],
             result["extracted_text"],

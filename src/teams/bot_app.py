@@ -30,7 +30,7 @@ from src.teams.cards import build_card
 from src.teams.insights import generate_proactive_insights, get_domain_actions
 from src.teams.logic import TeamsChatService
 from src.teams.state import TeamsStateStore
-from src.teams.tools import TeamsToolRouter, _card_activity
+from src.teams.tools import TeamsToolRouter, _card_activity, format_text_answer
 from src.utils.logging_utils import get_correlation_id, get_logger
 
 logger = get_logger(__name__)
@@ -497,7 +497,6 @@ class DocWainTeamsBot(TeamsActivityHandler):
             domain = answer.get("domain") or ""
 
             # Build plain text response (cards are for status only)
-            from src.teams.tools import format_text_answer
             text_activity = format_text_answer(
                 response_text=response_text,
                 sources=sources,

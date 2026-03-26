@@ -29,21 +29,6 @@ def _card_activity(card: Dict[str, Any], text: Optional[str] = None) -> Dict[str
         activity["text"] = text
     return activity
 
-def _format_sources(sources: Any) -> str:
-    items = sources or []
-    if not isinstance(items, list):
-        return ""
-    snippets = []
-    for src in items[:5]:
-        name = src.get("source_name") or src.get("source_id") or src.get("document_id") or "Source"
-        excerpt = (src.get("excerpt") or "")[:200]
-        if excerpt:
-            snippets.append(f"- {name}: {excerpt}")
-        else:
-            snippets.append(f"- {name}")
-    return "\n".join(snippets)
-
-
 def format_text_answer(
     response_text: str,
     sources: list,
@@ -277,9 +262,12 @@ class TeamsToolRouter:
                 build_card("error_card", message="Content generation failed. Please try again.")
             )
 
-        return _card_activity(
-            build_card("answer_card", title="Generated content", text=response_text, sources_text=""),
-            text="Content generation complete.",
+        sources = answer.get("sources") or []
+        return format_text_answer(
+            response_text=response_text,
+            sources=sources,
+            domain=content_type or "content",
+            grounded=bool(sources),
         )
 
     def _list_docs(self, context: TeamsChatContext) -> Dict[str, Any]:
