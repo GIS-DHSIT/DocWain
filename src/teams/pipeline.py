@@ -24,14 +24,50 @@ def _build_teams_collection_name(subscription_id: str, profile_id: str) -> str:
     return f"teams_{safe_sub}_{safe_prof}"
 
 
-async def _send_card(turn_context, card: Dict[str, Any], text: Optional[str], log) -> None:
-    """Send an Adaptive Card via the Bot Framework turn context."""
+async def _send_card(turn_context, card: Dict[str, Any], text: Optional[str], log) -> Optional[str]:
+    """Send an Adaptive Card via the Bot Framework turn context.
+
+    Returns the activity ID so the card can be updated in-place later.
+    """
     try:
         from src.teams.tools import _card_activity
         activity = _card_activity(card, text=text)
-        await turn_context.send_activity(activity)
+        resp = await turn_context.send_activity(activity)
+        return getattr(resp, "id", None)
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to send card: %s", exc, exc_info=True)
+        return None
+
+
+async def _update_card(turn_context, activity_id: Optional[str], card: Dict[str, Any], text: Optional[str], log) -> Optional[str]:
+    """Update an existing card in-place, falling back to send if update fails.
+
+    Returns the activity ID (same as input on success, new on fallback).
+    """
+    from src.teams.tools import _card_activity
+    activity = _card_activity(card, text=text)
+
+    if not activity_id:
+        return await _send_card(turn_context, card, text, log)
+
+    # Try in-place update first
+    try:
+        if isinstance(activity, dict):
+            activity["id"] = activity_id
+        elif hasattr(activity, "id"):
+            activity.id = activity_id
+        await turn_context.update_activity(activity)
+        return activity_id
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Fallback: delete old + send new
+    try:
+        await turn_context.delete_activity(activity_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return await _send_card(turn_context, card, text, log)
 
 
 class TeamsDocumentPipeline:
@@ -516,61 +552,64 @@ class TeamsDocumentPipeline:
             asyncio.to_thread(_upload_to_blob, file_bytes, filename, context.subscription_id, log)
         )
 
-        # Stage 1: Identify (Step 1/3)
-        progress1 = build_card(
+        # ── Single progress card updated in-place across all stages ──
+        progress_card = build_card(
             "stage_progress_card",
             step_indicator="1/3",
             stage_title=f"Analyzing: {filename}",
             stage_detail="Extracting content and identifying document type...",
-            progress_bar="[===>          ] 33%",
+            progress_bar="[██░░░░░░░░░░░░] 33%",
         )
-        await _send_card(turn_context, progress1, "Step 1/3: Analyzing document...", log)
+        progress_id = await _send_card(turn_context, progress_card, "Step 1/3: Analyzing document...", log)
 
+        # Stage 1: Identify
         result = await self.stage_identify(
             file_bytes, filename, content_type, context, correlation_id,
         )
         if result is None:
-            card = build_card("error_card", message=f"No extractable content found in {filename}.")
-            await _send_card(turn_context, card, "No content found.", log)
+            # Replace progress card with error
+            error_card = build_card("error_card", message=f"No extractable content found in {filename}.")
+            await _update_card(turn_context, progress_id, error_card, "No content found.", log)
             return
 
-        await _send_card(turn_context, result["card"], "Document identified.", log)
+        # Update progress → Stage 2
+        progress_card = build_card(
+            "stage_progress_card",
+            step_indicator="2/3",
+            stage_title=f"Screening: {filename}",
+            stage_detail=f"Document identified as {result['doc_type'].title()} ({result['confidence']*100:.0f}% confidence). Running security checks...",
+            progress_bar="[██████░░░░░░░░] 50%",
+        )
+        progress_id = await _update_card(turn_context, progress_id, progress_card, "Step 2/3: Screening...", log)
 
         # Cache extracted content for consent flow
         self.cache_content(result["document_id"], result["extracted_docs"])
 
-        # Stage 2: Screen (Step 2/3)
-        progress2 = build_card(
-            "stage_progress_card",
-            step_indicator="2/3",
-            stage_title=f"Screening: {filename}",
-            stage_detail="Running security checks...",
-            progress_bar="[=======>      ] 66%",
-        )
-        await _send_card(turn_context, progress2, "Step 2/3: Screening...", log)
-
+        # Stage 2: Screen
         screen_result = await self.stage_screen(
             result["document_id"],
             result["extracted_text"],
             filename,
             correlation_id,
         )
-        await _send_card(turn_context, screen_result["card"], "Screening complete.", log)
 
         if screen_result["needs_consent"]:
+            # Replace progress card with consent card (user must interact)
+            await _update_card(turn_context, progress_id, screen_result["card"], "Consent required.", log)
             log.info("Pipeline paused for consent: doc=%s", result["document_id"])
             return
 
-        # Stage 3: Embed (Step 3/3)
-        progress3 = build_card(
+        # Update progress → Stage 3
+        progress_card = build_card(
             "stage_progress_card",
             step_indicator="3/3",
-            stage_title="Embedding Document",
-            stage_detail="Chunking and indexing for intelligent retrieval...",
-            progress_bar="[============> ] 90%",
+            stage_title=f"Embedding: {filename}",
+            stage_detail=f"Security: {screen_result['risk_level']} risk. Chunking and indexing for intelligent retrieval...",
+            progress_bar="[██████████░░░░] 80%",
         )
-        await _send_card(turn_context, progress3, "Step 3/3: Embedding...", log)
+        progress_id = await _update_card(turn_context, progress_id, progress_card, "Step 3/3: Embedding...", log)
 
+        # Stage 3: Embed
         embed_result = await self.stage_embed(
             document_id=result["document_id"],
             extracted_content=result["extracted_docs"],
@@ -586,7 +625,9 @@ class TeamsDocumentPipeline:
                 "key_facts": result.get("key_facts", []),
             },
         )
-        await _send_card(turn_context, embed_result["card"], "Document ready.", log)
+
+        # Replace progress card with final completion card
+        await _update_card(turn_context, progress_id, embed_result["card"], "Document ready.", log)
 
     # ── Resume after consent ─────────────────────────────────────────
 
