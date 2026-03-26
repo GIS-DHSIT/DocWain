@@ -115,18 +115,47 @@ class TeamsDocumentPipeline:
 
         await asyncio.to_thread(build_content_map, first_extracted)
 
-        understanding = await asyncio.to_thread(
-            understand_document, extracted=first_extracted, doc_type=doc_type, llm_client=cloud_llm,
-        )
-        summary = ""
+        # Understand ALL extracted documents concurrently
+        async def _understand_one(doc_content):
+            return await asyncio.to_thread(
+                understand_document, extracted=doc_content, doc_type=doc_type, llm_client=cloud_llm,
+            )
+
+        understanding_tasks = [_understand_one(doc_content) for doc_content in extracted_docs.values()]
+        all_understandings = await asyncio.gather(*understanding_tasks, return_exceptions=True)
+
+        # Aggregate understanding from all documents
+        summary_parts: List[str] = []
         key_entities: List[str] = []
         key_facts: List[str] = []
         intent_tags: List[str] = []
-        if isinstance(understanding, dict):
-            summary = understanding.get("document_summary", "")
-            key_entities = understanding.get("key_entities", [])
-            key_facts = understanding.get("key_facts", [])
-            intent_tags = understanding.get("intent_tags", [])
+        seen_entities = set()
+        seen_facts = set()
+
+        for understanding in all_understandings:
+            if isinstance(understanding, Exception):
+                log.warning("Understanding failed for one sub-document: %s", understanding)
+                continue
+            if not isinstance(understanding, dict):
+                continue
+            s = understanding.get("document_summary", "")
+            if s:
+                summary_parts.append(s)
+            for ent in understanding.get("key_entities", []):
+                ent_key = str(ent.get("text", "")).lower() if isinstance(ent, dict) else str(ent).lower()
+                if ent_key and ent_key not in seen_entities:
+                    seen_entities.add(ent_key)
+                    key_entities.append(ent if isinstance(ent, str) else ent.get("text", str(ent)))
+            for fact in understanding.get("key_facts", []):
+                fact_key = str(fact.get("fact", "")).lower() if isinstance(fact, dict) else str(fact).lower()
+                if fact_key and fact_key not in seen_facts:
+                    seen_facts.add(fact_key)
+                    key_facts.append(fact if isinstance(fact, str) else fact.get("fact", str(fact)))
+            for tag in understanding.get("intent_tags", []):
+                if tag not in intent_tags:
+                    intent_tags.append(tag)
+
+        summary = " | ".join(summary_parts) if summary_parts else ""
 
         # Store extraction result in MongoDB
         self.storage.store_extraction_result(
