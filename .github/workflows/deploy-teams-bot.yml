@@ -33,7 +33,13 @@ jobs:
             tests/test_teams_pipeline.py \
             tests/test_teams_pipeline_e2e.py \
             tests/test_enhanced_embedding_simple.py \
-            -v --tb=short -q --timeout=60
+            tests/test_teams_text_responses.py \
+            tests/test_understand_full_text.py \
+            tests/test_pipeline_full_extraction.py \
+            tests/test_pipeline_progress.py \
+            tests/test_enriched_embedding.py \
+            tests/test_teams_integration.py \
+            -v --tb=short -q --timeout=120
         env:
           MICROSOFT_APP_ID: "test-app-id"
           MICROSOFT_APP_PASSWORD: "test-password"
