@@ -316,6 +316,7 @@ class TeamsDocumentPipeline:
         context,
         correlation_id: str,
         suggested_questions: Optional[List[str]] = None,
+        doc_intelligence: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Chunk, embed into Teams-isolated Qdrant collection, return completion card."""
         log = get_logger(__name__, correlation_id)
@@ -341,6 +342,27 @@ class TeamsDocumentPipeline:
             vector_store = QdrantVectorStore(client)
             vector_size = int(getattr(Config.Model, "EMBEDDING_DIM", 1024))
             vector_store.ensure_collection(collection_name, vector_size)
+
+            # Enrich extracted content with DI context for better embedding quality
+            if doc_intelligence:
+                di_context = []
+                if doc_intelligence.get("summary"):
+                    di_context.append(f"Document Summary: {doc_intelligence['summary']}")
+                if doc_intelligence.get("key_entities"):
+                    entities_str = ", ".join(str(e) for e in doc_intelligence["key_entities"][:10])
+                    di_context.append(f"Key Entities: {entities_str}")
+                if doc_intelligence.get("doc_type"):
+                    di_context.append(f"Document Type: {doc_intelligence['doc_type']}")
+
+                if di_context:
+                    di_prefix = "\n".join(di_context) + "\n\n---\n\n"
+                    enriched_content = {}
+                    for doc_name, doc_content in extracted_content.items():
+                        if isinstance(doc_content, str):
+                            enriched_content[doc_name] = di_prefix + doc_content
+                        else:
+                            enriched_content[doc_name] = doc_content
+                    extracted_content = enriched_content
 
             # Embed each extracted doc
             from src.api.dataHandler import train_on_document
@@ -544,6 +566,12 @@ class TeamsDocumentPipeline:
             context=context,
             correlation_id=correlation_id,
             suggested_questions=result.get("suggested_questions"),
+            doc_intelligence={
+                "summary": result.get("summary", ""),
+                "key_entities": result.get("key_entities", []),
+                "doc_type": result.get("doc_type", ""),
+                "key_facts": result.get("key_facts", []),
+            },
         )
         await _send_card(turn_context, embed_result["card"], "Document ready.", log)
 
@@ -588,6 +616,11 @@ class TeamsDocumentPipeline:
             doc_type=doc_type,
             context=context,
             correlation_id=correlation_id,
+            doc_intelligence={
+                "doc_type": doc_type,
+                "summary": doc.get("extraction", {}).get("summary", ""),
+                "key_entities": doc.get("extraction", {}).get("key_entities", []),
+            },
         )
         await _send_card(turn_context, embed_result["card"], "Document ready.", log)
 
